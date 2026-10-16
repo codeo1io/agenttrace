@@ -557,3 +557,90 @@ fn rm936_bidi_format_controls_neutralized_across_every_lane() {
         }
     }
 }
+
+#[test]
+fn zwj_zwnj_joiner_pair_dies_on_render_lanes_and_survives_json() {
+    // rm-933 widening arm (2026-10-16, run 7288595f): ZWJ U+200D and
+    // ZWNJ U+200C are invisible general-category-Cf characters, and
+    // they rode the rendered lanes RAW at d2a02af — od-verified E2 80
+    // 8D / E2 80 8C byte-for-byte in the `--sessions` TSV/CSV name and
+    // model cells while RLO and NUL on the same rows were
+    // U+FFFD-replaced (delegate assess 5dd9fe76). A zero-width joiner
+    // glues what a terminal renders as separate cells — the same
+    // single-cell spoofing class the directional Cf set already dies
+    // for. This arm subscribes the shared line-segment and document
+    // sanitizers to the joiner pair (`is_joiner_format_control` in
+    // agenttrace-core). The JSON lanes are the CONTROL and must keep
+    // the pair raw: losslessness is their recorded contract, and the
+    // carve-out is deliberately pinned against the directional
+    // predicate only — this arm does NOT widen it.
+    let tmp = tempdir("output-safety-zwj");
+    let corpus = tmp.join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    let a = corpus.join("20261001T110000+0000-zwj.jsonl");
+    fs::write(
+        &a,
+        r#"{"type": "user", "uuid": "u1", "timestamp": "2026-10-01T11:00:00Z", "message": {"role": "user", "content": "zw\u200djoin\u200cnj lane probe"}, "cwd": "/tmp/at-zwj-poc"}
+{"type": "assistant", "uuid": "a1", "timestamp": "2026-10-01T11:00:05Z", "message": {"role": "assistant", "model": "zw\u200dmodel", "content": [{"type": "text", "text": "done"}], "usage": {"input_tokens": 10, "output_tokens": 5}}}
+"#,
+    )
+    .unwrap();
+    let home = tmp.join("home");
+    fs::create_dir_all(home.join(".cache")).unwrap();
+
+    let zwj: &[u8] = &[0xe2, 0x80, 0x8d];
+    let zwnj: &[u8] = &[0xe2, 0x80, 0x8c];
+    let mut failures = Vec::new();
+    for cell in matrix() {
+        let stdout = run_cell(&corpus, &home, &cell);
+        for (name, enc) in [("ZWJ", zwj), ("ZWNJ", zwnj)] {
+            if stdout.windows(enc.len()).any(|w| w == enc) {
+                failures.push(format!(
+                    "raw {name} leaked into {} -f {}",
+                    cell.report, cell.format
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "raw joiner-pair bytes reached a rendered lane (rm-933):\n  {}",
+        failures.join("\n  ")
+    );
+
+    // Vacuity guard: the poison must REACH the lanes (the session name
+    // renders from the first user request). The sessions text lane
+    // must carry the substituted marker AND the honest body around it.
+    let sessions = run_cell(
+        &corpus,
+        &home,
+        &Cell {
+            report: "--sessions",
+            format: "text",
+        },
+    );
+    assert!(
+        sessions.windows(3).any(|w| w == [0xef, 0xbf, 0xbd].as_slice()),
+        "no U+FFFD in the sessions lane — the joiner pair never reached the renderer (fixture vacuity)"
+    );
+    assert!(
+        sessions.windows(4).any(|w| w == b"join"),
+        "honest text around the joiner pair missing (name fell back? fixture vacuity)"
+    );
+
+    // JSON control lanes: the pair survives raw (lossless carve-out).
+    for report in ["--sessions", "--overview"] {
+        let stdout = run_cell(
+            &corpus,
+            &home,
+            &Cell {
+                report,
+                format: "json",
+            },
+        );
+        assert!(
+            stdout.windows(zwj.len()).any(|w| w == zwj),
+            "{report} -f json must keep the ZWJ raw (lossless-by-design carve-out; rm-933 did not widen it)"
+        );
+    }
+}

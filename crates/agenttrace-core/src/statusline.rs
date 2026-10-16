@@ -417,11 +417,31 @@ pub fn is_bidi_format_control(c: char) -> bool {
     )
 }
 
+/// rm-933 widening arm (2026-10-16, run 7288595f): the zero-width
+/// JOINER pair — ZWJ U+200D and ZWNJ U+200C — general category Cf and
+/// invisible in every terminal, yet od-verified raw on the rendered
+/// rows at d2a02af: `--sessions` TSV and CSV emitted E2 80 8D / E2 80
+/// 8C byte-for-byte in the session-name and model cells while RLO and
+/// NUL on the same rows were U+FFFD-replaced (delegate assess
+/// 5dd9fe76). A ZWJ/ZWNJ glues what a terminal renders as separate
+/// cells — name onto model onto cost — the same single-cell spoofing
+/// class the directional set already dies for. This predicate stays
+/// deliberately SEPARATE from [`is_bidi_format_control`] (which keeps
+/// its directional-only set): the JSON lane's recorded carve-out is
+/// pinned against the directional predicate (data losslessness over
+/// terminal trust), the TUI display filter's emoji handling is pinned
+/// separately, and neither is widened by this arm. Only the shared
+/// line-segment and document sanitizers subscribe — every human-readable
+/// lane substitutes; every machine lane keeps the bytes.
+pub fn is_joiner_format_control(c: char) -> bool {
+    matches!(c, '\u{200C}' | '\u{200D}')
+}
+
 pub fn sanitize_line_segment(segment: &str) -> String {
     segment
         .chars()
         .map(|c| {
-            if c.is_control() || is_bidi_format_control(c) {
+            if c.is_control() || is_bidi_format_control(c) || is_joiner_format_control(c) {
                 '\u{FFFD}'
             } else {
                 c
@@ -440,14 +460,21 @@ pub fn sanitize_line_segment(segment: &str) -> String {
 /// transcript-derived sequences. rm-936 adds the Cf bidi/format set to the
 /// same substitution (see [`is_bidi_format_control`]) — serde and every
 /// structural escaper pass those through raw, so this boundary is where
-/// they die in every non-JSON lane. Idempotent by construction: U+FFFD is
+/// they die in every non-JSON lane. rm-933 (2026-10-16) composes the
+/// joiner pair ([`is_joiner_format_control`]) into the same substitution
+/// class at this boundary, so markdown/HTML cells — which carry no
+/// line-segment pass — cannot ride a raw ZWJ/ZWNJ either. Idempotent by
+/// construction: U+FFFD is
 /// printable, so already-sanitized documents (including cells that
 /// first went through the rm-383/rm-540 line sanitizer) pass through
 /// unchanged — the two layers compose instead of corrupting.
 pub fn sanitize_output_document(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if (c.is_control() || is_bidi_format_control(c)) && c != '\n' && c != '\r' && c != '\t'
+            if (c.is_control() || is_bidi_format_control(c) || is_joiner_format_control(c))
+                && c != '\n'
+                && c != '\r'
+                && c != '\t'
             {
                 '\u{FFFD}'
             } else {
@@ -1935,6 +1962,50 @@ mod tests {
         // The pre-existing Cc contract is unchanged.
         assert!(sanitize_line_segment("x\u{1B}[0my").contains('\u{FFFD}'));
         assert_eq!(sanitize_line_segment("plain-1"), "plain-1");
+    }
+
+    #[test]
+    fn rm933_is_joiner_format_control_bounds() {
+        // rm-933 widening arm: ONLY the joiner pair joins this
+        // substitution class. The predicate is deliberately separate
+        // from the directional set — the JSON carve-out and the TUI
+        // emoji lane are pinned against the directional predicate and
+        // are NOT widened by this arm.
+        assert!(is_joiner_format_control('\u{200D}')); // ZWJ
+        assert!(is_joiner_format_control('\u{200C}')); // ZWNJ
+                                                       // Near neighbors and the rest of the non-directional Cf family
+                                                       // stay on their own recorded paths (still-open lane on rm-933).
+        assert!(!is_joiner_format_control('\u{200E}')); // directional: the other predicate's job
+        assert!(!is_joiner_format_control('\u{00AD}')); // soft hyphen: non-directional Cf
+        assert!(!is_joiner_format_control('\u{FEFF}')); // BOM: non-directional Cf
+        assert!(!is_joiner_format_control('a'));
+        assert!(!is_joiner_format_control('\u{1B}')); // Cc: is_control's job
+    }
+
+    #[test]
+    fn rm933_line_segments_and_document_substitute_the_joiner_pair() {
+        // od-verified raw at d2a02af on the --sessions TSV/CSV name and
+        // model cells (E2 80 8D / E2 80 8C byte-for-byte while RLO and
+        // NUL on the same rows were U+FFFD-replaced) — both shared
+        // sanitizers now kill the pair.
+        for c in ['\u{200D}', '\u{200C}'] {
+            let seg = sanitize_line_segment(&format!("zw{c}join"));
+            assert!(!seg.contains(c), "raw {c:?} survived line sanitization");
+            assert!(seg.contains('\u{FFFD}'), "no replacement marker for {c:?}");
+            let doc = sanitize_output_document(&format!("name zw{c}join cost $5"));
+            assert!(!doc.contains(c), "raw {c:?} survived the document boundary");
+            assert!(doc.contains('\u{FFFD}'), "no replacement marker for {c:?}");
+        }
+        // Honest payloads stay byte-identical: plain ASCII and the CJK
+        // body every render lane already carries verbatim.
+        assert_eq!(sanitize_line_segment("hello 世界"), "hello 世界");
+        assert_eq!(sanitize_output_document("hello 世界\n"), "hello 世界\n");
+        // rm-625's structural-whitespace contract is untouched.
+        assert_eq!(sanitize_output_document("a\nb\tc\rd"), "a\nb\tc\rd");
+        // Idempotence: sanitizing an already-substituted segment is a
+        // no-op (the two layers compose, per rm-625).
+        let once = sanitize_line_segment("zw\u{200D}join");
+        assert_eq!(sanitize_line_segment(&once), once);
     }
 
     #[test]
