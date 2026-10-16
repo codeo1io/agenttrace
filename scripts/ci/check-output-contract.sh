@@ -37,13 +37,21 @@ mkdir -p "$out_dir"
 # (assess F2: a gate run mutated the real ~/.cache/agenttrace
 # sessions.json) and an unrelated $HOME under CI; neither is this
 # gate's subject — the probe only asserts that --doctor emits a
-# non-empty, valid-JSON report. The scratch path is FIXED (not
-# mktemp-random) so the captured doctor.json stays byte-deterministic
-# run-to-run: DoctorReport.cache_path embeds the cache location, so a
-# random suffix would leak into the artifact. This is the gate's only
-# real-HOME walker; the --demo legs below are corpus-scoped and keep
-# the ambient environment, byte-identical to before.
-doctor_scratch="${TMPDIR:-/tmp}/agenttrace-output-contract-home"
+# non-empty, valid-JSON report.
+#
+# rm-1543 (run 480d4916): the scratch home hangs under this lane's own
+# out_dir instead of a FIXED ${TMPDIR}/agenttrace-output-contract-home.
+# Two gate lanes running concurrently on one host used to sweep each
+# other's in-flight probe state mid-run: the fixed path put both lanes'
+# rm -rf on the SAME directory (the rm-377 /tmp collision class).
+# Determinism is preserved — DoctorReport.cache_path embeds the cache
+# location, and $out_dir is fixed within a lane, so the captured
+# doctor.json stays byte-stable run-to-run for that lane (the rm-1425
+# contract); the path is now separated ACROSS lanes, never within one.
+# This is the gate's only real-HOME walker; the --demo legs below are
+# corpus-scoped and keep the ambient environment, byte-identical to
+# before.
+doctor_scratch="$out_dir/doctor-home"
 rm -rf "$doctor_scratch"
 mkdir -p "$doctor_scratch"
 (

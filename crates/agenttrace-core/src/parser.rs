@@ -55,14 +55,27 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
     // may carry CONCATENATED frames (Codex appends by materializing and
     // re-encoding; upstream's own reader tolerates them), so the decode
     // runs to true EOF, never just the first frame (rm-1516).
-    let raw = if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+    let compressed_rollout = raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
+    let raw = if compressed_rollout {
         decode_zstd_rollout_bounded(raw, label)?
     } else {
         raw
     };
     let raw = String::from_utf8(raw)
         .with_context(|| format!("read session file {} (not valid UTF-8)", label))?;
-    parse_raw_session(name, label, &raw)
+    let mut session = parse_raw_session(name, label, &raw)?;
+    // rm-1541: the compressed lane is disclosed, never silent — a
+    // rollout that actually rode the zstd decode says so in its own
+    // counters, so a migrated corpus is visible in reports and doctor.
+    if compressed_rollout {
+        session
+            .metrics
+            .disclosure_counters
+            .entry("codex_compressed_rollouts_decoded".to_string())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+    Ok(session)
 }
 
 /// Output cap for in-process zstd rollout decode (rm-992). Compressed
@@ -8873,6 +8886,19 @@ fn apply_cline_metadata_timestamps(events: &mut [Event], metadata: &Map<String, 
 }
 
 fn session_name(path: &Path) -> String {
+    // rm-1541: the codex >=0.162 migration renames cold rollouts to
+    // `.jsonl.zst` (ccusage #1890); identity across the migration is the
+    // pre-migration stem — `file_stem` alone would leave a residual
+    // `.jsonl` on the migrated spelling. Only the `.jsonl.zst` tail takes
+    // the explicit trim; every other spelling keeps its file_stem
+    // derivation byte-identically.
+    if let Some(name) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".jsonl.zst"))
+    {
+        return name.to_string();
+    }
     path.file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or("session")

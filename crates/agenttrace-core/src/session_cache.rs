@@ -1081,7 +1081,14 @@ const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 /// load instead of being filtered. The batch's own 3 -> 4 bump re-bases
 /// onto the already-landed v4 lane (rm-732) per the same convention one
 /// lane up.
-const DIR_LISTING_WALK_VERSION: i64 = 5;
+/// v6 (run 480d4916, rm-1541): the walk admits codex-migrated
+/// `.jsonl.zst` rollouts inside codex-family roots — a v5 listing
+/// written before that admission names only the plain `.jsonl` twin,
+/// so a warm journal keeps hiding the compressed rollout the migration
+/// produced (codex stable >=0.162 migrates cold rollouts under
+/// `~/.codex/{sessions,archived_sessions}`, ccusage #1890). Pre-v6
+/// listings drop once at load and re-walk through the new filter.
+const DIR_LISTING_WALK_VERSION: i64 = 6;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")

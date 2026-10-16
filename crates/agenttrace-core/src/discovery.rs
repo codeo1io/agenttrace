@@ -685,6 +685,7 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
         dir,
         0,
         max_depth,
+        is_codex_walk_root(dir),
         &mut items,
         &mut visited,
         &mut file_targets,
@@ -821,6 +822,7 @@ fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<Pat
         dir,
         0,
         max_depth,
+        is_codex_walk_root(dir),
         cache,
         &mut items,
         &mut visited,
@@ -939,10 +941,15 @@ fn entry_is_dir_entry(file_type: &fs::FileType, path: &Path) -> bool {
     false
 }
 
+// rm-1541 threads the codex-family admission flag through the walk;
+// the parameter set is the recursive walk's own contract, kept explicit
+// per the same convention as the sites below.
+#[allow(clippy::too_many_arguments)]
 fn walk_session_files_cached(
     dir: &Path,
     depth: usize,
     max_depth: usize,
+    codex_tree: bool,
     cache: &mut SessionCache,
     items: &mut Vec<PathBuf>,
     visited: &mut SymlinkTargets,
@@ -982,10 +989,18 @@ fn walk_session_files_cached(
         );
         for child in listing.dirs {
             if visited.admit(&child) {
+                // rm-1541: the codex family extends down the tree — a walk
+                // rooted above `.codex` (e.g. `-d $HOME`) must still admit
+                // the migrated rollouts nested inside it.
+                let child_codex_tree = codex_tree
+                    || child
+                        .components()
+                        .any(|component| component.as_os_str() == ".codex");
                 walk_session_files_cached(
                     &child,
                     depth + 1,
                     max_depth,
+                    child_codex_tree,
                     cache,
                     items,
                     visited,
@@ -1025,7 +1040,11 @@ fn walk_session_files_cached(
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !is_session_file_name(&name) {
+        // rm-1541: codex stable >=0.162 migrates cold rollouts to
+        // `.jsonl.zst` (ccusage #1890). The extension is admitted ONLY
+        // inside codex-family walk roots — never a global relaxation: a
+        // `.jsonl.zst` under any other tree stays invisible.
+        if !is_session_file_name(&name) && !(codex_tree && is_codex_migrated_rollout_name(&name)) {
             continue;
         }
         // rm-212: only regular files (symlinks included) are session
@@ -1054,10 +1073,16 @@ fn walk_session_files_cached(
 
     items.extend(files.into_iter().filter(|path| file_targets.admit(path)));
     for child in dirs {
+        // rm-1541: mirrored warm-listing fold — see the replay arm above.
+        let child_codex_tree = codex_tree
+            || child
+                .components()
+                .any(|component| component.as_os_str() == ".codex");
         walk_session_files_cached(
             &child,
             depth + 1,
             max_depth,
+            child_codex_tree,
             cache,
             items,
             visited,
@@ -1070,6 +1095,7 @@ fn walk_session_files(
     dir: &Path,
     depth: usize,
     max_depth: usize,
+    codex_tree: bool,
     items: &mut Vec<(PathBuf, SystemTime)>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
@@ -1105,12 +1131,30 @@ fn walk_session_files(
             if !visited.admit(&path) {
                 continue;
             }
-            walk_session_files(&path, depth + 1, max_depth, items, visited, file_targets);
+            // rm-1541: the codex family extends down the tree — a walk
+            // rooted above `.codex` (e.g. `-d $HOME`) must still admit
+            // the migrated rollouts nested inside it.
+            let child_codex_tree = codex_tree
+                || path
+                    .components()
+                    .any(|component| component.as_os_str() == ".codex");
+            walk_session_files(
+                &path,
+                depth + 1,
+                max_depth,
+                child_codex_tree,
+                items,
+                visited,
+                file_targets,
+            );
             continue;
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !is_session_file_name(&name) {
+        // rm-1541: mirrored admission — the uncached walk admits the
+        // migrated `.jsonl.zst` rollouts inside codex-family roots
+        // under the same scoped rule as the cached walk above.
+        if !is_session_file_name(&name) && !(codex_tree && is_codex_migrated_rollout_name(&name)) {
             continue;
         }
         // rm-212: only regular files (symlinks included) are session
@@ -1180,6 +1224,33 @@ fn time_from_unix_nanos(nanos: i64) -> SystemTime {
         return SystemTime::UNIX_EPOCH;
     }
     SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(nanos as u64)
+}
+
+/// rm-1541: a walk root belongs to the codex family when it sits inside
+/// a `.codex` tree (by path component) or under a registered Codex
+/// session dir (canonicalized, so symlinked roots qualify too).
+fn is_codex_walk_root(dir: &Path) -> bool {
+    if dir
+        .components()
+        .any(|component| component.as_os_str() == ".codex")
+    {
+        return true;
+    }
+    let Some(canonical_dir) = fs::canonicalize(dir).ok() else {
+        return false;
+    };
+    known_session_dirs().iter().any(|known| {
+        known.name.contains("Codex")
+            && fs::canonicalize(&known.path)
+                .is_ok_and(|canonical_known| canonical_dir.starts_with(canonical_known))
+    })
+}
+
+/// rm-1541: the migrated cold-rollout name — codex stable >=0.162 writes
+/// `.jsonl.zst` (ccusage #1890, live since the 2026-10-14 update). A
+/// non-empty stem keeps `.jsonl.zst` itself (empty stem) out.
+fn is_codex_migrated_rollout_name(name: &str) -> bool {
+    name.len() > ".jsonl.zst".len() && name.ends_with(".jsonl.zst")
 }
 
 pub fn is_session_file_name(name: &str) -> bool {
