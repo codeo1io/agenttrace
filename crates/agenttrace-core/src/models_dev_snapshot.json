@@ -1,0 +1,28 @@
+{
+  "_snapshot": {
+    "source": "models.dev first-party pricing extract — the second catalog (rm-1532). Rows are the dated Anthropic model ids the LiteLLM snapshot carries NO first-party row for in any form (verified against live LiteLLM 2026-10-16, research run b1e8b617): only reseller-qualified rows (openrouter/, vercel_ai_gateway/, github_copilot/) end in these ids, so the base-model collapse attributed first-party sessions to a reseller. Rates are the vendor's list prices as published by models.dev, cross-checked against the reseller rows (identical, since resellers forward list pricing). Each row self-retires the day LiteLLM ships a first-party row: serving_catalog consults the LiteLLM ladder first and a first-party winner ends the search.",
+    "date": "2026-10-16",
+    "rates_basis": "USD per million tokens (input, output, cache_read, cache_write)"
+  },
+  "anthropic/claude-3-7-sonnet-20250219": {
+    "provider": "anthropic",
+    "input": 3.0,
+    "output": 15.0,
+    "cache_read": 0.3,
+    "cache_write": 3.75
+  },
+  "anthropic/claude-sonnet-4-20250514": {
+    "provider": "anthropic",
+    "input": 3.0,
+    "output": 15.0,
+    "cache_read": 0.3,
+    "cache_write": 3.75
+  },
+  "anthropic/claude-opus-4-1-20250805": {
+    "provider": "anthropic",
+    "input": 15.0,
+    "output": 75.0,
+    "cache_read": 1.5,
+    "cache_write": 18.75
+  }
+}

@@ -686,6 +686,9 @@ fn usage_overview(root: Option<&Path>, range: TimeRange) -> Result<Value, (i64, 
         report.skipped,
         report.cache_hits,
         report.opencode_fork_excluded,
+        // rm-1534: keep MCP and CLI disclosures agreeing — the
+        // future-bound exclusion count flows through here too.
+        report.future_excluded_sessions,
         report.sqlite.unreadable.clone(),
     );
     let text = report_overview_json_with_context(

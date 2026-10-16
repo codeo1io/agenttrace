@@ -982,6 +982,10 @@ fn run() -> anyhow::Result<()> {
                 report.skipped,
                 report.cache_hits,
                 report.opencode_fork_excluded,
+                // rm-1534: future-bound exclusions ride the same
+                // disclosure channel as fork copies — counted and
+                // disclosed, never a silent drop.
+                report.future_excluded_sessions,
                 report.sqlite.unreadable.clone(),
             ),
             None => data_health(&sessions, sessions.len(), 0),

@@ -665,7 +665,20 @@ fn filter_since(sessions: Vec<Session>, since: Option<DateTime<Utc>>) -> Vec<Ses
 /// with unknown time (empty or unparseable) stays in the unknown-time
 /// bucket instead of being silently dropped (N7).
 fn session_within_since(session: &Session, since: Option<DateTime<Utc>>) -> bool {
-    crate::insights::session_admitted_since(session, since)
+    // rm-890: same basis as every other lane — last known activity at
+    // or after the cutoff (overnight sessions stay in ranged views).
+    // rm-1534: this is a PRE-filter only, so it deliberately applies
+    // the LOWER bound alone: the future bound (now+grace) is applied
+    // once, by the merged-corpus retain in discovery.rs, so its
+    // exclusion count (`future_excluded_sessions`) sees every lane —
+    // sqlite-backed future sessions too. The pre-filter stays a
+    // strict superset of the ONE predicate's final view, so no lane
+    // can disagree about which sessions exist in a ranged view.
+    since.is_none_or(|since| {
+        crate::insights::session_last_activity(session)
+            .map(|time| time >= since)
+            .unwrap_or(true)
+    })
 }
 
 fn opencode_sqlite_session_rows(

@@ -20,6 +20,7 @@ const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
 const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
+static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
 static PRICING_OVERRIDE_STATUS: OnceLock<PricingOverrideStatus> = OnceLock::new();
 
@@ -167,6 +168,174 @@ pub fn lookup_price(model: &str) -> Price {
     lookup_price_tiered(model, None)
 }
 
+/// rm-1532: the embedded models.dev pricing extract — the SECOND
+/// catalog. Live LiteLLM (checked 2026-10-16, research run b1e8b617)
+/// carries no row in ANY form for the dated first-party Anthropic ids
+/// Claude Code actually records (`claude-sonnet-4-20250514`,
+/// `claude-3-7-sonnet-20250219`, `claude-opus-4-1-20250805`); the only
+/// rows ending in those ids are reseller-qualified, so the raw-first
+/// ladder's base-model collapse let the lowest-priority reseller
+/// winner serve the id — `By Provider: openrouter` for a session that
+/// ran first-party Anthropic. A snapshot refresh cannot fix that
+/// (upstream absence, not staleness), so first-party rates +
+/// attribution come from this extract instead: consulted AFTER the
+/// LiteLLM ladder finds no first-party row and BEFORE a reseller row
+/// serves. `pricing_source` discloses which catalog served;
+/// `catalog_identity` folds the extract bytes in so a changed extract
+/// (new binary) reprices cached sessions. Rows self-retire the day
+/// LiteLLM ships a first-party row (see `_snapshot.source`).
+const MODELS_DEV_SNAPSHOT_JSON: &str = include_str!("models_dev_snapshot.json");
+const MODELS_DEV_SNAPSHOT_DATE: &str = "2026-10-16";
+
+/// Providers that are the model's own vendor (rm-1532): a catalog row
+/// attributed to one of these ends the search — that IS the
+/// first-party answer. Everything else (openrouter,
+/// vercel_ai_gateway, github_copilot, bedrock_converse, …) is a
+/// reseller/mediation lane: correct for a session that genuinely ran
+/// through it, wrong as the default winner for a first-party id.
+const FIRST_PARTY_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "google",
+    "meta",
+    "mistral",
+    "xai",
+    "deepseek",
+    "qwen",
+    "cohere",
+    "perplexity",
+    "ai21",
+    "moonshot",
+];
+
+fn is_first_party_provider(provider: &str) -> bool {
+    FIRST_PARTY_PROVIDERS.contains(&provider)
+}
+
+/// One row of the embedded extract (`models_dev_snapshot.json`).
+/// Rates are USD per million tokens, exactly the units [`Price`]
+/// stores after LiteLLM's per-token conversion — no scaling here.
+#[derive(Debug, Deserialize)]
+struct ModelsDevRow {
+    provider: String,
+    #[serde(default)]
+    input: f64,
+    #[serde(default)]
+    output: f64,
+    #[serde(default)]
+    cache_read: Option<f64>,
+    #[serde(default)]
+    cache_write: Option<f64>,
+}
+
+/// The parsed second catalog: entries keyed by the model id EXACTLY
+/// as a session records it (dated suffix intact — never normalized to
+/// the base id), plus each row's first-party provider label.
+#[derive(Debug, Default)]
+struct ModelsDevCatalog {
+    entries: BTreeMap<String, Price>,
+    providers: BTreeMap<String, String>,
+}
+
+fn models_dev_catalog() -> &'static ModelsDevCatalog {
+    MODELS_DEV_CATALOG.get_or_init(|| {
+        let mut catalog = ModelsDevCatalog::default();
+        // The file's first key is `_snapshot` — provenance prose, not a
+        // row — so the map parses as JSON values first and each row
+        // converts individually. A malformed row fails loudly at
+        // startup (binary build-time content, never operator input).
+        let map: BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(MODELS_DEV_SNAPSHOT_JSON)
+                .expect("rm-1532: embedded models_dev_snapshot.json must parse");
+        for (id, value) in map {
+            if id == "_snapshot" {
+                continue;
+            }
+            let row: ModelsDevRow = serde_json::from_value(value).unwrap_or_else(|error| {
+                panic!("rm-1532: models_dev_snapshot.json row {id} must parse: {error}")
+            });
+            // Key: the model id after its "provider/" prefix — the raw
+            // dated id a session records. Lowercased to match the
+            // primary catalog's canonicalization.
+            let key = id
+                .rsplit_once('/')
+                .map(|(_, model)| model)
+                .unwrap_or(&id)
+                .to_ascii_lowercase();
+            catalog.entries.insert(
+                key.clone(),
+                Price {
+                    input: row.input,
+                    output: row.output,
+                    cr: row.cache_read.unwrap_or(0.0),
+                    cw: row.cache_write.unwrap_or(0.0),
+                    ..Price::default()
+                },
+            );
+            catalog.providers.insert(key, row.provider);
+        }
+        catalog
+    })
+}
+
+/// rm-1532: which catalog serves a session id — the ONE seam the rate
+/// ([`lookup_price_tiered`]), provider ([`provider_for_in`]), and
+/// pricing-source ([`pricing_source_for_catalog`]) lookups all
+/// resolve through, so they can never disagree about which row served
+/// a given session id.
+enum ServingCatalog {
+    /// The LiteLLM catalog — bundled snapshot, cached, or a
+    /// `--update-pricing` refresh (with user overrides applied on
+    /// top, which stay supreme: their rate AND identity are the
+    /// user's own).
+    Primary { key: String },
+    /// The embedded models.dev extract served a first-party row the
+    /// primary catalog lacks. `key` is the extract's raw dated id.
+    ModelsDev { key: String },
+}
+
+fn serving_catalog(model: &str, catalog: &PricingCatalog) -> Option<ServingCatalog> {
+    if let Some(key) = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries) {
+        if pricing_override_models().contains(&key)
+            || catalog
+                .providers
+                .get(&key)
+                .is_some_and(|provider| is_first_party_provider(provider))
+        {
+            return Some(ServingCatalog::Primary { key });
+        }
+        // The LiteLLM ladder found only a reseller row (or one with no
+        // provider label) — rm-1532: before that fall-through serves,
+        // the embedded extract may serve the id through its own
+        // first-party row.
+        if let Some(key) = models_dev_key(model) {
+            return Some(ServingCatalog::ModelsDev { key });
+        }
+        return Some(ServingCatalog::Primary { key });
+    }
+    models_dev_key(model).map(|key| ServingCatalog::ModelsDev { key })
+}
+
+/// rm-1532: the extract's EXACT-id ladder — the raw id and its
+/// lowercase form only. Deliberately NO normalization or base-model
+/// collapse: the extract speaks for the dated ids it carries rows
+/// for, never for base ids whose bundled-corpus winners must stay
+/// byte-stable (no collateral re-attribution).
+fn models_dev_key(model: &str) -> Option<String> {
+    let catalog = models_dev_catalog();
+    let raw = model.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let lower = raw.to_ascii_lowercase();
+    for candidate in [raw, lower.as_str()] {
+        if catalog.entries.contains_key(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
 /// rm-610 (flex) + cycle-2 rider (ultrafast): resolve a model's
 /// rates for the service tier the turn actually ran on.
 /// `Some("flex")`/`Some("ultrafast")` bills at the entry's tier
@@ -186,7 +355,19 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     // (flex + ultrafast) applies on top of whichever row the ladder
     // picked, so a qualified row's tier slots serve its own region
     // too.
-    let mut price = lookup_price_in(model, &catalog.aliases, &catalog.entries);
+    // rm-1532: the ONE serving seam — when the LiteLLM ladder finds no
+    // first-party row but the embedded models.dev extract carries one
+    // for the exact dated id, the extract's rates serve (its rows
+    // carry no tier slots, so the tier rewrite below no-ops on that
+    // arm).
+    let mut price = match serving_catalog(model, catalog) {
+        Some(ServingCatalog::ModelsDev { key }) => models_dev_catalog()
+            .entries
+            .get(&key)
+            .cloned()
+            .unwrap_or_default(),
+        _ => lookup_price_in(model, &catalog.aliases, &catalog.entries),
+    };
     let (input_tier, output_tier, cw_tier, cr_tier) = match service_tier {
         Some("flex") => (
             price.input_flex,
@@ -221,8 +402,10 @@ pub fn has_specific_price(model: &str) -> bool {
     }
     let catalog = pricing_catalog();
     // rm-1053: raw-first ladder, so a qualified id counts as priced
-    // through its own row too.
-    matching_catalog_key_for(model, &catalog.aliases, &catalog.entries).is_some()
+    // through its own row too. rm-1532: the serving seam — an id only
+    // the embedded extract prices (no LiteLLM row in any form) is
+    // specific NOW, not a fallback price.
+    serving_catalog(model, catalog).is_some()
 }
 
 pub fn list_pricing() -> BTreeMap<String, Price> {
@@ -385,7 +568,20 @@ fn lookup_context_window_in(model: &str, catalog: &PricingCatalog) -> Option<u64
 /// refresh must not trigger a pointless re-price).
 pub fn catalog_identity() -> &'static str {
     static IDENTITY: OnceLock<String> = OnceLock::new();
-    IDENTITY.get_or_init(|| catalog_identity_of(pricing_catalog()))
+    IDENTITY.get_or_init(|| {
+        // rm-1532: the embedded models.dev extract can reprice and
+        // re-attribute ids the primary catalog serves through reseller
+        // rows, so its bytes ride the identity — a changed extract (a
+        // new binary) must reprice cached sessions even when the
+        // primary catalog is byte-identical. `catalog_identity_of`
+        // (and every synthetic-catalog pin on it) stays untouched.
+        let primary = catalog_identity_of(pricing_catalog());
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in MODELS_DEV_SNAPSHOT_JSON.as_bytes() {
+            hash = (hash ^ *byte as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        format!("{primary}-d{hash:016x}")
+    })
 }
 
 /// Digest of every catalog fact that can change a cost or an
@@ -501,13 +697,21 @@ fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
     // normalize the id a second time — normalize of a normalize — so
     // a dated, versioned, regional id resolved to a different key
     // than its own rate did, and by-provider attributed the wrong
-    // vendor for exactly those rows.)
-    let key = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries)?;
-    catalog
-        .providers
-        .get(&key)
-        .cloned()
-        .filter(|provider| !provider.trim().is_empty())
+    // vendor for exactly those rows.) rm-1532: the ONE serving seam —
+    // when the extract serves the rate, the extract's first-party
+    // label serves the attribution, so rate and vendor can never
+    // disagree about which row spoke.
+    match serving_catalog(model, catalog) {
+        Some(ServingCatalog::Primary { key }) => catalog
+            .providers
+            .get(&key)
+            .cloned()
+            .filter(|provider| !provider.trim().is_empty()),
+        Some(ServingCatalog::ModelsDev { key }) => {
+            models_dev_catalog().providers.get(&key).cloned()
+        }
+        None => None,
+    }
 }
 
 fn pricing_source_for_catalog(
@@ -517,14 +721,25 @@ fn pricing_source_for_catalog(
 ) -> String {
     let normalized = normalize_model(model);
     let resolved = resolve_alias(&normalized, &catalog.aliases);
+    // rm-1532: disclose which catalog served. The extract arm comes
+    // first so a reseller fall-through can never masquerade as the
+    // LiteLLM catalog; its rows are their own provenance, so the
+    // vendor-retirement arms below (primary-catalog knowledge) do not
+    // apply to it.
+    let key = match serving_catalog(model, catalog) {
+        Some(ServingCatalog::ModelsDev { .. }) => {
+            return format!(
+                "models.dev snapshot {MODELS_DEV_SNAPSHOT_DATE} (embedded first-party extract; LiteLLM lacks a first-party row)"
+            );
+        }
+        Some(ServingCatalog::Primary { key }) => key,
+        None => return "built-in fallback".to_string(),
+    };
     // rm-1053: raw-first ladder — a qualified id's own row is found
     // before the base collapse resolves. `resolved` stays
     // alias-of-normalized: the override arms below detect whether an
     // alias actually moved the id, which raw-form resolution would
     // misreport for every qualified id.
-    let Some(key) = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries) else {
-        return "built-in fallback".to_string();
-    };
     if override_models.contains(&key) {
         // rm-419: a user-set rate keeps the vendor retirement
         // disclosure — the status is catalog knowledge, not a rate

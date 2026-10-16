@@ -741,7 +741,31 @@ pub fn filter_sessions(
         .collect()
 }
 pub fn session_matches_time_range(session: &Session, range: TimeRange, now: DateTime<Utc>) -> bool {
-    session_admitted_since(session, range.since(now))
+    session_admitted_since(session, range.since(now), now)
+}
+
+/// rm-1534: how far past `now` a session's last activity may sit
+/// before ranged views stop admitting it — 24h. Tight enough to
+/// exclude far-future fabrications (the year-9999 PoC: a single
+/// corrupted clock made every forward window report a session whose
+/// activity sits eight thousand years out), loose enough to keep a
+/// timezone-offset mistake or a small clock skew in scope. The same
+/// bound drives the `future_timestamp` anomaly class (lib.rs) and the
+/// `future_timestamp_sessions` disclosure counter, so all three say
+/// "beyond now+24h" or none of them do. Pinned by contract test.
+pub const FUTURE_ADMISSION_GRACE_SECS: i64 = 24 * 60 * 60;
+
+/// rm-1534: the upper admission bound — `now` plus the grace above.
+pub fn future_admission_bound(now: DateTime<Utc>) -> DateTime<Utc> {
+    now + chrono::Duration::seconds(FUTURE_ADMISSION_GRACE_SECS)
+}
+
+/// rm-1534: does this session's last known activity sit beyond the
+/// future bound? Unknown-time sessions are never "future" (no
+/// timestamp parsed) — they keep their own N7 unknown-time bucket
+/// contract and stay visible.
+pub fn session_beyond_future_grace(session: &Session, now: DateTime<Utc>) -> bool {
+    session_last_activity(session).is_some_and(|time| time > future_admission_bound(now))
 }
 
 /// rm-890: the ONE admission predicate for `--range`/`--since` on every
@@ -756,12 +780,28 @@ pub fn session_matches_time_range(session: &Session, range: TimeRange, now: Date
 /// it (overnight session, long-lived agent) counts; only sessions whose
 /// activity ended before the window start drop out. Unknown start times
 /// stay visible (N7 unknown-time bucket) — never a silent drop.
-pub fn session_admitted_since(session: &Session, since: Option<DateTime<Utc>>) -> bool {
-    since.is_none_or(|since| {
-        session_last_activity(session)
-            .map(|time| time >= since)
-            .unwrap_or(true)
-    })
+///
+/// rm-1534: admission is bounded ABOVE too (same spirit as the rm-1402
+/// snapshot clamp): when a range is active, a session whose last
+/// activity sits beyond `now` + [`FUTURE_ADMISSION_GRACE_SECS`] is
+/// EXCLUDED (counted + disclosed by the loader — see
+/// `LoadReport::future_excluded_sessions` — never a silent drop) and
+/// reported as a `future_timestamp` anomaly. `--range all`/default
+/// keeps such sessions visible (the anomaly + health drop are the
+/// disclosure there) — only a window that pretends "today" includes
+/// the year 9999 stops listing them.
+pub fn session_admitted_since(
+    session: &Session,
+    since: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    match since {
+        None => true,
+        Some(since) => match session_last_activity(session) {
+            None => true,
+            Some(time) => time >= since && time <= future_admission_bound(now),
+        },
+    }
 }
 
 /// rm-694: the session's last known activity — `session_end` when the
@@ -857,6 +897,7 @@ pub fn data_health_scoped(
     parse_failures: usize,
     cache_hits: usize,
     opencode_fork_excluded: usize,
+    future_excluded: usize,
     sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
 ) -> DataHealth {
     let parsed = sessions.len();
@@ -881,6 +922,20 @@ pub fn data_health_scoped(
             .disclosures
             .get_mut("opencode_fork_excluded_sessions")
             .expect("just inserted") += opencode_fork_excluded;
+    }
+    // rm-1534: sessions EXCLUDED by the future bound (activity
+    // beyond now+grace, see `session_admitted_since`) ride the same
+    // disclosure channel — a count instead of a silent drop, twin
+    // discipline with the fork copies above (rm-727).
+    if future_excluded > 0 {
+        health
+            .disclosures
+            .entry("future_timestamp_sessions".to_string())
+            .or_insert(0);
+        *health
+            .disclosures
+            .get_mut("future_timestamp_sessions")
+            .expect("just inserted") += future_excluded;
     }
     health
 }
