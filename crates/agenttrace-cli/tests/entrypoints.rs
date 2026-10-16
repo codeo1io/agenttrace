@@ -1656,12 +1656,28 @@ fn stdin_dash_overview_is_byte_identical_to_the_same_file() {
     );
 }
 
+fn scratch_path(name: &str) -> std::path::PathBuf {
+    // rm-1882 (rm-1065 discipline): per-call unique scratch paths. The
+    // pid separates concurrent cargo-test processes on one host; the
+    // monotonically increasing suffix separates tests (and repeat
+    // calls) within one process, so no two invocations can ever race
+    // remove_dir_all/create_dir_all on the same fixed path.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let (stem, ext) = match name.rfind('.') {
+        Some(idx) => (&name[..idx], &name[idx..]),
+        None => (name, ""),
+    };
+    std::env::temp_dir().join(format!("{stem}-{}-{seq}{ext}", std::process::id()))
+}
+
 #[test]
 fn stdin_dash_empty_input_fails_like_an_empty_file() {
     // rm-503: empty stdin is the empty-session error class (rc1), the
     // same failure an empty named file produces — not a hang, not a
     // zero-session success.
-    let empty = std::env::temp_dir().join("agenttrace-stdin-empty-probe.jsonl");
+    let empty = scratch_path("agenttrace-stdin-empty-probe.jsonl");
     std::fs::write(&empty, b"").expect("write empty probe file");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
@@ -2409,7 +2425,10 @@ fn error_stderr_carries_the_anyhow_cause_chain() {
 fn error_prefix_is_not_doubled_for_non_session_positional() {
     // The path must exist and be a directory to reach the positional
     // guard (a missing path bails earlier with its own message).
-    let dir = std::env::temp_dir().join("agenttrace-rm1434-not-a-session");
+    // rm-1882 integration completion: landed HEAD-side (34442197) as a
+    // pure fixed literal after the run's census base — same class the
+    // merge lands the fix for; gains the pid+seq components.
+    let dir = scratch_path("agenttrace-rm1434-not-a-session");
     std::fs::create_dir_all(&dir).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .arg("--overview")
@@ -2995,7 +3014,7 @@ fn cli_quota_view_clamps_a_future_skewed_corpus() {
     // billed $0.0045 against an honest $1.52. The cutoff must clamp
     // at the newest plausible instant, the guard firing must ride
     // the json, and the real events must still bill.
-    let sandbox = std::env::temp_dir().join("at-quota-future-clamp-cli");
+    let sandbox = scratch_path("at-quota-future-clamp-cli");
     let _ = std::fs::remove_dir_all(&sandbox);
     std::fs::create_dir_all(&sandbox).expect("sandbox dir");
     let journal = sandbox.join("future-skew.jsonl");

@@ -471,8 +471,15 @@ pub fn lookup_context_window(model: &str) -> Option<u64> {
 }
 
 fn lookup_context_window_in(model: &str, catalog: &PricingCatalog) -> Option<u64> {
-    let resolved = resolve_alias(model, &catalog.aliases);
-    let key = matching_catalog_key(&resolved, &catalog.entries)?;
+    // rm-1881: resolve through the rm-1053 raw-first ladder — the same
+    // resolver the rate, provider, and pricing-source lanes use — so the
+    // window can never disagree with the priced row about which catalog
+    // entry served the session id. Pre-fix this was the one lane still
+    // on the plain matcher (alias-resolve, then variants), which skipped
+    // the raw qualified id: "azure/eu/GPT-5.5" and alias-mapped ids like
+    // "aihubmix/glm-5.3-flash" got the BASE row's window (or None)
+    // while their rates came from their own rows.
+    let key = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries)?;
     catalog
         .entries
         .get(&key)
@@ -1182,12 +1189,6 @@ fn lookup_price_in(
         }
     }
     builtin.get("default").cloned().unwrap_or_default()
-}
-
-fn matching_catalog_key(model: &str, entries: &BTreeMap<String, Price>) -> Option<String> {
-    match_variants(model)
-        .into_iter()
-        .find(|variant| entries.contains_key(variant))
 }
 
 /// rm-1053: the ordered id ladder for catalog resolution. The id
