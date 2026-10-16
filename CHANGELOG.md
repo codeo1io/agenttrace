@@ -337,6 +337,10 @@
 
 ### Fixed
 
+- cost-anomaly cohorts pool spelling variants through pricing normalization (rm-1900, cycle-2 lead, run e43883b3): the same-model baseline the check draws (rm-1514) keyed on the raw `model_used` string, while the pricing layer folds dated snapshots (`claude-sonnet-4-5-20250929`), provider `/`-path forms and case variants onto one rate row — so a mixed-spelling corpus (the common dated/undated home) priced every session identically yet the check silently skipped with “No same-model cost history”. The cohort key now runs through `pricing::normalize_model` (the same identity the rate lookup prices by), so those spellings pool into one baseline and the check evaluates; the alert's basis names the normalized cohort identity. Boundaries pinned by tests: distinct models never pool (the rm-1514 anti-cross-model guarantee is unchanged), sentinel labels and their case variants still fold to the unattributed cohort, and the rm-1053 region/vendor-qualified SKU twins (`us.anthropic.…-v1:0`, `global.…` — deliberately their own catalog rows at their own list prices) keep their own cohort instead of being judged against the base model's rate norm. Contract test `cost_anomaly_cohort_spelling_contract.rs` exercises the real parse → attribution → pricing → diagnostics chain with the assessment PoC corpora (mixed-spelling arm flips skipped → 3.0x critical; identical-spelling control unchanged).
+
+- rustls lifted 0.23.45 → 0.23.46 in Cargo.lock (rm-018, cycle-2 rider, run e43883b3): RUSTSEC-2026-0346..0349 (four rustls advisories, fixed upstream in 0.23.46, released 2026-10-14) were the standing `cargo deny check advisories` red with `deny.toml` `ignore = []` — the lane re-run at the lifted lock reports `advisories ok, bans ok, licenses ok, sources ok`. The bump is exactly the two lockfile version lines (no other crate moves; `--precise` update, 57 deps unchanged); no manifest or `deny.toml` change.
+
 - cost-anomaly baselines are same-model, disclosed when thin (rm-1514, run
   f923a62a cycle 3; row renumbered at integration from the campaign-local
   rm-1438 — the landed c1cafed5 wall row owns that numeral per the 800cf090
