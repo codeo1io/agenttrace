@@ -2,16 +2,6 @@
 
 ## Unreleased
 
-### Fixed
-
-- antigravity: numeric `modelConfigId` values (JSON numbers, e.g. 1417/1277/1050) no longer silently drop model identity. They now attribute to their stringified id, map to the proven model name when one is known (1417 → `gemini-4-argon`), and every numeric sighting is disclosed via the new `antigravity_model:numeric_id` counter (rm-1864).
-- opencode: transcript read/parse failures are no longer silent. Unreadable files, unparseable JSON, and unreadable container dirs are counted per class and surfaced in `--doctor`/`Metrics::line_skips` (`opencode_transcript_files_unreadable`, `opencode_transcript_files_unparseable`, `opencode_transcript_dirs_unreadable`); a fully-lost corpus now parses with its disclosure instead of masquerading as "unsupported session format" (rm-1866).
-- opencode: session `directory` (and the `projectID` project doc's `directory`) now feeds session/project attribution — sessions attribute to their real project instead of "unknown"; the unknown fallback stays disclosed when neither is present (rm-1865).
-- opencode: a session doc's `projectID` is validated before the project doc is resolved — ids containing `/` or `\` or starting with `..` used to escape the opencode store through `Path::join` semantics (an absolute id replaced the base path outright), letting a planted session doc import any `*.json` on the machine as its project attribution; the project doc is now also stat-capped before reading (review F1 on rm-1865).
-- opencode: read-dir failures that fire mid-enumeration are counted into `opencode_transcript_dirs_unreadable` instead of being silently dropped by the iterator flatten (review F4 on rm-1866).
-- antigravity: float-spelled numeric model ids (`1417.0`) canonicalize to their integer spelling so proven mappings (`1417` → `gemini-4-argon`) still apply; fractional spellings keep their raw disclosed spelling (review F5 on rm-1864).
-- session cache: the schema advances 64 → 67 with this batch (attribution, read-loss disclosure, and numeric model ids all change the served report for unchanged files), so warm caches built beforehand regenerate once on the next scan (review F2).
-
 ### Added
 
 - terminal-spoofing sanitization covers the invisible zero-width Cf family, and the
@@ -170,7 +160,11 @@
   wholesale and rebuild the index, so the rare path pays O(n) and the common
   append path never pays a rescan. A hostile 20k-record journal now parses
   well under the test's linear bound (7.7 s red → 2.6 s green for the whole
-  contract suite).
+  contract suite). The linear-bound arm itself was re-stabilized by rm-1519
+  (run 1e4f6b95 cycle 4): at fleet load 50-58 the HEALTHY ratio ranged
+  7.5-24.9x with the noise concentrated in the 20k measurement, so large
+  now samples min-of-three and the floor rides at 60x — 3x of load headroom
+  over the observed tail while still catching the quadratic's ~100x.
 
 - delivery-evidence git probe drain is byte-capped (rm-731, same batch): the
   probe's helper thread `read_to_end`'d the whole `git log --all` stream —
@@ -182,20 +176,61 @@
   `methodology` string alongside the timeout ("bounded at 10 seconds per
   repository root and drains at most 64 KiB of log output"), pinned by test.
 
-- codex rollouts decode in-process, bounded (rm-992, run dae397f3 cycle 2):
-  Codex ≥0.163 writes rollout transcripts as zstd frames (upstream #53732),
-  and the parser's magic-byte bail left every new default-channel rollout as a
-  manual-decompress instruction. `parse_session_bytes` now decodes zstd
-  frames in-process via the pure-Rust `ruzstd` decoder, bounded at 64 MiB of
-  decompressed output per file — a frame past the cap is refused loudly (a
-  named error carrying the cap and the manual `zstd -d` recovery path), a
-  corrupt frame names the decode failure instead of surfacing as an opaque
-  UTF-8 error, and an empty frame says so. Piped stdin (`agenttrace … -`)
-  shares the same decode lane — composing with the rm-503 read cap above: the
-  raw stream is bounded at the stdin cap first, then the capped bytes flow
-  through the same zstd/UTF-16 decode tail as a named file. A new golden
-  fixture pair under `tests/fixtures/codex-zstd/` pins decode-parity with the
-  uncompressed twin and the over-cap refusal.
+- codex rollouts decode in-process, bounded (rm-992, run dae397f3 cycle
+  2, corrected by rm-1518 in run 1e4f6b95 cycle 4 — see below): Codex's
+  rollout reader has tolerated zstd frames since ≥0.152 (upstream #41357),
+  and stable Codex 0.162.x migrates cold rollouts to compressed storage
+  under `~/.codex/sessions`/`~/.codex/archived_sessions` (`.jsonl.zst`
+  names; writing compressed rollouts by default is still feature-flagged
+  upstream — #53732 rode the 0.163 alphas and no 0.163 stable had shipped
+  at correction time (2026-10-15); when 0.163.0 went stable later that
+  same day the write flag was still off (Stage::UnderDevelopment,
+  default_enabled false at tag rust-v0.163.0), and the parser's magic-byte
+  bail left every compressed rollout
+  as a manual-decompress instruction. `parse_session_bytes` now decodes
+  zstd frames in-process via the pure-Rust `ruzstd` decoder, bounded at
+  64 MiB of decompressed output per file — a frame past the cap is refused
+  loudly (a named error carrying the cap and the manual `zstd -d` recovery
+  path), a corrupt frame names the decode failure instead of surfacing as
+  an opaque UTF-8 error, and an empty frame says so. Piped stdin
+  (`agenttrace … -`) shares the same decode lane — composing with the
+  rm-503 read cap above: the raw stream is bounded at the stdin cap first,
+  then the capped bytes flow through the same zstd/UTF-16 decode tail as a
+  named file. A new golden fixture pair under `tests/fixtures/codex-zstd/`
+  pins decode-parity with the uncompressed twin and the over-cap refusal.
+
+- concatenated zstd frames decode to true EOF, and the codex-zstd story is
+  now told truthfully (rm-1516 + rm-1518, run 1e4f6b95 cycle 4, batch
+  "zstd rollout truth end-to-end + signal truth"): a compressed rollout is
+  not guaranteed to be one frame — Codex appends by materializing the
+  journal and re-encoding, upstream's own `seekable_reader.rs` explicitly
+  tolerates CONCATENATED zstd frames, and every codex read path rides
+  libzstd's multi-frame-default decoder — but `ruzstd`'s
+  `StreamingDecoder` is single-frame by contract, so the rm-992 decode
+  stopped after frame 1 and the parser silently billed a HALF journal
+  (proven red-first on the new two-frame fixture: 19 of 38 events parsed,
+  zero disclosure). The decode now recreates the decoder per frame to true
+  EOF, recovering each frame's exact end position from the decoder's own
+  advanced slice, and the failure surface got louder with it: the 64 MiB
+  cap now bounds the TOTAL across frames (two 40 MiB frames — each alone
+  under the cap — are refused together), trailing bytes that are not a
+  frame are refused with the byte offset where they start (matching
+  `zstd -d`, which refuses such files; the old decode silently parsed the
+  first-frame prefix), skippable frames (`184D2A50..=5F`) are skipped
+  exactly like `zstd -d`, and corrupt-frame failures name the frame number
+  and byte offset. Four new tests pin the arms under
+  `tests/fixtures/codex-zstd/`; the headline fixture is the golden twin
+  split at a line boundary and re-compressed as two concatenated frames,
+  byte-identical under `zstd -dc` to the twin. README gained a
+  compressed-rollout section stating the lane and its honest boundary
+  (`.jsonl.zst`-named files from Codex's own migration are explicit-path/
+  pipe only until discovery admits the suffix), and the rm-992 entry
+  above was corrected to the researched version truth (reader tolerance
+  ≥0.152 via #41357; stable 0.162.x migrates cold rollouts; writing
+  compressed rollouts is still feature-flagged upstream — no 0.163 stable
+  had shipped at research time (2026-10-15); 0.163.0 went stable later
+  that same day with the write flag still off, verified at tag
+  rust-v0.163.0).
 
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
@@ -432,6 +467,14 @@
 - Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
 
 ### Fixed
+
+- antigravity: numeric `modelConfigId` values (JSON numbers, e.g. 1417/1277/1050) no longer silently drop model identity. They now attribute to their stringified id, map to the proven model name when one is known (1417 → `gemini-4-argon`), and every numeric sighting is disclosed via the new `antigravity_model:numeric_id` counter (rm-1864).
+- opencode: transcript read/parse failures are no longer silent. Unreadable files, unparseable JSON, and unreadable container dirs are counted per class and surfaced in `--doctor`/`Metrics::line_skips` (`opencode_transcript_files_unreadable`, `opencode_transcript_files_unparseable`, `opencode_transcript_dirs_unreadable`); a fully-lost corpus now parses with its disclosure instead of masquerading as "unsupported session format" (rm-1866).
+- opencode: session `directory` (and the `projectID` project doc's `directory`) now feeds session/project attribution — sessions attribute to their real project instead of "unknown"; the unknown fallback stays disclosed when neither is present (rm-1865).
+- opencode: a session doc's `projectID` is validated before the project doc is resolved — ids containing `/` or `\` or starting with `..` used to escape the opencode store through `Path::join` semantics (an absolute id replaced the base path outright), letting a planted session doc import any `*.json` on the machine as its project attribution; the project doc is now also stat-capped before reading (review F1 on rm-1865).
+- opencode: read-dir failures that fire mid-enumeration are counted into `opencode_transcript_dirs_unreadable` instead of being silently dropped by the iterator flatten (review F4 on rm-1866).
+- antigravity: float-spelled numeric model ids (`1417.0`) canonicalize to their integer spelling so proven mappings (`1417` → `gemini-4-argon`) still apply; fractional spellings keep their raw disclosed spelling (review F5 on rm-1864).
+- session cache: the schema advances 64 → 67 with this batch (attribution, read-loss disclosure, and numeric model ids all change the served report for unchanged files), so warm caches built beforehand regenerate once on the next scan (review F2).
 
 - The install-runtime gate no longer hardcodes the installer's pinned default ref (assess F1, run 79fe78c0 cycle 3, batch "canonical CI truth"; adoption of salvage 9b2a7a1 U4 — the identical derive-from-install.sh shape was executed in parallel by sibling run `a64735b75a46` cycle 3 and folds here by title, one entry): `scripts/ci/check-install-runtime.sh` grepped the literal `^ref=v0.9.0$` (test D) plus `^clone --branch v0.9.0$` and `pinned ref v0.9.0` (test E) while install.sh's `AGENTTRACE_SOURCE_REF` default has been `v0.10.1` since 2026-10-05 — so the wired `Install runtime verification` CI lane was permanently red, masking every future regression it exists to catch. The gate now DERIVES the expected default from install.sh's own `REF="${AGENTTRACE_SOURCE_REF:-…}"` line and fails loudly if that line moves or changes shape: tests D and E track the pin by construction, and every future bump stays green-or-loud instead of silently re-staling. The default lanes also pin `AGENTTRACE_SOURCE_REF` empty (rm-1394 acceptance 4, review 6cbb259b F2): an operator's ambient export otherwise leaked through `env` into install.sh, the receipt recorded the override, and the derived-default assertion false-reds — the override lanes stay covered deliberately by tests F/H/I. The installer itself is untouched — the pin was always the correct side (it matches the newest release, which `check-install-ref-drift.sh` already ties to the newest CHANGELOG heading).
 - `--fetch` before the `statusline`/`mcp` keywords now fails loudly instead of

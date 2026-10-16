@@ -249,11 +249,24 @@ fn old_usage_metadata_shape_still_counts() {
 /// hostile append-only journal must parse in linear time. The original
 /// absolute 5 s bound flaked on loaded boxes (4/6 concurrent suite runs
 /// red at load 50 on 14 cores while standalone parses already took
-/// 2.3-3.9 s), so the shape is now asserted via a self-calibrated
-/// ratio: linear parsing grows ~10x from 2k to 20k records while the
+/// 2.3-3.9 s), so the shape is asserted via a self-calibrated ratio:
+/// linear parsing grows ~10x from 2k to 20k records while the
 /// pre-LEAD quadratic `Vec::find` upsert grew ~100x (9.5 s at 20k).
 /// min-of-two sampling sheds load spikes; the absolute ceiling only
 /// bounds runaway hangs.
+///
+/// rm-1519 (run 1e4f6b95 cycle 4, batch "zstd rollout truth end-to-end
+/// and signal truth") re-stabilized the same arm on a fleet box at load
+/// 50-58: 6 probe runs put the HEALTHY ratio at 7.5-24.9x, with the
+/// instability concentrated in the LARGE measurement (small stayed
+/// 205-287 ms while one run's large min-of-two was 5.8 s against another
+/// run's 2.1 s — cache-thrash under load multiplies per-record cost for
+/// the 20k journal that does not fit the working set the way 2k does).
+/// A 40.0 floor left only 1.6x headroom over that observed tail. The
+/// arm now samples large min-of-THREE (the noisy side) and the floor is
+/// 60.0: budget = 3x over the measured healthy tail, still a ~1.7x
+/// detection margin against the quadratic's ~100x (a regressed upsert
+/// at this box's speeds parses 20k in ~24 s, ratio ~109x, not 60x).
 #[test]
 fn hostile_append_journal_parses_within_the_linear_bound() {
     let build = |records: i64| {
@@ -283,9 +296,13 @@ fn hostile_append_journal_parses_within_the_linear_bound() {
     let (small_a, _) = parse_timed(&small);
     let (small_b, _) = parse_timed(&small);
     let small_time = small_a.min(small_b);
+    // rm-1519: large is the noisy side (see the doc comment above), so
+    // it takes the extra sample; one more ~2-6 s parse under load is
+    // cheap insurance against a 40->60-flake both-sides-bad run.
     let (large_a, session) = parse_timed(&large);
     let (large_b, _) = parse_timed(&large);
-    let large_time = large_a.min(large_b);
+    let (large_c, _) = parse_timed(&large);
+    let large_time = large_a.min(large_b).min(large_c);
 
     // Correctness alongside timing: every record bills exactly once —
     // an upsert that appends instead of replacing would double it.
@@ -298,9 +315,10 @@ fn hostile_append_journal_parses_within_the_linear_bound() {
     );
     let ratio = large_time.as_secs_f64() / small_time.as_secs_f64().max(1e-9);
     assert!(
-        ratio < 40.0,
+        ratio < 60.0,
         "gemini chats parse scaled {ratio:.1}x from 2k to 20k records \
          (small {small_time:?}, large {large_time:?}) — the upsert regressed \
-         to a per-record rescan (O(n^2) measured 9.5 s at 20k at cab6917)"
+         to a per-record rescan (O(n^2) measured 9.5 s at 20k at cab6917, \
+         ~100x ratio; the 60x floor rides 3x of load headroom, see rm-1519)"
     );
 }

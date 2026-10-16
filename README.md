@@ -335,6 +335,32 @@ the process until the allocator dies, and `AGENTTRACE_STDIN_CAP_BYTES`
 raises or lowers the cap (an unparseable or non-positive value falls back
 to the default rather than failing the run over a typo'd knob).
 
+### Compressed (zstd) Codex rollouts
+
+Codex stores rollout transcripts as zstd frames: the file keeps its
+`.jsonl` name but its content starts with the zstd magic (`28 B5 2F FD`;
+reader tolerance landed upstream in ≥0.152 via PR #41357, and stable
+Codex (0.162.x, and 0.163.0 since 2026-10-15) migrates cold rollouts
+under `~/.codex/sessions` and `~/.codex/archived_sessions` to
+compressed storage — writing compressed rollouts by default remains a
+feature flag upstream, still off at 0.163.0). agenttrace decodes
+these in place (rm-992), and a rollout is not guaranteed to be a single
+frame — Codex appends by materializing the journal and re-encoding, so a
+compressed rollout can carry CONCATENATED zstd frames — so every frame is
+decoded to true EOF, never just the first (rm-1516; a frame-1-only decode
+was a silent half-journal truncation). The decode is bounded at 64 MiB of
+TOTAL decompressed output across all frames, because a rollout is
+untrusted input; every refusal is loud and specific: a corrupt frame names
+the failure and its byte offset, trailing bytes that are not a frame are
+refused with the offset where they start (`zstd -d` refuses the same
+files), skippable frames are skipped exactly like `zstd -d`, and an
+over-cap file names the cap and suggests decompressing manually
+(`zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe). The
+same lane covers stdin (`agenttrace --overview - < rollout.jsonl.zst`).
+One honest boundary: discovery scans admit `.jsonl`/`.json` file names
+only, so files renamed `.jsonl.zst` by Codex's own migration are picked
+up via an explicit path or a pipe, not yet by default scans.
+
 ### `--demo` never silently replaces an explicit session source
 
 `--demo` substitutes the bundled demo corpus for session discovery. It is
