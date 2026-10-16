@@ -234,3 +234,26 @@ printf '%s\n' \
   | "$bin" mcp >"$out_dir/docs/mcp-tools.json"
 node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const names=r.result.tools.map(t=>t.name).sort(); if (names.join(",") !== "by_model_breakdown,usage_overview") { console.error("unexpected tools: " + names); process.exit(1); }' "$out_dir/docs/mcp-tools.json" \
   || fail "the mcp server must expose exactly usage_overview and by_model_breakdown"
+
+# rm-1560 (cycle-4, assess F1): flag-COMBINATION claims must state the
+# gate truth. --latest combines only with --diagnostics and --inspect;
+# the runtime rejects it alongside --waste and every corpus rollup. The
+# old claim "works with `--waste` and report actions" shipped for a gate
+# that never accepted it — pin both surfaces so it cannot return.
+"$bin" --help >"$out_dir/docs/main-help.txt"
+latest_help=$(grep -A2 -- '--latest' "$out_dir/docs/main-help.txt" | head -3)
+grep -q -- '--diagnostics' <<<"$latest_help" \
+  || fail "--help --latest block must name --diagnostics as a valid combination"
+grep -q -- '--inspect' <<<"$latest_help" \
+  || fail "--help --latest block must name --inspect as a valid combination"
+if grep -q 'works with `--waste`' <<<"$latest_help"; then
+  fail "--help --latest block still claims --waste support the gate rejects"
+fi
+latest_readme=$(grep -- '--latest` |' "$repo_root/README.md" | head -1)
+grep -q -- '--diagnostics' <<<"$latest_readme" \
+  || fail "README --latest row must name --diagnostics as a valid combination"
+grep -q -- '--inspect' <<<"$latest_readme" \
+  || fail "README --latest row must name --inspect as a valid combination"
+if grep -q 'works with `--waste`' <<<"$latest_readme"; then
+  fail "README --latest row still claims --waste support the gate rejects"
+fi

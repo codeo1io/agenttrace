@@ -182,6 +182,23 @@ def trim(data):
             ultrafast = value.get(ultrafast_field)
             if isinstance(ultrafast, (int, float)) and ultrafast > 0:
                 entry[ultrafast_field] = ultrafast
+        # Priority-tier rates ride along under the identical contract
+        # (rm-1556 cycle-4, run 1fb751544907): without this arm the next
+        # refresh would silently strip the `*_priority` fields the Rust
+        # loader now ingests, regressing priority turns back to
+        # standard-rate billing. Zero/absent values are omitted (same
+        # greppability rule); `_above_272k_tokens_priority`
+        # long-context variants are not carried (the rm-610 decision,
+        # held for every tier family).
+        for priority_field in (
+            "input_cost_per_token_priority",
+            "output_cost_per_token_priority",
+            "cache_creation_input_token_cost_priority",
+            "cache_read_input_token_cost_priority",
+        ):
+            priority = value.get(priority_field)
+            if isinstance(priority, (int, float)) and priority > 0:
+                entry[priority_field] = priority
         keep[key] = entry
     return keep
 
