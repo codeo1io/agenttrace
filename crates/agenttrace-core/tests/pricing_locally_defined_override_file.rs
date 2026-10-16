@@ -26,6 +26,13 @@ fn override_file_resolves_locally_defined_slug() {
     let price = agenttrace_core::lookup_price_tiered("glm-5.2", None);
     assert_eq!(price.input, 0.0000014);
     assert_eq!(price.output, 0.0000044);
+    // rm-1426 acceptance (4): the rate row CARRIES operator provenance —
+    // "user override", not a catalog/fallback claim (rm-231 family).
+    assert_eq!(
+        agenttrace_core::pricing_source_for("glm-5.2"),
+        "user override",
+        "operator-bound price is disclosed as such"
+    );
 
     std::env::remove_var("AGENTTRACE_PRICING_FILE");
     let _ = std::fs::remove_file(&path);

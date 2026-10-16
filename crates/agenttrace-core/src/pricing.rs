@@ -21,6 +21,11 @@ const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
+// rm-1426: exact keys of the ACTIVE catalog's raw origin (downloaded
+// cache when one is served, else the bundled snapshot), captured when
+// the catalog singleton loads — `--update-pricing` refreshes it in
+// lockstep with the catalog it publishes.
+static PRICING_RAW_KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
 static PRICING_OVERRIDE_STATUS: OnceLock<PricingOverrideStatus> = OnceLock::new();
 
 /// Cycle-4 B1: what actually happened to a requested
@@ -199,14 +204,18 @@ pub fn is_locally_defined(model: &str) -> bool {
         return false;
     }
     let catalog = pricing_catalog();
+    let normalized = normalize_model(model);
     // Operator or built-in SKU alias mapping this slug onto a named row.
-    if resolve_alias(model, &catalog.aliases) != model {
+    // `resolve_alias` normalizes before the alias chain, so the comparison
+    // baseline is the NORMALIZED slug — otherwise every carrier-prefixed
+    // slug ("myco/gpt-9-private") would early-return here and silently
+    // keep its fabricated-default dollars undisclosed.
+    if resolve_alias(model, &catalog.aliases) != normalized {
         return false;
     }
-    let normalized = normalize_model(model);
     // Exact published row — the bare key, or the slug carrying its own
     // carrier prefix as the session recorded it.
-    if raw_snapshot_keys().contains(model) || raw_snapshot_keys().contains(&normalized) {
+    if pricing_raw_keys().contains(model) || pricing_raw_keys().contains(&normalized) {
         return false;
     }
     // Operator override file binds this slug (the pricing-catalog loader
@@ -221,17 +230,25 @@ pub fn is_locally_defined(model: &str) -> bool {
     true
 }
 
-/// Exact keys as published in the bundled snapshot, BEFORE
+/// Exact keys of the ACTIVE catalog's raw origin — the downloaded
+/// cache when one is served, else the bundled snapshot — BEFORE
 /// `convert_litellm` normalizes/collapses carrier prefixes. rm-1426 uses
 /// this to tell a row that names the deployment's own slug from a foreign
-/// carrier's row that merely shares the collapsed name.
-fn raw_snapshot_keys() -> &'static BTreeSet<String> {
-    static KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
-    KEYS.get_or_init(|| {
-        serde_json::from_str::<BTreeMap<String, serde_json::Value>>(PRICING_SNAPSHOT_JSON)
-            .map(|rows| rows.into_keys().collect())
-            .unwrap_or_default()
-    })
+/// carrier's row that merely shares the collapsed name; the set follows
+/// the same origin `pricing_catalog()` serves entries from, so a slug the
+/// LIVE catalog names is never locally-defined just because the bundled
+/// snapshot predates it (and a slug only the stale bundle names is
+/// locally-defined, exactly like any other borrowed rate).
+fn pricing_raw_keys() -> &'static BTreeSet<String> {
+    PRICING_RAW_KEYS.get_or_init(|| litellm_raw_keys(PRICING_SNAPSHOT_JSON.as_bytes()))
+}
+
+/// Top-level keys of a raw LiteLLM-format catalog (the snapshot constant
+/// and the on-disk cache store the same envelope).
+fn litellm_raw_keys(raw: &[u8]) -> BTreeSet<String> {
+    serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(raw)
+        .map(|rows| rows.into_keys().collect())
+        .unwrap_or_default()
 }
 
 pub fn list_pricing() -> BTreeMap<String, Price> {
@@ -622,6 +639,7 @@ pub fn update_pricing() -> anyhow::Result<usize> {
     // survive it (rm-610) instead of silently reverting to fallback.
     apply_codex_sku_entries(&mut catalog);
     apply_codex_sku_aliases(&mut catalog);
+    let _ = PRICING_RAW_KEYS.set(litellm_raw_keys(raw.as_bytes()));
     let _ = PRICING_CATALOG.set(catalog);
     Ok(count)
 }
@@ -741,7 +759,18 @@ fn pricing_catalog() -> &'static PricingCatalog {
 /// bundled snapshot is used. The only network path is the explicit
 /// `--update-pricing` action.
 fn load_catalog_for_current_env() -> PricingCatalog {
-    let mut catalog = load_pricing_cache().unwrap_or_else(fallback_catalog);
+    let mut catalog = match load_pricing_cache() {
+        Some((catalog, raw_keys)) => {
+            // rm-1426: the active origin is the cache — its raw keys (not
+            // the bundled snapshot's) decide which slugs are named.
+            let _ = PRICING_RAW_KEYS.set(raw_keys);
+            catalog
+        }
+        None => {
+            let _ = PRICING_RAW_KEYS.set(litellm_raw_keys(PRICING_SNAPSHOT_JSON.as_bytes()));
+            fallback_catalog()
+        }
+    };
     let override_models = apply_pricing_overrides(&mut catalog);
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
     apply_codex_sku_entries(&mut catalog);
@@ -855,7 +884,7 @@ fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
     override_models
 }
 
-fn load_pricing_cache() -> Option<PricingCatalog> {
+fn load_pricing_cache() -> Option<(PricingCatalog, BTreeSet<String>)> {
     let path = pricing_cache_path();
     let metadata = path.metadata().ok()?;
     let stale = metadata
@@ -865,21 +894,27 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
         .map(|age| age > CACHE_MAX_AGE)
         .unwrap_or(false);
     let raw = std::fs::read(&path).ok()?;
+    // rm-1426: the raw keys travel with the catalog they came from —
+    // the active origin decides which slugs count as "named".
+    let raw_keys = litellm_raw_keys(&raw);
     let converted = convert_litellm(&raw);
     if converted.entries.is_empty() {
         return None;
     }
-    Some(PricingCatalog {
-        entries: converted.entries,
-        aliases: BTreeMap::new(),
-        source: if stale { "cache(stale)" } else { "cache" }.to_string(),
-        providers: converted.providers,
-        // A cached catalog's vintage is its fetch date (rm-419); when
-        // the provenance stamp is missing (pre-rm-167 cache) fall back
-        // to the bundled snapshot date as a conservative anchor.
-        reference_date: pricing_cache_vintage_ymd(&path)
-            .or_else(|| iso_to_ymd(PRICING_SNAPSHOT_DATE)),
-    })
+    Some((
+        PricingCatalog {
+            entries: converted.entries,
+            aliases: BTreeMap::new(),
+            source: if stale { "cache(stale)" } else { "cache" }.to_string(),
+            providers: converted.providers,
+            // A cached catalog's vintage is its fetch date (rm-419); when
+            // the provenance stamp is missing (pre-rm-167 cache) fall back
+            // to the bundled snapshot date as a conservative anchor.
+            reference_date: pricing_cache_vintage_ymd(&path)
+                .or_else(|| iso_to_ymd(PRICING_SNAPSHOT_DATE)),
+        },
+        raw_keys,
+    ))
 }
 
 /// YYYYMMDD of the fetch recorded in a pricing cache's provenance

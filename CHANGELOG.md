@@ -10,10 +10,13 @@
   snapshot, live LiteLLM and the builtin table while ~90 prefixed `zai/glm-5.2`
   carrier rows exist — so every lookup priced such usage at the builtin default
   ($3.00/$15.00 per Mtok) with zero indication. `pricing::is_locally_defined`
-  classifies the slug against the RAW published snapshot keys (pre-collapse:
-  a bare name that only matches a carrier-prefixed row after `convert_litellm`
+  classifies the slug against the RAW keys of the ACTIVE catalog origin — the
+  downloaded cache when one is served, else the bundled snapshot (kept in
+  lockstep by catalog load and `--update-pricing`) — pre-collapse: a bare
+  name that only matches a carrier-prefixed row after `convert_litellm`
   collapses it is still locally-defined — arm b — which the collapsed-catalog
-  `has_specific_price` cannot see); `analyze` now mints
+  `has_specific_price` cannot see; conversely a slug the LIVE cache names is
+  never locally-defined just because the older bundle predates it); `analyze` now mints
   `locally_defined_model_pricing:{slug}` occurrence counters and a
   `locally_defined_priced_cents` total (both arms: per-block and the
   single-model catalog formula; upstream-recorded cost excluded, staying in the

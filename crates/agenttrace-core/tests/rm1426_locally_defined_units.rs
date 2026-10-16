@@ -43,6 +43,45 @@ fn recorded_cost_blocks_stay_in_rm1052_lane() {
         .contains_key("locally_defined_priced_cents"));
 }
 
+/// rm-1426 per-block arm: a MULTI-model session (pi model_change shape,
+/// rm-438) prices each usage block at its own model — the locally-defined
+/// census must attribute fabricated dollars per block, not just for the
+/// single-model catalog formula.
+#[test]
+fn multi_model_session_prices_each_locally_defined_block() {
+    let mut local = Event {
+        model_used: "glm-9.9-not-a-sku".to_string(),
+        role: "session_meta".to_string(),
+        ..Event::default()
+    };
+    local.usage.insert("input_tokens".to_string(), 1_000_000);
+    local.usage.insert("output_tokens".to_string(), 1_000_000);
+    let mut priced = Event {
+        model_used: "claude-sonnet-4-5".to_string(),
+        role: "session_meta".to_string(),
+        ..Event::default()
+    };
+    priced.usage.insert("input_tokens".to_string(), 1_000);
+    priced.usage.insert("output_tokens".to_string(), 1_000);
+
+    let m = analyze(&[local, priced], "glm-9.9-not-a-sku");
+    assert_eq!(
+        m.disclosure_counters
+            .get("locally_defined_model_pricing:glm-9.9-not-a-sku"),
+        Some(&1),
+        "the locally-defined BLOCK is counted per slug even in a mixed session"
+    );
+    // 1M in at $3.00/Mtok + 1M out at $15.00/Mtok = exactly $18.00 of
+    // fabricated-default dollars for that one block; the priced block
+    // contributes nothing.
+    assert_eq!(
+        m.disclosure_counters.get("locally_defined_priced_cents"),
+        Some(&1800),
+        "per-block fabricated dollars; got {:?}",
+        m.disclosure_counters
+    );
+}
+
 #[test]
 fn unpriced_usage_without_identity_is_not_locally_defined() {
     let mut e = Event::default();
