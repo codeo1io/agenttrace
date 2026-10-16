@@ -19,7 +19,7 @@
 //! 4. a full-catalog sweep: every snapshot key bills at a real
 //!    snapshot row — no invented prices, no collateral collapse.
 
-use agenttrace_core::{lookup_price, pricing_source_for, provider_for};
+use agenttrace_core::{lookup_context_window, lookup_price, pricing_source_for, provider_for};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -240,6 +240,94 @@ fn base_model_pricing_is_unchanged_by_the_regional_split() {
         provider_for("gpt-4o").as_deref(),
         Some("openai"),
         "plain-id provider attribution is unchanged"
+    );
+}
+
+/// The bundled snapshot's own `max_input_tokens` for a raw key — the
+/// value the window lane must serve for that key's sessions.
+fn snapshot_window(key: &str) -> Option<u64> {
+    let row = snapshot_json().get(key)?.as_object()?;
+    let window = row.get("max_input_tokens")?.as_u64()?;
+    (window > 0).then_some(window)
+}
+
+#[test]
+fn window_pins_regional_twins_resolve_to_their_own_rows() {
+    // rm-1881: the window lane must resolve through the same rm-1053
+    // raw-first ladder the rate lane uses. Pre-fix it was the one
+    // resolver still on the plain matcher, so a mixed-case deployment
+    // id (assess 532cfddb PoC: "azure/eu/GPT-5.5") billed at its OWN
+    // row while the utilization denominator came from the BASE row
+    // (1,050,000 labeled window_source "catalog"; the own row pins
+    // 922,000) — and the mixed-case dotted regional form missed
+    // entirely (None) instead of hitting its own row.
+    let probes = [
+        // (session id, own snapshot key)
+        ("azure/eu/gpt-5.5", "azure/eu/gpt-5.5"), // raw exact
+        ("azure/eu/GPT-5.5", "azure/eu/gpt-5.5"), // lowercased-raw ladder arm
+        (
+            "US.Anthropic.Claude-Opus-4-6-V1",
+            "us.anthropic.claude-opus-4-6-v1",
+        ), // dotted regional, mixed case
+    ];
+    for (model, own_key) in probes {
+        let own = snapshot_window(own_key)
+            .unwrap_or_else(|| panic!("snapshot must carry a window for {own_key:?}"));
+        assert_eq!(
+            lookup_context_window(model),
+            Some(own),
+            "{model:?} must resolve to its OWN row's window ({own}), not a twin's"
+        );
+    }
+
+    // Controls: the plain base id and a variant-path id (suffix-strip
+    // onto the base row) are unchanged by the ladder reroute.
+    assert_eq!(lookup_context_window("gpt-5.5"), snapshot_window("gpt-5.5"));
+    assert_eq!(
+        lookup_context_window("gpt-5.5-2026-04"),
+        snapshot_window("gpt-5.5")
+    );
+}
+
+#[test]
+fn bundled_catalog_window_sweep_serves_own_rows() {
+    // rm-1881 full-catalog sweep, mirroring the rate sweep: every
+    // chat-priced qualified key that carries a window must resolve its
+    // window to its OWN row's value through the public lane.
+    let mut checked = 0usize;
+    for key in snapshot_json()
+        .as_object()
+        .expect("snapshot root is an object")
+        .keys()
+    {
+        if !is_chat_priced(key) || !is_qualified_key(key) {
+            continue;
+        }
+        if let Some(own) = snapshot_window(key) {
+            assert_eq!(
+                lookup_context_window(key),
+                Some(own),
+                "window lane must serve {key:?}'s own row"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 100,
+        "window sweep must cover the qualified population (checked {checked})"
+    );
+}
+
+#[test]
+fn unresolvable_window_is_none_not_a_twin() {
+    // None is the honest answer for an unresolvable id: the
+    // diagnostics caller then labels the utilization a fallback
+    // estimate. The window lane must never reach for a base-twin
+    // window through the back door.
+    assert_eq!(lookup_context_window("no/such/model-anywhere"), None);
+    assert_eq!(
+        lookup_context_window("azure/eu/definitely-not-a-model"),
+        None
     );
 }
 

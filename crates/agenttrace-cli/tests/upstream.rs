@@ -523,6 +523,22 @@ fn upstream_report_honors_dash_o() {
     let _ = std::fs::remove_dir_all(&fixture.root);
 }
 
+fn scratch_path(name: &str) -> std::path::PathBuf {
+    // rm-1882 (rm-1065 discipline): per-call unique scratch paths. The
+    // pid separates concurrent cargo-test processes on one host; the
+    // monotonically increasing suffix separates tests (and repeat
+    // calls) within one process, so no two invocations can ever race
+    // remove_dir_all/create_dir_all on the same fixed path.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let (stem, ext) = match name.rfind('.') {
+        Some(idx) => (&name[..idx], &name[idx..]),
+        None => (name, ""),
+    };
+    std::env::temp_dir().join(format!("{stem}-{}-{seq}{ext}", std::process::id()))
+}
+
 #[test]
 fn diagnostics_lane_neutralizes_the_hostile_formula_corpus() {
     let bin = env!("CARGO_BIN_EXE_agenttrace");
@@ -530,7 +546,7 @@ fn diagnostics_lane_neutralizes_the_hostile_formula_corpus() {
         .join("../../crates/agenttrace-core/tests/fixtures/formula-lane/hostile-tool.jsonl")
         .canonicalize()
         .expect("hostile-tool.jsonl fixture exists");
-    let home = std::env::temp_dir().join("at-diag-lane-home");
+    let home = scratch_path("at-diag-lane-home");
     let _ = std::fs::create_dir_all(&home);
 
     // Human TEXT lane (default format): every spreadsheet-formula leaf inside

@@ -121,11 +121,27 @@ fn mixed_session_counts_only_the_zero_blocks() {
 // This is the review's PoC pinned as a regression: on a tree where the
 // const is still 22 the hand-written v22 entry below IS served and the
 // first assertion fails.
+fn scratch_path(name: &str) -> std::path::PathBuf {
+    // rm-1882 (rm-1065 discipline): per-call unique scratch paths. The
+    // pid separates concurrent cargo-test processes on one host; the
+    // monotonically increasing suffix separates tests (and repeat
+    // calls) within one process, so no two invocations can ever race
+    // remove_dir_all/create_dir_all on the same fixed path.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let (stem, ext) = match name.rfind('.') {
+        Some(idx) => (&name[..idx], &name[idx..]),
+        None => (name, ""),
+    };
+    std::env::temp_dir().join(format!("{stem}-{}-{seq}{ext}", std::process::id()))
+}
+
 #[test]
 fn stale_schema_22_cache_cannot_mask_the_disclosure() {
     use std::os::unix::fs::MetadataExt;
 
-    let root = std::env::temp_dir().join("at-zero-usage-stale-v22");
+    let root = scratch_path("at-zero-usage-stale-v22");
     let _ = fs::remove_dir_all(&root);
     let sessions_dir = root.join("sessions");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");

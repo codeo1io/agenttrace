@@ -362,9 +362,25 @@ fn copy_fixture_to(dir: &std::path::Path, fixture: &str, as_name: &str) -> std::
     dst
 }
 
+fn scratch_path(name: &str) -> std::path::PathBuf {
+    // rm-1882 (rm-1065 discipline): per-call unique scratch paths. The
+    // pid separates concurrent cargo-test processes on one host; the
+    // monotonically increasing suffix separates tests (and repeat
+    // calls) within one process, so no two invocations can ever race
+    // remove_dir_all/create_dir_all on the same fixed path.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let (stem, ext) = match name.rfind('.') {
+        Some(idx) => (&name[..idx], &name[idx..]),
+        None => (name, ""),
+    };
+    std::env::temp_dir().join(format!("{stem}-{}-{seq}{ext}", std::process::id()))
+}
+
 #[test]
 fn doctor_zero_usage_sample_lane_gets_formula_guard() {
-    let tmp = std::env::temp_dir().join("at-doc-guard-zero");
+    let tmp = scratch_path("at-doc-guard-zero");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("mkdir zero-usage corpus");
     copy_fixture_to(
@@ -430,7 +446,7 @@ fn doctor_duplicate_db_lane_gets_formula_guard_and_json_stays_raw() {
 
     // Contrast: the same hostile session flows through the JSON surface with
     // NO marker — machine lanes stay byte-lossless BY DESIGN.
-    let tmp = std::env::temp_dir().join("at-doc-guard-json");
+    let tmp = scratch_path("at-doc-guard-json");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("mkdir json corpus");
     copy_fixture_to(

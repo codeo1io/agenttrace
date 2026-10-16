@@ -54,6 +54,22 @@ fn fixture(tag: &str, lines: &[String]) -> PathBuf {
     path
 }
 
+fn scratch_path(name: &str) -> std::path::PathBuf {
+    // rm-1882 (rm-1065 discipline): per-call unique scratch paths. The
+    // pid separates concurrent cargo-test processes on one host; the
+    // monotonically increasing suffix separates tests (and repeat
+    // calls) within one process, so no two invocations can ever race
+    // remove_dir_all/create_dir_all on the same fixed path.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let (stem, ext) = match name.rfind('.') {
+        Some(idx) => (&name[..idx], &name[idx..]),
+        None => (name, ""),
+    };
+    std::env::temp_dir().join(format!("{stem}-{}-{seq}{ext}", std::process::id()))
+}
+
 #[test]
 fn torn_tail_line_is_disclosed_not_dropped() {
     let torn = parse_file(&fixture(
@@ -193,7 +209,7 @@ fn workbuddy_torn_tail_discloses_through_both_channels() {
     // pin isolates the disclosure, not an undercount.
     let torn_tail = r#"{"type":"function_call_result","output":"do"#;
     let corpus = format!("{head}\n{message}\n{torn_tail}\n");
-    let path = std::env::temp_dir().join("at-torn-tail-workbuddy.jsonl");
+    let path = scratch_path("at-torn-tail-workbuddy.jsonl");
     fs::write(&path, corpus).expect("write fixture");
     let session = parse_file(&path).expect("torn workbuddy journal still parses");
     assert_eq!(session.metrics.source_tool, "workbuddy");
@@ -220,7 +236,7 @@ fn workbuddy_torn_tail_discloses_through_both_channels() {
 
     // The intact twin discloses nothing — the skip is the reader's truth,
     // not the format's.
-    let intact_path = std::env::temp_dir().join("at-torn-tail-workbuddy-intact.jsonl");
+    let intact_path = scratch_path("at-torn-tail-workbuddy-intact.jsonl");
     fs::write(
         &intact_path,
         format!(
