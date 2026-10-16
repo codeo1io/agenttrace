@@ -1048,7 +1048,9 @@ fn render_explorer_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn project_preview(app: &App, session: &Session) -> String {
     let identity = app.project_identity(session);
-    let project = identity.display_name.clone();
+    // rm-933 (review-6f85e2c9 F2): display_name is cwd-derived and
+    // previously format!ed raw into the whole summary block.
+    let project = sanitize_display(&identity.display_name);
     let sessions = app
         .visible_sessions()
         .into_iter()
@@ -2156,22 +2158,28 @@ fn key_hint_line(text: &str, raw: bool) -> Line<'static> {
 }
 
 fn sidebar_field(label: &str, value: String, style: Style) -> Line<'static> {
+    // rm-933 (review-6f85e2c9 F2): Source/Model values derive from
+    // transcript metadata and render raw — sanitize at the span.
     Line::from(vec![
         Span::styled(
             pad_display_width(label, 9),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled(value, style),
+        Span::styled(sanitize_display(&value), style),
     ])
 }
 
 fn preview_field(label: &str, value: String) -> Line<'static> {
+    // rm-933 (review-6f85e2c9 F2): the cwd-derived project display_name
+    // (insights.rs resolve_project Opaque arm) and the transcript-
+    // derived source/model reached these spans raw — compose the union
+    // at the choke point so every preview value passes it.
     Line::from(vec![
         Span::styled(
             pad_display_width(label, 9),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::raw(value),
+        Span::raw(sanitize_display(&value)),
     ])
 }
 

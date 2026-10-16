@@ -4,6 +4,38 @@
 
 ### Added
 
+- terminal-spoofing sanitization covers the invisible zero-width Cf family, and the
+  machine lanes stay lossless (rm-933 slice 3, run ff7615be cycle 3; review fix 6f85e2c9): the shared
+  predicate split into directional (`is_bidi_format_control`, unchanged set) and
+  invisible-spoofing (`is_invisible_spoofing_control`: U+FEFF BOM/ZWNBSP, U+2060
+  word joiner, U+180E Mongolian vowel separator, and the plane-14 tag block
+  U+E0000–U+E007F — the acceptance's tag arm, closed by the review fix; the Variation
+  Selectors Supplement sharing plane 14 stays out as functional orthography) with a
+  composed union (`is_spoofing_format_control`) that every render boundary now
+  applies. U+00AD soft hyphen and the ZWSP/ZWNJ/ZWJ joiner family stay deliberately
+  excluded (legitimate typography/orthography) and are test-pinned. The serialized-JSON
+  lane switched from lossy U+FFFD substitution to `escape_spoofing_json` — hostile
+  characters reach the byte stream as `\uXXXX` escapes (serde passes Cf raw, so the
+  escape pass is what neutralizes the stream) and the decoded value round-trips
+  to the exact original: zero raw spoofing characters in flight, zero data loss;
+  non-BMP tag characters ride as their UTF-16 surrogate pairs (`\uDB40\uDC01`),
+  because a JSON `\u` escape is exactly four hex digits.
+  OTel attribute values and TUI display cells compose the same union — including
+  (review fix) the TUI preview/summary choke points that previously rendered raw
+  (explorer preview and sidebar value spans, project summaries, the
+  project-resolution line, and the ASCII-fallback report renderer). Pinned by a
+  cross-format kitchen-sink invariant (OSC-52 + OSC-7501 + DCS + directional +
+  invisible + excluded-Cf + plane-14 tag chars with explicit surrogate-pair and
+  bounds assertions, across render/document/JSON lanes, idempotence included) and
+  an end-to-end hostile-cwd probe (`--overview -f json` name bytes).
+- fresh-install / empty-store corpora on the antigravity lane report empty, never
+  crash (rm-947, run ff7615be cycle 3): ccusage #1874/#1875 exposed the crash
+  class — store present, conversations absent. agenttrace's journal-based family
+  takes the same shapes: a conversation whose only line is a CONVERSATION_HISTORY
+  marker (probe claimed, zero events) skips as the generic benign empty-file
+  error, a torn-tail journal line skips with the existing line-skip disclosure
+  while the parseable prefix survives, and a real discovery root with a fresh
+  store yields exit 0 / empty overview / 0 sessions end-to-end.
 - codex MultiAgent V2 replayed prefixes are counted once per family (rm-402,
   run aa36ecb0 cycle 3; review af521003 fixes): a multi-agent child rollout
   opens by replaying the parent's transcript as its own context, so a corpus
