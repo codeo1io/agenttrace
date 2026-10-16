@@ -38,7 +38,11 @@ const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const LOAD_BATCH_SIZE: usize = 8;
 enum LoadMessage {
     Progress(Vec<LoadProgress>),
-    Complete(anyhow::Result<(bool, LoadReport)>),
+    // rm-367 rider: LoadReport grew the sqlite budget-truncation
+    // disclosure (`SqliteIngestReport.partial_dbs`), which pushed the
+    // largest variant over clippy's large_enum_variant threshold —
+    // box the one-shot completion payload (the hot path is Progress).
+    Complete(Box<anyhow::Result<(bool, LoadReport)>>),
 }
 
 pub fn run(sessions_dir: &str) -> anyhow::Result<()> {
@@ -1022,7 +1026,7 @@ impl App {
             if !batch.is_empty() {
                 let _ = tx.send(LoadMessage::Progress(batch));
             }
-            let _ = tx.send(LoadMessage::Complete(result));
+            let _ = tx.send(LoadMessage::Complete(Box::new(result)));
         });
     }
 
@@ -1053,15 +1057,17 @@ impl App {
                     }
                     changed = true;
                 }
-                Ok(LoadMessage::Complete(Ok((force, report)))) => {
-                    self.apply_loaded_sessions(report, force);
-                    return true;
-                }
-                Ok(LoadMessage::Complete(Err(err))) => {
-                    self.load_state.phase = LoadPhase::Failed;
-                    self.status = format!("{}: {err}", self.t("reload failed", "重新加载失败"));
-                    return true;
-                }
+                Ok(LoadMessage::Complete(result)) => match *result {
+                    Ok((force, report)) => {
+                        self.apply_loaded_sessions(report, force);
+                        return true;
+                    }
+                    Err(err) => {
+                        self.load_state.phase = LoadPhase::Failed;
+                        self.status = format!("{}: {err}", self.t("reload failed", "重新加载失败"));
+                        return true;
+                    }
+                },
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.load_state.phase = LoadPhase::Failed;

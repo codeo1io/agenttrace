@@ -32,7 +32,29 @@ require_json() {
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir"
 
-"$bin" --doctor -f json >"$out_dir/doctor.json"
+# rm-1425: scope the doctor probe to a throwaway scratch home. The
+# inherited HOME is the operator's real corpus on a developer host
+# (assess F2: a gate run mutated the real ~/.cache/agenttrace
+# sessions.json) and an unrelated $HOME under CI; neither is this
+# gate's subject — the probe only asserts that --doctor emits a
+# non-empty, valid-JSON report. The scratch path is FIXED (not
+# mktemp-random) so the captured doctor.json stays byte-deterministic
+# run-to-run: DoctorReport.cache_path embeds the cache location, so a
+# random suffix would leak into the artifact. This is the gate's only
+# real-HOME walker; the --demo legs below are corpus-scoped and keep
+# the ambient environment, byte-identical to before.
+doctor_scratch="${TMPDIR:-/tmp}/agenttrace-output-contract-home"
+rm -rf "$doctor_scratch"
+mkdir -p "$doctor_scratch"
+(
+  export HOME="$doctor_scratch"
+  export XDG_CONFIG_HOME="$doctor_scratch/.config"
+  export XDG_CACHE_HOME="$doctor_scratch/.cache"
+  export XDG_DATA_HOME="$doctor_scratch/.local/share"
+  export AGENTTRACE_SESSION_CACHE_DIR="$doctor_scratch/.cache/agenttrace"
+  "$bin" --doctor -f json >"$out_dir/doctor.json"
+)
+rm -rf "$doctor_scratch"
 require_file "$out_dir/doctor.json"
 require_json "$out_dir/doctor.json"
 

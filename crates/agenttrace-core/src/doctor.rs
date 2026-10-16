@@ -1,15 +1,74 @@
 use crate::reports::guard_formula_cell;
+use crate::sqlite_sessions::{
+    load_sqlite_backed_sessions_reported_bounded, SqlitePartialDb, SqliteScanBudget,
+};
 use crate::{
     cache_dir::user_cache_dir, cached_session, find_session_files, known_session_dirs,
-    load_session_cache, load_sqlite_backed_sessions_reported, parse_file, save_session_cache,
-    store_session, Session, SqliteIngestReport, VERSION,
+    load_session_cache, parse_file, save_session_cache, store_session, Session, SqliteIngestReport,
+    VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// rm-367(b)/(d): top-level honest-truncation disclosure for the
+/// doctor scan. Built only when a bound actually truncated work;
+/// partial counts are never presented as complete ones.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DoctorScanPartial {
+    pub roots: usize,
+    pub roots_truncated: usize,
+    pub session_files: usize,
+    pub files_parsed: usize,
+    pub files_skipped_budget: usize,
+    pub files_skipped_size: usize,
+    pub sqlite_dbs_partial: usize,
+    pub elapsed_ms: u64,
+    pub note: String,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+fn doctor_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// rm-367(b)/(d): the per-root scan bound — a wall-clock budget for
+/// fresh parses and a cumulative parsed-byte cap for oversized
+/// roots. A root that crosses either bound keeps what it parsed and
+/// discloses the rest as `skipped_budget` / `skipped_size` counts.
+#[derive(Debug, Clone, Copy)]
+struct DoctorRootBound {
+    budget_ms: u64,
+    max_bytes: u64,
+}
+
+impl DoctorRootBound {
+    fn from_env() -> Self {
+        Self {
+            budget_ms: doctor_env_u64("AGENTTRACE_DOCTOR_ROOT_BUDGET_MS", 60_000),
+            max_bytes: doctor_env_u64("AGENTTRACE_DOCTOR_ROOT_MAX_BYTES", 536_870_912),
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        Some(Instant::now() + Duration::from_millis(self.budget_ms))
+    }
+
+    fn deadline_exceeded(&self, deadline: Option<Instant>) -> bool {
+        deadline.is_some_and(|bound| Instant::now() >= bound)
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
@@ -91,6 +150,16 @@ pub struct DoctorReport {
     /// matched the discovery glob.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sqlite_duplicate_dbs: Vec<crate::sqlite_sessions::SqliteDuplicateDb>,
+    /// rm-367(b)/(d): present exactly when the scan budget or the
+    /// per-root size cap truncated something ('scanned N of M roots in
+    /// Ts'); a complete scan leaves it `None` so output stays
+    /// byte-identical to pre-budget binaries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_partial: Option<DoctorScanPartial>,
+    /// rm-367(b): sqlite databases whose ingest pass was cut short by
+    /// the per-db/lane wall-clock budget (kept sessions disclosed).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sqlite_partial_dbs: Vec<SqlitePartialDb>,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
     /// `agenttrace statusline` has been configured as the statusLine
@@ -129,6 +198,14 @@ pub struct DoctorDirReport {
     pub parsed: usize,
     pub failed: usize,
     pub cache_hits: usize,
+    /// rm-367(b): files this root skipped because its wall-clock
+    /// budget was exhausted — counted, never labeled as failures.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub skipped_budget: usize,
+    /// rm-367(d): files this root skipped because the cumulative
+    /// parsed bytes crossed the size cap (count-sampled pass).
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub skipped_size: usize,
     /// Present when the provider directory is itself a symlink, so the
     /// doctor names the link it follows instead of implying a plain
     /// directory (cycle 7, Codex `#42135`).
@@ -233,7 +310,22 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
     // disclosures the dedup through one struct instead of a second
     // load lane.
     let (sessions, sqlite_ingest) = if dir.is_none() {
-        load_sqlite_backed_sessions_reported(None)
+        // rm-367(b): the sqlite lane runs under the doctor's
+        // wall-clock budget (per-db + lane total, interrupt-based)
+        // with live stderr progress; truncated databases are
+        // disclosed as partial passes, never dropped or cached.
+        let budget = SqliteScanBudget {
+            per_db: Duration::from_millis(doctor_env_u64("AGENTTRACE_DOCTOR_DB_BUDGET_MS", 25_000)),
+            total: Duration::from_millis(doctor_env_u64(
+                "AGENTTRACE_DOCTOR_SQLITE_TOTAL_BUDGET_MS",
+                90_000,
+            )),
+            // rm-367(b): per-database progress shares the same
+            // terminal gate as the root-lane line — a captured stderr
+            // stays JSON/disclosure-only.
+            progress: std::io::stderr().is_terminal(),
+        };
+        load_sqlite_backed_sessions_reported_bounded(None, Some(budget))
     } else {
         (Vec::new(), SqliteIngestReport::default())
     };
@@ -248,6 +340,9 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
 }
 
 pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
+    // rm-367(b): the scan disclosure's clock covers the whole pass,
+    // discovery included (the sqlite lane runs inside discovery).
+    let started = Instant::now();
     let DoctorDiscovery {
         cache,
         cache_size_bytes,
@@ -320,6 +415,41 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions: files.len() + sessions.len(),
         session_files: files.len(),
         sqlite_duplicate_dbs: sqlite_ingest.duplicate_dbs,
+        scan_partial: {
+            // rm-367(b)/(d): honest-truncation disclosure — present
+            // exactly when a bound truncated work, so a complete scan
+            // serializes byte-identically to pre-budget binaries.
+            let files_skipped_budget: usize =
+                directories.iter().map(|row| row.skipped_budget).sum();
+            let files_skipped_size: usize = directories.iter().map(|row| row.skipped_size).sum();
+            let roots_truncated = directories
+                .iter()
+                .filter(|row| row.skipped_budget + row.skipped_size > 0)
+                .count();
+            let sqlite_dbs_partial = sqlite_ingest.partial_dbs.len();
+            if files_skipped_budget + files_skipped_size + sqlite_dbs_partial == 0 {
+                None
+            } else {
+                let bound = DoctorRootBound::from_env();
+                Some(DoctorScanPartial {
+                    roots: directories.len(),
+                    roots_truncated,
+                    session_files: directories.iter().map(|row| row.files).sum(),
+                    files_parsed: directories.iter().map(|row| row.parsed).sum(),
+                    files_skipped_budget,
+                    files_skipped_size,
+                    sqlite_dbs_partial,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    note: format!(
+                        "scan budget reached: root wall-clock {}s, per-root size cap {} MB, sqlite lane {}s — skipped files and truncated database passes are disclosed per row; these counts are partial, not complete",
+                        bound.budget_ms / 1000,
+                        bound.max_bytes / (1024 * 1024),
+                        doctor_env_u64("AGENTTRACE_DOCTOR_SQLITE_TOTAL_BUDGET_MS", 90_000) / 1000
+                    ),
+                })
+            }
+        },
+        sqlite_partial_dbs: sqlite_ingest.partial_dbs.clone(),
         project_decode,
         zero_usage,
         disclosures,
@@ -745,6 +875,27 @@ fn doctor_directories(
         );
         return Vec::new();
     }
+    // rm-367(c): stderr progress before the first parse, so a slow
+    // scan is diagnosable live (stage (c) of the row). Terminal-gated:
+    // a captured/piped stderr stays machine-readable — the CLI's
+    // knob-disclosure JSON owns captured stderr (entrypoints
+    // contract; regression: env_history_knob test).
+    let mut roots_seen: HashSet<&Path> = HashSet::new();
+    for file in files {
+        if let Some(parent) = file.parent() {
+            roots_seen.insert(parent);
+        }
+    }
+    let root_bound = DoctorRootBound::from_env();
+    if std::io::stderr().is_terminal() {
+        eprintln!(
+            "agenttrace: doctor: parsing {} session file(s) across {} root(s) (root budget {}s, per-root size cap {} MB)",
+            files.len(),
+            roots_seen.len(),
+            root_bound.budget_ms / 1000,
+            root_bound.max_bytes / (1024 * 1024),
+        );
+    }
     let mut cache = load_session_cache();
     let mut dirs: Vec<DoctorDirReport> = Vec::new();
     if let Some(dir) = dir {
@@ -759,6 +910,7 @@ fn doctor_directories(
             "custom",
             &abs,
             files,
+            &root_bound,
             &mut cache,
             scanned_sessions,
             project_decode,
@@ -788,6 +940,7 @@ fn doctor_directories(
                 &candidate.name,
                 &candidate.path,
                 &matching,
+                &root_bound,
                 &mut cache,
                 &mut scan.scanned_sessions,
                 &mut scan.project_decode,
@@ -860,6 +1013,7 @@ fn doctor_dir_report(
     name: &str,
     path: &Path,
     files: &[PathBuf],
+    bound: &DoctorRootBound,
     cache: &mut crate::SessionCache,
     scanned_sessions: &mut Vec<Session>,
     project_decode: &mut DoctorProjectDecodeReport,
@@ -869,6 +1023,14 @@ fn doctor_dir_report(
     let mut parsed = 0;
     let mut cache_hits = 0;
     let mut failure_samples = Vec::new();
+    // rm-367(b)/(d): fresh parses run under the root's wall-clock
+    // budget and cumulative parsed-byte cap; cache hits are cheap and
+    // exempt. A skipped file is counted in its own bucket — never
+    // labeled a parse failure.
+    let deadline = bound.deadline();
+    let mut parsed_bytes: u64 = 0;
+    let mut skipped_budget = 0;
+    let mut skipped_size = 0;
     for file in files {
         // Keep the parsed session where the decode disclosure (rm-381) can
         // see it; the parse accounting below is unchanged.
@@ -876,8 +1038,19 @@ fn doctor_dir_report(
             cache_hits += 1;
             parsed += 1;
             Some(session)
+        } else if bound.deadline_exceeded(deadline) {
+            // rm-367(b): the root's wall-clock budget is exhausted —
+            // disclose the file as budget-skipped, never as failed.
+            skipped_budget += 1;
+            None
+        } else if parsed_bytes > bound.max_bytes {
+            // rm-367(d): count-sampled pass for oversized roots — the
+            // root is counted past the cap, not parsed.
+            skipped_size += 1;
+            None
         } else if let Ok(session) = parse_file(file) {
             parsed += 1;
+            parsed_bytes += fs::metadata(file).map(|meta| meta.len()).unwrap_or(0);
             // rm-367 stage (a): persist the fresh parse so an
             // immediate --doctor rerun reuses it — the loader lane's
             // discovery.rs:382 pattern. The reuse shows up on the
@@ -913,7 +1086,11 @@ fn doctor_dir_report(
         exists: path.is_dir(),
         files: files.len(),
         parsed,
-        failed: files.len().saturating_sub(parsed),
+        failed: files
+            .len()
+            .saturating_sub(parsed + skipped_budget + skipped_size),
+        skipped_budget,
+        skipped_size,
         cache_hits,
         symlink_target: symlink_target_of(path),
         failure_samples,
@@ -996,6 +1173,8 @@ fn doctor_sqlite_directories(
             parsed,
             failed,
             cache_hits: 0,
+            skipped_budget: 0,
+            skipped_size: 0,
             symlink_target: symlink_target_of(&path),
             failure_samples,
         });

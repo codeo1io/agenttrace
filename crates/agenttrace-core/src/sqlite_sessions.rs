@@ -3,11 +3,12 @@ use crate::{
     SummaryDiffDivergence,
 };
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default)]
 struct RoleCounts {
@@ -121,6 +122,12 @@ pub struct SqliteIngestReport {
     /// `--doctor`), never silently skipped: the numbers are honest but
     /// the user should learn their backup lives inside the glob.
     pub duplicate_dbs: Vec<SqliteDuplicateDb>,
+    /// rm-367(b): databases whose ingest pass was cut short by the
+    /// doctor's scan budget. A budget-truncated pass keeps the
+    /// sessions it loaded and is disclosed here — partial counts are
+    /// never presented as complete ones, and the truncated pass never
+    /// writes a snapshot (see `SqliteFileFailures::is_clean`).
+    pub partial_dbs: Vec<SqlitePartialDb>,
 }
 
 /// rm-607: a sibling sqlite database whose sessions were fully or
@@ -129,6 +136,15 @@ pub struct SqliteIngestReport {
 pub struct SqliteDuplicateDb {
     pub path: String,
     pub duplicate_sessions: usize,
+}
+
+/// rm-367(b): a sqlite database whose ingest pass was truncated by
+/// the doctor's per-database wall-clock budget; `sessions_kept` is
+/// what the pass loaded before the bound hit.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SqlitePartialDb {
+    pub path: String,
+    pub sessions_kept: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -147,7 +163,22 @@ pub struct SqliteDroppedRows {
 }
 
 impl SqliteIngestReport {
-    fn absorb(&mut self, path: &Path, source: &'static str, failures: SqliteFileFailures) {
+    fn absorb(
+        &mut self,
+        path: &Path,
+        source: &'static str,
+        failures: SqliteFileFailures,
+        loaded: usize,
+    ) {
+        // rm-367(b): a budget-truncated pass is disclosed as partial —
+        // the sessions it kept are returned, the rest is visibly
+        // uncounted, and no snapshot is written for the pass.
+        if failures.budget_exhausted {
+            self.partial_dbs.push(SqlitePartialDb {
+                path: path.to_string_lossy().to_string(),
+                sessions_kept: loaded,
+            });
+        }
         if let Some(reason) = failures.unreadable {
             self.unreadable.push(SqliteUnreadableDb {
                 path: path.to_path_buf(),
@@ -174,10 +205,31 @@ struct SqliteFileFailures {
     unreadable: Option<String>,
     dropped: usize,
     dropped_sample: Option<String>,
+    /// rm-367(b): set when the pass was cut short by the scan budget
+    /// (progress-handler interrupt or phase-boundary deadline), which
+    /// is a bound, not a decode failure.
+    budget_exhausted: bool,
 }
 
 impl SqliteFileFailures {
     fn record_dropped(&mut self, error: &rusqlite::Error) {
+        // rm-367(b): the doctor's budget interrupt surfaces as
+        // OperationInterrupted — that is a scan bound being enforced,
+        // not a row that failed to decode, so it must not inflate the
+        // dropped-row disclosure.
+        if matches!(
+            error,
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: ErrorCode::OperationInterrupted,
+                    ..
+                },
+                _,
+            )
+        ) {
+            self.budget_exhausted = true;
+            return;
+        }
         self.dropped += 1;
         if self.dropped_sample.is_none() {
             self.dropped_sample = Some(error.to_string());
@@ -192,10 +244,11 @@ impl SqliteFileFailures {
         if self.dropped_sample.is_none() {
             self.dropped_sample = other.dropped_sample;
         }
+        self.budget_exhausted |= other.budget_exhausted;
     }
 
     fn is_clean(&self) -> bool {
-        self.unreadable.is_none() && self.dropped == 0
+        self.unreadable.is_none() && self.dropped == 0 && !self.budget_exhausted
     }
 }
 
@@ -232,15 +285,79 @@ pub(crate) fn load_sqlite_backed_sessions_since(since: Option<DateTime<Utc>>) ->
 pub fn load_sqlite_backed_sessions_reported(
     since: Option<DateTime<Utc>>,
 ) -> (Vec<Session>, SqliteIngestReport) {
+    load_sqlite_backed_sessions_reported_bounded(since, None)
+}
+
+/// rm-367(b): the doctor's wall-clock bound for the SQLite lane.
+/// `per_db` caps any single database (installed as a SQLite progress
+/// handler, so even one multi-minute aggregate statement is
+/// interruptible), `total` caps the lane, and `progress` emits
+/// per-database stderr lines so a slow run is diagnosable live.
+#[derive(Debug, Clone, Copy)]
+pub struct SqliteScanBudget {
+    pub per_db: Duration,
+    pub total: Duration,
+    pub progress: bool,
+}
+
+fn db_ingest_deadline(
+    budget: Option<SqliteScanBudget>,
+    total_deadline: Option<Instant>,
+) -> Option<Instant> {
+    let per_db = budget.map(|b| Instant::now() + b.per_db)?;
+    Some(match total_deadline {
+        Some(total) if total < per_db => total,
+        _ => per_db,
+    })
+}
+
+/// rm-367(b): `SqliteFileFailures::budget_exhausted` discriminator —
+/// true when the deadline has passed or an interrupt already landed.
+fn budget_deadline_hit(deadline: Option<Instant>, failures: &mut SqliteFileFailures) -> bool {
+    if deadline.is_some_and(|bound| Instant::now() >= bound) {
+        failures.budget_exhausted = true;
+    }
+    failures.budget_exhausted
+}
+
+pub fn load_sqlite_backed_sessions_reported_bounded(
+    since: Option<DateTime<Utc>>,
+    budget: Option<SqliteScanBudget>,
+) -> (Vec<Session>, SqliteIngestReport) {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return (Vec::new(), SqliteIngestReport::default());
     };
+    let total_deadline = budget.map(|b| Instant::now() + b.total);
     let mut sessions = Vec::new();
     let mut report = SqliteIngestReport::default();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for path in hermes_state_db_paths(&home) {
-        let loaded = load_hermes_sqlite_sessions(&path, since, &mut report);
+        // rm-367(b): an exhausted lane budget skips the database
+        // before it is opened — disclosed as a partial pass with zero
+        // sessions kept, never as an absent store.
+        if total_deadline.is_some_and(|bound| Instant::now() >= bound) {
+            report.partial_dbs.push(SqlitePartialDb {
+                path: path.to_string_lossy().to_string(),
+                sessions_kept: 0,
+            });
+            continue;
+        }
+        let deadline = db_ingest_deadline(budget, total_deadline);
+        if budget.is_some_and(|b| b.progress) {
+            eprintln!(
+                "agenttrace: doctor: sqlite hermes {} (budget {}s)",
+                path.display(),
+                budget.map(|b| b.per_db.as_secs()).unwrap_or(0)
+            );
+        }
+        let loaded = load_hermes_sqlite_sessions(&path, since, &mut report, deadline);
+        let loaded_count = loaded.len();
         extend_deduped(&mut sessions, &mut report, &mut seen, loaded, &path);
+        if deadline.is_some_and(|bound| Instant::now() >= bound)
+            && budget.is_some_and(|b| b.progress)
+        {
+            eprintln!("agenttrace: doctor: sqlite hermes {} — budget reached, {} sessions kept, disclosed partial", path.display(), loaded_count);
+        }
     }
     // rm-548 (JSON-lane scope after the rm-791 supersession): fork
     // copies re-emit their parent's history, so counting them would
@@ -249,8 +366,29 @@ pub fn load_sqlite_backed_sessions_reported(
     // `parent_id` rows are subagent children (rm-791) and are retained
     // and attributed instead — see `opencode_sqlite_session_rows`.
     for path in opencode_db_paths(&home) {
-        let loaded = load_opencode_sqlite_sessions(&path, since, &mut report);
+        if total_deadline.is_some_and(|bound| Instant::now() >= bound) {
+            report.partial_dbs.push(SqlitePartialDb {
+                path: path.to_string_lossy().to_string(),
+                sessions_kept: 0,
+            });
+            continue;
+        }
+        let deadline = db_ingest_deadline(budget, total_deadline);
+        if budget.is_some_and(|b| b.progress) {
+            eprintln!(
+                "agenttrace: doctor: sqlite opencode {} (budget {}s)",
+                path.display(),
+                budget.map(|b| b.per_db.as_secs()).unwrap_or(0)
+            );
+        }
+        let loaded = load_opencode_sqlite_sessions(&path, since, &mut report, deadline);
+        let loaded_count = loaded.len();
         extend_deduped(&mut sessions, &mut report, &mut seen, loaded, &path);
+        if deadline.is_some_and(|bound| Instant::now() >= bound)
+            && budget.is_some_and(|b| b.progress)
+        {
+            eprintln!("agenttrace: doctor: sqlite opencode {} — budget reached, {} sessions kept, disclosed partial", path.display(), loaded_count);
+        }
     }
     (sessions, report)
 }
@@ -377,19 +515,55 @@ fn sqlite_file_exists(path: &Path) -> bool {
 /// no longer caches — instead of caching "no data".
 const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
-fn open_sqlite_read_only(path: &Path) -> rusqlite::Result<Connection> {
+/// rm-367(b): keeps the deadline watcher thread alive for the
+/// connection's ingest pass; dropped (stopping the watcher) as soon
+/// as the queries finish.
+struct SqliteBudgetWatch {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for SqliteBudgetWatch {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// rm-367(b): `deadline` spawns a watcher thread that interrupts any
+/// statement still running past the bound — the only way to bound a
+/// single multi-minute aggregate over a huge store without pulling
+/// in rusqlite's `hooks` feature.
+fn open_sqlite_read_only_bounded(
+    path: &Path,
+    deadline: Option<Instant>,
+) -> rusqlite::Result<(Connection, Option<SqliteBudgetWatch>)> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-    Ok(connection)
+    let watch = deadline.map(|deadline| {
+        let handle = connection.get_interrupt_handle();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if Instant::now() >= deadline {
+                    handle.interrupt();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        SqliteBudgetWatch { done }
+    });
+    Ok((connection, watch))
 }
 
 fn load_hermes_sqlite_sessions(
     path: &Path,
     since: Option<DateTime<Utc>>,
     report: &mut SqliteIngestReport,
+    deadline: Option<Instant>,
 ) -> Vec<Session> {
     if !sqlite_file_exists(path) {
         return Vec::new();
@@ -404,9 +578,10 @@ fn load_hermes_sqlite_sessions(
             return filter_since(sessions, since);
         }
     }
-    let (sessions, failures) = query_hermes_sqlite_sessions(path, None);
+    let (sessions, failures) = query_hermes_sqlite_sessions(path, None, deadline);
     let clean = failures.is_clean();
-    report.absorb(path, "hermes", failures);
+    let loaded = sessions.len();
+    report.absorb(path, "hermes", failures, loaded);
     // A failed pass must not poison the snapshot cache with an empty
     // result: the failure would replay as "absent" on every later run.
     if clean {
@@ -418,10 +593,11 @@ fn load_hermes_sqlite_sessions(
 fn query_hermes_sqlite_sessions(
     path: &Path,
     since: Option<DateTime<Utc>>,
+    deadline: Option<Instant>,
 ) -> (Vec<Session>, SqliteFileFailures) {
     let mut failures = SqliteFileFailures::default();
-    let db = match open_sqlite_read_only(path) {
-        Ok(db) => db,
+    let (db, _budget_watch) = match open_sqlite_read_only_bounded(path, deadline) {
+        Ok(opened) => opened,
         // rm-753: found-but-unopenable is a distinct failure from
         // absent (permissions, lock policy) — disclose, don't null.
         Err(error) => {
@@ -435,6 +611,13 @@ fn query_hermes_sqlite_sessions(
     // database file).
     let roles = sqlite_role_counts(&db, "messages", "session_id", "role", &mut failures);
     let tool_outcomes = hermes_tool_outcome_counts(&db, &mut failures);
+    // rm-367(b): an aggregate interrupted mid-scan can return a
+    // partial map with no row-level error — the deadline check turns
+    // that into a disclosed partial pass instead of a silently
+    // undercounted ingest.
+    if budget_deadline_hit(deadline, &mut failures) {
+        return (Vec::new(), failures);
+    }
     let cwd = if sqlite_has_column(&db, "sessions", "cwd") {
         "cwd"
     } else {
@@ -534,6 +717,7 @@ fn load_opencode_sqlite_sessions(
     path: &Path,
     since: Option<DateTime<Utc>>,
     report: &mut SqliteIngestReport,
+    deadline: Option<Instant>,
 ) -> Vec<Session> {
     if !sqlite_file_exists(path) {
         return Vec::new();
@@ -556,9 +740,10 @@ fn load_opencode_sqlite_sessions(
             return filter_since(sessions, since);
         }
     }
-    let (sessions, failures, fork_excluded) = query_opencode_sqlite_sessions(path, None);
+    let (sessions, failures, fork_excluded) = query_opencode_sqlite_sessions(path, None, deadline);
     let clean = failures.is_clean();
-    report.absorb(path, "opencode", failures);
+    let loaded = sessions.len();
+    report.absorb(path, "opencode", failures, loaded);
     report.fork_excluded += fork_excluded;
     if clean {
         let _ = crate::session_cache::store_sqlite_snapshot_with_meta(
@@ -574,10 +759,11 @@ fn load_opencode_sqlite_sessions(
 fn query_opencode_sqlite_sessions(
     path: &Path,
     since: Option<DateTime<Utc>>,
+    deadline: Option<Instant>,
 ) -> (Vec<Session>, SqliteFileFailures, usize) {
     let mut failures = SqliteFileFailures::default();
-    let db = match open_sqlite_read_only(path) {
-        Ok(db) => db,
+    let (db, _budget_watch) = match open_sqlite_read_only_bounded(path, deadline) {
+        Ok(opened) => opened,
         Err(error) => {
             failures.unreadable = Some(error.to_string());
             return (Vec::new(), failures, 0);
@@ -585,13 +771,22 @@ fn query_opencode_sqlite_sessions(
     };
     let (mut aggs, row_failures, fork_excluded) = opencode_sqlite_session_rows(&db, path, since);
     failures.merge(row_failures);
+    if budget_deadline_hit(deadline, &mut failures) {
+        return (Vec::new(), failures, fork_excluded);
+    }
     if aggs.is_empty() {
         return (Vec::new(), failures, fork_excluded);
     }
     // rm-893: enrichment decode failures count into the same per-file
     // disclosure as session-row drops.
     add_opencode_sqlite_messages(&db, &mut aggs, &mut failures);
+    if budget_deadline_hit(deadline, &mut failures) {
+        return (Vec::new(), failures, fork_excluded);
+    }
     add_opencode_sqlite_parts(&db, &mut aggs, &mut failures);
+    if budget_deadline_hit(deadline, &mut failures) {
+        return (Vec::new(), failures, fork_excluded);
+    }
     capture_opencode_user_text(&db, &mut aggs, &mut failures);
 
     let sessions = aggs
@@ -1798,7 +1993,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let (sessions, failures) = query_hermes_sqlite_sessions(&path, None);
+        let (sessions, failures) = query_hermes_sqlite_sessions(&path, None, None);
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(sessions.len(), 2, "both fixture sessions must load");
         assert!(
@@ -1864,7 +2059,7 @@ mod tests {
         // store gate is `failures.is_clean()`.
         std::fs::write(&database, b"not a sqlite database at all").expect("write garbage db");
         let mut report = SqliteIngestReport::default();
-        assert!(load_hermes_sqlite_sessions(&database, None, &mut report).is_empty());
+        assert!(load_hermes_sqlite_sessions(&database, None, &mut report, None).is_empty());
         assert!(
             !hermes_snapshot.exists(),
             "a failed hermes read must not persist any snapshot"
@@ -1872,10 +2067,13 @@ mod tests {
         std::fs::write(&opencode_database, b"not a sqlite database either")
             .expect("write garbage opencode db");
         let mut opencode_report = SqliteIngestReport::default();
-        assert!(
-            load_opencode_sqlite_sessions(&opencode_database, None, &mut opencode_report)
-                .is_empty()
-        );
+        assert!(load_opencode_sqlite_sessions(
+            &opencode_database,
+            None,
+            &mut opencode_report,
+            None
+        )
+        .is_empty());
         assert!(
             !opencode_snapshot.exists(),
             "a failed opencode read must not persist any snapshot"
@@ -1906,7 +2104,8 @@ mod tests {
                 assert!(load_hermes_sqlite_sessions(
                     &database,
                     None,
-                    &mut SqliteIngestReport::default()
+                    &mut SqliteIngestReport::default(),
+                    None
                 )
                 .is_empty());
                 assert!(
@@ -1919,6 +2118,7 @@ mod tests {
                     &database,
                     None,
                     &mut SqliteIngestReport::default(),
+                    None,
                 );
                 assert_eq!(
                     recovered.len(),
@@ -1980,14 +2180,15 @@ mod tests {
         // lock is waited out either way; the long-lock leg just stalls
         // ~20s instead of ~1s), so the constant is pinned by reading it
         // back off the connection the loader actually opens.
-        let pinned_timeout = open_sqlite_read_only(&database)
+        let pinned_timeout = open_sqlite_read_only_bounded(&database, None)
+            .map(|(connection, _watch)| connection)
             .expect("open read-only connection for the pragma probe")
             .query_row("pragma busy_timeout", [], |row| row.get::<_, i64>(0))
             .expect("read busy_timeout pragma");
         assert_eq!(
             pinned_timeout,
             SQLITE_BUSY_TIMEOUT.as_millis() as i64,
-            "open_sqlite_read_only must keep SQLITE_BUSY_TIMEOUT (250ms); \
+            "open_sqlite_read_only_bounded must keep SQLITE_BUSY_TIMEOUT (250ms); \
              rusqlite's silent 5s default is the regression this pins out"
         );
 
@@ -2013,7 +2214,7 @@ mod tests {
         };
         locked_rx.recv().expect("wait for the short lock");
         let short_sessions =
-            load_hermes_sqlite_sessions(&database, None, &mut SqliteIngestReport::default());
+            load_hermes_sqlite_sessions(&database, None, &mut SqliteIngestReport::default(), None);
         short_lock.join().expect("short writer thread");
         assert_eq!(
             short_sessions.len(),
@@ -2045,7 +2246,7 @@ mod tests {
         };
         held_rx.recv().expect("wait for the long lock");
         let long_sessions =
-            load_hermes_sqlite_sessions(&database, None, &mut SqliteIngestReport::default());
+            load_hermes_sqlite_sessions(&database, None, &mut SqliteIngestReport::default(), None);
         assert!(
             long_sessions.is_empty(),
             "a permanently locked database must fail closed to zero sessions"
@@ -2060,7 +2261,7 @@ mod tests {
         // Leg 3 — recovery: once the lock is gone the same database loads
         // and stores normally again.
         let recovered =
-            load_hermes_sqlite_sessions(&database, None, &mut SqliteIngestReport::default());
+            load_hermes_sqlite_sessions(&database, None, &mut SqliteIngestReport::default(), None);
         assert_eq!(
             recovered.len(),
             2,
@@ -2092,7 +2293,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let (sessions, _failures) = query_hermes_sqlite_sessions(&path, None);
+        let (sessions, _failures) = query_hermes_sqlite_sessions(&path, None, None);
         std::fs::remove_dir_all(&root).ok();
 
         // s1: ok 1 / fail 1 -> 50% across the corpus (s2 contributes no
@@ -2192,7 +2393,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = opencode_user_text_fixture(&root, true);
-        let (sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
+        let (sessions, failures, _fork_excluded) =
+            query_opencode_sqlite_sessions(&path, None, None);
         std::fs::remove_dir_all(&root).ok();
         assert!(failures.is_clean(), "corpus must load clean: {failures:?}");
         assert_eq!(sessions.len(), 1, "one session in the fixture");
@@ -2209,7 +2411,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = opencode_user_text_fixture(&root, false);
-        let (sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
+        let (sessions, failures, _fork_excluded) =
+            query_opencode_sqlite_sessions(&path, None, None);
         std::fs::remove_dir_all(&root).ok();
         assert!(failures.is_clean(), "corpus must load clean: {failures:?}");
         // Same minimum time (100000000) on two parts: the lower rowid
@@ -2272,7 +2475,7 @@ mod tests {
         // (a) hostile load through the snapshot-caching entry point:
         // 4 decodable rows, 1 dropped row counted, no snapshot stored.
         let mut report = SqliteIngestReport::default();
-        let sessions = load_opencode_sqlite_sessions(&path, None, &mut report);
+        let sessions = load_opencode_sqlite_sessions(&path, None, &mut report, None);
         assert_eq!(sessions.len(), 4, "the four decodable rows load");
         assert_eq!(
             report.dropped_rows.len(),
@@ -2294,7 +2497,7 @@ mod tests {
             .expect("hand-poison an empty snapshot");
         assert!(snapshot.exists(), "poisoned snapshot is in place");
         let mut report = SqliteIngestReport::default();
-        let sessions = load_opencode_sqlite_sessions(&path, None, &mut report);
+        let sessions = load_opencode_sqlite_sessions(&path, None, &mut report, None);
         assert_eq!(sessions.len(), 4, "decodable rows still load");
         assert_eq!(
             report.dropped_rows.len(),
@@ -2324,7 +2527,7 @@ mod tests {
         std::fs::write(&path, b"SQLite format 3\x00corrupted-bytes").expect("write corrupt db");
 
         let mut report = SqliteIngestReport::default();
-        let sessions = load_hermes_sqlite_sessions(&path, None, &mut report);
+        let sessions = load_hermes_sqlite_sessions(&path, None, &mut report, None);
         assert!(
             sessions.is_empty(),
             "no sessions can come from a corrupt db"
@@ -2353,7 +2556,7 @@ mod tests {
         let healthy = hermes_state_db_fixture(&root);
         assert_eq!(healthy, path, "fixture must land on the same path");
         let mut repaired_report = SqliteIngestReport::default();
-        let repaired = load_hermes_sqlite_sessions(&path, None, &mut repaired_report);
+        let repaired = load_hermes_sqlite_sessions(&path, None, &mut repaired_report, None);
         match previous_cache {
             Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
             None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
@@ -2394,7 +2597,7 @@ mod tests {
         let unreadable = Connection::open(&path).is_err();
         let mut report = SqliteIngestReport::default();
         let sessions = if unreadable {
-            load_hermes_sqlite_sessions(&path, None, &mut report)
+            load_hermes_sqlite_sessions(&path, None, &mut report, None)
         } else {
             // Running as root: the disclosure assertion would be
             // vacuous, and the mode must be restored either way.
@@ -2449,7 +2652,8 @@ mod tests {
             std::env::temp_dir().join(format!("agenttrace-rm753-golden-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = opencode_hostile_fixture(&root);
-        let (sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
+        let (sessions, failures, _fork_excluded) =
+            query_opencode_sqlite_sessions(&path, None, None);
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(sessions.len(), 4, "the four decodable rows load");
         assert_eq!(failures.dropped, 1, "the NULL-id ghost is counted");
@@ -2542,7 +2746,8 @@ mod tests {
             std::env::temp_dir().join(format!("agenttrace-rm790-key-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = opencode_lineage_fixture(&root, true);
-        let (sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
+        let (sessions, failures, _fork_excluded) =
+            query_opencode_sqlite_sessions(&path, None, None);
         std::fs::remove_dir_all(&root).ok();
         assert!(failures.is_clean(), "fixture must load clean: {failures:?}");
         assert_eq!(sessions.len(), 5);
@@ -2582,7 +2787,8 @@ mod tests {
             std::env::temp_dir().join(format!("agenttrace-rm791-rollup-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = opencode_lineage_fixture(&root, true);
-        let (mut sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
+        let (mut sessions, failures, _fork_excluded) =
+            query_opencode_sqlite_sessions(&path, None, None);
         std::fs::remove_dir_all(&root).ok();
         assert!(failures.is_clean(), "fixture must load clean: {failures:?}");
         // Pre-attribution: children carry the raw parent row marker.
@@ -2654,7 +2860,8 @@ mod tests {
             std::env::temp_dir().join(format!("agenttrace-rm791-nocol-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = opencode_lineage_fixture(&root, false);
-        let (mut sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
+        let (mut sessions, failures, _fork_excluded) =
+            query_opencode_sqlite_sessions(&path, None, None);
         std::fs::remove_dir_all(&root).ok();
         assert!(failures.is_clean(), "fixture must load clean: {failures:?}");
         assert_eq!(sessions.len(), 5, "every row loads");
