@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- antigravity: numeric `modelConfigId` values (JSON numbers, e.g. 1417/1277/1050) no longer silently drop model identity. They now attribute to their stringified id, map to the proven model name when one is known (1417 → `gemini-4-argon`), and every numeric sighting is disclosed via the new `antigravity_model:numeric_id` counter (rm-1864).
+- opencode: transcript read/parse failures are no longer silent. Unreadable files, unparseable JSON, and unreadable container dirs are counted per class and surfaced in `--doctor`/`Metrics::line_skips` (`opencode_transcript_files_unreadable`, `opencode_transcript_files_unparseable`, `opencode_transcript_dirs_unreadable`); a fully-lost corpus now parses with its disclosure instead of masquerading as "unsupported session format" (rm-1866).
+- opencode: session `directory` (and the `projectID` project doc's `directory`) now feeds session/project attribution — sessions attribute to their real project instead of "unknown"; the unknown fallback stays disclosed when neither is present (rm-1865).
+- opencode: a session doc's `projectID` is validated before the project doc is resolved — ids containing `/` or `\` or starting with `..` used to escape the opencode store through `Path::join` semantics (an absolute id replaced the base path outright), letting a planted session doc import any `*.json` on the machine as its project attribution; the project doc is now also stat-capped before reading (review F1 on rm-1865).
+- opencode: read-dir failures that fire mid-enumeration are counted into `opencode_transcript_dirs_unreadable` instead of being silently dropped by the iterator flatten (review F4 on rm-1866).
+- antigravity: float-spelled numeric model ids (`1417.0`) canonicalize to their integer spelling so proven mappings (`1417` → `gemini-4-argon`) still apply; fractional spellings keep their raw disclosed spelling (review F5 on rm-1864).
+- session cache: the schema advances 64 → 67 with this batch (attribution, read-loss disclosure, and numeric model ids all change the served report for unchanged files), so warm caches built beforehand regenerate once on the next scan (review F2).
+
 ### Added
 
 - stdin sessions read through a named cap (rm-503, run 80e8beb6 cycle 1, batch
