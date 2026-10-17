@@ -972,7 +972,12 @@ fn card_daily_series(sessions: &[Session], days: usize) -> Vec<(chrono::NaiveDat
             Some(current) if current >= day => current,
             _ => day,
         });
-        *buckets.entry(day).or_insert(0.0) += session.metrics.cost_estimated;
+        // rm-1500 (run 22f0c980 cycle 2): the insights rollups skip
+        // poisoned (non-finite) costs at every fold — the daily-spend
+        // buckets are the last remaining ungated fold.
+        if session.metrics.cost_estimated.is_finite() {
+            *buckets.entry(day).or_insert(0.0) += session.metrics.cost_estimated;
+        }
     }
     let mut series = Vec::with_capacity(days);
     match latest {
@@ -4272,5 +4277,43 @@ mod tests {
         assert!(cell.contains("workbuddy_input_basis:zeroed_suspected_mismatch=1"));
         assert!(cell.contains("upstream luoyuctl/agenttrace#310"));
         assert!(cell.contains("cache-inclusive"));
+    }
+
+    #[test]
+    fn card_daily_series_skips_poisoned_costs() {
+        // rm-1500 arm (run 22f0c980 cycle 2): the card's daily-spend
+        // buckets were the last ungated fold in the insights lanes —
+        // one poisoned session NaN'd its whole day, and every card
+        // after it rendered a NaN sparkline bar.
+        let poisoned = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "poisoned".to_string(),
+            path: "/tmp/poisoned.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                cost_estimated: f64::NAN,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let clean = Session {
+            name: "clean".to_string(),
+            path: "/tmp/clean.jsonl".to_string(),
+            metrics: Metrics {
+                cost_estimated: 1.5,
+                ..Metrics::default()
+            },
+            ..poisoned.clone()
+        };
+        let series = card_daily_series(&[poisoned, clean], 7);
+        assert!(
+            series.iter().all(|(_, v)| v.is_finite()),
+            "NaN cost must not leak into the daily buckets"
+        );
     }
 }

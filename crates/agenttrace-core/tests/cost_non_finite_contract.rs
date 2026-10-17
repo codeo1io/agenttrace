@@ -87,6 +87,52 @@ fn non_finite_cost_is_excluded_from_every_group_fold() {
             group.cost
         );
     }
+    // rm-1500 arm (run 22f0c980 cycle 2): the by_org fold is the last
+    // overview group to gain the guard — a poisoned session used to
+    // poison the whole org's cost, and org totals feed downstream
+    // rankings that then ranked NaN-poisoned orgs as if they were
+    // real spend.
+    for (name, group) in overview.by_org.iter().filter(|(org, _)| !org.is_empty()) {
+        assert!(
+            group.cost.is_finite(),
+            "by_org[{name}] folded a non-finite cost ({})",
+            group.cost
+        );
+    }
+}
+
+#[test]
+fn non_finite_cost_is_excluded_from_governance_folds() {
+    // rm-1500 arm (run 22f0c980 cycle 2): cost_audit's per-agent rows
+    // and the drift aggregate are governance's folds of the same
+    // poisoned members — both now skip-while-counting like the
+    // overview lanes.
+    let sessions = sessions_with_one_poisoned_cost();
+    let audit = agenttrace_core::governance::cost_audit(&sessions);
+    assert!(
+        audit.total_estimated_cost.is_finite(),
+        "cost_audit total folded a non-finite cost"
+    );
+    assert!(
+        audit.stored_estimated_cost_usd.is_finite(),
+        "cost_audit stored total folded a non-finite cost"
+    );
+    for row in audit.by_provider_model.iter() {
+        assert!(
+            row.stored_estimated_cost_usd.is_finite(),
+            "cost_audit model row [{}/{}] folded a non-finite cost",
+            row.provider,
+            row.model
+        );
+        if let Some(cost) = row.estimated_cost_usd {
+            assert!(
+                cost.is_finite(),
+                "cost_audit model row [{}/{}] re-priced a non-finite cost",
+                row.provider,
+                row.model
+            );
+        }
+    }
 }
 
 #[test]

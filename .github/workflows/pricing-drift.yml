@@ -102,6 +102,19 @@ jobs:
           sed -i "s/const PRICING_SNAPSHOT_DATE: &str = \"[0-9-]*\";/const PRICING_SNAPSHOT_DATE: \&str = \"$new_date\";/" crates/agenttrace-core/src/pricing.rs
           grep -q "PRICING_SNAPSHOT_DATE: &str = \"$new_date\"" crates/agenttrace-core/src/pricing.rs
 
+          # rm-176 safety arm (run 22f0c980 cycle 2): the three demo-card
+          # goldens are bundle-DERIVED (footer snapshot date + catalog
+          # counts baked into tests/fixtures/svg-card/demo-*.svg). A
+          # refresh that stages only pricing.rs and the snapshot ships
+          # a PR whose goldens no longer match the refreshed footer —
+          # and GITHUB_TOKEN PRs run no CI, so master would go red
+          # only after the merge. Regenerate the goldens from the
+          # refreshed bundle and stage them below so the PR is
+          # self-consistent. Uses the runner's preinstalled stable
+          # toolchain (the repo pins third-party actions by full SHA,
+          # so this step deliberately adds no new action pins).
+          UPDATE_CARD_GOLDEN=1 cargo test --locked -p agenttrace-core --test svg_card_contract
+
           # Post-regeneration verification: the refreshed pair must pass the gate clean
           # (rc 0 on the keep-filter basis, desync cleared, removal guard still clear),
           # verified against the same single fetch the bundle was regenerated from
@@ -115,6 +128,7 @@ jobs:
           fi
 
           git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs
+          git add tests/fixtures/svg-card/demo-auto.svg tests/fixtures/svg-card/demo-dark.svg tests/fixtures/svg-card/demo-light.svg
           git commit -m "chore(pricing): refresh bundled snapshot to $new_date (pricing-drift gate)"
 
           counts="$(grep -E 'costed-chat models' refresh-check.txt | tr -s ' ' | tr '\n' ';')"

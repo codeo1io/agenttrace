@@ -2989,7 +2989,12 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         if !session.org.is_empty() {
             let org_entry = overview.by_org.entry(session.org.clone()).or_default();
             org_entry.sessions += 1;
-            org_entry.cost += session.metrics.cost_estimated;
+            // rm-1500 (run 22f0c980 cycle 2): skip poisoned
+            // (non-finite) costs at the by_org fold, like every other
+            // insights rollup.
+            if session.metrics.cost_estimated.is_finite() {
+                org_entry.cost += session.metrics.cost_estimated;
+            }
         }
 
         for anomaly in &session.anomalies {

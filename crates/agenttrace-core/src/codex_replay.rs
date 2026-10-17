@@ -397,18 +397,26 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
                 .saturating_sub(session.metrics.tokens_input)
                 .max(0);
             let dropped = dropped_input
-                + before_cache_r
-                    .saturating_sub(session.metrics.tokens_cache_r)
-                    .max(0)
-                + before_cache_w
-                    .saturating_sub(session.metrics.tokens_cache_w)
-                    .max(0)
-                + before_output
-                    .saturating_sub(session.metrics.tokens_output)
-                    .max(0)
-                + before_reasoning
-                    .saturating_sub(session.metrics.tokens_reasoning)
-                    .max(0);
+                .saturating_add(
+                    before_cache_r
+                        .saturating_sub(session.metrics.tokens_cache_r)
+                        .max(0),
+                )
+                .saturating_add(
+                    before_cache_w
+                        .saturating_sub(session.metrics.tokens_cache_w)
+                        .max(0),
+                )
+                .saturating_add(
+                    before_output
+                        .saturating_sub(session.metrics.tokens_output)
+                        .max(0),
+                )
+                .saturating_add(
+                    before_reasoning
+                        .saturating_sub(session.metrics.tokens_reasoning)
+                        .max(0),
+                );
             let dropped_usize = u64::try_from(dropped.max(0))
                 .map(|v| v.min(usize::MAX as u64) as usize)
                 .unwrap_or(usize::MAX);
@@ -426,19 +434,32 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
                 .or_insert(dropped_usize);
 
             stats.children_adjusted += 1;
-            stats.tokens_input_dropped += dropped_input;
-            stats.tokens_cache_read_dropped += before_cache_r
-                .saturating_sub(session.metrics.tokens_cache_r)
-                .max(0);
-            stats.tokens_cache_write_dropped += before_cache_w
-                .saturating_sub(session.metrics.tokens_cache_w)
-                .max(0);
-            stats.tokens_output_dropped += before_output
-                .saturating_sub(session.metrics.tokens_output)
-                .max(0);
-            stats.tokens_reasoning_dropped += before_reasoning
-                .saturating_sub(session.metrics.tokens_reasoning)
-                .max(0);
+            // rm-487 arm (run 22f0c980 cycle 2): saturate the
+            // dropped-token accumulators like the adjacent cache and
+            // output legs — parsed-data-fed counters on a hostile
+            // corpus must not panic a debug build or wrap a release
+            // total.
+            stats.tokens_input_dropped = stats
+                .tokens_input_dropped
+                .saturating_add(dropped_input);
+            stats.tokens_cache_read_dropped = stats.tokens_cache_read_dropped.saturating_add(
+                before_cache_r
+                    .saturating_sub(session.metrics.tokens_cache_r)
+                    .max(0),
+            );
+            stats.tokens_cache_write_dropped = stats.tokens_cache_write_dropped.saturating_add(
+                before_cache_w
+                    .saturating_sub(session.metrics.tokens_cache_w)
+                    .max(0),
+            );
+            stats.tokens_output_dropped = stats
+                .tokens_output_dropped
+                .saturating_add(before_output.saturating_sub(session.metrics.tokens_output).max(0));
+            stats.tokens_reasoning_dropped = stats.tokens_reasoning_dropped.saturating_add(
+                before_reasoning
+                    .saturating_sub(session.metrics.tokens_reasoning)
+                    .max(0),
+            );
         }
     }
     stats

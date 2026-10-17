@@ -46,7 +46,7 @@
 
 use crate::discovery::{same_file_identity, SameFileIdentity};
 use crate::{total_tokens, Session};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::Path;
 
@@ -186,6 +186,12 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
         .collect::<Vec<_>>();
     let mut unlinked = 0usize;
     let mut links = Vec::new();
+    // rm-487 arm (run 22f0c980 cycle 2): children consumed by the path
+    // lane must not be consumed AGAIN by the sqlite key lane — a child
+    // matching both lanes was rolled into its parent twice (count and
+    // cost doubled). The lanes are disjoint only by construction on
+    // current shapes; this guard makes disjointness an invariant.
+    let mut path_linked: HashSet<usize> = HashSet::new();
     for (child, session) in sessions.iter().enumerate() {
         // The rm-545 `subagents/` rule first; the rm-487 same-dir
         // rule only for agent-*.jsonl files outside `subagents/`
@@ -201,7 +207,10 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
             // Self-links (a child transcript hardlinked onto its own
             // parent file) would roll a session into itself — count
             // them as unlinked instead.
-            Some(&parent) if parent != child => links.push((child, parent)),
+            Some(&parent) if parent != child => {
+                links.push((child, parent));
+                path_linked.insert(child);
+            }
             _ => unlinked += 1,
         }
     }
@@ -242,7 +251,19 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
             .saturating_add(tokens);
         sessions[child].metrics.parent_session = sessions[parent].path.clone();
     }
+    // rm-487 arm (run 22f0c980 cycle 2): key-lane misses now count
+    // into the unlinked disclosure, exactly like path-lane misses —
+    // a sqlite child whose parent_session key resolves to nothing is
+    // a subagent row whose parent is gone, which is precisely what
+    // the unlinked disclosure exists to surface. Before, only the
+    // path lane's misses were counted.
     for (child, parent_key) in key_links {
+        // rm-487 arm: a child already attributed through the path
+        // lane keeps that attribution — it is linked, never counted
+        // twice and never unlinked.
+        if path_linked.contains(&child) {
+            continue;
+        }
         // The row id is only unique inside its own source database, so the
         // marker resolves within the same DB path and lane only; a child
         // whose parent is absent keeps no stale link (rm-545 semantics)
@@ -253,9 +274,11 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
                 && candidate.path == sessions[child].path
                 && candidate.metrics.source_tool == sessions[child].metrics.source_tool
         }) else {
+            unlinked += 1;
             continue;
         };
         if parent == child {
+            unlinked += 1;
             continue;
         }
         let (cost, tokens) = (
@@ -454,6 +477,68 @@ mod tests {
         assert!(sessions[3].metrics.parent_session.is_empty());
         assert_eq!(sessions[3].metrics.subagent_count, 0);
         assert_eq!(sessions[4].metrics.subagent_count, 0);
+    }
+
+    #[test]
+    fn both_lane_child_rolls_into_its_parent_once() {
+        // rm-487 arm (run 22f0c980 cycle 2): a child qualifying for
+        // BOTH lanes — a Claude `subagents/` transcript path whose
+        // parent journal is loaded AND a sqlite parent_session key
+        // inside its own database — used to be attributed twice:
+        // subagent count 2 and the cost doubled into whichever
+        // parent each lane picked. The path lane wins once and the
+        // key lane skips the child entirely.
+        let db = "/home/u/.local/share/opencode/opencode.db";
+        let journal_parent = "/w/landed/51207be0.jsonl";
+        let mut sessions = vec![
+            // The path-lane parent: the child's journal lives under
+            // its own tree.
+            session(journal_parent, 1.0, 100),
+            // The both-lane child: path lane sees
+            // /w/landed/subagents/agent-x.jsonl -> journal_parent;
+            // key lane sees parent_session "ses-sql".
+            session("/w/landed/subagents/agent-x.jsonl", 0.5, 50),
+            // The sqlite parent the key lane would match: same DB,
+            // same source, session_key ses-sql.
+            sqlite_row_session("p", "ses-sql", "", 2.0, 200, db),
+        ];
+        sessions[1].metrics.session_key = "ses-child".to_string();
+        sessions[1].metrics.parent_session = "ses-sql".to_string();
+        sessions[1].metrics.source_tool = sessions[2].metrics.source_tool.clone();
+        let unlinked = attribute_subagents(&mut sessions);
+        assert_eq!(
+            sessions[0].metrics.subagent_count, 1,
+            "the journal parent owns the child exactly once"
+        );
+        assert!((sessions[0].metrics.subagent_cost - 0.5).abs() < 1e-9);
+        assert_eq!(
+            sessions[2].metrics.subagent_count, 0,
+            "the key lane must not double-attribute the same child"
+        );
+        assert_eq!(sessions[0].metrics.subagent_tokens, 50);
+        assert_eq!(unlinked, 0, "a both-lane child is linked, never unlinked");
+    }
+
+    #[test]
+    fn key_lane_miss_counts_into_the_unlinked_disclosure() {
+        // rm-487 arm (run 22f0c980 cycle 2): a sqlite child whose
+        // parent_session key resolves to nothing inside its own
+        // database is a subagent row whose parent is gone — exactly
+        // what the unlinked disclosure exists to surface. Before,
+        // only path-lane misses were counted, so these children
+        // vanished from every disclosure lane.
+        let db = "/home/u/.local/share/opencode/opencode.db";
+        let mut sessions = vec![
+            sqlite_row_session("orphan", "ses-orphan", "ses-gone", 0.5, 40, db),
+            sqlite_row_session("selfrow", "ses-self", "ses-self", 0.25, 10, db),
+        ];
+        let unlinked = attribute_subagents(&mut sessions);
+        assert_eq!(
+            unlinked, 2,
+            "the gone parent AND the self-referential row both surface"
+        );
+        assert!(sessions[0].metrics.parent_session.is_empty());
+        assert_eq!(sessions[0].metrics.subagent_count, 0);
     }
 
     #[test]

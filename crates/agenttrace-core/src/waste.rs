@@ -62,6 +62,17 @@ pub struct WasteReport {
     /// allocated from. Per-tool "cost" is an allocated share, never
     /// measured per-tool spend (rm-004).
     session_cost: f64,
+    /// Flat 5% spend premium added when bloat_score > 50 (rm-1957).
+    /// Disclosed separately with a heuristic basis marker — it is a
+    /// synthetic estimate, not a measured cost.
+    bloat_premium: f64,
+    /// True when the raw sum of the priced components exceeded the
+    /// session spend and `total_wasted` was clamped to it with an
+    /// explicit overlap note (rm-1957 — the components overlap: the
+    /// uncached-input waste re-prices the retry loops' input leg and
+    /// the bloat premium is heuristic, so the raw sum could report
+    /// >100% of the session's whole cost).
+    total_clamped: bool,
     summary: String,
     top_actions: Vec<String>,
 }
@@ -99,9 +110,31 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
     let loop_cost = session.diagnostics.loop_cost.total_loop_cost;
     let loop_basis = session.diagnostics.loop_cost.cost_basis;
     let loop_percent = loop_waste_percent(loop_cost, session.metrics.cost_estimated);
-    let mut total_wasted = cache.wasted_cost + loop_cost;
-    if bloat.bloat_score > 50 {
-        total_wasted += session.metrics.cost_estimated * 0.05;
+    // rm-1957 (run 22f0c980 cycle 2): the three priced components
+    // OVERLAP — `cache.wasted_cost` prices every uncached input token,
+    // the priced loop cost re-prices the retry loops' share of that
+    // same input, and the bloat premium is a flat synthetic 5% — so
+    // the raw sum could exceed the session's whole spend (assess
+    // 6e6f1a96 PoC: $4.125 "wasted" on a $3.75 session). Non-finite
+    // components are skipped (rm-1500 fold rule) and the total is
+    // clamped to the session spend with an explicit overlap
+    // disclosure instead of silently reporting >100% of the spend.
+    let mut total_wasted = 0.0;
+    if cache.wasted_cost.is_finite() {
+        total_wasted += cache.wasted_cost;
+    }
+    if loop_cost.is_finite() {
+        total_wasted += loop_cost;
+    }
+    let mut bloat_premium = 0.0;
+    if bloat.bloat_score > 50 && session.metrics.cost_estimated.is_finite() {
+        bloat_premium = session.metrics.cost_estimated * 0.05;
+        total_wasted += bloat_premium;
+    }
+    let session_cost = session.metrics.cost_estimated.max(0.0);
+    let total_clamped = total_wasted > session_cost && session_cost > 0.0;
+    if total_clamped {
+        total_wasted = session_cost;
     }
 
     let mut score = match cache.rating {
@@ -218,7 +251,9 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         total_wasted,
         loop_percent,
         loop_cost_basis: loop_basis,
-        session_cost: session.metrics.cost_estimated.max(0.0),
+        session_cost,
+        bloat_premium: round4(bloat_premium),
+        total_clamped,
         summary,
         top_actions,
     }
@@ -249,6 +284,16 @@ pub fn waste_report_json(report: &WasteReport) -> String {
         "waste_score": report.waste_score,
         "waste_level": report.waste_level,
         "total_wasted_cost": round4(report.total_wasted),
+        // rm-1957: the total clamps to the session spend when the
+        // overlapping components sum past it; the note names the
+        // overlap so a consumer never mistakes the clamp for the raw
+        // figure.
+        "total_clamped_to_session_cost": report.total_clamped,
+        "overlap_note": if report.total_clamped {
+            serde_json::json!("components overlap: uncached-input waste re-prices the retry loops' input leg and the bloat premium is a flat 5% heuristic; total clamped to session spend")
+        } else {
+            serde_json::Value::Null
+        },
         "loop_waste_percent": (report.loop_percent * 10.0).round() / 10.0,
         "loop_cost_basis": if report.loop_cost_basis == LoopCostBasis::Synthetic {
             "synthetic"
@@ -263,7 +308,17 @@ pub fn waste_report_json(report: &WasteReport) -> String {
             // ratio, disclosed verbatim — `tokens_input` is the
             // parser's fresh-only basis, so this exceeds 100% on every
             // healthy cache-heavy session and is not an anomaly.
-            "hit_rate_exclusive_percent": (report.cache.hit_rate_exclusive * 10.0).round() / 10.0,
+            // rm-1957 (run 22f0c980 cycle 2): a fully-cached session
+            // (fresh input 0, reads > 0 — the NORMAL post-rm-1884
+            // Cline shape) yields an internal ratio of INFINITY,
+            // which JSON cannot carry (it serialized as null).
+            // Serialize the finite sentinel 100.0 — every billed
+            // token was served from cache.
+            "hit_rate_exclusive_percent": if report.cache.hit_rate_exclusive.is_finite() {
+                serde_json::json!((report.cache.hit_rate_exclusive * 10.0).round() / 10.0)
+            } else {
+                serde_json::json!(100.0)
+            },
             "cache_read_tokens": report.cache.cache_read_tokens,
             "total_input_tokens": report.cache.total_input_tokens,
             "wasted_cost": round4(report.cache.wasted_cost),
@@ -273,6 +328,11 @@ pub fn waste_report_json(report: &WasteReport) -> String {
             "tools_per_turn": (report.bloat.tools_per_turn * 100.0).round() / 100.0,
             "bloat_score": report.bloat.bloat_score,
             "bloat_level": report.bloat.bloat_level,
+            // rm-1957: the flat 5% premium is a heuristic, not a
+            // measured cost — disclosed with an explicit basis marker
+            // the same way the loop cost basis is.
+            "bloat_premium_cost": report.bloat_premium,
+            "bloat_premium_basis": "heuristic",
             "top_bloat": report
                 .bloat
                 .top_bloat
@@ -452,6 +512,19 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
         t(language, "Wasted", "浪费成本"),
         format_cost(report.total_wasted)
     ));
+    // rm-1957: name the clamp wherever the clamped figure is shown,
+    // so the text lane and the JSON lane tell the same story.
+    if report.total_clamped {
+        out.push_str(&format!(
+            "  {}: {}\n",
+            t(language, "Overlap note", "重叠说明"),
+            t(
+                language,
+                "components overlap; total clamped to session spend",
+                "各分项存在重叠；总额已截断为会话总花费"
+            )
+        ));
+    }
     if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
         out.push_str(&format!(
             "  {}: {}\n",
@@ -1124,5 +1197,183 @@ mod loop_cost_basis_disclosure_tests {
             !zh.contains("合成估算"),
             "loopless zh text must stay unmarked: {zh}"
         );
+    }
+
+    #[test]
+    fn total_wasted_clamps_with_overlap_disclosure() {
+        // rm-1957 (run 22f0c980 cycle 2, assess 6e6f1a96 POC1): the
+        // priced components OVERLAP — uncached-input waste, the priced
+        // loop's share of that same input, and a flat 5% bloat
+        // premium — so the raw sum could report MORE waste than the
+        // session spent ($4.125 on a $3.75 session). The total clamps
+        // to the session spend and every lane names the overlap.
+        let session = Session {
+            name: "overlap".to_string(),
+            path: "/tmp/overlap.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics {
+                model_used: "claude-sonnet-4-5".to_string(),
+                tokens_input: 1_000_000,
+                cost_estimated: 3.75,
+                assistant_turns: 10,
+                tool_calls_total: 60,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics {
+                loop_cost: crate::diagnostics::LoopCost {
+                    tool_loop_cost: 0.6,
+                    total_loop_cost: 0.9375,
+                    cost_basis: crate::LoopCostBasis::Priced,
+                    ..crate::diagnostics::LoopCost::default()
+                },
+                ..crate::Diagnostics::default()
+            },
+        };
+        let report = compute_waste_report(&session);
+        assert!(
+            report.total_clamped,
+            "the overlapping components sum past the session spend"
+        );
+        assert_eq!(
+            report.total_wasted, 3.75,
+            "total waste clamps to the session spend, never above it"
+        );
+        assert!(
+            report.bloat_premium > 0.0,
+            "the flat 5% premium is disclosed as its own figure"
+        );
+        let json = waste_report_json(&report);
+        let parsed: serde_json::Value =
+            serde_json::from_str(json.trim()).expect("waste json parses");
+        assert_eq!(
+            parsed["total_clamped_to_session_cost"], true,
+            "the JSON lane carries the clamp flag"
+        );
+        assert!(
+            parsed["overlap_note"].is_string(),
+            "the JSON lane names the overlap: {json}"
+        );
+        assert_eq!(
+            parsed["tool_bloat"]["bloat_premium_basis"], "heuristic",
+            "the flat premium carries a heuristic basis marker"
+        );
+        let text = waste_report_text(&report, ReportLanguage::En);
+        assert!(
+            text.contains("Overlap note"),
+            "the text lane names the clamp: {text}"
+        );
+    }
+
+    #[test]
+    fn total_wasted_sum_without_overlap_is_untouched() {
+        // rm-1957 guard arm: a session whose components do NOT sum
+        // past the spend keeps the raw sum — no clamp flag, no note.
+        let session = Session {
+            name: "plain".to_string(),
+            path: "/tmp/plain.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics {
+                model_used: "claude-sonnet-4-5".to_string(),
+                tokens_input: 1_000,
+                cost_estimated: 10.0,
+                assistant_turns: 4,
+                tool_calls_total: 4,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let report = compute_waste_report(&session);
+        assert!(!report.total_clamped);
+        assert!(report.total_wasted <= 10.0);
+        let json = waste_report_json(&report);
+        assert!(
+            json.contains("\"total_clamped_to_session_cost\": false"),
+            "no overlap, no clamp flag: {json}"
+        );
+    }
+
+    #[test]
+    fn fully_cached_session_serializes_finite_exclusive_rate() {
+        // rm-1957 / rm-339 (run 22f0c980 cycle 2, assess 6e6f1a96
+        // POC2): fresh input 0 with reads > 0 is the NORMAL
+        // post-rm-1884 Cline shape; the internal exclusive ratio is
+        // INFINITY, which serde maps to JSON null. Serialize the
+        // finite sentinel 100.0 instead — every billed token was
+        // served from cache.
+        let session = Session {
+            name: "cached".to_string(),
+            path: "/tmp/cached.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics {
+                tokens_input: 0,
+                tokens_cache_r: 5_000,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let report = compute_waste_report(&session);
+        assert!(
+            report.cache.hit_rate_exclusive.is_infinite(),
+            "the internal ratio is INFINITY for the fully-cached shape"
+        );
+        let json = waste_report_json(&report);
+        let parsed: serde_json::Value =
+            serde_json::from_str(json.trim()).expect("waste json parses");
+        assert_eq!(
+            parsed["cache"]["hit_rate_exclusive_percent"], 100.0,
+            "the JSON lane carries the finite sentinel, never null: {json}"
+        );
+    }
+
+    #[test]
+    fn non_finite_components_do_not_poison_the_total() {
+        // rm-1957 + rm-1500 fold rule: a poisoned (NaN) session cost
+        // is skipped by the waste total instead of producing NaN
+        // waste — the disclosure lanes own poisoned members, not the
+        // arithmetic.
+        let session = Session {
+            name: "poison".to_string(),
+            path: "/tmp/poison.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics {
+                model_used: "claude-sonnet-4-5".to_string(),
+                tokens_input: 1_000,
+                cost_estimated: f64::NAN,
+                assistant_turns: 2,
+                tool_calls_total: 20,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let report = compute_waste_report(&session);
+        assert!(
+            report.total_wasted.is_finite(),
+            "NaN session cost must not poison the waste total"
+        );
+        assert!(!report.total_clamped, "no spend to clamp against");
     }
 }

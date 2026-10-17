@@ -9035,12 +9035,24 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
         // message are ONE measurement, not two; token-shaped JSON in any
         // other say-type is content (an echo, an export), not usage
         // evidence.
-        let sibling_carrier = message.get("metrics").and_then(cline_carrier_from_object);
+        //
+        // rm-1885 arm (run 22f0c980 cycle 2): the vocabulary gate now
+        // covers BOTH carrier shapes — the sibling `metrics` OBJECT is
+        // gated by the same say-type allowlist as the text carrier.
+        // Before, a metrics object on a NON-usage say row folded
+        // ungated (assess 6e6f1a96 PoC3: a user_feedback row carrying
+        // {tokensIn:500,...} folded 500/50 tokens while the identical
+        // numbers as text folded 0). Content is not usage evidence,
+        // whichever shape it arrives in.
+        let say = string(message.get("say")).unwrap_or("");
+        let sibling_carrier = if cline_say_carries_usage(say) {
+            message.get("metrics").and_then(cline_carrier_from_object)
+        } else {
+            None
+        };
         if let Some(carrier) = sibling_carrier {
             cline_absorb_carrier(&mut usage_state, carrier, &ts);
-        } else if !text.is_empty()
-            && cline_say_carries_usage(string(message.get("say")).unwrap_or(""))
-        {
+        } else if !text.is_empty() && cline_say_carries_usage(say) {
             if let Some(carrier) = cline_text_metrics_carrier(text) {
                 cline_absorb_carrier(&mut usage_state, carrier, &ts);
             }
@@ -9050,7 +9062,6 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
         }
         let kind = string(message.get("type")).unwrap_or("");
         let ask = string(message.get("ask")).unwrap_or("");
-        let say = string(message.get("say")).unwrap_or("");
         let mut role = "assistant";
         if kind == "ask" || !ask.is_empty() {
             role = "user";
@@ -11640,6 +11651,27 @@ mod tests {
         assert!(
             events.iter().all(|event| event.role != "session_meta"),
             "token-shaped JSON text in a non-usage say-type must not fold usage"
+        );
+    }
+
+    #[test]
+    fn cline_sibling_object_outside_usage_say_types_is_not_a_carrier() {
+        // rm-1885 arm (run 22f0c980 cycle 2, assess 6e6f1a96 PoC3):
+        // the say-vocabulary gate must cover BOTH carrier shapes — a
+        // sibling `metrics` OBJECT on a NON-usage say row is content,
+        // not usage evidence, exactly like the text carrier. Before
+        // this arm, a user_feedback row carrying
+        // {tokensIn:500,...} as a sibling object folded 500/50 tokens
+        // while the identical numbers as text folded 0.
+        let doc = serde_json::json!([
+            {"ts":1700000001,"type":"say","say":"user_feedback",
+             "text":"hi there",
+             "metrics":{"tokensIn":500,"tokensOut":50,"cacheReads":700,"cacheWrites":100,"cost":0.01}}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        assert!(
+            events.iter().all(|event| event.role != "session_meta"),
+            "a sibling metrics object on a non-usage say row must not fold usage"
         );
     }
 

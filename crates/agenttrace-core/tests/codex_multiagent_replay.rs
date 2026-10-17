@@ -362,3 +362,36 @@ fn unrelated_short_opening_is_not_a_family() {
         );
     }
 }
+
+#[test]
+fn dropped_counters_saturate_instead_of_overflowing() {
+    // rm-487 arm (run 22f0c980 cycle 2): the dropped-token
+    // accumulators used plain `+=` on parsed-data-fed counters while
+    // the adjacent cache legs saturated — a corpus of replay children
+    // each reporting ~i64::MAX input panicked debug builds (overflow)
+    // and wrapped release totals. Two hostile children saturate the
+    // accumulator instead of wrapping past zero.
+    let parent = load("parent.jsonl");
+    let mut child1 = load("child.jsonl");
+    let mut child2 = load("child.jsonl");
+    for child in [&mut child1, &mut child2] {
+        child.metrics.tokens_input = i64::MAX;
+        child.metrics.tokens_cache_r = i64::MAX;
+        child.metrics.tokens_output = i64::MAX;
+    }
+    let mut sessions = vec![parent, child1, child2];
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.children_adjusted, 2, "both children rebase");
+    assert_eq!(
+        stats.tokens_input_dropped, i64::MAX,
+        "the accumulator saturates — it must never wrap past zero"
+    );
+    assert_eq!(
+        stats.tokens_output_dropped, i64::MAX,
+        "the output accumulator saturates too"
+    );
+    for session in &sessions {
+        assert!(session.metrics.tokens_input.is_positive());
+        assert!(session.metrics.tokens_output.is_positive());
+    }
+}
