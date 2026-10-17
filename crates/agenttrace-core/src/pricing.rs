@@ -1426,6 +1426,25 @@ fn lookup_price_in(
     if let Some(key) = matching_catalog_key_for(model, aliases, entries) {
         return entries.get(&key).cloned().unwrap_or_default();
     }
+    // rm-1511 review fix (1a615b64, review ed20477f F1/F4): the catalog-first
+    // arm above (matching_catalog_key_for, alias-aware since the landed
+    // rm-1053/rm-196 ladder) already offered every variant
+    // candidate to the catalog BEFORE this batch — the pre-batch defect was
+    // that match_variants had no effort arm, so an effort-suffixed id's
+    // candidate list was [raw, normalized] only and never contained the
+    // in-catalog base (has_specific_price walks the same list and agreed —
+    // no divergence existed). The loop below is the second-order expansion:
+    // variants OF variants (claude-sonnet-5-5-pro-high -> the effort arm
+    // yields claude-sonnet-5-5-pro, whose own minor arm yields the
+    // in-catalog claude-sonnet-5-5), pinned by
+    // second_order_variant_expansion_resolves_via_the_catalog_loop.
+    for variant in match_variants(model) {
+        if variant != model {
+            if let Some(key) = matching_catalog_key_for(&variant, aliases, entries) {
+                return entries.get(&key).cloned().unwrap_or_default();
+            }
+        }
+    }
     let builtin = builtin_pricing();
     for variant in match_variants(&resolve_alias(model, aliases)) {
         if let Some(price) = builtin.get(&variant) {
@@ -2037,7 +2056,82 @@ fn match_variants(raw: &str) -> Vec<String> {
             variants.push("deepseek-r1".to_string());
         }
     }
+    // rm-1511: clients (Antigravity CLI emits claude-sonnet-5-5-medium / -low)
+    // append a reasoning-effort tier to the model id. No catalog (bundled or
+    // upstream) carries effort-suffixed keys, but the exact base does — strip
+    // the tier as a candidate so the base rate beats the builtin default. The
+    // raw id keeps the suffix (see `effort_tier_of`), so tier-aware lanes lose
+    // nothing.
+    if let Some(base) = strip_effort_suffix(&normalized) {
+        variants.push(base);
+    }
     variants
+}
+
+/// Effort tiers clients append to model ids (rm-1511): `-low/-medium/-high`
+/// (Antigravity style) and `-thinking` / `:thinking` (models.dev style).
+const EFFORT_TIERS: [(&str, &str); 5] = [
+    ("-medium", "medium"),
+    ("-high", "high"),
+    ("-low", "low"),
+    ("-thinking", "thinking"),
+    (":thinking", "thinking"),
+];
+
+/// The reasoning-effort tier a client suffixed onto a model id, if any
+/// (`claude-sonnet-5-5-medium` -> `medium`). Pricing resolution strips the
+/// tier; this re-derives it so tier-aware lanes keep their input.
+///
+/// Limitation (review 1a615b64 F5): the marker test is purely lexical, so
+/// ids whose tier-like tail is part of a catalogued SKU also report a tier
+/// (`aihubmix/gpt-5.4-high`, `azure_ai/kimi-k2-thinking` — 48 such keys in
+/// the bundled snapshot). Pricing is unaffected — the exact catalog match
+/// wins before any stripping — but a `Some` here is not proof that a client
+/// appended an effort tier; check the catalog first when that distinction
+/// matters.
+pub fn effort_tier_of(model: &str) -> Option<&'static str> {
+    let normalized = normalize_model(model);
+    EFFORT_TIERS
+        .iter()
+        .find(|(marker, _)| normalized.ends_with(marker) && normalized.len() > marker.len())
+        .map(|(_, tier)| *tier)
+}
+
+fn strip_effort_suffix(normalized: &str) -> Option<String> {
+    let (marker, _) = EFFORT_TIERS
+        .iter()
+        .find(|(marker, _)| normalized.ends_with(marker) && normalized.len() > marker.len())?;
+    let base = normalized[..normalized.len() - marker.len()].trim_end_matches(['-', ':']);
+    if base.is_empty() {
+        None
+    } else {
+        Some(base.to_string())
+    }
+}
+
+/// For a model id with NO specific catalog price, the in-catalog base id
+/// hiding under a single unrecognized trailing `-token`, if one exists
+/// (`claude-sonnet-5-5-ultra` -> `claude-sonnet-5-5`). rm-1511 disclosure:
+/// such sessions price at the builtin default while the exact base was
+/// available, and the data-health lane names them instead of only counting.
+pub fn specific_base_for_unpriced(model: &str) -> Option<String> {
+    if has_specific_price(model) {
+        return None;
+    }
+    let normalized = normalize_model(model);
+    if let Some(base) = strip_effort_suffix(&normalized) {
+        if has_specific_price(&base) {
+            return Some(base);
+        }
+        return None;
+    }
+    let (head, tail) = normalized.rsplit_once('-')?;
+    let tail_is_token =
+        !tail.is_empty() && tail.len() <= 10 && tail.chars().all(|c| c.is_ascii_alphabetic());
+    if tail_is_token && has_specific_price(head) {
+        return Some(head.to_string());
+    }
+    None
 }
 
 fn normalize_model(raw: &str) -> String {

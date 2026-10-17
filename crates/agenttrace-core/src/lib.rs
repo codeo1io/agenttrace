@@ -66,10 +66,10 @@ pub use insights::{
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
-    cache_rate_census, catalog_identity, has_specific_price, list_pricing, lookup_context_window,
-    lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source, pricing_source_for,
-    provider_for, render_model_pricing_list, render_test_match, update_pricing, CacheRateCensus,
-    Price,
+    cache_rate_census, catalog_identity, effort_tier_of, has_specific_price, list_pricing,
+    lookup_context_window, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
+    pricing_source_for, provider_for, render_model_pricing_list, render_test_match,
+    specific_base_for_unpriced, update_pricing, CacheRateCensus, Price,
 };
 pub use reports::{
     add_baseline_comparison, guard_formula_json_leaves, report_compare, report_compare_json,

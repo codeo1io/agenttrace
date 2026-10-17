@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 70 and the SQLite snapshot is schema 13; the
+The session cache is schema 71 and the SQLite snapshot is schema 13; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -480,7 +480,19 @@ case eec3bbea63554a21aefe4daccdba2ec3, re-bases it onto the advanced
 ceiling as 69 → 70 per the landed-rung-keeps-numeral convention,
 keeping 66 free for run abb3b091's in-flight mint, one invalidation
 either way; the SQLite snapshot stays 13 — no snapshot semantics
-moved)
+moved),
+and to 71 when reasoning-effort-suffixed model ids began pricing at
+their in-catalog base instead of the builtin Claude default
+(`claude-sonnet-5-5-medium` and kin — the recorded PoC's $0.0105
+over-bill against the base's $0.007, rm-1511, run 0915f736 cycle 4):
+the batch carried no rung of its own and `pricing_snapshot.json` is
+byte-identical, so the catalog-identity freshness gate keys an
+unchanged digest and a warm entry would keep replaying the over-billed
+`cost_estimated` for unchanged files (the rm-485 class); this
+integration, conflict case ab19f050f02e4aa882c9c659a9a089b8, lands the
+rung as 70 → 71 — the lowest rung unique above the ceiling at the
+fleet census, one invalidation either way; the SQLite snapshot stays
+13 — no snapshot semantics moved)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

@@ -143,6 +143,12 @@ pub struct DataHealth {
     pub unknown_sources: usize,
     pub unknown_models: usize,
     pub fallback_pricing: usize,
+    /// rm-1511: distinct model ids still on fallback pricing whose
+    /// suffix-stripped base HAS a catalog row — they bill at the builtin
+    /// default while the exact base was available. Naming them (bounded to
+    /// 5) instead of only counting turns a silent mis-price into a visible
+    /// one for suffix classes the alias table does not know yet.
+    pub fallback_with_base_available: Vec<String>,
     /// Last ACTIVITY across parsed sessions — max(session_start,
     /// session_end) per session, the same basis as the report scope
     /// window end (rm-694): the health block can never report a
@@ -964,6 +970,16 @@ fn data_health_from_parts(
         .iter()
         .filter(|s| !pricing::has_specific_price(&s.metrics.model_used))
         .count();
+    // rm-1511: name the fallback-priced models whose exact base sits in
+    // the catalog — priced at the default while the base was available.
+    let fallback_with_base_available: Vec<String> = sessions
+        .iter()
+        .filter(|s| !pricing::has_specific_price(&s.metrics.model_used))
+        .filter_map(|s| pricing::specific_base_for_unpriced(&s.metrics.model_used))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .take(5)
+        .collect();
     let stored_totals_sessions = sessions
         .iter()
         .filter(|s| s.metrics.provenance.tokens == "stored_session_totals")
@@ -1008,6 +1024,7 @@ fn data_health_from_parts(
         unknown_sources,
         unknown_models,
         fallback_pricing,
+        fallback_with_base_available,
         // rm-694 review fix (0772a0ca, HIGH finding): same activity
         // basis as `report_scope` — a start-basis value let the
         // data_health block report a "latest" older than the window

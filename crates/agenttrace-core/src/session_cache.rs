@@ -8,7 +8,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 70;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 71;
+// Bumped 70 -> 71 (integration of run 0915f736aa1c488ebd3b085b73a6d7df
+// cycle 4 'reasoning-effort-suffixed model ids price at their
+// in-catalog base', rm-1511, review fix 1a615b64 / independent review
+// ed20477f; candidate 136274e @ base 8bc0587, conflict case
+// ab19f050f02e4aa882c9c659a9a089b8): the batch changed derived COST
+// SEMANTICS for UNCHANGED source files — effort-suffixed model ids
+// (claude-sonnet-5-5-medium and kin) resolve to their in-catalog base
+// instead of the builtin Claude default (the recorded PoC: $0.0105
+// over-billed against the base's $0.007, a 1.5x output bill) — but it
+// shipped NO rung of its own and pricing_snapshot.json is
+// byte-identical (the base keys were already bundled), so the rm-196
+// catalog-identity freshness gate keys an UNCHANGED digest and a warm
+// v70 entry keeps replaying the over-billed cost_estimated for
+// unchanged files forever — the rm-485 class (derived cost moving for
+// unchanged files) under a cache whose identity input cannot see it.
+// rm-230 convention: cached sessions must regenerate under corrected
+// accounting. Per the landed-rung-keeps-numeral convention
+// (c7c07e48/58fbbd6c) the landed rungs keep their numerals and no
+// sibling worktree holds an uncommitted 71 at the fleet census (the
+// highest observed rung is this tree's landed 70), so this integration
+// lands the rung as 71, the lowest rung unique above the ceiling, one
+// invalidation either way. No SQLite snapshot rung rode the batch; the
+// landed 13 (run b01c2b6a, below) remains the snapshot ceiling.
+// Entries regenerate once on next scan.
 // Bumped 69 -> 70 (integration of run e30a880139e54a60ba60b458cc2077a5
 // cycle 1 'Cline envelope intake: role-walk absorption + canonical-
 // store discovery + single-carrier rule', rm-1881 LEAD + rm-1882 +
