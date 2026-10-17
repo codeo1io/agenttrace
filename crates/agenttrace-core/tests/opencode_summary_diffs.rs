@@ -337,3 +337,47 @@ fn overview_by_agent_still_keys_on_the_agent_column() {
         .expect("builder bucket");
     assert_eq!(builder.sessions, 2);
 }
+
+/// rm-1913 (run 0779d26b, cycle 6): the rm-1509 cross-check silently
+/// skipped when either integer `summary_*` leg was NULL or non-numeric
+/// — even with the per-file list present and healthy (sums 130/10) —
+/// so a writer that recorded diffs but lost a summary column was
+/// never checked AND never disclosed. The skip is now per-session
+/// visible; the numbers themselves still never move, and the healthy
+/// path (both legs present, sums matching) stays counter-free.
+#[test]
+fn null_or_non_numeric_summary_leg_discloses_the_skipped_crosscheck() {
+    let sessions = loaded("opencode-summary-diffs-nulllegs/opencode.db");
+    const COUNTER: &str = "opencode_summary_diffs_crosscheck_null_leg";
+    for key in ["ses-null-add", "ses-null-del", "ses-text-leg"] {
+        let session = session_named(&sessions, key);
+        // The per-file payload is present and healthy — the check had
+        // something to compare and could not run.
+        assert_eq!(
+            session.metrics.summary_diffs.as_ref().unwrap().len(),
+            2,
+            "{key}: per-file list present"
+        );
+        assert_eq!(session.metrics.summary_diffs_dropped, 0);
+        assert!(
+            session.metrics.summary_diffs_divergence.is_none(),
+            "{key}: no divergence verdict without both legs"
+        );
+        assert_eq!(
+            session.metrics.disclosure_counters.get(COUNTER),
+            Some(&1),
+            "{key}: the skipped cross-check is disclosed"
+        );
+    }
+
+    // Healthy control: both legs present and matching the per-file
+    // sums — no divergence, and no skip disclosure.
+    let healthy = session_named(&sessions, "ses-healthy");
+    assert_eq!(healthy.metrics.summary_additions, Some(130));
+    assert_eq!(healthy.metrics.summary_deletions, Some(10));
+    assert!(healthy.metrics.summary_diffs_divergence.is_none());
+    assert!(!healthy.metrics.disclosure_counters.contains_key(COUNTER));
+
+    // The rm-991 contract (opencode_agent_summary.rs) stays the
+    // authority for the legacy column set: its fixture is untouched.
+}

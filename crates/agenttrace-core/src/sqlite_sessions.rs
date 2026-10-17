@@ -1314,6 +1314,17 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     // rm-1509: per-file sums vs the integer columns, computed before
     // the aggregate is partially moved into the Metrics literal below.
     let summary_diffs_divergence = summary_diffs_divergence(&agg);
+    // rm-1913 (run 0779d26b, cycle 6): the cross-check above silently
+    // returned None when either integer leg was NULL or non-numeric —
+    // even with the per-file list present and healthy — so a writer
+    // that recorded diffs but lost a summary column was never checked
+    // AND never disclosed. The skip is now visible per session (counter
+    // below); the numbers themselves still never move.
+    let summary_crosscheck_null_leg = agg
+        .summary_diffs
+        .as_ref()
+        .is_some_and(|diffs| !diffs.is_empty())
+        && (agg.summary_additions.is_none() || agg.summary_deletions.is_none());
     let mut models = agg.models;
     if models.is_empty() && !agg.model.is_empty() {
         models.insert(agg.model.clone());
@@ -1406,6 +1417,12 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     if agg.end_unix > agg.start_unix {
         metrics.duration_sec = agg.end_unix - agg.start_unix;
         metrics.provenance.duration = "timestamp_span".to_string();
+    }
+    if summary_crosscheck_null_leg {
+        metrics
+            .disclosure_counters
+            .entry("opencode_summary_diffs_crosscheck_null_leg".to_string())
+            .or_insert(1);
     }
     // rm-790: the source row id makes the derived-history identity per-row
     // (two same-second sessions from one database no longer hash to one

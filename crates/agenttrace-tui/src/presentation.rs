@@ -3379,11 +3379,12 @@ pub(super) fn load_summary_line(app: &App) -> String {
             } else {
                 String::new()
             };
-            // rm-402 (review af521003 F5): replay-adjusted children
-            // disclose in the same Ready summary — the TUI's
-            // counterpart to the CLI's codex_multiagent_replayed_child_adjusted
-            // disclosure counter. 0-count-clean clause.
-            let replay = if state.replay_children_adjusted > 0 {
+            // rm-402 (review af521003 F5) + 0531858e F3: replay
+            // disclosures ride the same Ready summary — the TUI's
+            // counterparts of the CLI's codex_multiagent_replayed_child_adjusted,
+            // family_unresolved and scan_unreadable counters.
+            // 0-count-clean per clause.
+            let replay_adjusted = if state.replay_children_adjusted > 0 {
                 format!(
                     ", {} {}",
                     format_count(state.replay_children_adjusted as i64),
@@ -3392,6 +3393,25 @@ pub(super) fn load_summary_line(app: &App) -> String {
             } else {
                 String::new()
             };
+            let replay_unresolved = if state.replay_children_unresolved > 0 {
+                format!(
+                    ", {} {}",
+                    format_count(state.replay_children_unresolved as i64),
+                    app.t("replay-unresolved sessions", "回放未定会话")
+                )
+            } else {
+                String::new()
+            };
+            let replay_unreadable = if state.replay_scans_unreadable > 0 {
+                format!(
+                    ", {} {}",
+                    format_count(state.replay_scans_unreadable as i64),
+                    app.t("unreadable rollouts", "无法读取的回放")
+                )
+            } else {
+                String::new()
+            };
+            let replay = format!("{replay_adjusted}{replay_unresolved}{replay_unreadable}");
             format!(
                 "{} {} {}, {} {}, {source}{unlinked}{replay}",
                 app.t("loaded", "已加载"),

@@ -386,6 +386,14 @@ struct LoadState {
     /// showed reconciled numbers. 0-count-clean, same clause pattern
     /// as `unlinked_subagents`.
     replay_children_adjusted: usize,
+    /// rm-1907/rm-1908 (review 0531858e F3): unresolved replay families
+    /// and unreadable rollouts disclose in the same Ready-summary clause
+    /// lane — the TUI's counterparts of the CLI's
+    /// codex_multiagent_replay_family_unresolved and
+    /// codex_multiagent_replay_scan_unreadable counters. 0-count-clean,
+    /// same reset-per-load pattern as `replay_children_adjusted`.
+    replay_children_unresolved: usize,
+    replay_scans_unreadable: usize,
     cache_state: String,
     sources: Vec<(String, usize)>,
     showing_cached: bool,
@@ -992,6 +1000,8 @@ impl App {
             // the report that lands, not the previous one.
             unlinked_subagents: 0,
             replay_children_adjusted: 0,
+            replay_children_unresolved: 0,
+            replay_scans_unreadable: 0,
             cache_state,
             sources: Vec::new(),
             showing_cached: !force && !self.sessions.is_empty(),
@@ -1123,6 +1133,10 @@ impl App {
         let replay = reconcile_codex_multiagent_replays(&mut self.sessions);
         // Reset per load with the report that landed (rm-904 pattern).
         self.load_state.replay_children_adjusted = replay.children_adjusted;
+        // 0531858e F3: the sibling disclosures reach the TUI Ready
+        // summary beside the adjusted count.
+        self.load_state.replay_children_unresolved = replay.children_unresolved;
+        self.load_state.replay_scans_unreadable = replay.scans_unreadable;
         self.sessions
             .sort_by(|left, right| compare_sessions(left, right, SortKey::Recent, true));
         // rm-038: the session list was replaced wholesale — identities are

@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 65 and the SQLite snapshot is schema 13; the
+The session cache is schema 65 and the SQLite snapshot is schema 14; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -447,7 +447,16 @@ by-agent rollup collapses back onto the source-tool bucket) while a
 fresh parse of the same database splits it, so every older snapshot
 regenerates once, in place (rm-991, run b5affead cycle 2; the JSONL
 session cache moved for the same reason — 62 → 63 at this integration,
-the run's 60 → 61 mint re-based onto the advanced ceiling). Older versions are discarded and
+the run's 60 → 61 mint re-based onto the advanced ceiling), and to 13
+when the sqlite lane began reading the opencode v2 `session.summary_diffs`
+json column beside the `summary_*` integers — a v12 snapshot banked before
+the column existed replays the same database with no per-file list and no
+divergence disclosure on an unchanged (size, mtime) fingerprint
+(rm-1509), and to 14 when the NULL-leg cross-check counter joined the
+computed aggregate — the counter is derived inside the fresh sqlite parse,
+so a v13 snapshot banked by a pre-counter binary reconciles NULL legs
+silently again on warm hits; one regeneration per database retires the
+stale entry either way (rm-1913). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
 pruned the next time the cache loads, and the JSONL-backed session cache is

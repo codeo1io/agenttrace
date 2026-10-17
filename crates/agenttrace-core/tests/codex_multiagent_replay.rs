@@ -331,6 +331,124 @@ fn zstd_rollout_family_reconciles_like_the_uncompressed_twin() {
     assert_eq!(mixed_counts, vec![1_400, 300]);
 }
 
+/// rm-1907 (run 0779d26b, cycle 6): a SIBLING-ONLY corpus — two
+/// independent sessions sharing a long onboarding-template opening
+/// (4 items, 1,069 serialized bytes: passes the F4 ≥384-byte gate) that
+/// each continue past it — must never be treated as a replay family.
+/// The assess PoC: the shape-only pass promoted the earlier sibling to
+/// "parent" and rebased the later one onto its final snapshot, silently
+/// reporting 900 in ($0.0027) against a true 1,400 ($0.0042), −36%,
+/// under a FALSE replay disclosure (`..._child_adjusted=1`, 500 tokens
+/// "dropped"). The reconciliation now requires positive parent
+/// evidence; a family without it is UNRESOLVED: no member's usage moves,
+/// and the would-be child discloses
+/// `codex_multiagent_replay_family_unresolved`.
+#[test]
+fn sibling_only_corpus_keeps_true_totals_under_unresolved_disclosure() {
+    let early = load_dir("codex-multiagent-v2-sibling", "early.jsonl");
+    let late = load_dir("codex-multiagent-v2-sibling", "late.jsonl");
+    // True totals: early final 900 uncached; late final 1,000 input
+    // with 500 cached reads → 500 uncached; corpus truth 1,400.
+    assert_eq!(early.metrics.tokens_input, 900);
+    assert_eq!(late.metrics.tokens_input, 500);
+
+    let mut sessions = vec![early, late];
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 1, "the shared opening still ties a family");
+    assert_eq!(
+        stats.children_adjusted, 0,
+        "siblings must never be rebased onto each other"
+    );
+    let total: i64 = sessions.iter().map(|s| s.metrics.tokens_input).sum();
+    assert_eq!(
+        total, 1_400,
+        "true totals must survive, not the rebase's 900"
+    );
+
+    // The later member — the one the shape-only pass used to rebase —
+    // carries the unresolved-family disclosure and NO replay claims.
+    let later = sessions
+        .iter()
+        .find(|s| {
+            s.metrics
+                .disclosure_counters
+                .contains_key("codex_multiagent_replay_family_unresolved")
+        })
+        .expect("the would-be child discloses the unresolved family");
+    assert_eq!(later.metrics.tokens_input, 500);
+    assert!(
+        later
+            .metrics
+            .disclosure_counters
+            .iter()
+            .all(|(k, _)| k.as_str() != "codex_multiagent_replayed_tokens_dropped"),
+        "no tokens were dropped — the family was never corroborated"
+    );
+    // The earlier member (the presumed parent) is untouched either way.
+    let earlier = sessions
+        .iter()
+        .find(|s| s.metrics.tokens_input == 900)
+        .expect("earlier sibling intact");
+    assert!(earlier.metrics.disclosure_counters.is_empty());
+}
+
+/// rm-1908 (run 0779d26b, cycle 6): reconciliation re-reads rollout
+/// files, and a session whose rollout cannot be read at that moment
+/// used to lose its family SILENTLY — the corpus's reported totals
+/// flipped between runs with no disclosure (assess PoC: the sibling
+/// corpus's rebase appeared and vanished with a chmod, "2/2 cache
+/// hits" either way). Every unreadable rollout now marks its own
+/// session: the family is still gone, but the flip is VISIBLE.
+#[test]
+fn unreadable_rollout_discloses_instead_of_silently_losing_the_family() {
+    // Sanity: readable, the canonical family reconciles.
+    let mut readable = vec![load("parent.jsonl"), load("child.jsonl")];
+    let stats = reconcile_codex_multiagent_replays(&mut readable);
+    assert_eq!(stats.children_adjusted, 1);
+    assert_eq!(stats.scans_unreadable, 0);
+
+    // (a) read failure: the path resolves (it is a directory) but the
+    // read fails — the deterministic permission-free stand-in for a
+    // chmod 000 rollout on a warm cache.
+    let mut sessions = vec![load("parent.jsonl"), load("child.jsonl")];
+    sessions[1].path = fixture("parent.jsonl")
+        .parent()
+        .unwrap()
+        .display()
+        .to_string();
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 0, "the unreadable member anchors nothing");
+    assert_eq!(stats.scans_unreadable, 1);
+    assert_eq!(
+        sessions[1]
+            .metrics
+            .disclosure_counters
+            .get("codex_multiagent_replay_scan_unreadable"),
+        Some(&1),
+        "the session whose rollout could not be read discloses it"
+    );
+    // No replay claims anywhere: the family never formed, so no
+    // member's numbers moved.
+    for session in &sessions {
+        assert!(child_adjusted_counters(session).is_none());
+    }
+    assert_eq!(sessions[0].metrics.tokens_input, 1_400);
+    assert_eq!(sessions[1].metrics.tokens_input, 1_700);
+
+    // (b) vanished path: canonicalize fails outright — same disclosure.
+    let mut sessions = vec![load("parent.jsonl"), load("child.jsonl")];
+    sessions[1].path = "/definitely/not/a/rollout.jsonl".to_string();
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.scans_unreadable, 1);
+    assert_eq!(
+        sessions[1]
+            .metrics
+            .disclosure_counters
+            .get("codex_multiagent_replay_scan_unreadable"),
+        Some(&1)
+    );
+}
+
 /// Review af521003 F4: two unrelated sessions that merely share a short
 /// 2-item opening (293 bytes — the prompt-retry / templated-first-turns
 /// shape) must NOT merge into a family; both keep their full usage with

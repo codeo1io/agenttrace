@@ -888,7 +888,15 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 65;
 // trailing column, the fixed read indices the snapshot was built on
 // no longer describe the fresh parse. One regeneration per database
 // retires the stale entry (rm-230 convention).
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 13;
+// Bumped 13 -> 14 (run 0779d26b cycle 6 review, rm-1913 / 0531858e
+// F1): the NULL-leg cross-check counter
+// (`opencode_summary_diffs_crosscheck_null_leg`) is computed inside
+// `session_from_sqlite_agg`, which a warm sqlite-snapshot hit bypasses
+// — a v13 snapshot banked by a pre-counter binary serves the
+// pre-counter aggregate and the NULL legs reconcile silently again
+// on an unchanged (size, mtime) fingerprint. One regeneration per
+// database retires the stale entry (rm-230 convention).
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 14;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -3507,6 +3515,63 @@ mod tests {
     }
 
     #[test]
+    fn stale_sqlite_snapshot_schema_version_never_serves() {
+        // Review 0531858e F1 (rm-1913): the null-leg cross-check counter
+        // is computed in `session_from_sqlite_agg`, which a warm snapshot
+        // hit bypasses — a snapshot banked by a pre-counter binary serves
+        // the pre-counter aggregate and the NULL legs reconcile silently
+        // again. The version bump is the whole fix: same bytes, one stale
+        // field, must never serve.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-sqlite-schema-version-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let database = root.join("state.db");
+        let snapshot = root.join("snapshot.json");
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(&database, b"db").expect("write database");
+        let session = Session {
+            name: "cached".to_string(),
+            path: database.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0)
+            .expect("store current-version snapshot");
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot).is_some(),
+            "a current-version snapshot must serve"
+        );
+        // Forge exactly one stale field: the pre-bump binary's ledger.
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&snapshot).expect("read stored ledger"))
+                .expect("parse stored ledger");
+        assert_eq!(
+            ledger["schema_version"].as_i64(),
+            Some(SQLITE_SNAPSHOT_SCHEMA_VERSION),
+            "stored ledger must carry the current version"
+        );
+        ledger["schema_version"] = (SQLITE_SNAPSHOT_SCHEMA_VERSION - 1).into();
+        fs::write(
+            &snapshot,
+            serde_json::to_vec(&ledger).expect("serialize ledger"),
+        )
+        .expect("write stale ledger");
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot).is_none(),
+            "a pre-bump (v{}) snapshot must be rejected so the aggregate — and its null-leg counter — recompute",
+            SQLITE_SNAPSHOT_SCHEMA_VERSION - 1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn sqlite_snapshot_is_invalidated_by_database_wal_or_shm_changes() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-cache-{}-{:?}",
@@ -3634,7 +3699,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_thirteen_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_fourteen_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -3706,6 +3771,15 @@ mod tests {
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
         let ledger_key = database.to_string_lossy().to_string();
+        // Version fourteen (run 0779d26b cycle-6 review, rm-1913 /
+        // 0531858e F1): the NULL-leg cross-check counter joined the
+        // summary-diff reconciliation inside `session_from_sqlite_agg`
+        // — the aggregate a warm snapshot hit bypasses — so a v13 snapshot
+        // banked by a pre-counter binary serves the pre-counter
+        // aggregate and the NULL legs reconcile silently again on an
+        // unchanged (size, mtime) fingerprint. Every older snapshot
+        // regenerates once, in place.
+        //
         // Version thirteen (rm-1509, cycle 2 of run b01c2b6a): the
         // opencode v2 `session.summary_diffs` per-file list joined
         // the snapshot payload beside the `summary_*` integers —
@@ -3740,7 +3814,7 @@ mod tests {
         // and the raw parent row id; v8 (rm-548/rm-734) — the opencode
         // fork-exclusion count plus the poison-gate eviction; v7
         // (rm-198) — hermes tool outcome semantics.
-        assert_eq!(doc["schema_version"], 13);
+        assert_eq!(doc["schema_version"], 14);
         assert_eq!(
             doc["entries"][ledger_key.as_str()]["sessions"][0]["Metrics"]["Provenance"]["Tokens"]
                 .as_str(),
@@ -3752,7 +3826,7 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema thirteen cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema fourteen cache hit");
         let (loaded, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
