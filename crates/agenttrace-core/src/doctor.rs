@@ -127,6 +127,10 @@ pub struct DoctorDirReport {
     pub files: usize,
     pub parsed: usize,
     pub failed: usize,
+    /// rm-451: the read-cap-refused share of `failed` — files past
+    /// [`crate::FILE_READ_CAP_BYTES`] (knob
+    /// `AGENTTRACE_FILE_CAP_BYTES`), refused before the read.
+    pub read_cap_refused: usize,
     pub cache_hits: usize,
     /// Present when the provider directory is itself a symlink, so the
     /// doctor names the link it follows instead of implying a plain
@@ -867,27 +871,47 @@ fn doctor_dir_report(
 ) -> DoctorDirReport {
     let mut parsed = 0;
     let mut cache_hits = 0;
+    // rm-451: read-cap refusals counted separately from other parse
+    // failures (the `failed` counter keeps covering every failure).
+    let mut read_cap_refused = 0;
     let mut failure_samples = Vec::new();
     for file in files {
         // Keep the parsed session where the decode disclosure (rm-381) can
-        // see it; the parse accounting below is unchanged.
+        // see it; the parse accounting below is unchanged. The parse stays
+        // on the cache-miss lane only (warm --doctor reruns never
+        // re-parse: cache hits stay lazy, the pre-rm-451 shape).
         let session = if let Some(session) = cached_session(file, cache) {
             cache_hits += 1;
             parsed += 1;
             Some(session)
-        } else if let Ok(session) = parse_file(file) {
-            parsed += 1;
-            // rm-367 stage (a): persist the fresh parse so an
-            // immediate --doctor rerun reuses it — the loader lane's
-            // discovery.rs:382 pattern. The reuse shows up on the
-            // NEXT run (cache_hits / cached_valid), not this one.
-            let _ = store_session(file, &session, cache);
-            Some(session)
         } else {
-            if failure_samples.len() < 3 {
-                failure_samples.push(file.to_string_lossy().to_string());
+            match parse_file(file) {
+                Ok(session) => {
+                    parsed += 1;
+                    // rm-367 stage (a): persist the fresh parse so an
+                    // immediate --doctor rerun reuses it — the loader lane's
+                    // discovery.rs:382 pattern. The reuse shows up on the
+                    // NEXT run (cache_hits / cached_valid), not this one.
+                    let _ = store_session(file, &session, cache);
+                    Some(session)
+                }
+                Err(error) => {
+                    // rm-451: classify read-cap refusals so --doctor
+                    // names the admission class (knob
+                    // AGENTTRACE_FILE_CAP_BYTES), not a bare parse
+                    // failure. Skip, never crash.
+                    if error
+                        .downcast_ref::<crate::parser::ReadCapRefused>()
+                        .is_some()
+                    {
+                        read_cap_refused += 1;
+                    }
+                    if failure_samples.len() < 3 {
+                        failure_samples.push(file.to_string_lossy().to_string());
+                    }
+                    None
+                }
             }
-            None
         };
         if let Some(session) = session {
             // rm-904: the session is retained (post-folds) for the
@@ -916,6 +940,7 @@ fn doctor_dir_report(
         cache_hits,
         symlink_target: symlink_target_of(path),
         failure_samples,
+        read_cap_refused,
     }
 }
 
@@ -997,6 +1022,7 @@ fn doctor_sqlite_directories(
             cache_hits: 0,
             symlink_target: symlink_target_of(&path),
             failure_samples,
+            read_cap_refused: 0,
         });
     }
     dirs
@@ -1276,6 +1302,15 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         ));
         for sample in &dir.failure_samples {
             out.push_str(&format!("    failed: {sample}\n"));
+        }
+        // rm-451: name the read-cap share explicitly so the admission
+        // bound is visible at a glance in the text report (the JSON
+        // arm carries the same counter as a field).
+        if dir.read_cap_refused > 0 {
+            out.push_str(&format!(
+                "    read-cap refused: {} file(s) past the AGENTTRACE_FILE_CAP_BYTES admission bound\n",
+                dir.read_cap_refused
+            ));
         }
     }
     out.push_str("\nRecommendations:\n");
