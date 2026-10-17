@@ -3,7 +3,8 @@
 //! `agenttrace` resolves a small set of knobs from a layered
 //! configuration before any report code runs:
 //!
-//! 1. CLI flags (`--history-dir`, `--pricing-file`, `--weekly-budget`)
+//! 1. CLI flags (`--history-dir`, `--pricing-file`, `--weekly-budget`,
+//!    `--five-hour-limit`, `--weekly-limit`)
 //! 2. an explicit `--config PATH` file
 //! 3. a project file at `./.agenttrace/config.toml`
 //! 4. a user file at `~/.config/agenttrace/config.toml`
@@ -28,7 +29,7 @@
 //! pull a new dependency for three flat keys; the subset keeps the
 //! binary dependency-surface unchanged and every deviation loud.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{bail, Context};
 
@@ -49,6 +50,26 @@ pub struct ConfigFile {
     /// [1, 1_000_000] by core at read time; validated here so a typo'd
     /// file fails loudly at parse instead of silently clamping.
     pub session_cache_entries: Option<usize>,
+    /// rm-1950 (run 63488b83 cycle 4): declared five-hour plan-block
+    /// cap in USD for the `--quota` view (overridden by
+    /// `--five-hour-limit`). A declaration, never a measurement —
+    /// agenttrace reads no credentials and no vendor plan data.
+    pub five_hour_limit_usd: Option<f64>,
+    /// rm-1950: declared weekly plan cap in USD for `--quota`
+    /// (overridden by `--weekly-limit`).
+    pub weekly_limit_usd: Option<f64>,
+    /// rm-1950: declared plan activation instant (RFC 3339). Corpus
+    /// spend strictly before it is excluded from every cap comparison
+    /// and disclosed — spend that predates the plan never bills the
+    /// plan. No CLI flag; file-only (it is a fact about the past, not
+    /// a per-invocation choice).
+    pub plan_effective_utc: Option<chrono::DateTime<chrono::Utc>>,
+    /// rm-1950: declared per-model weekly allowances in USD, keyed by
+    /// the exact `model_used` label the corpus carries, written as a
+    /// quoted `"label = USD, label = USD"` string (the scalar-subset
+    /// file lane stays flat). Unmatched corpus models are disclosed,
+    /// never silently folded into another model's cap.
+    pub weekly_model_allowances: Option<BTreeMap<String, f64>>,
 }
 
 impl ConfigFile {
@@ -67,11 +88,24 @@ impl ConfigFile {
         if upper.session_cache_entries.is_some() {
             self.session_cache_entries = upper.session_cache_entries;
         }
+        if upper.five_hour_limit_usd.is_some() {
+            self.five_hour_limit_usd = upper.five_hour_limit_usd;
+        }
+        if upper.weekly_limit_usd.is_some() {
+            self.weekly_limit_usd = upper.weekly_limit_usd;
+        }
+        if upper.plan_effective_utc.is_some() {
+            self.plan_effective_utc = upper.plan_effective_utc;
+        }
+        if upper.weekly_model_allowances.is_some() {
+            self.weekly_model_allowances = upper.weekly_model_allowances.clone();
+        }
         self
     }
 }
 
-const SUPPORTED_KEYS: &str = "history_dir, pricing_file, weekly_budget_usd, session_cache_entries";
+const SUPPORTED_KEYS: &str = "history_dir, pricing_file, weekly_budget_usd, session_cache_entries, \
+     five_hour_limit_usd, weekly_limit_usd, plan_effective_utc, weekly_model_allowances";
 
 /// The user-level configuration path:
 /// `$XDG_CONFIG_HOME/agenttrace/config.toml` or
@@ -152,7 +186,14 @@ pub fn parse_config(text: &str, path: &Path) -> anyhow::Result<ConfigFile> {
         // match below.
         if matches!(
             key,
-            "history_dir" | "pricing_file" | "weekly_budget_usd" | "session_cache_entries"
+            "history_dir"
+                | "pricing_file"
+                | "weekly_budget_usd"
+                | "session_cache_entries"
+                | "five_hour_limit_usd"
+                | "weekly_limit_usd"
+                | "plan_effective_utc"
+                | "weekly_model_allowances"
         ) && !seen.insert(key.to_string())
         {
             bail!(
@@ -215,6 +256,57 @@ pub fn parse_config(text: &str, path: &Path) -> anyhow::Result<ConfigFile> {
                     text.display()
                 );
             }
+            // rm-1950 (run 63488b83 cycle 4): the plan-profile keys.
+            // Same validation posture as weekly_budget_usd: a config
+            // file is authored once, so a bad declaration fails loudly
+            // at parse time instead of distorting the quota view.
+            ("five_hour_limit_usd", Scalar::Number(amount))
+            | ("weekly_limit_usd", Scalar::Number(amount)) => {
+                if !amount.is_finite() || amount <= 0.0 {
+                    bail!(
+                        "{shown}:{number}: {key} must be a positive finite \
+                         USD amount, got `{amount}`"
+                    );
+                }
+                if key == "five_hour_limit_usd" {
+                    file.five_hour_limit_usd = Some(amount);
+                } else {
+                    file.weekly_limit_usd = Some(amount);
+                }
+            }
+            ("plan_effective_utc", Scalar::String(text)) => {
+                let text = text.display().to_string();
+                let parsed = chrono::DateTime::parse_from_rfc3339(text.trim()).map_err(
+                    |error| {
+                        anyhow::anyhow!(
+                            "{shown}:{number}: plan_effective_utc must be an \
+                             RFC 3339 timestamp (e.g. \"2026-10-01T00:00:00Z\"), \
+                             got `{text}`: {error}"
+                        )
+                    },
+                )?;
+                file.plan_effective_utc = Some(parsed.with_timezone(&chrono::Utc));
+            }
+            ("weekly_model_allowances", Scalar::String(text)) => {
+                file.weekly_model_allowances = Some(parse_model_allowances(
+                    &text.display().to_string(),
+                    shown,
+                    number,
+                )?);
+            }
+            ("five_hour_limit_usd" | "weekly_limit_usd", Scalar::String(text)) => {
+                bail!(
+                    "{shown}:{number}: {key} expects a number, got the \
+                     string `{}`",
+                    text.display()
+                );
+            }
+            ("plan_effective_utc" | "weekly_model_allowances", Scalar::Number(amount)) => {
+                bail!(
+                    "{shown}:{number}: {key} expects a quoted string, got the \
+                     number `{amount}`"
+                );
+            }
             _ => bail!(
                 "{shown}:{number}: unknown config key `{key}` \
                  (supported keys: {SUPPORTED_KEYS})"
@@ -222,6 +314,70 @@ pub fn parse_config(text: &str, path: &Path) -> anyhow::Result<ConfigFile> {
         }
     }
     Ok(file)
+}
+
+/// Parse the rm-1950 `weekly_model_allowances` value: comma-separated
+/// `label = USD` pairs inside one quoted string (the config lane is a
+/// flat scalar subset — no tables, no arrays). Every deviation is
+/// loud: a missing `=`, an empty label, a non-positive or non-finite
+/// amount, or a duplicate label (which would silently discard the
+/// earlier allowance) all name the offending pair with file and line.
+fn parse_model_allowances(
+    text: &str,
+    shown: &Path,
+    number: usize,
+) -> anyhow::Result<BTreeMap<String, f64>> {
+    let mut allowances = BTreeMap::new();
+    let mut pairs = 0;
+    for pair in text.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            bail!(
+                "{shown}:{number}: weekly_model_allowances has an empty entry — \
+                 write pairs as `label = USD` separated by commas"
+            );
+        }
+        let Some((label, amount)) = pair.split_once('=') else {
+            bail!(
+                "{shown}:{number}: weekly_model_allowances entry `{pair}` is \
+                 missing `=` — write pairs as `label = USD`"
+            );
+        };
+        let label = label.trim();
+        if label.is_empty() {
+            bail!(
+                "{shown}:{number}: weekly_model_allowances entry `{pair}` has an \
+                 empty model label"
+            );
+        }
+        let amount: f64 = amount.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "{shown}:{number}: weekly_model_allowances entry `{pair}` has a \
+                 non-numeric USD amount — write pairs as `label = USD`"
+            )
+        })?;
+        if !amount.is_finite() || amount <= 0.0 {
+            bail!(
+                "{shown}:{number}: weekly_model_allowances entry `{pair}` must be \
+                 a positive finite USD amount"
+            );
+        }
+        if allowances.insert(label.to_string(), amount).is_some() {
+            bail!(
+                "{shown}:{number}: weekly_model_allowances declares `{label}` \
+                 twice — set each model allowance once (a later value would silently \
+                 discard the earlier one)"
+            );
+        }
+        pairs += 1;
+    }
+    if pairs == 0 {
+        bail!(
+            "{shown}:{number}: weekly_model_allowances needs at least one \
+             `label = USD` pair"
+        );
+    }
+    Ok(allowances)
 }
 
 enum Scalar {
@@ -310,6 +466,17 @@ pub struct ResolvedConfig {
     /// Winning session-cache entry bound (rm-298 capacity arm; no CLI
     /// flag — config file > env > default).
     pub session_cache_entries: Option<usize>,
+    /// rm-1950 (run 63488b83 cycle 4): winning five-hour plan-block
+    /// cap for `--quota` (CLI flag > config file).
+    pub five_hour_limit: Option<f64>,
+    /// rm-1950: winning weekly plan cap for `--quota` (CLI flag >
+    /// config file).
+    pub weekly_limit: Option<f64>,
+    /// rm-1950: winning plan activation instant (config file only).
+    pub plan_effective: Option<chrono::DateTime<chrono::Utc>>,
+    /// rm-1950: winning per-model weekly allowances (config file
+    /// only).
+    pub weekly_model_allowances: Option<BTreeMap<String, f64>>,
     /// Env-knob values for display only: when no layer set the knob,
     /// these remain the effective level-5 values core falls back to.
     pub env_history_dir: Option<PathBuf>,
@@ -321,7 +488,7 @@ pub struct ResolvedConfig {
     pub env_session_cache_entries: Option<String>,
     /// Where each winning knob came from (`CLI flag`, `config file`,
     /// `env`, or `default`).
-    pub sources: [(&'static str, &'static str); 4],
+    pub sources: [(&'static str, &'static str); 8],
 }
 
 /// Resolve the configuration for this invocation: discover the user
@@ -400,6 +567,13 @@ pub fn resolve_with_paths(
         .or_else(|| merged.pricing_file.clone());
     let weekly_budget = args.weekly_budget.or(merged.weekly_budget_usd);
     let session_cache_entries = merged.session_cache_entries;
+    // rm-1950: the plan-profile knobs. The two USD caps have CLI
+    // flags above every file layer; the activation date and the
+    // per-model allowances are file-only facts.
+    let five_hour_limit = args.five_hour_limit.or(merged.five_hour_limit_usd);
+    let weekly_limit = args.weekly_limit.or(merged.weekly_limit_usd);
+    let plan_effective = merged.plan_effective_utc;
+    let weekly_model_allowances = merged.weekly_model_allowances;
 
     let source_for = |flag: bool, file: bool, env: bool| -> &'static str {
         if flag {
@@ -459,6 +633,46 @@ pub fn resolve_with_paths(
                     .is_some(),
             ),
         ),
+        (
+            "five_hour_limit_usd",
+            source_for(
+                args.five_hour_limit.is_some(),
+                layers
+                    .iter()
+                    .any(|layer| layer.file.five_hour_limit_usd.is_some()),
+                false,
+            ),
+        ),
+        (
+            "weekly_limit_usd",
+            source_for(
+                args.weekly_limit.is_some(),
+                layers
+                    .iter()
+                    .any(|layer| layer.file.weekly_limit_usd.is_some()),
+                false,
+            ),
+        ),
+        (
+            "plan_effective_utc",
+            source_for(
+                false,
+                layers
+                    .iter()
+                    .any(|layer| layer.file.plan_effective_utc.is_some()),
+                false,
+            ),
+        ),
+        (
+            "weekly_model_allowances",
+            source_for(
+                false,
+                layers
+                    .iter()
+                    .any(|layer| layer.file.weekly_model_allowances.is_some()),
+                false,
+            ),
+        ),
     ];
 
     Ok(ResolvedConfig {
@@ -468,6 +682,10 @@ pub fn resolve_with_paths(
         pricing_file,
         weekly_budget,
         session_cache_entries,
+        five_hour_limit,
+        weekly_limit,
+        plan_effective,
+        weekly_model_allowances,
         env_history_dir,
         env_pricing_file,
         env_session_cache_entries,
@@ -557,6 +775,49 @@ pub fn disclosure_json(config: &ResolvedConfig) -> String {
                 }
                 .as_str(),
             ),
+            knob(
+                "five_hour_limit_usd",
+                config
+                    .five_hour_limit
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+                config.sources[4].1,
+            ),
+            knob(
+                "weekly_limit_usd",
+                config
+                    .weekly_limit
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+                config.sources[5].1,
+            ),
+            knob(
+                "plan_effective_utc",
+                config
+                    .plan_effective
+                    .map(|ts| serde_json::Value::String(
+                        ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    ))
+                    .unwrap_or(serde_json::Value::Null),
+                config.sources[6].1,
+            ),
+            knob(
+                "weekly_model_allowances",
+                config
+                    .weekly_model_allowances
+                    .as_ref()
+                    .map(|allowances| {
+                        serde_json::Value::String(
+                            allowances
+                                .iter()
+                                .map(|(label, amount)| format!("{label} = {amount}"))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        )
+                    })
+                    .unwrap_or(serde_json::Value::Null),
+                config.sources[7].1,
+            ),
         ],
     });
     serde_json::to_string_pretty(&doc).unwrap_or_default()
@@ -625,6 +886,45 @@ pub fn disclosure_text(config: &ResolvedConfig) -> String {
                 .map(|(effective, _)| effective.to_string())
                 .unwrap_or_else(|| "(unset)".to_string()),
             session_cache_source.as_str(),
+        ),
+        (
+            config.sources[4].0,
+            config
+                .five_hour_limit
+                .map(|amount| format!("${amount:.2}"))
+                .unwrap_or_else(|| "(unset)".to_string()),
+            config.sources[4].1,
+        ),
+        (
+            config.sources[5].0,
+            config
+                .weekly_limit
+                .map(|amount| format!("${amount:.2}"))
+                .unwrap_or_else(|| "(unset)".to_string()),
+            config.sources[5].1,
+        ),
+        (
+            config.sources[6].0,
+            config
+                .plan_effective
+                .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_else(|| "(unset)".to_string()),
+            config.sources[6].1,
+        ),
+        (
+            config.sources[7].0,
+            config
+                .weekly_model_allowances
+                .as_ref()
+                .map(|allowances| {
+                    allowances
+                        .iter()
+                        .map(|(label, amount)| format!("{label} = ${amount:.2}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "(unset)".to_string()),
+            config.sources[7].1,
         ),
     ];
     for (key, value, source) in knobs {

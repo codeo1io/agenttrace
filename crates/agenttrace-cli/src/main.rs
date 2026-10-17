@@ -190,6 +190,19 @@ struct Args {
     /// `weekly_budget_usd` (rm-385).
     #[arg(long, value_name = "USD")]
     weekly_budget: Option<f64>,
+    /// rm-1950 (run 63488b83 cycle 4): declared five-hour plan-block
+    /// cap in USD for `--quota`'s plan reconciliation — highest
+    /// precedence, then config `five_hour_limit_usd`. A user
+    /// declaration the report never verifies against a vendor plan;
+    /// without it (or any profile knob) `limits` stays null-with-basis
+    /// instead of invented numbers.
+    #[arg(long, value_name = "USD")]
+    five_hour_limit: Option<f64>,
+    /// rm-1950: declared weekly plan cap in USD for `--quota`'s plan
+    /// reconciliation — highest precedence, then config
+    /// `weekly_limit_usd`.
+    #[arg(long, value_name = "USD")]
+    weekly_limit: Option<f64>,
     /// Show the weekly budget window-burn view: per-day spend from
     /// the statusline journal against the resolved weekly budget
     /// (rm-385).
@@ -746,8 +759,11 @@ fn run() -> anyhow::Result<()> {
         // loudly upstream by the applicability guards (`--range`,
         // `--sample`, `--include-history`), which do not count `--quota`
         // as a session report action for exactly that reason.
+        // rm-1950 (run 63488b83 cycle 4): the user-declared plan
+        // profile rides along — limits, blocks, reconciliation.
+        let plan = quota_plan_profile(&args, resolved)?;
         let sessions = load_sessions(&args)?;
-        let out = agenttrace_core::render_quota_view(&args.format, &sessions)?;
+        let out = agenttrace_core::render_quota_view(&args.format, &sessions, &plan)?;
         let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
@@ -1383,6 +1399,8 @@ fn refuse_inapplicable_mcp_flags(args: &Args) {
     flag(args.quota, "--quota");
     flag(args.fetch, "--fetch");
     flag(args.weekly_budget.is_some(), "--weekly-budget");
+    flag(args.five_hour_limit.is_some(), "--five-hour-limit");
+    flag(args.weekly_limit.is_some(), "--weekly-limit");
     flag(args.budget, "--budget");
     flag(args.demo, "--demo");
     flag(args.doctor, "--doctor");
@@ -1684,10 +1702,35 @@ where
                 write_stdout(&keyword_help_text(&keyword))?;
                 std::process::exit(0);
             }
+            // rm-558 (F5 arm): a token that is not on the clap surface
+            // is a typo first — say "unknown flag" instead of letting
+            // the order-guard mask it, but keep the keyword context so
+            // both facts are named.
+            if !is_known_cli_flag(flag) {
+                bail!(
+                    "unknown flag `{}` (dropped: `{tail}`); it follows the `{keyword}` \
+                     keyword, so clap never saw it and cannot report the typo — check \
+                     the spelling; `{keyword}` takes no flags after it — place flags \
+                     before the keyword, or run `agenttrace {keyword} --help`",
+                    flag.to_string_lossy()
+                );
+            }
             bail!(
                 "flag `{}` follows the `{keyword}` keyword and would be silently dropped \
                  (dropped: `{tail}`); `{keyword}` takes no flags after it — place flags \
                  before the keyword, or run `agenttrace {keyword} --help`",
+                flag.to_string_lossy()
+            );
+        }
+        // rm-558 (F5 arm): same truth split on the session-path lane —
+        // `agenttrace sessions --snice foo` used to report an ordering
+        // problem for a flag that does not exist; name the unknown
+        // flag AND the positional context.
+        if !is_known_cli_flag(flag) {
+            bail!(
+                "unknown flag `{}` (dropped: `{tail}`); it follows the positional \
+                 session path, so clap never saw it and cannot report the typo — check \
+                 the spelling, or place known flags before the positional path",
                 flag.to_string_lossy()
             );
         }
@@ -1803,6 +1846,49 @@ fn is_go_flag_positional(arg: &OsString) -> bool {
     text == "-" || !text.starts_with('-')
 }
 
+/// rm-558 (F5 arm, run 63488b83 cycle 4): is a dropped `-`-prefixed
+/// token a flag the CLI actually knows? Derived from the clap surface
+/// — the same authority the `flag_takes_value` canary pins — so the
+/// dropped-tail diagnostics can separate "you typo'd a flag" (clap
+/// would have rejected it as unknown anyway, but the shim errors
+/// first and must not mislabel it) from "a real flag sat after the
+/// positional" (an ordering error only). Dashes normalize Go-style:
+/// `-format` and `--format` are the same known flag; a single-dash
+/// single-character token matches shorts (`-f`); `=`-attached values
+/// are stripped before the lookup.
+fn is_known_cli_flag(token: &OsString) -> bool {
+    use clap::CommandFactory;
+
+    let text = token.to_string_lossy();
+    let (single_dash, name) = if let Some(rest) = text.strip_prefix("--") {
+        (false, rest.split('=').next().unwrap_or(""))
+    } else if let Some(rest) = text.strip_prefix('-') {
+        (true, rest.split('=').next().unwrap_or(""))
+    } else {
+        return false;
+    };
+    if name.is_empty() {
+        // Bare `-`/`--`: the former is a positional, the latter is the
+        // end-of-flags marker — neither is a flag name to diagnose.
+        return false;
+    }
+    let mut short = None;
+    if single_dash && name.chars().count() == 1 {
+        short = name.chars().next();
+    }
+    for argument in Args::command().get_arguments() {
+        if argument.get_long().is_some_and(|long| long == name) {
+            return true;
+        }
+        if short.is_some_and(|flag| argument.get_short() == Some(flag)) {
+            return true;
+        }
+    }
+    // clap's built-in `--help` rides the surface even when the help
+    // argument is customized away; keep the diagnostic truthful.
+    name == "help" || short == Some('h')
+}
+
 fn flag_takes_value(arg: &OsString) -> bool {
     let text = arg.to_string_lossy();
     if text.contains('=') {
@@ -1846,6 +1932,10 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--history-dir"
             | "--pricing-file"
             | "--weekly-budget"
+            // rm-1950 (run 63488b83 cycle 4): plan-profile limit flags
+            // take a USD value on the same contract.
+            | "--five-hour-limit"
+            | "--weekly-limit"
     )
 }
 
@@ -3247,6 +3337,16 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
     if actions.into_iter().filter(|active| *active).count() > 1 {
         bail!("choose exactly one report action");
     }
+    // rm-1950 (run 63488b83 cycle 4): the plan-profile limit flags are
+    // consumed only by --quota. On any other lane they would be
+    // silently ignored — the exact class rm-593 closed for --sample,
+    // so the same loud contract applies: name the flags and the lane
+    // that honors them.
+    if (args.five_hour_limit.is_some() || args.weekly_limit.is_some()) && !args.quota {
+        bail!(
+            "--five-hour-limit and --weekly-limit feed the --quota view's plan reconciliation (config five_hour_limit_usd / weekly_limit_usd are the same knobs); every other lane ignores them — pass them with --quota"
+        );
+    }
     if args.latest
         && actions.into_iter().any(|active| active)
         && !args.diagnostics
@@ -3259,6 +3359,55 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
 
 /// The report flag that selected the governance branch, for gate-evidence
 /// `inspect` hints that reproduce the gated run (rm-346 arm-a).
+/// rm-1950 (run 63488b83 cycle 4): assemble the user-declared
+/// [`agenttrace_core::QuotaPlanProfile`] for the `--quota` view from
+/// the resolved config plus the `--five-hour-limit` / `--weekly-limit`
+/// flags (flags win). Every value is a user declaration — the profile
+/// carries a provenance `basis` sentence the report prints verbatim,
+/// and agenttrace reads no credentials and never invents plan data:
+/// nothing declared means the reserved `limits`/`reconciliation`
+/// seams stay null-with-basis rather than fabricated.
+fn quota_plan_profile(
+    args: &Args,
+    resolved: &config::ResolvedConfig,
+) -> anyhow::Result<agenttrace_core::QuotaPlanProfile> {
+    for (value, flag) in [
+        (args.five_hour_limit, "--five-hour-limit"),
+        (args.weekly_limit, "--weekly-limit"),
+    ] {
+        if let Some(value) = value {
+            if !value.is_finite() || value <= 0.0 {
+                bail!("{flag} must be a positive finite USD amount, got `{value}`");
+            }
+        }
+    }
+    let five_hour_usd = args.five_hour_limit.or(resolved.five_hour_limit);
+    let weekly_usd = args.weekly_limit.or(resolved.weekly_limit);
+    let weekly_model_allowances = resolved
+        .weekly_model_allowances
+        .clone()
+        .unwrap_or_default();
+    let effective_utc = resolved.plan_effective;
+    if five_hour_usd.is_none()
+        && weekly_usd.is_none()
+        && weekly_model_allowances.is_empty()
+        && effective_utc.is_none()
+    {
+        return Ok(agenttrace_core::QuotaPlanProfile::default());
+    }
+    Ok(agenttrace_core::QuotaPlanProfile {
+        five_hour_usd,
+        weekly_usd,
+        weekly_model_allowances,
+        effective_utc,
+        basis: "user-declared plan profile (five_hour_limit_usd / --five-hour-limit, \
+                weekly_limit_usd / --weekly-limit, weekly_model_allowances, \
+                plan_effective_utc); agenttrace reads no credentials and does not verify \
+                it against any vendor plan"
+            .to_string(),
+    })
+}
+
 fn governance_inspect_flag(args: &Args) -> &'static str {
     if args.audit {
         "--audit"
@@ -3436,15 +3585,39 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     // invalid regardless of the dispatched action — so both rows are
     // retired here rather than kept as a second, weaker source of
     // truth; --weekly-budget keeps its table row.
-    let rows: Vec<(&str, bool, String)> = vec![(
-        "--weekly-budget",
-        args.weekly_budget
-            .is_none_or(|value| value.is_finite() && value > 0.0),
-        format!(
-            "--weekly-budget must be a positive finite USD amount (got {})",
-            args.weekly_budget.unwrap_or(f64::NAN)
+    let rows: Vec<(&str, bool, String)> = vec![
+        (
+            "--weekly-budget",
+            args.weekly_budget
+                .is_none_or(|value| value.is_finite() && value > 0.0),
+            format!(
+                "--weekly-budget must be a positive finite USD amount (got {})",
+                args.weekly_budget.unwrap_or(f64::NAN)
+            ),
         ),
-    )];
+        // rm-1950 (run 63488b83 cycle 4): the plan-profile limit flags
+        // ride the same dispatch-time table — a negative or NaN cap
+        // must fail loudly wherever the flag appears, not just on the
+        // --quota lane that consumes it.
+        (
+            "--five-hour-limit",
+            args.five_hour_limit
+                .is_none_or(|value| value.is_finite() && value > 0.0),
+            format!(
+                "--five-hour-limit must be a positive finite USD amount (got {})",
+                args.five_hour_limit.unwrap_or(f64::NAN)
+            ),
+        ),
+        (
+            "--weekly-limit",
+            args.weekly_limit
+                .is_none_or(|value| value.is_finite() && value > 0.0),
+            format!(
+                "--weekly-limit must be a positive finite USD amount (got {})",
+                args.weekly_limit.unwrap_or(f64::NAN)
+            ),
+        ),
+    ];
     for (_, valid, message) in rows {
         if !valid {
             bail!("{message}");
@@ -4402,6 +4575,87 @@ mod tests {
         assert!(
             message.contains("`-f json`"),
             "names the dropped tail: {message}"
+        );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_names_unknown_flags_after_the_positional_path() {
+        // rm-558 (F5 arm, run 63488b83 cycle 4): the order-guard fired
+        // for ANY flag-looking token after a consuming positional, so
+        // a typo'd flag reported an ordering problem ("flag `--snice`
+        // follows the positional session path") exactly like a real
+        // misplaced flag — the unknown-flag truth was masked. A
+        // dropped token that is NOT on the clap surface must say so,
+        // with the positional context still named.
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("session.jsonl"),
+            OsString::from("--snice"),
+            OsString::from("foo"),
+        ])
+        .expect_err("unknown flags after the positional must be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown flag `--snice`"),
+            "names the unknown flag: {message}"
+        );
+        assert!(
+            message.contains("positional session path"),
+            "keeps the positional context: {message}"
+        );
+        assert!(
+            message.contains("`--snice foo`"),
+            "names the dropped tail: {message}"
+        );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_keeps_the_order_diagnostic_for_known_flags() {
+        // The other half of rm-558's truth split: a REAL flag after
+        // the positional is an ordering error, not a typo — clap
+        // would have accepted `--format` placed earlier, so the
+        // message stays the order-guard wording and never calls a
+        // clap-surface flag unknown.
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("session.jsonl"),
+            OsString::from("--format"),
+            OsString::from("json"),
+        ])
+        .expect_err("known flags after the positional must stay rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("follows the positional session path"),
+            "known flags keep the order-guard wording: {message}"
+        );
+        assert!(
+            !message.contains("unknown flag"),
+            "a clap-surface flag is never called unknown: {message}"
+        );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_names_unknown_flags_after_a_keyword_host() {
+        // Same truth for the keyword hosts (rm-505 family): a typo
+        // after `mcp` is a typo, not merely a flag-after-keyword
+        // ordering issue — name both facts.
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("mcp"),
+            OsString::from("--snice"),
+        ])
+        .expect_err("unknown flags after a keyword must be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown flag `--snice`"),
+            "names the unknown flag: {message}"
+        );
+        assert!(
+            message.contains("`mcp` keyword"),
+            "keeps the keyword context: {message}"
         );
     }
 
