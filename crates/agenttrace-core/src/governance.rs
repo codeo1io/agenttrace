@@ -497,7 +497,12 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .cache_read
             .saturating_add(session.metrics.tokens_cache_r);
         row.tokens.total = row.tokens.total.saturating_add(total_tokens(session));
-        row.cost += session.metrics.cost_estimated;
+        // rm-1500 (run 22f0c980 cycle 2): skip poisoned (non-finite)
+        // costs at the per-agent-per-org fold, like every other
+        // insights rollup.
+        if session.metrics.cost_estimated.is_finite() {
+            row.cost += session.metrics.cost_estimated;
+        }
         // rm-520: carry each session's rm-436 recorded-cost basis into
         // the row so the drift comparison prices recorded classes
         // exactly once instead of re-estimating them at catalog rates.
@@ -1611,7 +1616,13 @@ fn add_context_session(aggregate: &mut ContextAggregate, session: &Session) {
     aggregate.output = aggregate
         .output
         .saturating_add(session.metrics.tokens_output);
-    aggregate.cost += session.metrics.cost_estimated;
+    // rm-1500 (run 22f0c980 cycle 2): skip poisoned (non-finite)
+    // costs at the drift aggregate fold, like every other insights
+    // rollup (this was the third ungated site found by the cycle-2
+    // assess pass).
+    if session.metrics.cost_estimated.is_finite() {
+        aggregate.cost += session.metrics.cost_estimated;
+    }
     aggregate.reads += session
         .metrics
         .tool_usage
@@ -2814,6 +2825,34 @@ mod tests {
             item.evidence.iter().any(|line| line
                 .contains("synthetic estimate -- no token mass recorded, not price-derived")),
             "synthetic arm must disclose its basis: {item:?}"
+        );
+    }
+
+    #[test]
+    fn insights_folds_skip_poisoned_costs() {
+        // rm-1500 arm (run 22f0c980 cycle 2): both per-agent
+        // rollup folds (cost_audit's group rows and the drift
+        // aggregate built by add_context_session) skip non-finite
+        // cost_estimated instead of poisoning their totals —
+        // completing the skip-while-counting rule across insights.
+        let mut poisoned = session("poisoned");
+        poisoned.metrics.cost_estimated = f64::NAN;
+        let clean = session("clean");
+        let audit = cost_audit(&[poisoned.clone(), clean.clone()]);
+        assert!(
+            audit.total_estimated_cost.is_finite(),
+            "NaN session cost must not poison the audit total"
+        );
+        let mut aggregate = ContextAggregate::default();
+        add_context_session(&mut aggregate, &poisoned);
+        add_context_session(&mut aggregate, &clean);
+        assert!(
+            aggregate.cost.is_finite(),
+            "NaN session cost must not poison the drift aggregate"
+        );
+        assert_eq!(
+            aggregate.sessions, 2,
+            "the poisoned session is still COUNTED — skipped only from the arithmetic"
         );
     }
 }
