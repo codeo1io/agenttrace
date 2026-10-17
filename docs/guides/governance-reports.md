@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 64 and the SQLite snapshot is schema 12; the
+The session cache is schema 69 and the SQLite snapshot is schema 12; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -416,7 +416,21 @@ number is never repriced, the zero side is disclosed, not resolved;
 minted 60 → 61 at the run's base 82e23b9, below the frontier — this
 tree's landed 62 and 63 rungs — so this integration, conflict case
 8fbcfcfd5e4d440b8e2890456aaacede, re-bases it onto the advanced
-ceiling as 63 → 64, one invalidation either way)
+ceiling as 63 → 64, one invalidation either way),
+to 65 when the opencode v2 summary_diffs shape rung landed (sibling run
+b01c2b6abe28, merged before this batch's census), to 66 when the sibling
+warm-cache-truth rung landed (run abb3b0914e48, rm-1385), to 67 as a
+held-uncommitted sibling rung (run 6d2a1d8d), and to 68 when opencode
+warm-cache entries began fingerprinting the full message/part fan-out the
+parse reads — opencode v1.19.0 touches the session doc at prompt START
+only, so doc-only keys served the last turn of every completed
+conversation as stale totals silently (fleet PoC warm $0.0011 vs cold
+$0.0461) — the doc's `directory` now groups sessions into by_project,
+and antigravity numeric model ids map to catalog keys with disclosure
+(run 477a0c5c cycle 2, rm-1865 + rm-1864; minted 64 → 65 at the batch
+base d2a02af before the fleet census, re-based onto the advanced
+ceiling as 65 → 68 per the c7c07e48/58fbbd6c convention, one
+invalidation either way)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

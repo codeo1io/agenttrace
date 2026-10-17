@@ -88,11 +88,21 @@ Windows CMD：
 curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
-安装脚本会下载对应平台的发布版程序，按发布的校验和验证 SHA-256，并把安装目录
-（`~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\agenttrace`）加入 PATH。
-Shell 安装脚本始终获取最新发布版（源码构建回退可用
-`AGENTTRACE_SOURCE_REF=v0.10.1` 固定）；Windows 上用 `-Version v0.10.1`
-（PowerShell）固定版本。
+安装脚本会下载对应平台的发布版程序，按发布的校验和验证 SHA-256，并提示如何把
+安装目录（`~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\agenttrace`）加入
+PATH——脚本从不自行修改 PATH 或 shell 配置。固定版本请设置
+`AGENTTRACE_VERSION`（rm-550；`irm | iex` 方式下 `-Version` 参数无法传入脚本）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | AGENTTRACE_VERSION=v0.10.1 sh
+```
+
+```powershell
+$env:AGENTTRACE_VERSION = "v0.10.1"; irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+```
+
+Shell 安装脚本的源码构建回退单独用 `AGENTTRACE_SOURCE_REF=v0.10.1` 固定；
+`AGENTTRACE_INSTALL_DIR` 可在两个平台上重定位安装目录。
 
 包管理器：
 

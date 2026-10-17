@@ -1104,17 +1104,98 @@ const ANTIGRAVITY_USAGE_KEYS: [&str; 3] = ["usageStats", "usage", "usageMetadata
 // (exact/fallback/unknown) instead of silently costing $0.
 const ANTIGRAVITY_MODEL_KEYS: [&str; 4] = ["modelConfigId", "model_enum", "modelVersion", "model"];
 
+/// rm-1864: Antigravity's usage stats can also carry the model as a BARE
+/// NUMERIC id (ccusage #1894 mapped 1417 -> gemini-4-argon on their
+/// corpus and repriced ~4.6M previously-unpriced tokens; #1897 reports
+/// 1277/1050 still unidentified). A numeric id previously fell through
+/// the string-only extraction below, reporting the session with NO model
+/// at all — no display identity and no pricing hook. Known numerics map
+/// to their priced catalog keys; unknown numerics keep the raw id as the
+/// model string. Both arms are disclosed through the fold's
+/// `antigravity_model_numeric_id_*` counters — never a silent drop.
+const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(u64, &str)] = &[(1417, "gemini/gemini-4-argon")];
+
+/// Which numeric-id arm produced a model id (rm-1864): a known id
+/// resolved through the mapping table, or an unknown one rendered raw
+/// — the raw spelling keeps the journal's exact text (an integral
+/// float `1417.0` canonicalizes to `1417`; `1277.5` stays `1277.5`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AntigravityModelNote {
+    Mapped(u64, &'static str),
+    Unmapped(String),
+}
+
 fn antigravity_usage_block(obj: &Map<String, Value>) -> Option<BTreeMap<String, i64>> {
     ANTIGRAVITY_USAGE_KEYS
         .iter()
         .find_map(|key| obj.get(*key).and_then(usage_from_value))
 }
 
-fn antigravity_model_id(obj: &Map<String, Value>) -> Option<String> {
-    ANTIGRAVITY_MODEL_KEYS
-        .iter()
-        .find_map(|key| string(obj.get(*key)).map(str::to_string))
-        .filter(|model| !model.is_empty())
+/// rm-1864: string ids win first (existing behavior unchanged); a bare
+/// numeric id (JSON number, or an all-digits string) then resolves
+/// through [`ANTIGRAVITY_NUMERIC_MODEL_MAP`] when known and otherwise
+/// renders the raw digits, in both cases reporting the numeric note so
+/// the fold can disclose it.
+fn antigravity_model_id(
+    obj: &Map<String, Value>,
+) -> (Option<String>, Option<AntigravityModelNote>) {
+    for key in ANTIGRAVITY_MODEL_KEYS {
+        let Some(value) = obj.get(key) else {
+            continue;
+        };
+        // Numeric-id lane (rm-1864): a JSON number, or an all-digits
+        // string, resolves through the mapping table when known and
+        // otherwise renders the raw digits — the same id must price
+        // identically however the journal spells it. An integral
+        // float spelling (1417.0) canonicalizes to its integer id
+        // (the |x| <= 2^53 bound keeps the u64 cast exact); any other
+        // float (1277.5) is rendered raw below. Both arms report the
+        // note so the fold can disclose the sighting.
+        let numeric = value
+            .as_u64()
+            .or_else(|| {
+                let float = value.as_number()?.as_f64()?;
+                if (0.0..=9_007_199_254_740_992.0).contains(&float) && float.fract() == 0.0 {
+                    Some(float as u64)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                let digits = value.as_str()?;
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                digits.parse::<u64>().ok()
+            });
+        if let Some(numeric) = numeric {
+            return match ANTIGRAVITY_NUMERIC_MODEL_MAP
+                .iter()
+                .find(|(id, _)| *id == numeric)
+            {
+                Some((_, mapped)) => (
+                    Some((*mapped).to_string()),
+                    Some(AntigravityModelNote::Mapped(numeric, mapped)),
+                ),
+                None => (
+                    Some(numeric.to_string()),
+                    Some(AntigravityModelNote::Unmapped(numeric.to_string())),
+                ),
+            };
+        }
+        // Non-integral float spellings (1277.5): a numeric shape
+        // must never fold to a silent None (rm-1864 arm 1) — render
+        // the raw spelling and disclose the sighting unmapped.
+        if let Some(raw) = value.as_number().map(|number| number.to_string()) {
+            return (Some(raw.clone()), Some(AntigravityModelNote::Unmapped(raw)));
+        }
+        // String lane (existing behavior): a non-empty string id wins
+        // as-is; an empty string keeps scanning the remaining keys.
+        if let Some(model) = value.as_str().filter(|model| !model.is_empty()) {
+            return (Some(model.to_string()), None);
+        }
+    }
+    (None, None)
 }
 
 /// rm-720 fold state: sums per-generation usage blocks and emits ONE
@@ -1127,6 +1208,11 @@ struct AntigravityUsageFold {
     models_seen: usize,
     generations: usize,
     latest_timestamp: String,
+    /// rm-1864: per-numeric-id sighting counts for the disclosure
+    /// counters — mapped ids (raw -> catalog key) and unmapped ids
+    /// rendered raw, each disclosed, never silently dropped.
+    numeric_mapped: BTreeMap<(u64, &'static str), i64>,
+    numeric_unmapped: BTreeMap<String, i64>,
 }
 
 impl AntigravityUsageFold {
@@ -1137,11 +1223,31 @@ impl AntigravityUsageFold {
             models_seen: 0,
             generations: 0,
             latest_timestamp: String::new(),
+            numeric_mapped: BTreeMap::new(),
+            numeric_unmapped: BTreeMap::new(),
         }
     }
 
-    fn fold(&mut self, usage: &BTreeMap<String, i64>, model: Option<String>, timestamp: &str) {
+    fn fold(
+        &mut self,
+        usage: &BTreeMap<String, i64>,
+        model: Option<String>,
+        numeric: Option<AntigravityModelNote>,
+        timestamp: &str,
+    ) {
         self.generations += 1;
+        // rm-1864: record the numeric sighting FIRST — the note exists
+        // even when the id itself is absent downstream, and the
+        // counters are what make a numeric id inspectable.
+        match numeric {
+            Some(AntigravityModelNote::Mapped(id, mapped)) => {
+                *self.numeric_mapped.entry((id, mapped)).or_insert(0) += 1;
+            }
+            Some(AntigravityModelNote::Unmapped(id)) => {
+                *self.numeric_unmapped.entry(id).or_insert(0) += 1;
+            }
+            None => {}
+        }
         for (key, value) in usage {
             // rm-831: the rm-046 clamp-plus-saturate contract
             // (add_usage / add_usage_value) — hostile journals repeat
@@ -1180,6 +1286,21 @@ impl AntigravityUsageFold {
             counters.insert(
                 "antigravity_model:multi_model_last_wins".to_string(),
                 self.models_seen as i64,
+            );
+        }
+        // rm-1864: numeric-id disclosures — each mapped pair and each
+        // unmapped raw id is itemized so a journal full of numeric ids
+        // never looks like model-less usage.
+        for ((id, mapped), count) in &self.numeric_mapped {
+            counters.insert(
+                format!("antigravity_model_numeric_id_mapped:{id}->{mapped}"),
+                *count,
+            );
+        }
+        for (id, count) in &self.numeric_unmapped {
+            counters.insert(
+                format!("antigravity_model_numeric_id_unmapped:{id}"),
+                *count,
             );
         }
         Some(Event {
@@ -1292,7 +1413,8 @@ fn parse_antigravity_trajectory(raw: &str) -> Option<Vec<Event>> {
                 events.push(assistant);
                 if let Some(planner) = step.pointer("/plannerResponse").and_then(Value::as_object) {
                     if let Some(usage) = antigravity_usage_block(planner) {
-                        usage_fold.fold(&usage, antigravity_model_id(planner), &timestamp);
+                        let (model, numeric) = antigravity_model_id(planner);
+                        usage_fold.fold(&usage, model, numeric, &timestamp);
                     }
                 }
             }
@@ -1393,7 +1515,8 @@ fn parse_antigravity_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     })
                     .collect();
                 if let Some(usage) = antigravity_usage_block(entry) {
-                    usage_fold.fold(&usage, antigravity_model_id(entry), &timestamp);
+                    let (model, numeric) = antigravity_model_id(entry);
+                    usage_fold.fold(&usage, model, numeric, &timestamp);
                 }
                 events.push(Event {
                     role: "assistant".to_string(),
@@ -6382,6 +6505,64 @@ fn is_opencode_storage_session_file(path: &str) -> bool {
     parts.len() == 3 && parts[0] == "session" && parts[2].ends_with(".json")
 }
 
+/// rm-1865: enumerate every file the opencode session parse reads
+/// below the storage root — the message records plus each message's
+/// part records — so the session cache can fingerprint the full
+/// fan-out the parse depends on, not just the session doc (opencode
+/// v1.19.0 touches the session doc at prompt START only, leaving the
+/// last turn invisible to a doc-only freshness key). Returns None for
+/// anything that is not a parseable opencode storage session file.
+pub(crate) fn opencode_fanout_paths(session_file: &str) -> Option<Vec<PathBuf>> {
+    if !is_opencode_storage_session_file(session_file) {
+        return None;
+    }
+    let storage_root = opencode_storage_root_from_session_file(session_file)?;
+    let doc: Map<String, Value> =
+        serde_json::from_str(&std::fs::read_to_string(session_file).ok()?).ok()?;
+    let session_id = string(doc.get("id"))?;
+    if session_id.is_empty() || string(doc.get("projectID")).unwrap_or("").is_empty() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    // Independent-review fix F2 (run 477a0c5c cycle 2, review
+    // eb14625e): the landed sibling arm resolves the session's working
+    // directory through the v1-store project doc
+    // (`storage/project/<id>.json`) whenever the session doc itself
+    // carries no `directory`, so that file joins the parse's read set
+    // at the merged base even though this tree's arm reads only the
+    // doc's own `directory`. Enumerate it under the landed arm's read
+    // predicate — doc `directory` absent-or-empty AND a CONFINED
+    // projectID (same hostile-path guard the landed parse applies:
+    // `Path::join` is not a confinement, and a freshness walk must
+    // not stat attacker-named machine paths) — and only when it
+    // exists: a project doc created after store is caught by the
+    // path-list diff in `fanout_is_stale`, edits and deletes by the
+    // stat fingerprint.
+    let reads_project_doc = string(doc.get("directory")).is_none_or(|d| d.is_empty());
+    if reads_project_doc {
+        if let Some(project_id) = string(doc.get("projectID")).filter(|id| {
+            !id.is_empty() && !id.contains('/') && !id.contains('\\') && !id.starts_with("..")
+        }) {
+            let project_doc = storage_root
+                .join("project")
+                .join(format!("{project_id}.json"));
+            if project_doc.is_file() {
+                paths.push(project_doc);
+            }
+        }
+    }
+    for message in read_opencode_records(&storage_root.join("message").join(session_id)) {
+        paths.push(message.path.clone());
+        let Some(message_id) = string(message.doc.get("id")).filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        for part in read_opencode_records(&storage_root.join("part").join(message_id)) {
+            paths.push(part.path.clone());
+        }
+    }
+    Some(paths)
+}
+
 fn opencode_storage_rel(path: &str) -> Option<String> {
     if let Ok(root) = std::env::var("OPENCODE_DATA_DIR") {
         if !root.is_empty() {
@@ -6472,6 +6653,21 @@ fn parse_opencode_storage_session(
         });
     }
     events.extend(body);
+
+    // rm-1865: the session doc carries the workspace `directory`; the
+    // opencode lane never stamped it onto events, so every opencode
+    // Session kept an empty cwd and fell into the "unknown" project
+    // bucket in by_project views. Stamp it onto every event that has no
+    // cwd of its own so project grouping resolves like every other
+    // lane; an absent `directory` stays disclosed-unknown through the
+    // existing empty-cwd path.
+    if let Some(directory) = string(session.get("directory")).filter(|d| !d.is_empty()) {
+        for event in &mut events {
+            if event.cwd.is_empty() {
+                event.cwd = directory.to_string();
+            }
+        }
+    }
     Ok(events)
 }
 
@@ -9509,6 +9705,170 @@ mod tests {
                 .get("antigravity_usage_basis:planner_response_summed"),
             Some(&2),
             "the fold names its basis"
+        );
+    }
+
+    #[test]
+    fn antigravity_numeric_model_id_maps_and_discloses() {
+        // rm-1864: Antigravity usage stats can carry the model as a BARE
+        // NUMERIC id (ccusage #1894 mapped 1417 -> gemini-4-argon and
+        // repriced ~4.6M tokens; #1897 reports 1277/1050 still unknown).
+        // Known numerics resolve through the mapping table to a catalog
+        // key; the sighting is disclosed. Never a silent model-less
+        // session.
+        let raw = serde_json::json!({
+            "trajectoryId": "11111111-2222-3333-4444-555555555555",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:05Z"},
+                    "plannerResponse": {
+                        "response": "Numeric id generation.",
+                        "usageStats": {
+                            "inputTokens": 100,
+                            "outputTokens": 50
+                        },
+                        "modelConfigId": 1417
+                    }
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:09Z"},
+                    "plannerResponse": {
+                        "response": "Same id, digits string spelling.",
+                        "usageMetadata": {
+                            "inputTokens": 30,
+                            "outputTokens": 20
+                        },
+                        "modelConfigId": "1417"
+                    }
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:11Z"},
+                    "plannerResponse": {
+                        "response": "Same id, float spelling.",
+                        "usageMetadata": {
+                            "inputTokens": 10,
+                            "outputTokens": 10
+                        },
+                        "modelConfigId": 1417.0
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session = parse_raw_session("traj", "traj.trajectory.json", &raw)
+            .expect("numeric-id trajectory parses");
+        assert_eq!(
+            session.metrics.model_used, "gemini/gemini-4-argon",
+            "both spellings of the numeric id resolve to the mapped catalog key"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model_numeric_id_mapped:1417->gemini/gemini-4-argon"),
+            Some(&3),
+            "each numeric sighting is disclosed — mapped lane"
+        );
+        assert!(
+            !session
+                .metrics
+                .disclosure_counters
+                .contains_key("antigravity_model_numeric_id_unmapped:1417"),
+            "mapped ids never double-report as unmapped"
+        );
+        // acceptance (3), end-to-end: the mapped catalog key must
+        // actually PRICE through the snapshot's argon rows — the
+        // numeric-id session is no longer silently unpriced. Folded
+        // usage: 140 input @ 2e-6 + 80 output @ 1e-5 = 0.00108, which
+        // the metrics contract round4's to 0.0011 (gemini/gemini-4-argon,
+        // ccusage #1894's repricing arm).
+        assert!(
+            (session.metrics.cost_estimated - 0.0011).abs() < 1e-9,
+            "the mapped numeric id must price through the snapshot row, got {}",
+            session.metrics.cost_estimated
+        );
+    }
+
+    #[test]
+    fn antigravity_numeric_model_id_unknown_renders_raw_and_discloses() {
+        // rm-1864: an UNKNOWN numeric id keeps its raw digits as the
+        // model string (identity preserved, pricing can resolve later
+        // mappings) and the sighting is disclosed — never a silent
+        // None model.
+        let raw = serde_json::json!({
+            "trajectoryId": "11111111-2222-3333-4444-555555555555",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:03Z"},
+                    "plannerResponse": {
+                        "response": "Non-integral float spelling.",
+                        "usageStats": {
+                            "inputTokens": 4,
+                            "outputTokens": 2
+                        },
+                        "modelConfigId": 1277.5
+                    }
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:05Z"},
+                    "plannerResponse": {
+                        "response": "Unknown numeric id.",
+                        "usageStats": {
+                            "inputTokens": 10,
+                            "outputTokens": 5
+                        },
+                        "modelConfigId": 1277
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session = parse_raw_session("traj", "traj.trajectory.json", &raw)
+            .expect("unknown numeric-id trajectory parses");
+        assert_eq!(
+            session.metrics.model_used, "1277",
+            "unknown numeric ids render raw — identity preserved"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model_numeric_id_unmapped:1277"),
+            Some(&1),
+            "the unknown numeric sighting is disclosed"
+        );
+        // the non-integral float spelling (1277.5) keeps its RAW text
+        // as the model string and its own disclosed sighting — a
+        // numeric shape never folds to a silent None (arm 1); it is
+        // NOT canonicalized into the integer 1277 bucket.
+        assert_eq!(
+            session.metrics.model_used, "1277",
+            "the last sighted id sets the session model — the integer sighting, while the float arm still carries its own raw rendering"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model_numeric_id_unmapped:1277.5"),
+            Some(&1),
+            "the float-spelled sighting is disclosed under its raw text"
+        );
+        assert!(
+            !session
+                .metrics
+                .disclosure_counters
+                .contains_key("antigravity_model_numeric_id_unmapped:1417"),
+            "no mapped-lane counter for raw floats"
         );
     }
 

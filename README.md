@@ -82,11 +82,23 @@ curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.
 ```
 
 The install scripts download the release binary for your platform, verify its
-SHA-256 against the published checksum, and add the install directory to your
-PATH (`~/.local/bin`, or `%LOCALAPPDATA%\agenttrace` on Windows). The shell
-installer always fetches the newest release (pin its build-from-source
-fallback with `AGENTTRACE_SOURCE_REF=v0.10.1`); on Windows, pin a release
-with `-Version v0.10.1` (PowerShell).
+SHA-256 against the published checksum, and print how to add the install
+directory to your PATH (`~/.local/bin`, or `%LOCALAPPDATA%\agenttrace` on
+Windows) — they never edit your PATH or shell profile themselves. To pin a
+release, set `AGENTTRACE_VERSION` (rm-550; `-Version`/`-InstallDir` parameters
+cannot reach a script run through `irm | iex`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | AGENTTRACE_VERSION=v0.10.1 sh
+```
+
+```powershell
+$env:AGENTTRACE_VERSION = "v0.10.1"; irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+```
+
+The shell installer's build-from-source fallback stays pinned separately with
+`AGENTTRACE_SOURCE_REF=v0.10.1`, and `AGENTTRACE_INSTALL_DIR` relocates the
+install on both platforms.
 
 Package managers:
 

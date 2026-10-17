@@ -50,7 +50,16 @@ DEST="${INSTALL_DIR}/${BIN}"
 echo "🔍 Fetching latest release..."
 ASSET="${BIN}-${OS}-${ARCH}"
 # AGENTTRACE_DOWNLOAD_URL overrides the release URL (used by offline CI tests).
-RELEASE_URL="${AGENTTRACE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download/${ASSET}}"
+# rm-550 (port of upstream #317, b761269): AGENTTRACE_VERSION pins a
+# release tag ("v0.10.1"); unset or "latest" keeps the moving tag, so
+# scripted installs can pin exactly like the PowerShell installer.
+AGENTTRACE_VERSION="${AGENTTRACE_VERSION:-latest}"
+if [ "$AGENTTRACE_VERSION" = "latest" ]; then
+    RELEASE_PATH="releases/latest/download/${ASSET}"
+else
+    RELEASE_PATH="releases/download/${AGENTTRACE_VERSION}/${ASSET}"
+fi
+RELEASE_URL="${AGENTTRACE_DOWNLOAD_URL:-https://github.com/${REPO}/${RELEASE_PATH}}"
 # AGENTTRACE_SOURCE_URL overrides the source-build clone/fetch URL (offline CI tests).
 SRC_URL="${AGENTTRACE_SOURCE_URL:-https://github.com/${REPO}.git}"
 

@@ -5,7 +5,42 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 64;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 69;
+// Bumped 64 -> 68 at implement, re-minted 68 -> 69 at the
+// independent-review fix (integration of run
+// 477a0c5c43544a92914267cd29f2de5e cycle 2 'recorded-session truth
+// end-to-end', rm-1865 LEAD @ d2a02af).
+// opencode warm-cache entries now fingerprint the FULL message/part
+// fan-out the parse reads (parser::opencode_fanout_paths), not just
+// the session doc — opencode v1.19.0 touches the session doc at
+// prompt START only, so doc-only keys served stale totals silently
+// (fleet PoC warm $0.0011 vs cold $0.0461). Pre-fanout opencode
+// entries re-parse on first hit and re-store fanout-fresh; opencode
+// events also gain the doc's `directory` as cwd so by_project
+// resolves; antigravity numeric model ids map to catalog keys with
+// disclosure (rm-1864). Minted 64 -> 65 at the batch base before a
+// fleet census, re-based as 65 -> 68: the census found 65 TAKEN
+// (run b01c2b6abe28's landed opencode v2 summary_diffs shape rung,
+// merged across the 65-band siblings), 66 landed (run
+// abb3b0914e48, warm-cache truth rm-1385) and 67 held uncommitted
+// (run 6d2a1d8d), so this mint goes ABOVE the frontier per the
+// c7c07e48/58fbbd6c convention (52 -> 66->+ precedent) — one
+// invalidation either way; entries stamped <= 67 already regenerate.
+// REVIEW-FIX RE-MINT (2026-10-17, review eb14625e F1): origin/master
+// landed its OWN rung 68 (run 4f2af62e's org-dimension rung, merge
+// 0b2aa0c, 2026-10-16 18:08Z) ~2.5h after this batch minted — the
+// landed rung keeps its numeral (same convention), so this
+// uncommitted batch re-mints one above; a warm v68 entry written by
+// the landed build would otherwise serve the landed arm's
+// unqualified, unpriced antigravity numeric-id mapping without
+// invalidation. Same review F2: the fan-out manifest widens to the
+// project-doc class — storage/project/<id>.json is enumerated
+// whenever the merged parse would read it (doc `directory` empty,
+// confined projectID, file present), so pre-fix entries re-parse
+// under the widened key too.
+// rm-230 convention: parser-semantics changes that alter reported
+// totals for unchanged files bump the schema so cached sessions
+// regenerate under corrected accounting.
 // Bumped 63 -> 64 (integration of run 90514a3833d04721a6a3ca40ea695423
 // cycle 4 'pi cost truth: recorded-zero disclosure + 1h-tier cache
 // accounting', rm-1052 LEAD + rm-499, conflict case
@@ -1040,6 +1075,23 @@ struct CacheEntry {
     mod_time: i64,
     size: i64,
     session: GoSession,
+    /// rm-1865: every message/part file the opencode parse reads below
+    /// the storage root, fingerprinted at store time. A warm hit
+    /// re-validates every listed file; any missing or changed file is a
+    /// miss (delete + re-parse). `None` on non-opencode lanes, which
+    /// keep the session-doc-only key.
+    #[serde(default)]
+    fanout: Option<Vec<FanoutFile>>,
+}
+
+/// rm-1865: one fan-out file of an opencode warm-cache entry. A file
+/// recorded with mod_time -1 failed to stat at store time and always
+/// mismatches at validation (conservative miss, never a stale hit).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FanoutFile {
+    path: String,
+    mod_time: i64,
+    size: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1958,6 +2010,101 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
         mod_time: file_mod_time_nanos(&metadata),
         size: metadata.len() as i64,
     })
+}
+
+/// rm-1865: store-side snapshot of one fan-out file.
+fn fanout_file(path: &Path) -> FanoutFile {
+    match fs::metadata(path) {
+        Ok(metadata) => FanoutFile {
+            path: path.to_string_lossy().into_owned(),
+            mod_time: file_mod_time_nanos(&metadata),
+            size: metadata.len() as i64,
+        },
+        Err(_) => FanoutFile {
+            path: path.to_string_lossy().into_owned(),
+            mod_time: -1,
+            size: 0,
+        },
+    }
+}
+
+/// rm-1865: is a warm hit for `key` stale because the opencode parse's
+/// fan-out moved under it? Entries without a recorded fan-out are only
+/// stale when the file is opencode-shaped (its parse WOULD fan out —
+/// belt-and-braces against pre-fanout entries surviving a hand-edited
+/// schema stamp); other lanes keep the doc-only key by contract.
+fn fanout_is_stale(path: &Path, key: &str, cache: &SessionCache) -> bool {
+    if !cache.entries.contains_key(key) && !cache.raw_entries.contains_key(key) {
+        return false;
+    }
+    let Some(stored) = stored_fanout(key, cache) else {
+        // entry predates fan-out keys: conservative miss whenever the
+        // file is opencode-shaped (its parse WOULD fan out)
+        return crate::parser::opencode_fanout_paths(&path.to_string_lossy()).is_some();
+    };
+    // Re-enumerate the CURRENT fan-out and compare against the stored
+    // snapshot by path. A file that APPEARED after store (the last-turn
+    // case: opencode touches the session doc at prompt START only, the
+    // transcript keeps growing) is invisible to a stored-list-only
+    // comparison — growth is the whole bug, so enumerate.
+    let Some(current) = crate::parser::opencode_fanout_paths(&path.to_string_lossy()) else {
+        // doc no longer enumerates (unreadable/renamed): conservative miss
+        return true;
+    };
+    if current.len() != stored.len() {
+        return true;
+    }
+    for file in stored {
+        match current
+            .iter()
+            .find(|cur| cur.to_string_lossy() == file.path)
+            .and_then(|cur| file_fingerprint(cur))
+        {
+            Some(fp) => {
+                if fp.mod_time != file.mod_time || fp.size != file.size {
+                    return true;
+                }
+            }
+            // path gone, or unstatable: changed fan-out
+            None => return true,
+        }
+    }
+    false
+}
+
+/// rm-1865: the stored fan-out for an entry, resolved through BOTH
+/// entry maps. A freshly loaded cache keeps every entry lazily in
+/// `raw_entries` (decoded only on first `cached_entry`); resolving the
+/// fan-out through `entries` alone silently bypassed the fan-out gate
+/// for EVERY warm lookup in a new process — the live PoC (message
+/// appended under an untouched session doc) served the stale entry with
+/// its old fan-out intact. The gate must see the entry wherever load
+/// parked it.
+fn stored_fanout(key: &str, cache: &SessionCache) -> Option<Vec<FanoutFile>> {
+    if let Some(fanout) = cache
+        .entries
+        .get(key)
+        .and_then(|entry| entry.fanout.as_ref())
+    {
+        return Some(fanout.clone());
+    }
+    let raw = cache.raw_entries.get(key)?;
+    serde_json::from_value::<Vec<FanoutFile>>(raw.get("fanout")?.clone()).ok()
+}
+
+/// rm-1865: doctor-side disclosure — how many fan-out files a fresh
+/// warm hit for `path` was validated against (None when the entry is
+/// absent, stale, or carries no fan-out).
+pub fn warm_fanout_file_count(path: &Path, cache: &SessionCache) -> Option<usize> {
+    let key = cache_key(path);
+    // resolved through BOTH maps (see `stored_fanout`): a freshly
+    // loaded cache keeps entries lazily in `raw_entries`, and the
+    // disclosure must not go dark exactly when a warm run served.
+    let fanout = stored_fanout(&key, cache)?;
+    if fanout_is_stale(path, &key, cache) {
+        return None;
+    }
+    Some(fanout.len())
 }
 
 pub fn load_session_cache() -> SessionCache {
@@ -2960,6 +3107,13 @@ pub fn cached_session(path: &Path, cache: &mut SessionCache) -> Option<Session> 
         delete_cached_session_key(&key, cache);
         return None;
     }
+    // rm-1865: opencode entries carry the full message/part fan-out
+    // the parse reads; any missing or changed fan-out file means the
+    // parse would report different totals — delete + miss.
+    if fanout_is_stale(path, &key, cache) {
+        delete_cached_session_key(&key, cache);
+        return None;
+    }
     let entry = cached_entry(&key, cache)?;
     // The fallback path is display-only (Session.path is a String),
     // but it must name the real file: decode a losslessly-encoded key
@@ -2975,12 +3129,22 @@ pub fn store_session(
 ) -> anyhow::Result<()> {
     let metadata = fs::metadata(path)?;
     let key = cache_key(path);
+    // rm-1865: opencode entries fingerprint the full message/part
+    // fan-out the parse reads, so warm hits re-validate every file the
+    // parse depends on — not just the session doc.
+    let fanout = crate::parser::opencode_fanout_paths(&path.to_string_lossy()).map(|paths| {
+        paths
+            .iter()
+            .map(|path| fanout_file(path))
+            .collect::<Vec<_>>()
+    });
     cache.entries.insert(
         key.clone(),
         CacheEntry {
             mod_time: file_mod_time_nanos(&metadata),
             size: metadata.len() as i64,
             session: GoSession::from_session(session),
+            fanout,
         },
     );
     cache.raw_entries.remove(&key);
@@ -3456,6 +3620,540 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files must not survive: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_warm_cache_misses_when_fanout_moves_under_the_session_doc() {
+        // rm-1865: opencode v1.19.0 touches the session doc at prompt
+        // START only, so a transcript that grows after the last prompt
+        // never moves the doc. A doc-only freshness key kept serving the
+        // stale warm entry (fleet PoC: warm $0.0011 vs cold $0.0461,
+        // silent). The fan-out key must miss when ANY message/part file
+        // changes, even though the session doc itself is untouched.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-opencode-warm-miss-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let session_id = "ses_warm_miss";
+        let dir = root
+            .join("opencode")
+            .join("storage")
+            .join("session")
+            .join("proj");
+        let message_dir = root
+            .join("opencode")
+            .join("storage")
+            .join("message")
+            .join(session_id);
+        fs::create_dir_all(&dir).expect("create session dir");
+        fs::create_dir_all(&message_dir).expect("create message dir");
+        let doc_path = dir.join("ses_warm_miss.json");
+        fs::write(
+            &doc_path,
+            format!(
+                "{{\"id\":\"{session_id}\",\"projectID\":\"proj\",\"time\":{{\"created\":\"2026-09-01T10:00:00Z\",\"lastModified\":\"2026-09-01T10:00:00Z\"}},\"directory\":\"/home/user/proj\"}}"
+            ),
+        )
+        .expect("write session doc");
+        fs::write(
+            message_dir.join("msg_1.json"),
+            "{\"id\":\"msg_1\",\"role\":\"assistant\",\"time\":{\"created\":\"2026-09-01T10:00:01Z\",\"lastModified\":\"2026-09-01T10:00:01Z\"},\"tokens\":{\"input\":10,\"output\":5}}",
+        )
+        .expect("write first message");
+        let session = Session {
+            name: "warm-miss".to_string(),
+            path: doc_path.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let mut cache = SessionCache::default();
+        store_session(&doc_path, &session, &mut cache).expect("store warm entry");
+        assert!(
+            cached_session(&doc_path, &mut cache).is_some(),
+            "nothing moved yet: the warm hit must serve"
+        );
+        // the last turn arrives WITHOUT touching the session doc
+        fs::write(
+            message_dir.join("msg_2.json"),
+            "{\"id\":\"msg_2\",\"role\":\"assistant\",\"time\":{\"created\":\"2026-09-01T10:05:00Z\",\"lastModified\":\"2026-09-01T10:05:00Z\"},\"tokens\":{\"input\":1000,\"output\":500}}",
+        )
+        .expect("write second message");
+        assert!(
+            cached_session(&doc_path, &mut cache).is_none(),
+            "a fan-out file changed under an untouched session doc: the entry MUST miss"
+        );
+        assert_eq!(
+            warm_fanout_file_count(&doc_path, &cache),
+            None,
+            "the stale entry must not report a fan-out scope"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_warm_cache_miss_fires_on_the_lazy_raw_entry_path() {
+        // rm-1865 regression: `load_session_cache` parks EVERY entry
+        // lazily in `raw_entries` (decoded only on first
+        // `cached_entry`). The fan-out gate originally resolved the
+        // entry through `entries` alone, so every warm lookup in a NEW
+        // process skipped the gate entirely — the live PoC (message
+        // appended under an untouched session doc, fresh binary) served
+        // the stale entry with its old 2-file fan-out. Reconstructed
+        // here with the entry parked exactly where load parks it.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-opencode-warm-lazy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let session_id = "ses_warm_lazy";
+        let dir = root
+            .join("opencode")
+            .join("storage")
+            .join("session")
+            .join("proj");
+        let message_dir = root
+            .join("opencode")
+            .join("storage")
+            .join("message")
+            .join(session_id);
+        fs::create_dir_all(&dir).expect("create session dir");
+        fs::create_dir_all(&message_dir).expect("create message dir");
+        let doc_path = dir.join("ses_warm_lazy.json");
+        fs::write(
+            &doc_path,
+            format!(
+                "{{\"id\":\"{session_id}\",\"projectID\":\"proj\",\"time\":{{\"created\":\"2026-09-01T10:00:00Z\",\"lastModified\":\"2026-09-01T10:00:00Z\"}},\"directory\":\"/home/user/proj\"}}"
+            ),
+        )
+        .expect("write session doc");
+        fs::write(
+            message_dir.join("msg_1.json"),
+            "{\"id\":\"msg_1\",\"role\":\"assistant\",\"time\":{\"created\":\"2026-09-01T10:00:01Z\"},\"tokens\":{\"input\":10,\"output\":5}}",
+        )
+        .expect("write first message");
+        let session = Session {
+            name: "warm-lazy".to_string(),
+            path: doc_path.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                // a lazily-parked entry is inspected through the raw
+                // JSON (the empty-source-tool gate reads raw_entries
+                // only); real parses always stamp a source tool.
+                source_tool: "opencode".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let mut cache = SessionCache::default();
+        store_session(&doc_path, &session, &mut cache).expect("store warm entry");
+        // Park the entry exactly where a freshly loaded cache parks it:
+        // raw JSON in `raw_entries`, `entries` empty.
+        let key = cache_key(&doc_path);
+        let raw = serde_json::to_value(cache.entries.get(&key).expect("stored entry"))
+            .expect("serialize entry");
+        assert!(
+            raw.get("fanout").is_some(),
+            "the stored entry must carry its fan-out snapshot"
+        );
+        let mut lazy = SessionCache {
+            raw_entries: BTreeMap::from([(key.clone(), raw)]),
+            ..SessionCache::default()
+        };
+        // positive arm FIRST, before any promotion can move the entry
+        // into `entries`: a fresh hit on the lazy path must serve.
+        assert!(
+            cached_session(&doc_path, &mut lazy).is_some(),
+            "an intact lazy entry must still serve a warm hit"
+        );
+        // the last turn arrives WITHOUT touching the session doc; the
+        // entry is now promoted into `entries` (the cached_entry decode
+        // above), so re-park it raw to pin the LAZY gate, not the
+        // promoted one.
+        fs::write(
+            message_dir.join("msg_2.json"),
+            "{\"id\":\"msg_2\",\"role\":\"assistant\",\"time\":{\"created\":\"2026-09-01T10:05:00Z\"},\"tokens\":{\"input\":1000,\"output\":500}}",
+        )
+        .expect("write second message");
+        let raw_again = serde_json::to_value(cache.entries.get(&key).expect("still stored"))
+            .expect("serialize entry again");
+        let mut lazy_stale = SessionCache {
+            raw_entries: BTreeMap::from([(key.clone(), raw_again)]),
+            ..SessionCache::default()
+        };
+        assert!(
+            cached_session(&doc_path, &mut lazy_stale).is_none(),
+            "a changed fan-out under a lazily-parked entry MUST miss — the entries-only lookup was the live stale-serve bug"
+        );
+        assert!(
+            !lazy_stale.raw_entries.contains_key(&key),
+            "the stale lazy entry must be deleted from raw_entries too"
+        );
+        assert_eq!(
+            warm_fanout_file_count(&doc_path, &lazy_stale),
+            None,
+            "the stale lazy entry must not report a fan-out scope"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_warm_cache_stays_fresh_and_discloses_fanout_scope() {
+        // rm-1865: an unchanged fan-out serves a warm hit whose scope is
+        // inspectable: warm_fanout_file_count reports how many fan-out
+        // files the hit was validated against.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-opencode-warm-scope-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let session_id = "ses_warm_scope";
+        let dir = root
+            .join("opencode")
+            .join("storage")
+            .join("session")
+            .join("proj");
+        let message_dir = root
+            .join("opencode")
+            .join("storage")
+            .join("message")
+            .join(session_id);
+        fs::create_dir_all(&dir).expect("create session dir");
+        fs::create_dir_all(&message_dir).expect("create message dir");
+        let doc_path = dir.join("ses_warm_scope.json");
+        fs::write(
+            &doc_path,
+            format!(
+                "{{\"id\":\"{session_id}\",\"projectID\":\"proj\",\"time\":{{\"created\":\"2026-09-01T10:00:00Z\",\"lastModified\":\"2026-09-01T10:00:00Z\"}}}}"
+            ),
+        )
+        .expect("write session doc");
+        fs::write(
+            message_dir.join("msg_1.json"),
+            "{\"id\":\"msg_1\",\"role\":\"assistant\"}",
+        )
+        .expect("write message");
+        let session = Session {
+            name: "warm-scope".to_string(),
+            path: doc_path.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let mut cache = SessionCache::default();
+        store_session(&doc_path, &session, &mut cache).expect("store warm entry");
+        assert!(cached_session(&doc_path, &mut cache).is_some());
+        assert_eq!(
+            warm_fanout_file_count(&doc_path, &cache),
+            Some(1),
+            "the hit discloses it validated the single fan-out file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_warm_cache_misses_when_a_part_file_joins_the_fanout() {
+        // rm-1865 acceptance (5): the fan-out key is closed under the
+        // file classes the parse reads — no file class may join the
+        // fan-out later without entering the key. This fixture adds a
+        // NEW PART file under storage/part/<message>/ after the warm
+        // entry was stored, touching neither the session doc nor the
+        // message record: the fan-out enumeration grows, so the warm
+        // hit MUST miss (test-enforced, not convention-enforced).
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-opencode-warm-part-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let session_id = "ses_warm_part";
+        let dir = root
+            .join("opencode")
+            .join("storage")
+            .join("session")
+            .join("proj");
+        let message_dir = root
+            .join("opencode")
+            .join("storage")
+            .join("message")
+            .join(session_id);
+        let part_dir = root
+            .join("opencode")
+            .join("storage")
+            .join("part")
+            .join("msg_1");
+        fs::create_dir_all(&dir).expect("create session dir");
+        fs::create_dir_all(&message_dir).expect("create message dir");
+        fs::create_dir_all(&part_dir).expect("create part dir");
+        let doc_path = dir.join("ses_warm_part.json");
+        fs::write(
+            &doc_path,
+            format!(
+                "{{\"id\":\"{session_id}\",\"projectID\":\"proj\",\"time\":{{\"created\":\"2026-09-01T10:00:00Z\",\"lastModified\":\"2026-09-01T10:00:00Z\"}}}}"
+            ),
+        )
+        .expect("write session doc");
+        fs::write(
+            message_dir.join("msg_1.json"),
+            "{\"id\":\"msg_1\",\"role\":\"assistant\"}",
+        )
+        .expect("write message");
+        fs::write(
+            part_dir.join("p1.json"),
+            "{\"type\":\"text\",\"text\":\"first part\"}",
+        )
+        .expect("write first part");
+        let session = Session {
+            name: "warm-part".to_string(),
+            path: doc_path.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let mut cache = SessionCache::default();
+        store_session(&doc_path, &session, &mut cache).expect("store warm entry");
+        assert!(
+            cached_session(&doc_path, &mut cache).is_some(),
+            "nothing moved yet: the warm hit must serve"
+        );
+        assert_eq!(
+            warm_fanout_file_count(&doc_path, &cache),
+            Some(2),
+            "the hit validated BOTH fan-out files (message + its part)"
+        );
+        // a NEW part file joins the fan-out — doc and message untouched
+        fs::write(
+            part_dir.join("p2.json"),
+            "{\"type\":\"text\",\"text\":\"a part file the parse did not see at store time\"}",
+        )
+        .expect("write second part");
+        assert!(
+            cached_session(&doc_path, &mut cache).is_none(),
+            "a part file joined the fan-out: the entry MUST miss — no file class may enter the parse without entering the key"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_warm_cache_misses_when_the_project_doc_moves_under_the_store() {
+        // Independent-review fix F2 (run 477a0c5c cycle 2, review
+        // eb14625e): the landed sibling arm resolves the session's
+        // working directory through the v1-store project doc
+        // (`storage/project/<id>.json`) whenever the session doc
+        // carries no `directory`, so the project doc is part of the
+        // parse's read set at the merged base — it must sit in the
+        // fan-out key too, or a project-doc-only edit leaves a warm
+        // entry serving stale by_project attribution. Enumerated only
+        // under the landed read predicate: doc `directory` empty,
+        // CONFINED projectID, file present.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-opencode-warm-project-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let session_id = "ses_warm_project";
+        let dir = root
+            .join("opencode")
+            .join("storage")
+            .join("session")
+            .join("proj");
+        let message_dir = root
+            .join("opencode")
+            .join("storage")
+            .join("message")
+            .join(session_id);
+        let project_dir = root.join("opencode").join("storage").join("project");
+        fs::create_dir_all(&dir).expect("create session dir");
+        fs::create_dir_all(&message_dir).expect("create message dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let doc_path = dir.join("ses_warm_project.json");
+        // no `directory` on the doc: the landed parse falls through to
+        // the project doc
+        fs::write(
+            &doc_path,
+            format!(
+                "{{\"id\":\"{session_id}\",\"projectID\":\"proj\",\"time\":{{\"created\":\"2026-09-01T10:00:00Z\",\"lastModified\":\"2026-09-01T10:00:00Z\"}}}}"
+            ),
+        )
+        .expect("write session doc");
+        fs::write(
+            message_dir.join("msg_1.json"),
+            "{\"id\":\"msg_1\",\"role\":\"assistant\"}",
+        )
+        .expect("write message");
+        fs::write(
+            project_dir.join("proj.json"),
+            "{\"directory\":\"/home/user/proj\"}",
+        )
+        .expect("write project doc");
+        let session = Session {
+            name: "warm-project".to_string(),
+            path: doc_path.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let mut cache = SessionCache::default();
+        store_session(&doc_path, &session, &mut cache).expect("store warm entry");
+        assert!(
+            cached_session(&doc_path, &mut cache).is_some(),
+            "nothing moved yet: the warm hit must serve"
+        );
+        assert_eq!(
+            warm_fanout_file_count(&doc_path, &cache),
+            Some(2),
+            "the hit validated BOTH fan-out files (message + the project doc)"
+        );
+        // the project doc moves under the store — session doc and
+        // message untouched — so by_project attribution would change
+        // on a re-parse: the entry MUST miss
+        fs::write(
+            project_dir.join("proj.json"),
+            "{\"directory\":\"/home/user/renamed-elsewhere\"}",
+        )
+        .expect("rewrite project doc");
+        assert!(
+            cached_session(&doc_path, &mut cache).is_none(),
+            "the project doc changed under an untouched session doc: the entry MUST miss"
+        );
+        // and the predicate: a doc that CARRIES its own `directory`
+        // never reads the project doc, so the class must NOT be
+        // enumerated and a later project-doc edit must NOT invalidate
+        fs::write(
+            &doc_path,
+            format!(
+                "{{\"id\":\"{session_id}\",\"projectID\":\"proj\",\"directory\":\"/home/user/proj\",\"time\":{{\"created\":\"2026-09-01T10:00:00Z\",\"lastModified\":\"2026-09-01T10:00:00Z\"}}}}"
+            ),
+        )
+        .expect("stamp directory onto the doc");
+        let mut cache = SessionCache::default();
+        store_session(&doc_path, &session, &mut cache).expect("store with directory on doc");
+        assert!(
+            cached_session(&doc_path, &mut cache).is_some(),
+            "re-stored under the narrowed key: the warm hit must serve"
+        );
+        assert_eq!(
+            warm_fanout_file_count(&doc_path, &cache),
+            Some(1),
+            "a doc that carries its own directory does not read the project doc: not enumerated"
+        );
+        fs::write(
+            project_dir.join("proj.json"),
+            "{\"directory\":\"/home/user/changed-again\"}",
+        )
+        .expect("rewrite project doc again");
+        assert!(
+            cached_session(&doc_path, &mut cache).is_some(),
+            "the parse does not read the project doc here: its edit must NOT invalidate"
+        );
+        // and a hostile projectID never enumerates a machine path:
+        // the guard mirrors the landed parse's confinement check
+        // (`..`-prefixed would resolve outside storage/project — the
+        // decoy proves the join would have found it)
+        let hostile_doc = dir.join("ses_warm_hostile.json");
+        fs::write(
+            &hostile_doc,
+            "{\"id\":\"ses_warm_hostile\",\"projectID\":\"../escape\",\"time\":{\"created\":\"2026-09-01T10:00:00Z\",\"lastModified\":\"2026-09-01T10:00:00Z\"}}",
+        )
+        .expect("write hostile doc");
+        fs::write(
+            root.join("opencode").join("storage").join("escape.json"),
+            "{\"directory\":\"/etc\"}",
+        )
+        .expect("write decoy");
+        let hostile_session = Session {
+            name: "warm-hostile".to_string(),
+            path: hostile_doc.to_string_lossy().to_string(),
+            ..session.clone()
+        };
+        let mut cache = SessionCache::default();
+        store_session(&hostile_doc, &hostile_session, &mut cache).expect("store hostile entry");
+        assert_eq!(
+            warm_fanout_file_count(&hostile_doc, &cache),
+            Some(0),
+            "a hostile projectID enumerates NOTHING — no machine paths, not the decoy"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_session_doc_directory_becomes_event_cwd() {
+        // rm-1865: the session doc's `directory` was never stamped onto
+        // events, so every opencode Session kept an empty cwd and fell
+        // into the "unknown" project bucket in by_project views.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-opencode-cwd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let session_id = "ses_cwd";
+        let dir = root
+            .join("opencode")
+            .join("storage")
+            .join("session")
+            .join("proj");
+        let message_dir = root
+            .join("opencode")
+            .join("storage")
+            .join("message")
+            .join(session_id);
+        fs::create_dir_all(&dir).expect("create session dir");
+        fs::create_dir_all(&message_dir).expect("create message dir");
+        let doc_path = dir.join("ses_cwd.json");
+        fs::write(
+            &doc_path,
+            format!(
+                "{{\"id\":\"{session_id}\",\"projectID\":\"proj\",\"directory\":\"/home/user/proj\",\"time\":{{\"created\":\"2026-09-01T10:00:00Z\",\"lastModified\":\"2026-09-01T10:00:00Z\"}}}}"
+            ),
+        )
+        .expect("write session doc");
+        fs::write(
+            message_dir.join("msg_1.json"),
+            "{\"id\":\"msg_1\",\"role\":\"user\",\"time\":{\"created\":\"2026-09-01T10:00:01Z\",\"lastModified\":\"2026-09-01T10:00:01Z\"}}",
+        )
+        .expect("write message");
+        let part_dir = root
+            .join("opencode")
+            .join("storage")
+            .join("part")
+            .join("msg_1");
+        fs::create_dir_all(&part_dir).expect("create part dir");
+        fs::write(
+            part_dir.join("p1.json"),
+            "{\"type\":\"text\",\"text\":\"hello\"}",
+        )
+        .expect("write part");
+        let parsed = crate::parser::parse_file(&doc_path).expect("parse opencode session");
+        assert_eq!(
+            parsed.cwd, "/home/user/proj",
+            "the session doc's directory must group the session out of the unknown bucket"
+        );
+        assert_eq!(
+            crate::insights::project_name(&parsed),
+            "proj",
+            "by_project resolves the stamped cwd to the project directory name, not the unknown sentinel"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -4637,6 +5335,7 @@ mod tests {
                         mod_time: 900_000 + i * 1_000,
                         size: 1,
                         session,
+                        fanout: None,
                     },
                 );
             }

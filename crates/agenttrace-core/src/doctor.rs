@@ -120,6 +120,10 @@ pub struct DoctorStatuslineReport {
     pub bytes: u64,
 }
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorDirReport {
     pub name: String,
@@ -129,6 +133,12 @@ pub struct DoctorDirReport {
     pub parsed: usize,
     pub failed: usize,
     pub cache_hits: usize,
+    /// rm-1865: total fan-out files the directory's warm hits were
+    /// validated against (opencode message/part fan-out). Makes warm
+    /// staleness scope inspectable: 0 while no fan-out-carrying hit
+    /// served, growing as fan-out-fresh entries serve.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub warm_fanout_files: usize,
     /// Present when the provider directory is itself a symlink, so the
     /// doctor names the link it follows instead of implying a plain
     /// directory (cycle 7, Codex `#42135`).
@@ -868,12 +878,17 @@ fn doctor_dir_report(
 ) -> DoctorDirReport {
     let mut parsed = 0;
     let mut cache_hits = 0;
+    let mut warm_fanout_files = 0;
     let mut failure_samples = Vec::new();
     for file in files {
         // Keep the parsed session where the decode disclosure (rm-381) can
         // see it; the parse accounting below is unchanged.
         let session = if let Some(session) = cached_session(file, cache) {
             cache_hits += 1;
+            // rm-1865: disclose the freshness scope of the hit — how
+            // many fan-out files it was validated against.
+            warm_fanout_files +=
+                crate::session_cache::warm_fanout_file_count(file, cache).unwrap_or(0);
             parsed += 1;
             Some(session)
         } else if let Ok(session) = parse_file(file) {
@@ -915,6 +930,7 @@ fn doctor_dir_report(
         parsed,
         failed: files.len().saturating_sub(parsed),
         cache_hits,
+        warm_fanout_files,
         symlink_target: symlink_target_of(path),
         failure_samples,
     }
@@ -996,6 +1012,7 @@ fn doctor_sqlite_directories(
             parsed,
             failed,
             cache_hits: 0,
+            warm_fanout_files: 0,
             symlink_target: symlink_target_of(&path),
             failure_samples,
         });
@@ -1273,8 +1290,16 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
             None => String::new(),
         };
         out.push_str(&format!(
-            "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} {}{}\n",
-            dir.name, status, dir.files, dir.parsed, dir.failed, dir.cache_hits, dir.path, symlink
+            "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} warmfanout={:<5} {}{}\n",
+            dir.name,
+            status,
+            dir.files,
+            dir.parsed,
+            dir.failed,
+            dir.cache_hits,
+            dir.warm_fanout_files,
+            dir.path,
+            symlink
         ));
         for sample in &dir.failure_samples {
             out.push_str(&format!("    failed: {sample}\n"));

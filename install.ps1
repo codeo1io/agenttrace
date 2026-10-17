@@ -1,20 +1,51 @@
 # agenttrace Windows installer (PowerShell)
 # Usage: powershell -ExecutionPolicy Bypass -File install.ps1
 # Or:    iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+#
+# Environment (rm-550, port of upstream #317 b761269; used when the
+# matching parameter is not given, which is always the case under
+# `irm | iex`):
+#   AGENTTRACE_VERSION       release tag to install (default: latest), e.g. v0.10.1
+#   AGENTTRACE_INSTALL_DIR   install directory (default: %LOCALAPPDATA%\agenttrace)
+#
+# Unlike upstream's installer this fork NEVER edits the user PATH —
+# when the install directory is not on PATH it prints the command to
+# add it — so upstream's AGENTTRACE_NO_MODIFY_PATH knob has no
+# behavior to gate here and is deliberately not honored.
 
 param(
-    [string]$Version = "latest",
-    [string]$InstallDir = "$env:LOCALAPPDATA\agenttrace"
+    # rm-550 (port of upstream #317, b761269): the installer honors the
+    # same environment variables as install.sh so CI and scripted users
+    # can pin a version or relocate the install without editing the
+    # one-liner. Explicit parameters still win over the environment.
+    [string]$Version = $(if ($env:AGENTTRACE_VERSION) { $env:AGENTTRACE_VERSION } else { "latest" }),
+    [string]$InstallDir = $(if ($env:AGENTTRACE_INSTALL_DIR) { $env:AGENTTRACE_INSTALL_DIR } else { "$env:LOCALAPPDATA\agenttrace" })
 )
 
 $REPO = "luoyuctl/agenttrace"
 $BIN = "agenttrace.exe"
 
-# Detect architecture
+# Detect architecture. rm-550 (port of upstream #314, 828bf6c):
+# ProcessArchitecture is unreliable on stock Windows PowerShell 5.1 —
+# modules like PSReadLine 2.0.0 export their own
+# System.Runtime.InteropServices.RuntimeInformation type, shadowing the
+# CLR's, and its ProcessArchitecture property comes back EMPTY — so the
+# switch fell through to 'Unsupported architecture: ' and the
+# `irm | iex` one-liner died. Fall back to the well-known
+# PROCESSOR_ARCHITECTURE / PROCESSOR_ARCHITEW6432 environment variables
+# (AMD64 spelled out, matching Windows' own values) before giving up.
 $ARCH = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
     "X64"   { "amd64" }
     "Arm64" { "arm64" }
-    default { throw "Unsupported architecture: $_" }
+    default {
+        # env-var fallback: AMD64 in native or WOW64 form, ARM64
+        $envArch = "$env:PROCESSOR_ARCHITEW6432"; if (-not $envArch) { $envArch = "$env:PROCESSOR_ARCHITECTURE" }
+        switch ($envArch) {
+            "AMD64"  { "amd64" }
+            "ARM64"  { "arm64" }
+            default  { throw "Unsupported architecture: $_ (env: $envArch)" }
+        }
+    }
 }
 
 Write-Host "🔍 Fetching latest release..." -ForegroundColor Cyan
