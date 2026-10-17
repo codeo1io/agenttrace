@@ -409,12 +409,14 @@ impl App {
         // CLI reconciles before any view — replay families must
         // reconcile here too, or the TUI rendered double-counted
         // family totals until the first reload landed.
-        let _replay = reconcile_codex_multiagent_replays(&mut sessions);
+        let replay = reconcile_codex_multiagent_replays(&mut sessions);
         let overview = compute_overview(&sessions);
         let project_identities = sessions
             .iter()
             .map(|session| (session.path.clone(), resolve_project(session)))
             .collect();
+        let boot_parsed = sessions.len();
+        let boot_sources = source_counts(&sessions);
         let mut app = Self {
             sessions,
             project_identities,
@@ -449,7 +451,29 @@ impl App {
             sort_desc: true,
             scroll: 0,
             pending_load: None,
-            load_state: LoadState::default(),
+            load_state: LoadState {
+                // rm-1543: the boot corpus lands already reconciled —
+                // the load summary discloses the replay adjustment on
+                // FIRST launch instead of only after the first reload
+                // (reload parity: the Complete handler threads the same
+                // count). Boot was a direct parse, not a cache read, so
+                // cache_hits stays zero; unlinked-subagent detection is
+                // reload-side only and is not claimed here.
+                //
+                // The phase only advances to Ready when the boot
+                // actually adjusted replay children — a corpus with
+                // nothing to disclose keeps the historical idle panel
+                // (pinned by tests; no disclosure exists to conceal).
+                phase: if replay.children_adjusted > 0 {
+                    LoadPhase::Ready
+                } else {
+                    LoadPhase::Idle
+                },
+                parsed: boot_parsed,
+                replay_children_adjusted: replay.children_adjusted,
+                sources: boot_sources,
+                ..LoadState::default()
+            },
             language: Language::En,
             derived: OverviewDerived::default(),
             raw_report_expanded: false,

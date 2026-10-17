@@ -326,6 +326,14 @@ fn render_status_line(payload: &Value) -> String {
         .and_then(|cost| cost.get("total_cost_usd"))
         .and_then(Value::as_f64)
     {
+        // rm-1544: honest magnitudes in the render lane — the one-line
+        // statusline must never emit junk ($NaN, $inf) or a negative
+        // total ($-5.00). Non-finite and negative costs clamp to the
+        // zero boundary, matching the rm-1500 undisclosed/zero
+        // discipline the aggregate folds already enforce (lib.rs
+        // folds skip-and-count non-finite costs; the render lane
+        // cannot skip the segment, so it clamps).
+        let cost = if cost.is_finite() { cost.max(0.0) } else { 0.0 };
         parts.push(format!("${cost:.2}"));
     }
     if parts.is_empty() {
@@ -4231,6 +4239,44 @@ mod tests {
         // line, never an empty string (a blank status line breaks the
         // host).
         assert_eq!(render_status_line(&serde_json::json!({})), "agenttrace");
+    }
+
+    #[test]
+    fn status_line_cost_magnitudes_are_honest() {
+        // rm-1544 red-first: the host payload is trusted, but a
+        // negative total must never reach the line as $-5.00 — the
+        // render lane clamps at the zero boundary (the rm-1500
+        // undisclosed/zero dialect; the aggregate folds already
+        // skip-and-count non-finite costs).
+        //
+        // Non-finite reachability, pinned by this test: serde_json
+        // REJECTS overflowing literals ("number out of range") and
+        // `Value` cannot hold NaN/inf at all (json!(f64::NAN) becomes
+        // null), so NaN/inf cannot ride a real payload today. The
+        // is_finite guard in render_status_line stays as
+        // defense-in-depth for future payload sources, and the null
+        // coercion below documents why the segment disappears instead
+        // of rendering junk.
+        let neg: Value = serde_json::from_str(
+            r#"{"hook_event_name":"Status","session_id":"neg-1",
+                "transcript_path":"/tmp/neg.jsonl","cwd":"/work","version":"2.0.9",
+                "model":{"id":"claude-sonnet-4-5"},
+                "cost":{"total_cost_usd":-5.0}}"#,
+        )
+        .expect("negative-cost fixture parses");
+        let line = render_status_line(&neg);
+        assert!(line.contains("$0.00"), "negative cost clamps: {line}");
+        assert!(!line.contains("$-"), "negative magnitude leaked: {line}");
+
+        assert!(serde_json::from_str::<Value>("1e999").is_err());
+        assert!(serde_json::json!({"x": f64::INFINITY})
+            .get("x")
+            .unwrap()
+            .is_null());
+        let null_cost = serde_json::json!({
+            "cost": {"total_cost_usd": serde_json::json!(f64::NAN)}
+        });
+        assert!(null_cost["cost"]["total_cost_usd"].is_null());
     }
 
     #[test]
