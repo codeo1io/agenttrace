@@ -120,6 +120,14 @@ pub struct SessionCostAudit {
     pub component_cost_usd: Option<PriceBreakdown>,
     pub estimated_cost_usd: Option<f64>,
     pub stored_estimated_cost_usd: f64,
+    /// rm-1965: effective date (YYYY-MM-DD) of the rate row that served the
+    /// "current" recompute, judged against the session's own timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_date: Option<String>,
+    /// rm-1965: `at_session`, or `newer_than_session` when the recompute
+    /// repriced the session with rates that postdate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_basis: Option<String>,
     /// Vendor-recorded cost this session carries, when any (rm-570).
     /// It rides the current-rate comparison at face value on the
     /// rm-520 same-basis re-price — or withholds the re-price when
@@ -216,7 +224,8 @@ fn current_cost_estimate(
     service_tier: Option<&str>,
     tokens: &TokenBreakdown,
     recorded: &RecordedCostBasis,
-) -> Option<(String, PriceBreakdown, PriceBreakdown)> {
+    session_ts: Option<DateTime<Utc>>,
+) -> Option<(String, PriceBreakdown, PriceBreakdown, pricing::RateBasis)> {
     if model == "multiple" {
         return None;
     }
@@ -224,7 +233,12 @@ fn current_cost_estimate(
     // session(s) actually ran on — an untiered recompute priced every
     // flex session at the standard row and flagged a false drift
     // (current 48 vs stored 36 on a flex+standard corpus).
-    let rate = pricing::lookup_price_tiered(model, service_tier);
+    // rm-1965: the recompute stays at CURRENT rates by design (rm-436 drift
+    // detection) but discloses how the serving row relates to the session it
+    // repriced — selection at `None` (newest rate), arm judged against
+    // `session_ts`.
+    let priced = pricing::rate_basis_against_session(model, service_tier, session_ts);
+    let rate = priced.price;
     // rm-1508: the recompute bills the same absent-rate fallback the
     // stored estimate did (cr = input rate, cw = 1.25× input), so the
     // drift check never flags a false mismatch on fallback-priced
@@ -279,7 +293,7 @@ fn current_cost_estimate(
     } else {
         source
     };
-    Some((source, rates, components))
+    Some((source, rates, components, priced.basis))
 }
 
 /// rm-521: `model_used == "multiple"` has two producers with opposite
@@ -602,7 +616,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             } else if mixed_tiers {
                 None
             } else {
-                current_cost_estimate(&model, row_tier, &row.tokens, &row.recorded)
+                current_cost_estimate(&model, row_tier, &row.tokens, &row.recorded, None)
             };
             let pricing_source = if row.split_lost {
                 // rm-578: withheld for the same reason as the estimate
@@ -616,7 +630,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             } else {
                 current
                     .as_ref()
-                    .map(|(source, _, _)| source.clone())
+                    .map(|(source, _, _, _)| source.clone())
                     .unwrap_or_else(|| "unavailable: multiple models".to_string())
             };
             let (pricing_status, pricing_note) = if model == "multiple" {
@@ -657,7 +671,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 pricing_note,
                 current
                     .as_ref()
-                    .map(|(_, _, components)| round4(components.total)),
+                    .map(|(_, _, components, _)| round4(components.total)),
                 row.cost,
                 row.recorded.usd,
                 !row.split_lost,
@@ -703,7 +717,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 pricing_note
             };
             let (rates_per_million_usd, component_cost_usd, estimated_cost_usd) = current
-                .map(|(_, rates, components)| {
+                .map(|(_, rates, components, _)| {
                     // The current-rate total carries the recorded
                     // dollars at face value (folded into
                     // `components.total` by `current_cost_estimate`)
@@ -826,6 +840,8 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
             session.metrics.service_tier.as_deref(),
             &tokens,
             &recorded,
+            // rm-1965: judge the serving row against the session's own time.
+            session.metrics.timestamps.first().copied(),
         )
     };
     // rm-570 (run e88f2da2 cycle 3): mark vendor-recorded dollars on
@@ -879,7 +895,7 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         pricing_note,
         current
             .as_ref()
-            .map(|(_, _, components)| round4(components.total)),
+            .map(|(_, _, components, _)| round4(components.total)),
         session.metrics.cost_estimated,
         recorded_usd,
         split_reproducible,
@@ -910,11 +926,13 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
     } else {
         current
             .as_ref()
-            .map(|(source, _, _)| source.clone())
+            .map(|(source, _, _, _)| source.clone())
             .unwrap_or_else(|| "unavailable: multiple models".to_string())
     };
+    // rm-1965: how the recompute's serving row relates to the session.
+    let rate_basis = current.as_ref().map(|(_, _, _, basis)| basis.clone());
     let (rates_per_million_usd, component_cost_usd, estimated_cost_usd) = current
-        .map(|(_, rates, components)| {
+        .map(|(_, rates, components, _)| {
             // rm-520: `components.total` already carries the recorded
             // dollars at face value, so the current-rate total shares
             // the stored estimate's basis.
@@ -937,6 +955,16 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         component_cost_usd,
         estimated_cost_usd,
         stored_estimated_cost_usd: round4(session.metrics.cost_estimated),
+        rate_date: rate_basis.as_ref().map(|basis| basis.rate_date.clone()),
+        rate_basis: rate_basis
+            .as_ref()
+            .map(|basis| {
+                match basis.basis {
+                    pricing::RateBasisArm::AtSession => "at_session",
+                    pricing::RateBasisArm::NewerThanSession => "newer_than_session",
+                }
+                .to_string()
+            }),
         recorded_cost_usd: if recorded_basis {
             Some(round4(session.metrics.upstream_cost_usd))
         } else {

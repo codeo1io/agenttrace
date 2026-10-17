@@ -19,6 +19,180 @@ const PRICING_URL: &str =
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
 const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+
+/// rm-1965: one dated rate STATE for a catalog key, observed live
+/// upstream. models.dev edits rows IN PLACE (research C1: eight edits
+/// within six hours on 2026-10-17 alone, catalog row count unchanged),
+/// so the bundled snapshot is just one state on a timeline — these rows
+/// record the others, each with the capture that proves it. Rates are
+/// USD per million tokens, matching the in-memory [`Price`] basis
+/// (the LiteLLM loader scales its per-token fields ×1e6).
+#[derive(Debug, Clone, Copy)]
+pub struct RateHistoryRow {
+    /// Catalog key the state belongs to: the serving key when the ladder
+    /// resolves one (e.g. `openrouter/~deepseek/deepseek-v4-flash-latest`),
+    /// else the raw model id as the session recorded it (e.g.
+    /// `kilo/tencent/hy3` — the LiteLLM snapshot carries no kilo rows).
+    pub key: &'static str,
+    /// Date (YYYY-MM-DD UTC) this state is known live from — the earliest
+    /// capture that observed it. Same-date rows keep observation order.
+    pub effective: &'static str,
+    /// The capture that first observed this state (models.dev api.json)
+    /// — the durable evidence trail.
+    pub observed: &'static str,
+    /// Standard input rate (USD per million tokens) from `effective` on.
+    pub input: f64,
+    /// Standard output rate (USD per million tokens) from `effective` on.
+    pub output: f64,
+    /// Cache-read rate (USD per million tokens) when the state published
+    /// one; `None` is a real "not published at that state" and bills at
+    /// the disclosed input-rate fallback (rm-1508 semantics).
+    pub cache_read: Option<f64>,
+    /// Cache-write rate (USD per million tokens), when published.
+    pub cache_write: Option<f64>,
+    /// Provenance note — the capture runs and the edit's shape.
+    pub note: &'static str,
+}
+
+const RATE_HISTORY: &[RateHistoryRow] = &[
+    RateHistoryRow { key: "kilo/tencent/hy3", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.0825, output: 0.33, cache_read: Some(0.020625), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/tencent/hy3", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.132, output: 0.528, cache_read: Some(0.033), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/tencent/hy3", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.0825, output: 0.33, cache_read: Some(0.020625), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/tencent/hy4-preview", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.7506, output: 2.2509, cache_read: Some(0.0378), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/tencent/hy4-preview", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.834, output: 2.501, cache_read: Some(0.042), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/tencent/hy4-preview", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.7506, output: 2.2509, cache_read: Some(0.0378), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/z-ai/glm-4.7", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.6, output: 2.2, cache_read: Some(0.11), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/z-ai/glm-4.7", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.54, output: 1.98, cache_read: Some(0.099), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/z-ai/glm-4.7", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.6, output: 2.2, cache_read: Some(0.11), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-flash-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.019, output: 0.424, cache_read: Some(0.009), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-flash-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.03, output: 0.3, cache_read: Some(0.01), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-flash-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.15, output: 0.6, cache_read: Some(0.003), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-flash-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.1, output: 0.5, cache_read: Some(0.002), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-flash-latest", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.09, output: 0.55, cache_read: Some(0.008), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-pro-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.2856, output: 4.2, cache_read: Some(0.2), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-pro-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.24948, output: 0.74844, cache_read: Some(0.007938), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-pro-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.12332, output: 0.3831, cache_read: Some(0.0041), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-pro-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.12, output: 8.0, cache_read: Some(0.12), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.018, output: 1.28, cache_read: Some(0.018), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.0128, output: 0.768, cache_read: Some(0.0128), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.0083, output: 0.2829, cache_read: Some(0.0083), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.0055, output: 1.28, cache_read: Some(0.0055), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T13:57Z", input: 0.0047, output: 1.28, cache_read: Some(0.0047), cache_write: None, note: "models.dev api.json capture 2026-10-17T13:57Z (research run 9a8b8c56); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T14:30Z", input: 0.018, output: 1.28, cache_read: Some(0.018), cache_write: None, note: "models.dev api.json capture 2026-10-17T14:30Z (research run 85ec940d); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.0119, output: 1.28, cache_read: Some(0.0119), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~moonshotai/kimi-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.49, output: 13.0, cache_read: Some(0.45), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~moonshotai/kimi-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.45, output: 14.9, cache_read: Some(0.29), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~moonshotai/kimi-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.27, output: 13.9778, cache_read: Some(0.0513), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~moonshotai/kimi-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.27, output: 14.0, cache_read: Some(0.27), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~z-ai/glm-flash-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.04, output: 0.5, cache_read: Some(0.025), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~z-ai/glm-flash-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.032, output: 0.84, cache_read: Some(0.032), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~z-ai/glm-flash-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.0251, output: 0.3966, cache_read: Some(0.008), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~z-ai/glm-flash-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.06, output: 1.6, cache_read: Some(0.04), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~z-ai/glm-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.062, output: 3.39, cache_read: Some(0.06), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~z-ai/glm-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.079, output: 4.8, cache_read: Some(0.059), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~z-ai/glm-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.069, output: 3.939, cache_read: Some(0.069), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "kilo/~z-ai/glm-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.0632, output: 4.4, cache_read: Some(0.0588), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "nano-gpt/deepseek/deepseek-v4-flash-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.05, output: 0.16, cache_read: Some(0.013), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "nano-gpt/deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.15, output: 0.6, cache_read: Some(0.003), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "nano-gpt/reflection/beam-1.0", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.45, output: 1.25, cache_read: Some(0.04), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "nano-gpt/reflection/beam-1.0", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.5, output: 1.5, cache_read: Some(0.05), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4-flash-0731", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.018, output: 1.28, cache_read: Some(0.018), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4-flash-0731", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.016, output: 0.64, cache_read: Some(0.016), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4-flash-0731", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.0079, output: 0.2829, cache_read: Some(0.0079), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4-flash-0731", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.0067, output: 1.28, cache_read: Some(0.0067), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4-flash-0731", effective: "2026-10-17", observed: "2026-10-17T13:57Z", input: 0.0047, output: 1.28, cache_read: Some(0.0047), cache_write: None, note: "models.dev api.json capture 2026-10-17T13:57Z (research run 9a8b8c56); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4-flash-0731", effective: "2026-10-17", observed: "2026-10-17T14:30Z", input: 0.018, output: 1.28, cache_read: Some(0.018), cache_write: None, note: "models.dev api.json capture 2026-10-17T14:30Z (research run 85ec940d); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4-flash-0731", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.0119, output: 1.28, cache_read: Some(0.0119), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4.1-flash", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.3, output: 1.2, cache_read: Some(0.006), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4.1-flash", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.04, output: 1.188, cache_read: Some(0.04), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4.1-flash", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.0153, output: 0.594, cache_read: Some(0.0015), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4.1-flash", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.0138, output: 0.594, cache_read: Some(0.00055), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/deepseek/deepseek-v4.1-flash", effective: "2026-10-17", observed: "2026-10-17T13:57Z", input: 0.15, output: 0.6, cache_read: Some(0.003), cache_write: None, note: "models.dev api.json capture 2026-10-17T13:57Z (research run 9a8b8c56); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/tencent/hy3", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.0825, output: 0.33, cache_read: Some(0.020625), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/tencent/hy3", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.132, output: 0.528, cache_read: Some(0.033), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/tencent/hy3", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.0825, output: 0.33, cache_read: Some(0.020625), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/tencent/hy4-preview", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.7506, output: 2.2509, cache_read: Some(0.0378), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/tencent/hy4-preview", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.834, output: 2.501, cache_read: Some(0.042), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/tencent/hy4-preview", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.7506, output: 2.2509, cache_read: Some(0.0378), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/z-ai/glm-4.7", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.6, output: 2.2, cache_read: Some(0.11), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/z-ai/glm-4.7", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.54, output: 1.98, cache_read: Some(0.099), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/z-ai/glm-4.7", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.6, output: 2.2, cache_read: Some(0.11), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/z-ai/glm-5.3-flash", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.15, output: 0.5, cache_read: Some(0.03), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/z-ai/glm-5.3-flash", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.0238, output: 0.3966, cache_read: Some(0.0076), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/z-ai/glm-5.3-flash", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.0215, output: 0.3966, cache_read: Some(0.0022), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/z-ai/glm-5.3-flash", effective: "2026-10-17", observed: "2026-10-17T13:57Z", input: 0.15, output: 0.5, cache_read: Some(0.03), cache_write: None, note: "models.dev api.json capture 2026-10-17T13:57Z (research run 9a8b8c56); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-flash-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.019, output: 0.424, cache_read: Some(0.009), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-flash-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.04, output: 1.188, cache_read: Some(0.04), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-flash-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.15, output: 0.6, cache_read: Some(0.003), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-flash-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.1, output: 0.5, cache_read: Some(0.002), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-flash-latest", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.09, output: 0.55, cache_read: Some(0.008), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-pro-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.2856, output: 4.2, cache_read: Some(0.2), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-pro-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.24948, output: 0.74844, cache_read: Some(0.007938), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-pro-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.12332, output: 0.3831, cache_read: Some(0.0041), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-pro-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.13332, output: 0.39996, cache_read: Some(0.004242), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-pro-latest", effective: "2026-10-17", observed: "2026-10-17T13:57Z", input: 0.12, output: 8.0, cache_read: Some(0.12), cache_write: None, note: "models.dev api.json capture 2026-10-17T13:57Z (research run 9a8b8c56); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.018, output: 1.28, cache_read: Some(0.018), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.0128, output: 0.768, cache_read: Some(0.0128), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.0079, output: 0.2829, cache_read: Some(0.0079), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.0067, output: 1.28, cache_read: Some(0.0067), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T13:57Z", input: 0.0047, output: 1.28, cache_read: Some(0.0047), cache_write: None, note: "models.dev api.json capture 2026-10-17T13:57Z (research run 9a8b8c56); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T14:30Z", input: 0.018, output: 1.28, cache_read: Some(0.018), cache_write: None, note: "models.dev api.json capture 2026-10-17T14:30Z (research run 85ec940d); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~deepseek/deepseek-v4-flash-latest", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.0119, output: 1.28, cache_read: Some(0.0119), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~moonshotai/kimi-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.49, output: 13.0, cache_read: Some(0.45), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~moonshotai/kimi-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.73, output: 10.0, cache_read: Some(0.55), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~moonshotai/kimi-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.27, output: 13.9778, cache_read: Some(0.0513), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~moonshotai/kimi-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.27, output: 14.0, cache_read: Some(0.27), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~z-ai/glm-flash-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.04, output: 0.5, cache_read: Some(0.025), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~z-ai/glm-flash-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.032, output: 0.84, cache_read: Some(0.032), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~z-ai/glm-flash-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.0238, output: 0.3966, cache_read: Some(0.0076), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~z-ai/glm-flash-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.0215, output: 0.3966, cache_read: Some(0.0022), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~z-ai/glm-flash-latest", effective: "2026-10-17", observed: "2026-10-17T13:57Z", input: 0.06, output: 1.6, cache_read: Some(0.04), cache_write: None, note: "models.dev api.json capture 2026-10-17T13:57Z (research run 9a8b8c56); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~z-ai/glm-latest", effective: "2026-10-07", observed: "2026-10-07T23:27Z", input: 0.062, output: 3.39, cache_read: Some(0.06), cache_write: None, note: "models.dev api.json capture 2026-10-07T23:27Z (research run f97d974e); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~z-ai/glm-latest", effective: "2026-10-12", observed: "2026-10-12T20:47Z", input: 0.079, output: 4.8, cache_read: Some(0.059), cache_write: None, note: "models.dev api.json capture 2026-10-12T20:47Z (research run ad6d83cb); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~z-ai/glm-latest", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.069, output: 3.939, cache_read: Some(0.069), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "openrouter/~z-ai/glm-latest", effective: "2026-10-17", observed: "2026-10-17T12:58Z", input: 0.0632, output: 4.4, cache_read: Some(0.0588), cache_write: None, note: "models.dev api.json capture 2026-10-17T12:58Z (research run acb57290); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "vercel/deepseek/deepseek-v4.1-flash-1017", effective: "2026-10-17", observed: "2026-10-17T10:57Z", input: 0.15, output: 0.6, cache_read: Some(0.003), cache_write: None, note: "models.dev api.json capture 2026-10-17T10:57Z (research run 939c4681); in-place cost edit, catalog row count unchanged" },
+    RateHistoryRow { key: "vercel/deepseek/deepseek-v4.1-flash-1017", effective: "2026-10-17", observed: "2026-10-17T16:56Z", input: 0.14, output: 0.42, cache_read: Some(0.0042), cache_write: None, note: "models.dev api.json capture 2026-10-17T16:56Z (research run 1e51bf14); in-place cost edit, catalog row count unchanged" },
+];
+
+/// rm-1965: the recorded rate-history states, grouped by key,
+/// date-ascending within a key (same-date rows in observation order),
+/// for disclosure and contract tests. Rows exist only where an edit was
+/// observed — bounded and deduped, never one per catalog key.
+pub fn rate_history_rows() -> &'static [RateHistoryRow] {
+    RATE_HISTORY
+}
+
+/// rm-1965: how the rate row that served relates to the session priced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateBasisArm {
+    /// The row was live at session time.
+    AtSession,
+    /// The row postdates the session — the estimate repriced with a rate
+    /// that did not exist when the session ran.
+    NewerThanSession,
+}
+
+/// rm-1965: rate-basis disclosure for one priced surface.
+#[derive(Debug, Clone, Serialize)]
+pub struct RateBasis {
+    /// Effective date (YYYY-MM-DD) of the rate row that served.
+    pub rate_date: String,
+    /// The existing source label (bundled snapshot / models.dev extract /
+    /// fallback pricing) — see `pricing_source_for`.
+    pub rate_source: String,
+    /// How the row relates to the session being priced.
+    pub basis: RateBasisArm,
+}
+
+/// rm-1965: a resolved rate plus its basis disclosure.
+#[derive(Debug, Clone)]
+pub struct PricedAt {
+    pub price: Price,
+    pub basis: RateBasis,
+}
+
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -412,6 +586,25 @@ fn models_dev_key(model: &str) -> Option<String> {
 /// published behavior (codeburn #1642, held for the third tier
 /// family), not a guess.
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
+    lookup_priced_at(model, service_tier, None).price
+}
+
+/// rm-1965: resolve the effective rate for `model` as of `at` (session or
+/// record time), together with the basis disclosure of the row that served.
+///
+/// `at: None` selects the newest known rate — the pre-rm-1965 behavior — so
+/// the legacy `lookup_price`/`lookup_price_tiered` wrappers stay numerically
+/// identical for every key without rate history. Keys WITH history select
+/// the latest row whose effective date is at or before `at`; a session
+/// predating every row keeps the bundled pre-edit row and is disclosed as
+/// `newer_than_session`. History rows are standard-rate supersessions: they
+/// override input/output only, so tier slots (flex/ultrafast) keep their
+/// bundled treatment on top of whichever row served.
+pub fn lookup_priced_at(
+    model: &str,
+    service_tier: Option<&str>,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+) -> PricedAt {
     let catalog = pricing_catalog();
     // rm-1053 (run f2fccaa9 cycle 3, assess 53af6c9e F1): resolve
     // through the raw-first ladder (see `resolution_ladder`) — a
@@ -425,13 +618,44 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     // for the exact dated id, the extract's rates serve (its rows
     // carry no tier slots, so the tier rewrite below no-ops on that
     // arm).
+    let serving_key: Option<String>;
+    let snapshot_date: &'static str;
     let mut price = match serving_catalog(model, catalog) {
-        Some(ServingCatalog::ModelsDev { key }) => models_dev_catalog()
-            .entries
-            .get(&key)
-            .cloned()
-            .unwrap_or_default(),
-        _ => lookup_price_in(model, &catalog.aliases, &catalog.entries),
+        Some(ServingCatalog::ModelsDev { key }) => {
+            serving_key = Some(key.clone());
+            snapshot_date = MODELS_DEV_SNAPSHOT_DATE;
+            models_dev_catalog()
+                .entries
+                .get(&key)
+                .cloned()
+                .unwrap_or_default()
+        }
+        _ => {
+            serving_key = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries);
+            snapshot_date = PRICING_SNAPSHOT_DATE;
+            lookup_price_in(model, &catalog.aliases, &catalog.entries)
+        }
+    };
+    let (row, rate_date, arm, history_served) = rate_history_selection(
+        serving_key.as_deref(),
+        model,
+        snapshot_date,
+        at,
+    );
+    if let Some(row) = row {
+        // rm-1965: the observed state supersedes the bundled standard
+        // rates — a full-row supersession, because the cache rates ride
+        // the state too (`None` is a real "not published at that state",
+        // billed at the disclosed fallback, rm-1508).
+        price.input = row.input;
+        price.output = row.output;
+        price.cr = row.cache_read;
+        price.cw = row.cache_write;
+    }
+    let rate_source = if history_served {
+        format!("rate history (models.dev observed state {rate_date})")
+    } else {
+        pricing_source_for(model)
     };
     let (input_tier, output_tier, cw_tier, cr_tier) = match service_tier {
         Some("flex") => (
@@ -446,7 +670,16 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
             price.cw_ultrafast,
             price.cr_ultrafast,
         ),
-        _ => return price,
+        _ => {
+            return PricedAt {
+                price,
+                basis: RateBasis {
+                    rate_date,
+                    rate_source,
+                    basis: arm,
+                },
+            }
+        }
     };
     if let (Some(input), Some(output)) = (input_tier, output_tier) {
         price.input = input;
@@ -458,7 +691,166 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
             price.cr = Some(cr);
         }
     }
-    price
+    PricedAt {
+        price,
+        basis: RateBasis {
+            rate_date,
+            rate_source,
+            basis: arm,
+        },
+    }
+}
+
+/// rm-1965: disclosure companion for surfaces that price at CURRENT rates
+/// by design (the cost-audit drift recompute) but must still disclose how
+/// the serving row relates to the session: selection runs at `None` (the
+/// newest rate) and only the arm is judged against `session_ts`.
+pub fn rate_basis_against_session(
+    model: &str,
+    service_tier: Option<&str>,
+    session_ts: Option<chrono::DateTime<chrono::Utc>>,
+) -> PricedAt {
+    let mut priced = lookup_priced_at(model, service_tier, None);
+    priced.basis.basis = arm_against(&priced.basis.rate_date, session_ts);
+    priced
+}
+
+/// rm-1965: walk the key's rate timeline and pick the state serving `at`.
+///
+/// The timeline is a date-ordered ladder: the bundled snapshot row (only
+/// when the catalog actually serves the key) plus every observed state
+/// row. Dates are ISO `YYYY-MM-DD`, which compare correctly as bytes; a
+/// same-date tie goes to the observed row (its capture is finer-grained
+/// than a snapshot date). Returns `(row, effective date, arm,
+/// history_served)`; `row` is `None` when the bundled row is the serving
+/// state. With no session time the newest state serves (legacy
+/// semantics). A session predating every state serves the EARLIEST known
+/// state, disclosed `newer_than_session` — the closest rate we can
+/// prove, never a silently newer one.
+fn rate_history_selection(
+    serving_key: Option<&str>,
+    raw_model: &str,
+    snapshot_date: &str,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+) -> (
+    Option<&'static RateHistoryRow>,
+    String,
+    RateBasisArm,
+    bool,
+) {
+    // rm-196: an operator override is the operator's own truth — it
+    // outranks every observed state, exactly as it outranks the bundled
+    // row in the resolution ladder.
+    if serving_key
+        .map(|key| pricing_override_models().contains(key))
+        .unwrap_or(false)
+    {
+        return (
+            None,
+            snapshot_date.to_string(),
+            arm_against(snapshot_date, at),
+            false,
+        );
+    }
+    // The history key is the SERVING key when one resolved, else the raw
+    // id. Catalog conversion derives base-id rows from reseller rows
+    // ("kilo/tencent/hy3" serves through a derived "hy3" entry), and a
+    // derived key is a snapshot-refresh artifact — the raw id is what
+    // the session recorded and what the captures keyed. Try the
+    // serving key first (catalog truth), then the raw id; first
+    // candidate with recorded states wins.
+    let candidates: [String; 2] = [
+        serving_key.unwrap_or(raw_model).to_string(),
+        raw_model.to_string(),
+    ];
+    let rows: Vec<&'static RateHistoryRow> = {
+        let mut matched: Vec<&'static RateHistoryRow> = Vec::new();
+        for candidate in &candidates {
+            matched = RATE_HISTORY
+                .iter()
+                .filter(|row| &row.key == candidate)
+                .collect();
+            if !matched.is_empty() {
+                break;
+            }
+        }
+        matched
+    };
+    // Lineage rule: the bundle state belongs on the ladder only when the
+    // states were recorded for the RESOLVED serving key. When the rows
+    // matched through the raw-id fallback, the serving row is a derived
+    // base-id entry ("kilo/tencent/hy3" resolves to a derived "hy3"
+    // row forwarded from a RESELLER — openrouter's rates, not kilo's):
+    // mixing that bundle into the kilo timeline would frankenstein two
+    // vendors' prices. The kilo-observed states supersede it outright.
+    let rows_from_serving_key = rows
+        .first()
+        .is_some_and(|row| serving_key.is_some_and(|key| row.key == key));
+    // Ladder in date order: the bundled state slots in at the snapshot
+    // date (only when the catalog serves the key), observed states in
+    // table order — which is date-ascending per key, same-date rows in
+    // observation order. The sort is stable and the bundle is pushed
+    // first, so a same-date tie leaves the observed row LATER in the
+    // ladder — the reverse scan below hands the tie to the observed
+    // row, whose capture is finer-grained than a snapshot date.
+    let mut ladder: Vec<(&str, Option<&'static RateHistoryRow>)> = Vec::new();
+    if serving_key.is_some() && (rows.is_empty() || rows_from_serving_key) {
+        ladder.push((snapshot_date, None));
+    }
+    for row in &rows {
+        ladder.push((row.effective, Some(row)));
+    }
+    ladder.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let date_le = |a: &str, b: &str| a.as_bytes() <= b.as_bytes();
+    let ymd = at.map(|t| t.format("%Y-%m-%d").to_string());
+    let picked = match ymd.as_deref() {
+        None => ladder.last().copied(),
+        Some(bound) => ladder
+            .iter()
+            .rev()
+            .find(|(date, _)| date_le(date, bound))
+            .copied()
+            // Session predates every known state: serve the earliest
+            // state we can prove, disclosed below.
+            .or_else(|| ladder.first().copied()),
+    };
+    match picked {
+        // Empty ladder: the catalog does not serve the key and no edit
+        // was ever observed — the built-in fallback row serves, dated at
+        // the bundled snapshot date (single-date rows span the snapshot).
+        None => (
+            None,
+            snapshot_date.to_string(),
+            RateBasisArm::AtSession,
+            false,
+        ),
+        Some((date, row)) => {
+            let arm = match ymd.as_deref() {
+                None => RateBasisArm::AtSession,
+                Some(bound) if !date_le(date, bound) => RateBasisArm::NewerThanSession,
+                Some(_) => RateBasisArm::AtSession,
+            };
+            (row, date.to_string(), arm, row.is_some())
+        }
+    }
+}
+
+/// ISO YYYY-MM-DD strings compare correctly as bytes, so the arm test is a
+/// plain string compare against the row's effective date.
+fn arm_against(
+    effective: &str,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+) -> RateBasisArm {
+    match at.map(|t| t.format("%Y-%m-%d").to_string()) {
+        None => RateBasisArm::AtSession,
+        Some(ymd) => {
+            if ymd.as_str() < effective {
+                RateBasisArm::NewerThanSession
+            } else {
+                RateBasisArm::AtSession
+            }
+        }
+    }
 }
 
 pub fn has_specific_price(model: &str) -> bool {

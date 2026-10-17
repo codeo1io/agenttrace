@@ -4,6 +4,16 @@
 
 ### Added
 
+- rm-1965: timestamp-aware rate selection. Rate rows now carry effective
+  dates (`rate_history_rows`); a session is priced at the rate live at its
+  own first-event time (not the newest known rate), and every priced
+  surface discloses the basis: `rate_date` + `rate_basis`
+  (`at_session` | `newer_than_session`) on session metrics
+  (`agenttrace --json`), and `rate_date` + `rate_basis` on the cost-audit
+  rows (which reprice at current rates by design and now say when that
+  rate postdates the session). First recorded edit:
+  `openrouter/deepseek-v4-flash-latest` (output 0.2829 → 1.28 on
+  2026-10-17, observed live on models.dev).
 - Standing battery reds get a typed environmental/flaky/defect verdict
   (rm-1507, run a1f6c1f8 cycle 2): `scripts/ci/check-battery-adjudicate.sh`
   re-runs a single failing test N times isolated (fresh mktemp TMPDIR per
