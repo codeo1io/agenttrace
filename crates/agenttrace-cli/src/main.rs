@@ -670,7 +670,23 @@ fn run() -> anyhow::Result<()> {
             // render_doctor_report's json arm (the rm-384 terminal
             // contract); the embedded payload equals the stderr doc.
             let report = build_doctor_report(doctor_dir.as_deref(), args.demo);
-            let out = serde_json::to_string_pretty(&report)? + "\n";
+            // rm-1917: this arm used to be the ONLY report emission
+            // skipping the dispatch choke point, so spoofing Cf
+            // controls (U+202E-class) rode the machine-readable doctor
+            // JSON raw — failure_samples embeds filesystem-derived
+            // strings (core doctor.rs :889 unparsed .jsonl paths,
+            // :983/:986 the sqlite lanes' reason and dropped-row
+            // samples) and serde leaves Cf chars unescaped. Routing
+            // both the stdout document and the `-o` artifact through
+            // dispatch_sanitize composes escape_spoofing_json in json
+            // mode: lossless (`\uXXXX` decodes back to the char), a
+            // no-op on clean documents (fast-path byte identity), and
+            // the same treatment the text arm below already applies —
+            // the rm-384 parity with render_doctor_report's json arm
+            // now holds for poisoned corpora too, because both arms
+            // sanitize identically.
+            let out =
+                dispatch_sanitize(&args.format, serde_json::to_string_pretty(&report)? + "\n");
             let artifact = match &args.output {
                 Some(_) => {
                     let mut doc = serde_json::to_value(&report)
@@ -682,7 +698,7 @@ fn run() -> anyhow::Result<()> {
                                 .context("parsing the config disclosure for -o embedding")?,
                         );
                     }
-                    serde_json::to_string_pretty(&doc)? + "\n"
+                    dispatch_sanitize(&args.format, serde_json::to_string_pretty(&doc)? + "\n")
                 }
                 None => out.clone(),
             };

@@ -55,6 +55,14 @@
 //!   fall outside the requested window reports the CLI's filter-miss
 //!   message, not a discovery miss (rm-781). The server itself stays
 //!   up in every one of those cases.
+//! * output parity (rm-1918) — every response line, success or error,
+//!   crosses the CLI's JSON-lane spoofing escape
+//!   ([`escape_spoofing_json`]) at the serialization boundary: no raw
+//!   directional/invisible Cf control (U+202E-class) ever rides the
+//!   stdio wire, while tool text payloads are escaped BEFORE wrapping
+//!   so they stay byte-identical to the CLI's `-f json` documents on
+//!   the same corpus (the escape is lossless and a no-op on clean
+//!   text).
 //!
 //! Dependency decision (recorded here per the rm-455 lane): the
 //! JSON-RPC layer is hand-rolled over `serde_json`. The CLI carries no
@@ -66,7 +74,7 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use agenttrace_core::{
-    compute_overview, data_health_scoped, load_sessions_with_options,
+    compute_overview, data_health_scoped, escape_spoofing_json, load_sessions_with_options,
     report_overview_json_with_context, LoadOptions, LoadReport, TimeRange,
 };
 use chrono::Utc;
@@ -414,7 +422,9 @@ fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
         }
     };
     Some(match result {
-        Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}).to_string(),
+        Ok(value) => {
+            wire_sanitize(json!({"jsonrpc": "2.0", "id": id, "result": value}).to_string())
+        }
         Err((code, message)) => error_response(Some(id), code, &message),
     })
 }
@@ -507,8 +517,12 @@ fn tools_list_result() -> Value {
 /// could not produce a report. Rendered as an `isError` result, not a
 /// protocol error — the host stays connected.
 fn tool_execution_error(message: String) -> Result<Value, (i64, String)> {
+    // rm-1918: error texts embed filesystem-derived strings (corpus
+    // paths, unreadable-database reasons), so they ride the same text
+    // escape as report payloads — a spoofing control in a scanned path
+    // must not reach the host's renderer through the error lane.
     Ok(json!({
-        "content": [{ "type": "text", "text": message }],
+        "content": [{ "type": "text", "text": escape_spoofing_json(&message) }],
         "isError": true
     }))
 }
@@ -746,9 +760,21 @@ fn by_model_breakdown(root: Option<&Path>, range: TimeRange) -> Result<Value, (i
 /// Wrap rendered report text as MCP tool content. The payload is the
 /// CLI's JSON document verbatim — text content keeps every host able
 /// to display it, and machine consumers parse the text.
+///
+/// rm-1918: "verbatim" means the SANITIZED document. The CLI's
+/// dispatch boundary passes its JSON documents through
+/// `escape_spoofing_json` before writing them, so composing the same
+/// escape here is what keeps MCP payloads byte-identical to
+/// `agenttrace --overview -f json` stdout on the same corpus — a raw
+/// U+202E in a model id used to ride the tool text while the CLI lane
+/// escaped it. The wire-level pass in [`wire_sanitize`] cannot provide
+/// that parity on its own: escaping only the outer line would leave
+/// the PARSED text payload carrying the raw control, so the escape
+/// happens at both layers (idempotently — payload escapes are literal
+/// backslash text by the time the outer line is serialized).
 fn tool_text_result(text: String) -> Value {
     json!({
-        "content": [{ "type": "text", "text": text }],
+        "content": [{ "type": "text", "text": escape_spoofing_json(&text) }],
         "isError": false
     })
 }
@@ -757,6 +783,19 @@ fn tool_text_result(text: String) -> Value {
 /// equal numbers shown by the CLI.
 fn round4(value: f64) -> f64 {
     (value * 10_000.0).round() / 10_000.0
+}
+
+/// rm-1918 wire pass: the LAST serialization boundary every response
+/// line crosses. serde leaves spoofing Cf controls (U+202E-class) raw
+/// inside a serialized document — and host-supplied strings echo into
+/// `-32602` messages (`range`/tool-name echoes) while error texts
+/// embed corpus paths — so the wire line itself is escaped. Lossless
+/// (`\uXXXX` decodes back to the char), a no-op on clean lines, and
+/// idempotent over payloads already escaped by [`tool_text_result`]
+/// (their escapes serialize as `\\uXXXX` backslash text, not Cf
+/// chars, so the predicate never matches them).
+fn wire_sanitize(line: String) -> String {
+    escape_spoofing_json(&line)
 }
 
 /// Serialize a JSON-RPC error response. `id: null` per the spec when
@@ -769,7 +808,7 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> String {
         "error".to_string(),
         json!({ "code": code, "message": message }),
     );
-    Value::Object(object).to_string()
+    wire_sanitize(Value::Object(object).to_string())
 }
 
 #[cfg(test)]

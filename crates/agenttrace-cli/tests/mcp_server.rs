@@ -1101,3 +1101,196 @@ fn config_layer_prices_the_mcp_tools_identically_to_the_cli() {
     let _ = std::fs::remove_dir_all(home_plain.parent().expect("root"));
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// rm-1918 lane: the raw stdout wire BYTES as a string. The parsed
+/// lane above cannot observe wire-level escaping — serde decodes
+/// `\uXXXX` escapes back to the char, so a raw-Cf line and an escaped
+/// line parse to the same Value; the spoofing contract lives in the
+/// bytes the host actually renders.
+fn mcp_session_wire(
+    home: &Path,
+    cache: &Path,
+    argv: &[&str],
+    input: &str,
+) -> (Option<i32>, String, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(argv)
+        .env("HOME", home)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", cache)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("AGENTTRACE_PRICING_FILE")
+        .env_remove("AGENTTRACE_HISTORY_DIR")
+        .current_dir(home.parent().expect("seeded root"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agenttrace");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(input.as_bytes())
+        .expect("write request script");
+    let output = child.wait_with_output().expect("collect output");
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("wire stdout is utf8"),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn rm1918_poisoned_names_escape_on_the_wire_with_cli_parity() {
+    // rm-1918 (run 3f0151d0, assess cbe6c127 F2 PoC): the MCP emit
+    // path had NO spoofing escape at all — `tools/call
+    // by_model_breakdown` over a corpus whose model id carries an RLO
+    // emitted the raw control on the stdio wire (mcp.rs composed none
+    // of the CLI's dispatch_sanitize machinery) while `agenttrace
+    // --overview -f json` escaped the same corpus. Every response line
+    // now crosses escape_spoofing_json at the serialization boundary,
+    // and tool payloads are escaped BEFORE wrapping so the text stays
+    // byte-identical to the CLI's sanitized documents.
+    let root = std::env::temp_dir().join(format!("agenttrace-mcp-rm1918-{}", std::process::id()));
+    let corpus = root.join("corpus");
+    let home = root.join("home");
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&corpus).expect("corpus dir");
+    std::fs::create_dir_all(&home).expect("home dir");
+    std::fs::create_dir_all(&cache).expect("cache dir");
+    let poisoned_model = format!("claude-evil\u{202E}5x\u{2060}-{}", std::process::id());
+    // The claude-format journal shape the rm-936 matrix corpus uses —
+    // model id in message.model, usage on the assistant turn.
+    std::fs::write(
+        corpus.join("session-poisoned.jsonl"),
+        format!(
+            concat!(
+                "{{\"type\": \"user\", \"uuid\": \"u1\", \"timestamp\": \"2026-10-16T09:00:00Z\", ",
+                "\"cwd\": \"/tmp/at-rm1918\", \"message\": {{\"role\": \"user\", ",
+                "\"content\": \"poc\"}}}}\n",
+                "{{\"type\": \"assistant\", \"uuid\": \"a1\", \"timestamp\": \"2026-10-16T09:00:05Z\", ",
+                "\"message\": {{\"role\": \"assistant\", \"model\": \"{model}\", ",
+                "\"content\": [{{\"type\": \"text\", \"text\": \"done\"}}], ",
+                "\"usage\": {{\"input_tokens\": 10, \"output_tokens\": 5}}}}}}\n"
+            ),
+            model = poisoned_model,
+        ),
+    )
+    .expect("plant poisoned journal");
+    let corpus_arg = corpus.to_str().expect("utf8 path");
+
+    // CLI lane on the SAME corpus: escaped, lossless (the control arm
+    // of the parity claim).
+    let (code, cli_json, _stderr) = cli_run(
+        &home,
+        &cache,
+        &["-d", corpus_arg, "--overview", "-f", "json"],
+    );
+    assert_eq!(Some(0), code, "CLI overview must succeed");
+    assert!(
+        !cli_json.contains('\u{202E}') && !cli_json.contains('\u{2060}'),
+        "control arm: the CLI json lane must carry no raw Cf control"
+    );
+    assert!(
+        cli_json.contains("\\u202E"),
+        "control arm: the CLI json lane carries the escape text"
+    );
+    let cli_by_model: Vec<String> = serde_json::from_str::<Value>(&cli_json).expect("cli json")
+        ["by_model"]
+        .as_array()
+        .expect("cli by_model")
+        .iter()
+        .map(|row| row["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        cli_by_model.iter().any(|name| name == &poisoned_model),
+        "CLI name decodes back to the raw model id (lossless): {cli_by_model:?}"
+    );
+
+    // MCP lane, wire bytes: initialize + both report tools.
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"range":"all"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"usage_overview","arguments":{"range":"all"}}}"#,
+        "\n",
+    );
+    let (code, wire, _stderr) =
+        mcp_session_wire(&home, &cache, &["-d", corpus_arg, "mcp"], requests);
+    assert_eq!(Some(0), code, "mcp server must exit 0");
+    assert!(
+        !wire.contains('\u{202E}') && !wire.contains('\u{2060}'),
+        "raw Cf control rode the MCP wire"
+    );
+    assert!(
+        wire.contains("\\u202E"),
+        "the escape text must be on the wire"
+    );
+    let responses: Vec<Value> = wire
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("wire line is json"))
+        .collect();
+    assert_eq!(3, responses.len(), "the notification stays silent");
+
+    // by_model_breakdown: the payload text itself carries the escape
+    // (byte parity with the CLI document), and its names decode to the
+    // same rollup the CLI reported.
+    let breakdown_text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("breakdown text");
+    assert!(
+        breakdown_text.contains("\\u202E") && !breakdown_text.contains('\u{202E}'),
+        "payload must carry the escape text, not the raw control: {breakdown_text}"
+    );
+    let breakdown: Value = serde_json::from_str(breakdown_text).expect("breakdown payload json");
+    let mcp_names: Vec<String> = breakdown["by_model"]
+        .as_array()
+        .expect("by_model")
+        .iter()
+        .map(|row| row["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        mcp_names, cli_by_model,
+        "MCP by_model must equal the CLI by_model on the same corpus"
+    );
+
+    // usage_overview: the payload is the CLI's own document — escaped
+    // identically, so the text is byte-equal to CLI stdout modulo the
+    // wall-clock `scope.generated_at` stamp (the only non-deterministic
+    // field; normalize it before comparing).
+    let overview_text = responses[2]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("overview text");
+    assert!(
+        overview_text.contains("\\u202E") && !overview_text.contains('\u{202E}'),
+        "overview payload must carry the escape text, not the raw control"
+    );
+    let mut mcp_doc: Value = serde_json::from_str(overview_text).expect("overview payload json");
+    let mut cli_doc: Value = serde_json::from_str(&cli_json).expect("cli json");
+    // Two run-context fields are nondeterministic across the compared
+    // processes, not document-shape divergence, so both are pinned to a
+    // fixed value in BOTH documents before comparing: `generated_at`
+    // (wall clock) and `data_health.cache_hits` — the CLI run and the
+    // MCP tool calls are separate processes over the same session-cache
+    // dir, so cache_hits reads 0 on the first scan and 1 once the cache
+    // is warm, by run order. Every other byte must match.
+    for doc in [&mut mcp_doc, &mut cli_doc] {
+        if let Some(scope) = doc.get_mut("scope").and_then(Value::as_object_mut) {
+            scope.insert("generated_at".to_string(), Value::String("<pinned>".into()));
+        }
+        if let Some(health) = doc.get_mut("data_health").and_then(Value::as_object_mut) {
+            health.insert("cache_hits".to_string(), Value::from(0));
+        }
+    }
+    assert_eq!(
+        serde_json::to_string(&mcp_doc).unwrap(),
+        serde_json::to_string(&cli_doc).unwrap(),
+        "usage_overview payload must be byte-identical to `--overview -f json` stdout (modulo generated_at)"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
