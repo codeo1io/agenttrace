@@ -2140,6 +2140,18 @@ fn disclose_sqlite_ingest(ingest: &agenttrace_core::SqliteIngestReport) {
             db.sample
         );
     }
+    // rm-1927 (run 9d3b927c cycle 1): a v2-shaped store is a healthy
+    // known format this reader does not ingest — its own census
+    // class, never "unreadable" (corrupt) and never a silent zero
+    // (which is how it used to classify: zero sessions, zero
+    // warnings, reading as "nothing happened here").
+    for store in &ingest.unhandled_v2_stores {
+        eprintln!(
+            "agenttrace: warning: agent database found but not ingested: {} ({})",
+            store.path.display(),
+            store.reason
+        );
+    }
 }
 
 /// rm-835 residual arm: the stderr advisory text for a load that

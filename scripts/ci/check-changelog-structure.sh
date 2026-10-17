@@ -23,6 +23,18 @@ changelog="$repo_root/CHANGELOG.md"
 
 [ -f "$changelog" ] || fail "CHANGELOG.md not found at $changelog"
 
+# Pass 0 (rm-1928, run 9d3b927c cycle 1): unresolved merge-conflict
+# fences. The standing tree's CHANGELOG.md carried committed
+# `<<<<<<<` / `=======` / `>>>>>>>` markers through the 2026-10-14 fog
+# while this gate returned rc0 on it — a half-merged changelog passed
+# CI. Fences are rejected BEFORE any structural check so the failure
+# names the real problem. Exactly seven `=` is the git separator
+# shape; markdown setext underlines (three or four `=` under a text
+# line) stay legal. Fence lines print so the operator sees where.
+if fences="$(grep -nE '^(<<<<<<<|>>>>>>>)|^=======$' "$changelog")" && [ -n "$fences" ]; then
+	fail "unresolved merge-conflict fence(s) present in CHANGELOG.md:"$'\n'"$fences"
+fi
+
 # Pass 1: every `### <kind>` must live inside a `## <section>`, and no
 # section may see the same kind twice.
 if ! dups="$(awk '
@@ -66,4 +78,4 @@ total="${counts##* }"
 [ "$visible" -eq "$total" ] ||
 	fail "a first-per-kind parse of Unreleased hides entries: $visible visible of $total — duplicate section headings"
 
-echo "check-changelog-structure: no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries"
+echo "check-changelog-structure: no merge-conflict fences; no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries"

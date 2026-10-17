@@ -933,7 +933,10 @@ fn symlink_target_of(path: &Path) -> Option<String> {
         .map(|target| target.to_string_lossy().to_string())
 }
 
-fn doctor_sqlite_directories(
+/// rm-1509/rm-1927: exposed (pub) for the census contract suite — the
+/// doctor row is the operator-visible face of the sqlite ingest
+/// report classes.
+pub fn doctor_sqlite_directories(
     sessions: &[Session],
     ingest: &SqliteIngestReport,
 ) -> Vec<DoctorDirReport> {
@@ -976,8 +979,20 @@ fn doctor_sqlite_directories(
         // opencode*.db siblings) stay rm-607's disclosure lane.
         let unreadable = ingest.unreadable.iter().find(|db| db.path == path);
         let dropped = ingest.dropped_rows.iter().find(|db| db.path == path);
-        let failed =
-            usize::from(unreadable.is_some()) + dropped.map(|entry| entry.dropped).unwrap_or(0);
+        // rm-1927: v2-shaped stores at the primary path are a distinct
+        // census class — a healthy known format this reader does not
+        // ingest. Counted as failed files with a named sample, never
+        // folded into "unreadable" (corrupt) and never a silent
+        // zero. Sibling databases keep disclosing through the ingest
+        // report (`unhandled_v2_stores`) like the rm-607 duplicates.
+        let unhandled: usize = ingest
+            .unhandled_v2_stores
+            .iter()
+            .map(|store| usize::from(store.path == path))
+            .sum();
+        let failed = usize::from(unreadable.is_some())
+            + dropped.map(|entry| entry.dropped).unwrap_or(0)
+            + unhandled;
         let mut failure_samples = Vec::new();
         if let Some(db) = unreadable {
             failure_samples.push(format!("unreadable: {}", db.reason));
@@ -986,6 +1001,17 @@ fn doctor_sqlite_directories(
             failure_samples.push(format!(
                 "{} session row(s) failed to decode (e.g. {})",
                 entry.dropped, entry.sample
+            ));
+        }
+        if unhandled > 0 {
+            failure_samples.push(format!(
+                "v2-shaped store not ingested: {}",
+                ingest
+                    .unhandled_v2_stores
+                    .iter()
+                    .find(|store| store.path == path)
+                    .map(|store| store.reason.as_str())
+                    .unwrap_or("opencode v2 store: ingest not implemented")
             ));
         }
         dirs.push(DoctorDirReport {

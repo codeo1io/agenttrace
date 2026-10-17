@@ -38,7 +38,13 @@ const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const LOAD_BATCH_SIZE: usize = 8;
 enum LoadMessage {
     Progress(Vec<LoadProgress>),
-    Complete(anyhow::Result<(bool, LoadReport)>),
+    // Boxed (rm-1927 ripple, run 9d3b927c cycle 1): the completion
+    // payload embeds `LoadReport`, whose sqlite ingest report grew a
+    // disclosure Vec (`unhandled_v2_stores`) past clippy's
+    // `large_enum_variant` threshold — and will keep growing as
+    // disclosure classes are added. One pointer on the channel
+    // message, heap for the report itself.
+    Complete(anyhow::Result<Box<(bool, LoadReport)>>),
 }
 
 pub fn run(sessions_dir: &str) -> anyhow::Result<()> {
@@ -1009,7 +1015,7 @@ impl App {
             if !batch.is_empty() {
                 let _ = tx.send(LoadMessage::Progress(batch));
             }
-            let _ = tx.send(LoadMessage::Complete(result));
+            let _ = tx.send(LoadMessage::Complete(result.map(Box::new)));
         });
     }
 
@@ -1040,7 +1046,8 @@ impl App {
                     }
                     changed = true;
                 }
-                Ok(LoadMessage::Complete(Ok((force, report)))) => {
+                Ok(LoadMessage::Complete(Ok(boxed))) => {
+                    let (force, report) = *boxed;
                     self.apply_loaded_sessions(report, force);
                     return true;
                 }

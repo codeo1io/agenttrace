@@ -1252,6 +1252,28 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
                 additions,
                 deletions
             ));
+            // rm-1926 (c) / rm-1509 residual (run 9d3b927c cycle 1):
+            // the module comment promises counts AND paths, but the
+            // render carried counts only — the operator could not see
+            // WHICH files the writer claimed. Paths render beside the
+            // counts, per-file, saturating per-entry like the sums
+            // above; a payload entry without a file renders
+            // `<unnamed>` rather than vanishing.
+            evidence.push(format!(
+                "writer-reported per-file paths: {}",
+                diffs
+                    .iter()
+                    .map(|diff| {
+                        format!(
+                            "{} (+{}/-{})",
+                            diff.file.as_deref().unwrap_or("<unnamed>"),
+                            diff.additions,
+                            diff.deletions
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         if let Some(divergence) = &session.metrics.summary_diffs_divergence {
             evidence.push(format!(
@@ -1261,6 +1283,19 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
                 divergence.per_file_deletions,
                 divergence.summary_deletions
             ));
+        }
+        // rm-1926 (a): present-but-unreadable summary integers beside
+        // a decoded payload — the cross-check could not run, and the
+        // silence was indistinguishable from "payload agreed". One
+        // line per unreadable column, naming the column and the
+        // storage-class reason.
+        if let Some(unreadable) = &session.metrics.summary_cross_check_unreadable {
+            for entry in unreadable {
+                evidence.push(format!(
+                    "cross-check not runnable: summary column unreadable — {} ({})",
+                    entry.column, entry.reason
+                ));
+            }
         }
         match level {
             "strong" => summary.strong += 1,
