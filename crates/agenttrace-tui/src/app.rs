@@ -409,7 +409,7 @@ impl App {
         // CLI reconciles before any view — replay families must
         // reconcile here too, or the TUI rendered double-counted
         // family totals until the first reload landed.
-        let _replay = reconcile_codex_multiagent_replays(&mut sessions);
+        let replay = reconcile_codex_multiagent_replays(&mut sessions);
         let overview = compute_overview(&sessions);
         let project_identities = sessions
             .iter()
@@ -465,6 +465,18 @@ impl App {
             compare_anchor: None,
             compare_open: false,
         };
+        // rm-1942: the boot path runs the same reconciliation as the reload
+        // lane (app.rs apply_loaded_sessions), so the stat it feeds must
+        // land here too — state-consistency: load_state tells the truth
+        // about a boot-adjusted family from the first frame, without
+        // waiting for a reload round-trip. (Review 020be87e F2: the
+        // disclosure clause itself renders only in the LoadPhase::Ready
+        // arm of the load summary — Ready is set solely by the reload
+        // lane, which re-captures this stat anyway — so this capture
+        // changes reachable RENDERING nowhere; it keeps the state
+        // truthful.) Capture-not-recompute: the reconcile above already
+        // paid for the pass.
+        app.load_state.replay_children_adjusted = replay.children_adjusted;
         app.refresh_filtered();
         app
     }

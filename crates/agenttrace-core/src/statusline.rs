@@ -455,7 +455,14 @@ pub fn sanitize_line_segment(segment: &str) -> String {
 /// (2026-10-16) composes the joiner pair
 /// ([`is_joiner_format_control`]) into the same substitution class at
 /// this boundary, so markdown/HTML cells — which carry no line-segment
-/// pass — cannot ride a raw ZWJ/ZWNJ either. Idempotent by
+/// pass — cannot ride a raw ZWJ/ZWNJ either. rm-1941 closes the
+/// lone-CR sibling of that gap one layer up instead of widening this
+/// exemption: the document pass above deliberately keeps `\r` as legal
+/// prose layout, so the cell renderers themselves own the single-line
+/// context — reports.rs `markdown_cell` / `markdown_inline_code` /
+/// `html_escape` normalize CRLF onto `\n` and map a lone `\r` to
+/// U+FFFD, inline-code spans included (review fix 020be87e), arm for
+/// arm with this lane's cell policy. Idempotent by
 /// construction: U+FFFD is
 /// printable, so already-sanitized documents (including cells that
 /// first went through the rm-383/rm-540 line sanitizer) pass through

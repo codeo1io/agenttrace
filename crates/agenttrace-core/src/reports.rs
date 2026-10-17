@@ -3500,6 +3500,16 @@ fn html_escape(value: &str) -> String {
     // cells bare so cost/token-adjacent strings still import as
     // values.
     let value = guard_formula_cell(value);
+    // rm-1941: single-line HTML text (cells, titles) carries the same
+    // CR arm as `markdown_cell`. CRLF normalizes onto `\n` FIRST —
+    // html collapses it as whitespace anyway and benign
+    // Windows-line-ending data gains no visible replacement noise —
+    // then a lone `\r` (a same-line overwrite primitive under
+    // cat/less when the document is read as text) becomes U+FFFD
+    // instead of riding the rendered `<td>` raw. The document
+    // sanitizer still keeps `\r` for prose layout; cells are not
+    // prose flow.
+    let value = value.replace("\r\n", "\n");
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -3508,6 +3518,7 @@ fn html_escape(value: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&#34;"),
             '\'' => out.push_str("&#39;"),
+            '\r' => out.push('\u{FFFD}'),
             _ => out.push(ch),
         }
     }
@@ -3722,9 +3733,17 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
 /// now happens at the output-dispatch choke point
 /// (`dispatch_sanitize` in agenttrace-cli/main.rs over
 /// `sanitize_output_document`), which covers every non-JSON lane for
-/// every report — including this markdown/html family. Entity escaping
-/// here stays as defense-in-depth; the two layers compose because the
-/// document sanitizer is idempotent.
+/// every report — including this markdown/html family — for
+/// non-layout control bytes. It does NOT cover the CR-in-a-cell
+/// class: the document sanitizer deliberately keeps `\r` as legal
+/// prose layout, so a lone CR riding a single-line cell (a same-line
+/// overwrite primitive when the report is read as text) survives it
+/// — rm-1941 closes that class at the cell renderers themselves
+/// (`markdown_cell` / `html_escape`: CRLF normalizes onto `\n`, lone
+/// `\r` → U+FFFD), arm-for-arm with the TSV/CSV cell policy
+/// (`sanitize_line_segment`). Entity escaping here stays as
+/// defense-in-depth; the layers compose because the document
+/// sanitizer is idempotent.
 /// rm-897: neutralizes spreadsheet-formula introducers in a markdown table
 /// cell, mirroring the landed rm-540 CSV guard (agenttrace-cli
 /// `csv_export.rs::guard_formula`) arm for arm. The numeric exemption is
@@ -3792,12 +3811,21 @@ pub fn guard_formula_json_leaves(value: &serde_json::Value) -> serde_json::Value
 }
 
 fn markdown_cell(value: &str) -> String {
+    // rm-1941: a table cell is a single-line context. CRLF normalizes
+    // onto the `\n` arm (no visible replacement noise for benign
+    // Windows-line-ending data); a lone `\r` — a same-line overwrite
+    // primitive under cat/less when the .md is read as text — dies
+    // here arm-for-arm with the TSV/CSV cell policy
+    // (`sanitize_line_segment`). The document sanitizer keeps `\r`
+    // for prose layout; a cell cannot.
     guard_formula_cell(value)
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('|', "\\|")
+        .replace("\r\n", "\n")
         .replace('\n', "<br>")
+        .replace('\r', "\u{FFFD}")
 }
 
 /// Escapes a transcript-derived string for a GFM inline code span (rm-403).
@@ -3806,12 +3834,19 @@ fn markdown_cell(value: &str) -> String {
 /// renderers escape code-span contents themselves, and pre-escaping would
 /// corrupt legitimate display (`&lt;img&gt;` would render literally instead of
 /// `<img>`). Backticks are stripped to keep the span closed; pipe and newline
-/// are made table-safe for spans emitted inside cells.
+/// are made table-safe for spans emitted inside cells. rm-1941 (review fix
+/// 020be87e): the CR arms mirror `markdown_cell` — CRLF normalizes onto the
+/// `\n` arm and a lone `\r` dies to U+FFFD — because these spans land inside
+/// table cells fed by RAW transcript tool names (the authority table's
+/// High-authority tools row via `report_markdown_code_list`), the same
+/// single-line context the plain cell renderers already guard.
 fn markdown_inline_code(value: &str) -> String {
     value
         .replace('`', "'")
         .replace('|', "\\|")
+        .replace("\r\n", "\n")
         .replace('\n', "<br>")
+        .replace('\r', "\u{FFFD}")
 }
 
 fn report_markdown_code_list(values: &[String]) -> String {
@@ -4261,5 +4296,105 @@ mod tests {
         assert!(cell.contains("workbuddy_input_basis:zeroed_suspected_mismatch=1"));
         assert!(cell.contains("upstream luoyuctl/agenttrace#310"));
         assert!(cell.contains("cache-inclusive"));
+    }
+
+    #[test]
+    fn markdown_and_html_cells_neutralize_lone_carriage_return() {
+        // rm-1941: a table cell is a single-line context. A lone CR
+        // (`0x0D`) inside a cell is a same-line overwrite primitive when
+        // the emitted .md/.html is read as text (cat/less/pagers) — it is
+        // not layout. The TSV/CSV lanes already route cells through
+        // `sanitize_line_segment` (every control byte -> U+FFFD); the
+        // markdown/html cell renderers now carry the same arm at the
+        // renderer layer. The document sanitizer deliberately keeps `\r`
+        // for prose layout, so the cell renderer is the choke point that
+        // closes the gap the cross-format sweep's 96..A0 exemption leaves.
+        let poisoned = "claude-sonnet\r4.5-poison";
+
+        let md = markdown_cell(poisoned);
+        assert!(
+            !md.contains('\r'),
+            "raw CR must not ship in a md cell: {md:?}"
+        );
+        assert!(
+            md.contains('\u{FFFD}'),
+            "lone CR must surface as U+FFFD, got {md:?}"
+        );
+
+        let html = html_escape(poisoned);
+        assert!(
+            !html.contains('\r'),
+            "raw CR must not ship in a html cell: {html:?}"
+        );
+        assert!(
+            html.contains('\u{FFFD}'),
+            "lone CR must surface as U+FFFD, got {html:?}"
+        );
+
+        // Benign CRLF content must not gain visible replacement noise:
+        // the pair normalizes onto the `\n` arm (`<br>` in markdown,
+        // newline in html), and only a stray lone CR degrades to U+FFFD.
+        assert_eq!(markdown_cell("a\r\nb"), "a<br>b");
+        let html_pair = html_escape("a\r\nb");
+        assert!(!html_pair.contains('\r'));
+        assert!(!html_pair.contains('\u{FFFD}'));
+
+        // Existing arms stay intact arm-for-arm.
+        assert_eq!(markdown_cell("a|b"), "a\\|b");
+        assert_eq!(html_escape("<&>"), "&lt;&amp;&gt;");
+    }
+
+    #[test]
+    fn markdown_inline_code_and_code_lists_neutralize_lone_carriage_return() {
+        // rm-1941 review fix (independent_review 020be87e, high
+        // finding): `markdown_inline_code` had no CR arm while its
+        // output lands INSIDE markdown table cells — the authority
+        // table's "High-authority tools" cell is fed by
+        // `report_markdown_code_list` with RAW transcript-derived tool
+        // names (`metrics.tool_usage` keys kept verbatim), so a poisoned
+        // tool name shipped a raw 0x0D into the cell: the same-line
+        // overwrite primitive the plain cell renderers already die on.
+        // The inline-code arms now mirror `markdown_cell` arm-for-arm.
+        let poisoned_tool = "write\rfiles-poison";
+
+        let inline = markdown_inline_code(poisoned_tool);
+        assert!(
+            !inline.contains('\r'),
+            "raw CR must not ship in an inline-code cell: {inline:?}"
+        );
+        assert!(
+            inline.contains('\u{FFFD}'),
+            "lone CR must surface as U+FFFD, got {inline:?}"
+        );
+
+        // Benign CRLF joins the `<br>` arm without replacement noise;
+        // the pre-existing arms (backtick, pipe) stay intact.
+        assert_eq!(markdown_inline_code("a\r\nb"), "a<br>b");
+        assert_eq!(markdown_inline_code("a|b"), "a\\|b");
+        assert_eq!(markdown_inline_code("a`b"), "a'b");
+
+        // The PoC pin at the list layer: the exact cell the review
+        // exploited must carry zero raw 0x0D on BOTH document lanes
+        // (the html twin routes through `html_escape` and was already
+        // cured — this locks the cross-lane parity in place).
+        let md_cell = report_markdown_code_list(&[poisoned_tool.to_string()]);
+        assert!(
+            !md_cell.contains('\r'),
+            "md code-list cell must not carry raw CR: {md_cell:?}"
+        );
+        assert!(
+            md_cell.contains("`write\u{FFFD}files-poison`"),
+            "PoC tool name must render U+FFFD inside the code span: {md_cell:?}"
+        );
+
+        let html_cell = report_html_code_list(&[poisoned_tool.to_string()]);
+        assert!(
+            !html_cell.contains('\r'),
+            "html code-list cell must not carry raw CR: {html_cell:?}"
+        );
+        assert!(
+            html_cell.contains('\u{FFFD}'),
+            "html twin must surface U+FFFD: {html_cell:?}"
+        );
     }
 }

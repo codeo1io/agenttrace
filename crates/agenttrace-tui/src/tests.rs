@@ -2802,3 +2802,60 @@ fn tui_reconciles_replay_families_and_discloses_them() {
         load_summary_line(&app)
     );
 }
+
+#[test]
+fn tui_boot_path_captures_replay_disclosure_stats() {
+    // rm-1942: App::new runs the boot reconcile (rm-402 lineage) but
+    // used to discard its stats (`let _replay = …`), leaving
+    // load_state.replay_children_adjusted at its 0 init — the
+    // replay-adjusted disclosure clause (presentation, gated > 0)
+    // could not fire on the boot lane until the first reload. The
+    // boot path now captures what the reconcile already computed
+    // (capture-not-recompute; no second pass).
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../agenttrace-core/tests/fixtures/codex-multiagent-v2");
+    let mut family = Vec::new();
+    for name in ["child.jsonl", "parent.jsonl"] {
+        let path = dir.join(name);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        family.push(
+            agenttrace_core::parse_raw_session("codex", path.to_str().unwrap(), &raw).unwrap(),
+        );
+    }
+    let app = App::new(family, "test", None);
+    // The sessions themselves reconciled at boot either way (the
+    // reconcile runs on `sessions` before the literal); the
+    // regression is the STAT: it must land in load state without a
+    // reload round-trip.
+    assert_eq!(
+        app.sessions
+            .iter()
+            .map(|s| s.metrics.tokens_input)
+            .sum::<i64>(),
+        1_700,
+        "boot sessions carry reconciled family totals"
+    );
+    assert_eq!(
+        app.load_state.replay_children_adjusted, 1,
+        "boot reconcile stats must land in load_state before any reload"
+    );
+    // Render truth pinned by the review fix (independent_review 020be87e
+    // F2): the replay-adjusted clause renders only inside the
+    // LoadPhase::Ready arm of load_summary_line — Ready is set solely by
+    // apply_loaded_sessions (the reload lane, which re-captures the stat
+    // itself), and App::new leaves the phase Idle. The boot fix is
+    // state-consistency (the stat is truthful from boot so the clause
+    // can fire on the FIRST Ready summary without a second reconcile
+    // pass); the clause's actual render is pinned on the reload lane by
+    // tui_reconciles_replay_families_and_discloses_them.
+    assert_eq!(
+        app.load_state.phase,
+        LoadPhase::Idle,
+        "boot lane stays Idle — the clause is Ready-gated, not boot-rendered"
+    );
+    let boot_line = load_summary_line(&app);
+    assert!(
+        !boot_line.contains("replay-adjusted"),
+        "no clause render on the Idle boot lane: {boot_line}"
+    );
+}

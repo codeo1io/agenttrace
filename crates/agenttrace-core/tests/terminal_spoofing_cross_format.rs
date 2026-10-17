@@ -215,3 +215,29 @@ fn plane14_tag_block_is_neutralized_and_json_escapes_as_surrogate_pair() {
     );
     assert_eq!(escape_spoofing_json(&escaped), escaped, "idempotent");
 }
+
+#[test]
+fn carriage_return_boundary_stays_two_layer() {
+    // rm-1941 policy pin (red-first at the renderer layer — those arms
+    // live in reports.rs `markdown_cell` / `html_escape` unit tests):
+    // CR is layout ONLY inside prose flow. The document sanitizer keeps
+    // it (a paragraph's line breaks survive), the line-segment
+    // sanitizer kills it (a single-line context must not carry a
+    // same-line overwrite primitive), and the markdown/html CELL
+    // renderers now carry the same arm at the cell layer — a cell is
+    // the single-line context of the document lanes. The 96..A0 sweep
+    // below exempts CR for exactly this reason; the cell gap it used
+    // to leave is closed one layer up, not by widening this exemption.
+    let poisoned = "claude-sonnet\r4.5-poison";
+    assert!(
+        sanitize_output_document(poisoned).contains('\r'),
+        "document prose keeps CR as layout"
+    );
+    let cell_lane = sanitize_line_segment(poisoned);
+    assert!(
+        !cell_lane.contains('\r') && cell_lane.contains('\u{FFFD}'),
+        "line segments (TSV/CSV cells) kill the lone CR"
+    );
+    // Benign CRLF prose data must survive the document pass untouched.
+    assert_eq!(sanitize_output_document("a\r\nb"), "a\r\nb");
+}

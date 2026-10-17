@@ -201,7 +201,11 @@ jobs:
               else
                 echo "conformance gate: gated surface untouched — pack still runs (guards silent token drift)"
               fi
-              echo "$CHANGED" | sed 's/^/  changed: /'
+              # SC2001-clean form of `sed 's/^/  changed: /'` (actionlint
+              # runs shellcheck on this block; the sed pipe fails the CI lint job).
+              while IFS= read -r changed_line; do
+                echo "  changed: $changed_line"
+              done <<< "$CHANGED"
             else
               echo "conformance gate: diff unavailable on this shallow checkout — pack runs unconditionally"
             fi
