@@ -8,7 +8,46 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 69;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 70;
+// Bumped 69 -> 70 (integration of run e30a880139e54a60ba60b458cc2077a5
+// cycle 1 'Cline envelope intake: role-walk absorption + canonical-
+// store discovery + single-carrier rule', rm-1881 LEAD + rm-1882 +
+// rm-1435 discovery arm, candidate 77e1480 @ base 8c9e882, conflict
+// case eec3bbea63554a21aefe4daccdba2ec3): the batch changed parser
+// SEMANTICS for UNCHANGED source files — the Cline CLI envelope's
+// per-message `metrics` sibling now folds into usage on every
+// production path (rm-1881: role/content walk + the canonical
+// ~/.cline/data/sessions discovery root, CLINE_SESSION_DATA_DIR
+// relocation), and the ui-lane double absorption of a say text beside
+// its structural sibling is cured (rm-1882 single-carrier rule, with
+// `carriers` counting entries-with-carriers) — but the batch shipped
+// only the DIR_LISTING_WALK_VERSION 5 -> 6 rung, which re-walks
+// listings WITHOUT re-parsing, so a warm pre-rung entry kept serving
+// the pre-fix silent zero ($0.0000 estimated_from_text) and the
+// double-counted ui-lane totals on unchanged files. The same rung
+// sweeps the review fix riding it — the text-carrier prefilter
+// widened from the "okens" substring to the full eight-key probe, so
+// cacheReads/cacheWrites-only text carriers fold again as at the
+// pre-batch base — and, landing above the ceiling, the earlier-landed
+// rm-1884 identity input basis and rm-1885 usage-say-vocabulary
+// gating (run 8a57b895, 842c62e), which shipped without a rung of
+// their own: a warm entry replayed the net-of-cache input tokens the
+// identity basis exists to cure. rm-230 convention: parser-semantics
+// changes that alter reported totals for unchanged files bump the
+// schema so cached sessions regenerate under corrected accounting.
+// SEAM: the run's review fix minted its bump 64 -> 65 straight at its
+// base 8c9e882 on the then-landed ceiling 64, but this tree had since
+// landed 65 (run b01c2b6abe28's rm-1509 opencode summary_diffs rung,
+// below), 67 (run 6d2a1d8d's newest-lanes mint, below, which left 66
+// free for run abb3b091's uncommitted sibling mint), 68 (run
+// 4f2af62e's Claude org-dimension rung, below) and 69 (run 7fd83ab2's
+// claude request-reproduction disclosure rung, below) — so per the
+// landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c) the landed
+// rungs keep their numerals and this integration lands the Cline
+// envelope rung as 70, the lowest rung unique above the ceiling, one
+// invalidation either way; 66 stays free. No SQLite snapshot rung
+// rode the batch; the landed 13 (run b01c2b6a, below) remains the
+// snapshot ceiling. Entries regenerate once on next scan.
 // Bumped 68 -> 69 (integration of run 7fd83ab2fd7f4ea090b5d540983a0abb
 // cycle 2 'evidence-lane paste-safety + claude-lane format-compat',
 // rm-1522, review 3ea62c4d F1 -> fix 282d5474; candidate e9c1c77 @
@@ -102,8 +141,7 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 69;
 // bump the schema so cached sessions regenerate). Entries
 // regenerate once on next scan. The SQLite snapshot moves 12 -> 13
 // in the same unit (below) — the snapshot lane holds the same
-// sessions and has the same warm-hit hole.
-// Bumped 63 -> 64 (integration of run 90514a3833d04721a6a3ca40ea695423
+// sessions and has the same warm-hit hole.// Bumped 63 -> 64 (integration of run 90514a3833d04721a6a3ca40ea695423
 // cycle 4 'pi cost truth: recorded-zero disclosure + 1h-tier cache
 // accounting', rm-1052 LEAD + rm-499, conflict case
 // 8fbcfcfd5e4d440b8e2890456aaacede, candidate 9a881b9 @ base 82e23b9):
@@ -1108,7 +1146,14 @@ const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 /// load instead of being filtered. The batch's own 3 -> 4 bump re-bases
 /// onto the already-landed v4 lane (rm-732) per the same convention one
 /// lane up.
-const DIR_LISTING_WALK_VERSION: i64 = 5;
+///
+/// v6 (rm-1881): Cline CLI canonical-store admission changed — under
+/// `~/.cline/data/sessions/` (or `CLINE_SESSION_DATA_DIR`) only the
+/// `<id>.messages.json` transcript is admitted; the `session.json`
+/// manifest and `hooks.jsonl` siblings no longer are. A listing stored
+/// by a pre-rm-1881 walk of that root replays the old admission set,
+/// so the lane bumps once to retire every stored listing.
+const DIR_LISTING_WALK_VERSION: i64 = 6;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")

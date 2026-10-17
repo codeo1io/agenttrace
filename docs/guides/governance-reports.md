@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 69 and the SQLite snapshot is schema 13; the
+The session cache is schema 70 and the SQLite snapshot is schema 13; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -458,7 +458,29 @@ integration, conflict case cded886e63e946aab0631f9c5e0e9f2e, re-bases
 it onto the advanced ceiling as 68 → 69 per the landed-rung-keeps-
 numeral convention, keeping 66 free for run abb3b091's in-flight
 mint, one invalidation either way; the SQLite snapshot stays 13 —
-no snapshot semantics moved)
+no snapshot semantics moved),
+and to 70 when the Cline CLI envelope's per-message `metrics`
+siblings began folding into usage on every production path (the
+role/content walk plus the canonical `~/.cline/data/sessions`
+discovery root, `CLINE_SESSION_DATA_DIR` relocation) and the ui-lane
+double absorption of a say text beside its structural sibling was
+cured under the single-carrier rule, with `carriers` counting
+entries-with-carriers — the batch shipped only the
+DIR_LISTING_WALK_VERSION 5 → 6 rung, which re-walks listings without
+re-parsing, so a warm entry kept serving the pre-fix silent $0 and
+the doubled ui-lane totals on unchanged files; the same rung sweeps
+the review fix riding it (the text-carrier prefilter widened from
+the "okens" substring to the full eight-key probe) and the
+earlier-landed rm-1884 identity input basis + rm-1885
+usage-say-vocabulary gating (run 8a57b895), which shipped without a
+rung of their own (run e30a8801 cycle 1, rm-1881 + rm-1882 +
+rm-1435; the run's review fix minted 64 → 65 straight at its base
+8c9e882 below this tree's ceiling 69 — so this integration, conflict
+case eec3bbea63554a21aefe4daccdba2ec3, re-bases it onto the advanced
+ceiling as 69 → 70 per the landed-rung-keeps-numeral convention,
+keeping 66 free for run abb3b091's in-flight mint, one invalidation
+either way; the SQLite snapshot stays 13 — no snapshot semantics
+moved)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

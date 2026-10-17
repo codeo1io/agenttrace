@@ -4,6 +4,47 @@
 
 ### Added
 
+- Cline CLI envelope intake works on every production path, and its
+  canonical store is auto-discovered (rm-1881 + rm-1882, run e30a8801
+  cycle 1): the Cline CLI `.messages.json` envelope carries usage as
+  per-message `metrics` siblings, but absorption lived only in the
+  ui-message walk (`ui_messages.json`) while the envelope has no
+  `type`/`say` entries — so positionally, via `-d` walks, and via
+  discovery, every envelope rendered text-estimated tokens and $0.00
+  with zero disclosures (the assess PoC: a $0.045 turn printed $0.00).
+  The role/content walk now absorbs `metrics` siblings through the
+  same carrier rules as the ui lane — clamp-at-intake, the identity
+  input basis (rm-1884: upstream `tokensIn` meters uncached input only,
+  so it is recorded as-is with the cache legs as separate disjoint
+  counters), cost-only refusal, disclosed counters — so one object
+  folds to identical totals through either lane; retry semantics
+  accumulate (saturating adds; nothing overwritten or dropped) and
+  unknown additive fields are tolerated. The canonical store
+  `~/.cline/data/sessions/<id>/<id>.messages.json` (messages contract
+  v1) is a discovery root — `CLINE_SESSION_DATA_DIR` relocates it,
+  trimmed-empty falls back to the default — and a transcript is
+  admitted only under content-shaped gates: `<dirName>.messages.json`
+  name plus the sibling `session.json` manifest, under the canonical
+  root. `session.json`/`hooks.jsonl` never become sessions, a generic
+  `.messages.json` outside the store never qualifies, and the same id
+  in both the canonical store and the legacy VS Code tasks root
+  renders one session (canonical wins). A ui entry carrying both a
+  structural `metrics` sibling and a metrics-shaped text carrier folds
+  once — the sibling supersedes the text (the same evidence encoded
+  twice must not double-count), with the text arm gated to the upstream
+  usage say vocabulary (rm-1885) — and
+  `cline_metrics_carriers_parsed` counts entries-with-carriers, not
+  absorptions. A prefilter skips the JSON parse for texts that cannot
+  possibly be carriers (substring probe over the eight token keys
+  themselves, since `cacheReads`/`cacheWrites` carry no "okens"
+  substring; any text containing a `\u` escape bypasses it), keeping
+  the admission set identical. Warm session caches regenerate once
+  under schema rung 70 (the run's 64 → 65 mint, re-based at integration
+  onto the advanced 69 ceiling per the landed-rung-keeps-numeral
+  convention; the same rung sweeps the earlier-landed rm-1884 identity
+  basis and rm-1885 vocabulary gate, which shipped without a rung of
+  their own), so pre-fix silent-zero and double-counted totals do not
+  survive the upgrade.
 - Standing battery reds get a typed environmental/flaky/defect verdict
   (rm-1507, run a1f6c1f8 cycle 2): `scripts/ci/check-battery-adjudicate.sh`
   re-runs a single failing test N times isolated (fresh mktemp TMPDIR per
@@ -180,8 +221,7 @@
   cannot evict real sampled days from the window (pinned by test against
   the row's literal 12-25 PoC shape).
 
-- OpenCode v2 per-file delivery evidence — the `summary_diffs` column is consumed, disclosed, and divergence-checked (rm-1509, run b01c2b6a cycle 2, batch "advisory closure + OpenCode v2 delivery-evidence readiness"): opencode's staged v2 session schema adds a `summary_diffs` json column beside the landed `summary_additions`/`summary_deletions`/`summary_files` integers, carrying the per-file `FileDiff.LegacyInfo[]` list (`{file?, additions, deletions, status?}` — patch bodies deliberately not mirrored; delivery evidence reports counts and paths). The sqlite lane reads it behind the same column-presence probe as the rm-991 integers (fixed read indices unchanged — the new column pads to index 16 and null-pads for 1.x stores, which parse byte-identically), and `Metrics` gains `summary_diffs`, `summary_diffs_dropped`, and `summary_diffs_divergence`: a payload that is present but fails to decode — or sits in a non-TEXT storage class — is counted per session, never a hard error and never silently re-derived, and when the per-file sums disagree with the integer columns on the same row the divergence is disclosed on its own evidence line (`per-file diff sums diverge from the row's summary columns: +40 vs +500 additions, -4 vs -50 deletions`) instead of silently reconciled into either side — the same recorded-vs-derived failure class ccusage closed with #1883's float tolerance. A writer-reported non-empty list also surfaces as `writer-reported per-file diff summary: N files (+A/-D)` in `--delivery-evidence`; an explicitly empty list never flags divergence (absence is not disagreement), sums saturate so hostile i64::MAX payloads cannot overflow the disclosure arithmetic (review fix: the delivery-evidence per-file sums initially used a plain `.sum()` that panicked debug builds on exactly that hostile payload and wrapped negative in release — they now share the divergence check's saturating fold, pinned end-to-end by a hostile fixture, and a present-but-BLOB payload is counted as dropped rather than read as absent), and the session cache rung advances 64 -> 65 (shape-only: warm entries replay no per-file evidence) with the sqlite snapshot rung 12 -> 13. Pinned red-first by `crates/agenttrace-core/tests/opencode_summary_diffs.rs` against a synthetic v2-shape fixture (matched/divergent/malformed/empty rows + builder/worker agent split) with the rm-991 fixture kept as the 1.x byte-stability oracle; v2 is not on npm yet, so the contract ships readiness-before-corpus, the same posture as rm-991 and the gemini 0.63 chats lane.
-- Cline/Roo usage metrics carriers are consumed, not zeroed (rm-1430, run
+- OpenCode v2 per-file delivery evidence — the `summary_diffs` column is consumed, disclosed, and divergence-checked (rm-1509, run b01c2b6a cycle 2, batch "advisory closure + OpenCode v2 delivery-evidence readiness"): opencode's staged v2 session schema adds a `summary_diffs` json column beside the landed `summary_additions`/`summary_deletions`/`summary_files` integers, carrying the per-file `FileDiff.LegacyInfo[]` list (`{file?, additions, deletions, status?}` — patch bodies deliberately not mirrored; delivery evidence reports counts and paths). The sqlite lane reads it behind the same column-presence probe as the rm-991 integers (fixed read indices unchanged — the new column pads to index 16 and null-pads for 1.x stores, which parse byte-identically), and `Metrics` gains `summary_diffs`, `summary_diffs_dropped`, and `summary_diffs_divergence`: a payload that is present but fails to decode — or sits in a non-TEXT storage class — is counted per session, never a hard error and never silently re-derived, and when the per-file sums disagree with the integer columns on the same row the divergence is disclosed on its own evidence line (`per-file diff sums diverge from the row's summary columns: +40 vs +500 additions, -4 vs -50 deletions`) instead of silently reconciled into either side — the same recorded-vs-derived failure class ccusage closed with #1883's float tolerance. A writer-reported non-empty list also surfaces as `writer-reported per-file diff summary: N files (+A/-D)` in `--delivery-evidence`; an explicitly empty list never flags divergence (absence is not disagreement), sums saturate so hostile i64::MAX payloads cannot overflow the disclosure arithmetic (review fix: the delivery-evidence per-file sums initially used a plain `.sum()` that panicked debug builds on exactly that hostile payload and wrapped negative in release — they now share the divergence check's saturating fold, pinned end-to-end by a hostile fixture, and a present-but-BLOB payload is counted as dropped rather than read as absent), and the session cache rung advances 64 -> 65 (shape-only: warm entries replay no per-file evidence) with the sqlite snapshot rung 12 -> 13. Pinned red-first by `crates/agenttrace-core/tests/opencode_summary_diffs.rs` against a synthetic v2-shape fixture (matched/divergent/malformed/empty rows + builder/worker agent split) with the rm-991 fixture kept as the 1.x byte-stability oracle; v2 is not on npm yet, so the contract ships readiness-before-corpus, the same posture as rm-991 and the gemini 0.63 chats lane.- Cline/Roo usage metrics carriers are consumed, not zeroed (rm-1430, run
   a3f96656 cycle 3): Cline journals record per-response usage — as a say
   entry whose text is a JSON object (`cost`/`tokensIn`/`tokensOut`/
   `cacheReads`/`cacheWrites`) on the Roo task-dir store, and as a sibling
