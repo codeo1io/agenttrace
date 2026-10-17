@@ -152,3 +152,4 @@ campaign-local numeral); renumbered to Rule 8 at its integration merge,
 where Rule 7 was already taken by run cf755698's fixture-root rule above —
 the cross-campaign collision convention both rules record.
 
+- 2026-10-17 audit closure (run 3b722c4e cycle 2): `check-output-contract.sh` — the one remaining gate invoking the binary without the isolation block — now pins `HOME`/`XDG_*`/`AGENTTRACE_SESSION_CACHE_DIR` to scratch and wraps the probe in `timeout 60` (two prior attempts died rc=124@300s with rchar 3.16GB walking the operator HOME; rc0 in 2s after). Rule of use: when adding or reviewing a `scripts/ci/*.sh` gate, enumerate EVERY binary invocation and require the isolation block — a rule without an enumerated audit surface stays unenforced.
