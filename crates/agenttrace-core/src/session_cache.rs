@@ -2026,7 +2026,17 @@ pub(crate) fn open_private_append(path: &Path) -> std::io::Result<fs::File> {
     }
     #[cfg(not(unix))]
     {
-        fs::OpenOptions::new().create(true).append(true).open(path)
+        // The journal is locked right after open (open_locked_journal)
+        // and std's File::lock on Windows requires GENERIC_WRITE on the
+        // handle; an append-only open carries just FILE_APPEND_DATA and
+        // LockFileEx denies it with os error 5. FILE_APPEND_DATA keeps
+        // every write appended regardless of the file pointer.
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .write(true)
+            .open(path)
     }
 }
 

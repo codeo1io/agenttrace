@@ -2689,7 +2689,10 @@ fn output_flag_refusal_names_the_directory_and_target() {
         "error must name the requested -o target: {stderr}"
     );
     assert!(
-        stderr.contains("File exists"),
+        // unix strerror: "File exists"; windows: "Cannot create a file
+        // when that file already exists." — the disclosed-cause contract
+        // is the OS message naming the collision, not its spelling.
+        stderr.contains("exists"),
         "the OS cause stays disclosed (rm-610): {stderr}"
     );
 

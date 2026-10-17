@@ -2773,8 +2773,17 @@ mod tests {
         let previous_env = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
         let previous_home = std::env::var_os("HOME");
         let previous_xdg = std::env::var_os("XDG_CACHE_HOME");
-        let default_root = root.join("home").join(".cache").join("agenttrace");
-        std::env::set_var("HOME", root.join("home"));
+        // The default root differs on macOS (Library/Caches ladder);
+        // derive it from the same resolver the production path uses
+        // instead of hardcoding the unix spelling.
+        let set_home = root.join("home");
+        let default_root = crate::cache_dir::resolve_user_cache_dir_for_test(
+            Some(set_home.as_os_str()),
+            None,
+            cfg!(target_os = "macos"),
+        )
+        .join("agenttrace");
+        std::env::set_var("HOME", set_home);
         std::env::remove_var("XDG_CACHE_HOME");
 
         std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
