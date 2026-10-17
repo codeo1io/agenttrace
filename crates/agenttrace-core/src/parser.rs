@@ -1128,8 +1128,158 @@ fn antigravity_usage_block(obj: &Map<String, Value>) -> Option<BTreeMap<String, 
 fn antigravity_model_id(obj: &Map<String, Value>) -> Option<String> {
     ANTIGRAVITY_MODEL_KEYS
         .iter()
-        .find_map(|key| string(obj.get(*key)).map(str::to_string))
+        .find_map(|key| {
+            let value = obj.get(*key)?;
+            // rm-1907 (ccusage #1897): `modelConfigId` rides as a JSON
+            // NUMBER on real ide-root journals (1277, 246, 1417 …), and
+            // the as_str-only read folded every numeric carrier to None
+            // — the generation kept its usage but reported `default`, so
+            // the cost_audit pricing-coverage channel (the rm-720
+            // contract's backstop for unpriced ids) never saw the model
+            // at all. Numbers stringify to their digits and take the
+            // same resolution ladder below as the enum spelling.
+            let text = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => match number.as_u64() {
+                    Some(int) => int.to_string(),
+                    None => number.to_string(),
+                },
+                _ => return None,
+            };
+            (!text.trim().is_empty()).then_some(text)
+        })
         .filter(|model| !model.is_empty())
+}
+
+/// rm-1907: what the numeric-ID ladder did to one raw carrier.
+enum AntigravityModelResolution {
+    /// A named string carrier ("gemini-pro-default") — outside the
+    /// ladder's scope; passes through verbatim exactly as before, and
+    /// cost_audit's pricing-coverage channel keeps owning its pricing
+    /// disclosure (pinned by the rm-720 trajectory test).
+    Named,
+    /// An opaque carrier (numeric id or MODEL_PLACEHOLDER_* enum) the
+    /// ladder resolved onto a named family row.
+    Resolved { model: String, carrier: String },
+    /// An opaque carrier with no table entry — the id stays VERBATIM
+    /// (the journal's own spelling, never a synthesized name) and the
+    /// gap is disclosed via `antigravity_model:no_catalog_row:*`.
+    Unresolved { model: String },
+}
+
+/// Numeric `modelConfigId` -> named model, mirroring ccusage's
+/// `model_name_from_id` table (fetched 2026-10-16, rust/adapters/
+/// antigravity/src/parser.rs) so agenttrace and the ecosystem resolve
+/// the same ids. One divergence, by design: ccusage renames unmapped
+/// numeric ids to `antigravity-model-{id}`, inventing an identity the
+/// journal never stated — agenttrace keeps the digits verbatim and
+/// discloses the gap instead (the truthfulness contract behind
+/// cost_audit's coverage channel).
+fn antigravity_numeric_model_name(id: u64) -> Option<&'static str> {
+    Some(match id {
+        246 => "gemini-2.5-pro",
+        312 => "gemini-2.5-flash",
+        313 | 329 => "gemini-2.5-flash-thinking",
+        330 => "gemini-2.5-flash-lite",
+        281 | 282 => "claude-4-sonnet",
+        290 | 291 => "claude-4-opus",
+        333 | 334 => "claude-4.5-sonnet",
+        340 | 341 => "claude-4.5-haiku",
+        342 => "gpt-oss-120b-medium",
+        1071 => "gemini-3.6-flash-high",
+        1072 => "gemini-3.6-flash-medium",
+        1073 => "gemini-3.6-flash-low",
+        1298 => "gemini-3.7-flash-high",
+        1299 => "gemini-3.7-flash-medium",
+        1300 => "gemini-3.7-flash-low",
+        1318 => "gemini-3.8-flash-high",
+        1319 => "gemini-3.8-flash-medium",
+        1320 => "gemini-3.8-flash-low",
+        1417 => "gemini-4-argon",
+        _ => return None,
+    })
+}
+
+/// Lowercase `model_placeholder_mNNN` -> named model, mirroring
+/// ccusage's `normalize_antigravity_model` placeholder table (fetched
+/// 2026-10-16) plus the two rows the ecosystem has live-tested since:
+/// ccusage #1904 pins m418 / m419 as gemini-4-argon at medium / low
+/// reasoning effort — ONE pricing family, so both placeholders bucket
+/// onto the named family row (the mint's bucketed fallback). m417
+/// (high effort) was already mapped upstream.
+fn antigravity_placeholder_model(placeholder: &str) -> Option<&'static str> {
+    Some(match placeholder {
+        "model_placeholder_m318" => "gemini-3.8-flash-high",
+        "model_placeholder_m319" => "gemini-3.8-flash-medium",
+        "model_placeholder_m320" => "gemini-3.8-flash-low",
+        "model_placeholder_m298" => "gemini-3.7-flash-high",
+        "model_placeholder_m299" => "gemini-3.7-flash-medium",
+        "model_placeholder_m300" => "gemini-3.7-flash-low",
+        "model_placeholder_m71" => "gemini-3.6-flash-high",
+        "model_placeholder_m72" => "gemini-3.6-flash-medium",
+        "model_placeholder_m73" => "gemini-3.6-flash-low",
+        "model_placeholder_m417" => "gemini-4-argon",
+        "model_placeholder_m418" | "model_placeholder_m419" => "gemini-4-argon",
+        "model_placeholder_m26" => "claude-opus-4-6",
+        "model_placeholder_m35" => "claude-sonnet-4-6",
+        "model_placeholder_m36" | "model_placeholder_m37" | "model_placeholder_m16" => {
+            "gemini-3.1-pro"
+        }
+        "model_placeholder_m18" | "model_placeholder_m84" | "model_placeholder_m47" => {
+            "gemini-3-flash-preview"
+        }
+        "model_placeholder_m132" | "model_placeholder_m133" => "gemini-3.5-flash-high",
+        "model_placeholder_m187" => "gemini-3.5-flash-extra-low",
+        "model_placeholder_m20" => "gemini-3.5-flash-medium",
+        _ => return None,
+    })
+}
+
+/// rm-1907: the numeric-ID resolution ladder. Numeric carriers check
+/// the numeric table first, then (ids >= 1000) their placeholder-enum
+/// form — ccusage's own two-step chain, so numeric 1418 resolves through
+/// m418 exactly like the enum spelling. Placeholder-enum carriers
+/// lowercase to the same table (the journal spells them uppercase;
+/// counter labels use the lowercase canonical form per the rm-756
+/// case-fold discipline). Unresolvable carriers stay verbatim.
+fn resolve_antigravity_model(raw: &str) -> AntigravityModelResolution {
+    if let Ok(id) = raw.trim().parse::<u64>() {
+        if let Some(model) = antigravity_numeric_model_name(id) {
+            return AntigravityModelResolution::Resolved {
+                model: model.to_string(),
+                carrier: id.to_string(),
+            };
+        }
+        if id >= 1_000 {
+            let placeholder = format!("model_placeholder_m{}", id - 1_000);
+            if let Some(model) = antigravity_placeholder_model(&placeholder) {
+                return AntigravityModelResolution::Resolved {
+                    model: model.to_string(),
+                    carrier: placeholder,
+                };
+            }
+        }
+        return AntigravityModelResolution::Unresolved {
+            model: raw.to_string(),
+        };
+    }
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("MODEL_PLACEHOLDER_")
+        .or_else(|| trimmed.strip_prefix("model_placeholder_"))
+    {
+        let canonical = format!("model_placeholder_{}", rest.to_lowercase());
+        if let Some(model) = antigravity_placeholder_model(&canonical) {
+            return AntigravityModelResolution::Resolved {
+                model: model.to_string(),
+                carrier: canonical,
+            };
+        }
+        return AntigravityModelResolution::Unresolved {
+            model: raw.to_string(),
+        };
+    }
+    AntigravityModelResolution::Named
 }
 
 /// rm-720 fold state: sums per-generation usage blocks and emits ONE
@@ -1142,6 +1292,10 @@ struct AntigravityUsageFold {
     models_seen: usize,
     generations: usize,
     latest_timestamp: String,
+    /// rm-1907: per-carrier resolution disclosures
+    /// (`antigravity_model:id_resolved:*` /
+    /// `antigravity_model:no_catalog_row:*`) merged onto the meta event.
+    disclosures: BTreeMap<String, i64>,
 }
 
 impl AntigravityUsageFold {
@@ -1152,6 +1306,7 @@ impl AntigravityUsageFold {
             models_seen: 0,
             generations: 0,
             latest_timestamp: String::new(),
+            disclosures: BTreeMap::new(),
         }
     }
 
@@ -1172,7 +1327,48 @@ impl AntigravityUsageFold {
         }
         if let Some(model) = model {
             self.models_seen += 1;
-            self.model = model;
+            // rm-1907: run every carrier through the numeric-ID
+            // resolution ladder at fold time. A resolved carrier
+            // replaces the opaque id with the named family row and
+            // discloses WHICH carrier resolved (`id_resolved:<carrier>`
+            // — digits for numeric-table hits, the lowercase
+            // placeholder spelling for enum-form hits, so one journal's
+            // two spellings of the same model land on one label). A
+            // carrier the ladder leaves unresolved stays VERBATIM, and
+            // any ladder participant whose FINAL id (resolved name or
+            // verbatim digits) has no pricing-catalog row raises
+            // `no_catalog_row:<id>` — the "model id not resolvable"
+            // counter the mint requires, so an unpriced argon or an
+            // unmapped 1277 is a disclosed gap instead of a silent
+            // `default`. Named string carriers pass through untouched.
+            match resolve_antigravity_model(&model) {
+                AntigravityModelResolution::Named => self.model = model,
+                AntigravityModelResolution::Resolved {
+                    model: name,
+                    carrier,
+                } => {
+                    *self
+                        .disclosures
+                        .entry(disclosure_key("antigravity_model:id_resolved", &carrier))
+                        .or_insert(0) += 1;
+                    if !crate::pricing::has_specific_price(&name) {
+                        *self
+                            .disclosures
+                            .entry(disclosure_key("antigravity_model:no_catalog_row", &name))
+                            .or_insert(0) += 1;
+                    }
+                    self.model = name;
+                }
+                AntigravityModelResolution::Unresolved { model: kept } => {
+                    if !crate::pricing::has_specific_price(&kept) {
+                        *self
+                            .disclosures
+                            .entry(disclosure_key("antigravity_model:no_catalog_row", &kept))
+                            .or_insert(0) += 1;
+                    }
+                    self.model = kept;
+                }
+            }
         }
         self.latest_timestamp = later_rfc3339(&self.latest_timestamp, timestamp);
     }
@@ -1196,6 +1392,9 @@ impl AntigravityUsageFold {
                 "antigravity_model:multi_model_last_wins".to_string(),
                 self.models_seen as i64,
             );
+        }
+        for (key, value) in &self.disclosures {
+            counters.insert(key.clone(), *value);
         }
         Some(Event {
             role: "meta".to_string(),
@@ -5025,6 +5224,19 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     }
     let mut tool_results_by_message: BTreeSet<(String, ToolResultFoldKey)> = BTreeSet::new();
     let mut tool_result_refolds: BTreeMap<String, i64> = BTreeMap::new();
+    // rm-1908 (claude 2.1.300/.301 shape parity, run 65afcf57): the
+    // changelog shapes this parser predates — cache-write 5m/1h split,
+    // the compaction record row, the resume-summary marker, the
+    // tool_decision block — used to fall through silent `_ => {}` arms,
+    // so a 2.1.300 journal parsed GREEN while quietly reporting none
+    // of the new facts. Every one of them now lands on THIS map and
+    // rides the same single meta carrier as the refold counters below
+    // (one-carrier discipline). Streaming re-emissions repeat rows and
+    // blocks verbatim, so each census dedups on the message id (or
+    // counts the row itself when the row carries no id — a system row
+    // IS the boundary event).
+    let mut lane_disclosures: BTreeMap<String, i64> = BTreeMap::new();
+    let mut unmatched_types_seen: BTreeSet<(String, String)> = BTreeSet::new();
     // rm-406 (dated 2026-10-07 arm): message ids whose usage.iterations[]
     // array was already mined — the streaming re-emission problem rm-601
     // solved for top-level usage applies to the iterations array verbatim
@@ -5069,7 +5281,15 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 let Some(message) = obj.get("message").and_then(Value::as_object) else {
                     continue;
                 };
-                claude_user_content_events(message.get("content"), &ts, &model, &mut events);
+                claude_user_content_events(
+                    message.get("content"),
+                    &ts,
+                    &model,
+                    string(message.get("id")).unwrap_or(""),
+                    &mut events,
+                    &mut lane_disclosures,
+                    &mut unmatched_types_seen,
+                );
             }
             "assistant" => {
                 saw_claude = true;
@@ -5083,7 +5303,23 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         model = next_model.to_string();
                     }
                 }
-                if let Some(usage) = message.get("usage").and_then(usage_from_value) {
+                // rm-1908 (claude 2.1.300 cache-write split): the
+                // nested buckets land on the numeric spelling's usage
+                // class ONLY when that key is absent (same write, two
+                // spellings); the flat OTel attrs are never folded.
+                let cache_split = claude_cache_write_split(message.get("usage"));
+                let mut usage = message.get("usage").and_then(usage_from_value);
+                if let (Some(usage), Some(split)) = (usage.as_mut(), cache_split.as_ref()) {
+                    if split.has_object_buckets()
+                        && !usage.contains_key("cache_creation_input_tokens")
+                    {
+                        usage.insert(
+                            "cache_creation_input_tokens".to_string(),
+                            split.object_total(),
+                        );
+                    }
+                }
+                if let Some(usage) = usage {
                     let message_id = string(message.get("id")).unwrap_or("");
                     match usage_by_message.get(message_id).copied() {
                         Some(index) => {
@@ -5104,6 +5340,40 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             if !message_id.is_empty() {
                                 usage_by_message.insert(message_id.to_string(), events.len());
                             }
+                            // rm-1908: first-sighting shape disclosures —
+                            // streaming re-emissions repeat the usage object
+                            // verbatim, so the per-lifetime census mints
+                            // exactly once per message id (presence per
+                            // message, never magnitudes: the totals ride
+                            // the folded usage map itself). The usage MAP
+                            // still folds keep-max above on every
+                            // re-emission.
+                            if let Some(split) = cache_split.as_ref() {
+                                if split.five > 0 {
+                                    *lane_disclosures
+                                        .entry("claude_cache_write_split:ephemeral_5m".to_string())
+                                        .or_insert(0) += 1;
+                                }
+                                if split.one > 0 {
+                                    *lane_disclosures
+                                        .entry("claude_cache_write_split:ephemeral_1h".to_string())
+                                        .or_insert(0) += 1;
+                                }
+                                if split.flat_five {
+                                    *lane_disclosures
+                                        .entry("claude_cache_write_split:5m_tokens".to_string())
+                                        .or_insert(0) += 1;
+                                }
+                                if split.flat_one {
+                                    *lane_disclosures
+                                        .entry("claude_cache_write_split:1h_tokens".to_string())
+                                        .or_insert(0) += 1;
+                                }
+                            }
+                            claude_usage_unmatched_keys(
+                                message.get("usage"),
+                                &mut lane_disclosures,
+                            );
                             events.push(Event {
                                 role: "meta".to_string(),
                                 timestamp: ts.clone(),
@@ -5208,7 +5478,28 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                                 ..Event::default()
                             })
                         }
-                        _ => {}
+                        _ => {
+                            // rm-1908 (claude 2.1.300 tool_decision /
+                            // classifier_verdict): the changelog adds block
+                            // shapes this loop predates. An unmatched
+                            // block carries no billable usage, so it stays
+                            // a skip — but a DISCLOSED one: once per
+                            // (message id, type), so a streaming
+                            // re-emission repeating the snapshot never
+                            // double-counts.
+                            if let Some(block_type) =
+                                string(block.get("type")).filter(|t| !t.is_empty())
+                            {
+                                let message_id = string(message.get("id")).unwrap_or("");
+                                let seen = unmatched_types_seen
+                                    .insert((message_id.to_string(), block_type.to_string()));
+                                if message_id.is_empty() || seen {
+                                    *lane_disclosures
+                                        .entry(disclosure_key("claude_unmatched_type", block_type))
+                                        .or_insert(0) += 1;
+                                }
+                            }
+                        }
                     }
                 }
                 if !assistant_parts.is_empty()
@@ -5267,7 +5558,64 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     }
                 }
             }
-            _ => {}
+            // rm-1908 (claude 2.1.300 compaction record): `system` rows
+            // (the compact boundary — isCompactSummary=true, subtype
+            // prose optional — with 2.1.300 optionally carrying a
+            // compactMetadata envelope) carry no billable usage, and
+            // skipping them silently hid the compaction boundary from
+            // every 2.1.300 journal. Disclosed, not dropped: the row
+            // class — with the metadata envelope distinguished from the
+            // plain row so an operator sees WHICH record shape a journal
+            // carries. The claim gate is deliberately untouched: only
+            // journals the lane already claims (user/assistant rows) get
+            // the census, so no foreign format is stolen.
+            "system" | "compact" => {
+                let has_envelope = obj.get("compactMetadata").is_some_and(Value::is_object)
+                    || obj.get("metadata").is_some_and(Value::is_object);
+                let row_class =
+                    if obj.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+                        "compact"
+                    } else {
+                        string(obj.get("subtype"))
+                            .filter(|class| !class.is_empty())
+                            .unwrap_or("unknown")
+                    };
+                let label = if has_envelope {
+                    format!("{row_class}+metadata")
+                } else {
+                    row_class.to_string()
+                };
+                *lane_disclosures
+                    .entry(disclosure_key("claude_system_row", &label))
+                    .or_insert(0) += 1;
+            }
+            // rm-1908 (claude 2.1.300 truncated-tail resume): a
+            // type:"summary" row (summary + leafUuid) marks a tail
+            // resumed after a cut — the session shown starts
+            // mid-conversation; earlier history lives in ANOTHER file.
+            // A truthfulness datum, not a dropped line: each summary
+            // row names ONE leaf boundary and counts once.
+            "summary" => {
+                *lane_disclosures
+                    .entry("claude_resume_summary:leaf".to_string())
+                    .or_insert(0) += 1;
+            }
+            _ => {
+                // rm-1908 (2.1.301 tool_decision parity): the codex lane
+                // names unmatched row types (`codex_unmatched_type:*`)
+                // and the qwen lane `qwen_unmatched_type:*`; the claude
+                // lane used to skip every other top-level type silently.
+                // An unmatched row carries no billable usage in this
+                // lane's fold, so it stays a skip — but a DISCLOSED one:
+                // named per type, once per row (a row IS one occurrence;
+                // OTel tool_decision rows carry no message id to dedup
+                // on, and two decisions are two facts).
+                if !typ.is_empty() {
+                    *lane_disclosures
+                        .entry(disclosure_key("claude_unmatched_type", typ))
+                        .or_insert(0) += 1;
+                }
+            }
         }
     }
     // One-carrier note (review 543ac419 F4): this Claude lane mints no
@@ -5282,12 +5630,19 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // 42 -> 52 at its base 15a8da8; this integration re-based it onto
     // the advanced ceiling as 57 -> 58 per the
     // landed-rung-keeps-numeral convention).
-    if !tool_result_refolds.is_empty() {
+    if !tool_result_refolds.is_empty() || !lane_disclosures.is_empty() {
+        // rm-1908: refold counters and shape-parity counters share the
+        // single meta carrier (the one-carrier shape above) — merged,
+        // never two meta events.
+        let mut counters = std::mem::take(&mut tool_result_refolds);
+        for (key, value) in &lane_disclosures {
+            *counters.entry(key.clone()).or_insert(0) += *value;
+        }
         events.insert(
             0,
             Event {
                 role: "meta".to_string(),
-                disclosure_counters: std::mem::take(&mut tool_result_refolds),
+                disclosure_counters: counters,
                 ..Event::default()
             },
         );
@@ -5401,11 +5756,106 @@ fn claude_iterations_events(
     }
 }
 
+/// rm-1908 (claude 2.1.300 cache-write split, run 65afcf57): cache
+/// creation billing split by lifetime. TWO spellings exist and must
+/// never double-fold: the transcript shape nests the buckets under a
+/// `cache_creation` OBJECT (`ephemeral_5m_input_tokens` /
+/// `ephemeral_1h_input_tokens` — CHANGELOG 2.1.300), and the OTel
+/// export shape mirrors them as FLAT attrs (`cache_creation_5m_tokens`
+/// / `cache_creation_1h_tokens`, the gen_ai.* convention). The
+/// generic extractor reads the numeric `cache_creation` spelling and
+/// cannot see an object — a split-only journal folded NO cache-write
+/// tokens at all, silently. Policy, pinned by the fixture pair:
+/// the nested object's total lands on the numeric spelling's
+/// `cache_creation_input_tokens` class ONLY when that key is absent
+/// (both spellings describe the SAME write); the flat OTel attrs are
+/// an export mirror and are NEVER folded — a journal carrying both
+/// spellings would double-bill. Every bucket sighting is disclosed
+/// per lifetime, presence-counted per message id (streaming
+/// re-emissions repeat the object verbatim).
+struct ClaudeCacheWriteSplit {
+    five: i64,
+    one: i64,
+    flat_five: bool,
+    flat_one: bool,
+}
+
+impl ClaudeCacheWriteSplit {
+    fn object_total(&self) -> i64 {
+        self.five.saturating_add(self.one)
+    }
+    fn has_object_buckets(&self) -> bool {
+        self.five > 0 || self.one > 0
+    }
+}
+
+fn claude_cache_write_split(usage: Option<&Value>) -> Option<ClaudeCacheWriteSplit> {
+    let object = usage.and_then(Value::as_object)?;
+    let buckets = object.get("cache_creation").and_then(Value::as_object);
+    let (five, one) = match buckets {
+        Some(buckets) => (
+            buckets
+                .get("ephemeral_5m_input_tokens")
+                .and_then(number_as_i64)
+                .unwrap_or(0),
+            buckets
+                .get("ephemeral_1h_input_tokens")
+                .and_then(number_as_i64)
+                .unwrap_or(0),
+        ),
+        None => (0, 0),
+    };
+    let flat_five = object.contains_key("cache_creation_5m_tokens");
+    let flat_one = object.contains_key("cache_creation_1h_tokens");
+    if !buckets.is_some() && !flat_five && !flat_one {
+        return None;
+    }
+    Some(ClaudeCacheWriteSplit {
+        five,
+        one,
+        flat_five,
+        flat_one,
+    })
+}
+
+/// rm-1908: usage-envelope keys outside every folded class (the four
+/// token classes + the reasoning spellings) plus the known-benign
+/// envelope set mint `claude_usage_unmatched_key:<key>` — a future
+/// 2.1.30x usage field becomes a visible counter instead of a silent
+/// drop. Benign envelope keys (service_tier: routing metadata, no
+/// token counts) stay quiet by design.
+fn claude_usage_unmatched_keys(usage: Option<&Value>, disclosures: &mut BTreeMap<String, i64>) {
+    let Some(object) = usage.and_then(Value::as_object) else {
+        return;
+    };
+    for key in object.keys() {
+        let folded_or_benign = matches!(
+            key.as_str(),
+            "input_tokens"
+                | "output_tokens"
+                | "cache_creation"
+                | "cache_creation_input_tokens"
+                | "cache_read_input_tokens"
+                | "cache_creation_5m_tokens"
+                | "cache_creation_1h_tokens"
+                | "service_tier"
+        ) || REASONING_TOKEN_KEYS.contains(&key.as_str());
+        if !folded_or_benign {
+            *disclosures
+                .entry(disclosure_key("claude_usage_unmatched_key", key))
+                .or_insert(0) += 1;
+        }
+    }
+}
+
 fn claude_user_content_events(
     content: Option<&Value>,
     ts: &str,
     model: &str,
+    message_id: &str,
     events: &mut Vec<Event>,
+    disclosures: &mut BTreeMap<String, i64>,
+    unmatched_types_seen: &mut BTreeSet<(String, String)>,
 ) {
     match content {
         Some(Value::String(text)) => events.push(Event {
@@ -5442,7 +5892,24 @@ fn claude_user_content_events(
                         source_tool: "claude_code".to_string(),
                         ..Event::default()
                     }),
-                    _ => {}
+                    _ => {
+                        // rm-1908: same disclosed-skip census as the
+                        // assistant loop — user-side blocks (2.1.300's
+                        // tool_decision rides a USER row) once per
+                        // (message id, type); id-less messages count
+                        // every row, mirroring the legacy fold.
+                        if let Some(block_type) =
+                            string(block.get("type")).filter(|t| !t.is_empty())
+                        {
+                            let seen = unmatched_types_seen
+                                .insert((message_id.to_string(), block_type.to_string()));
+                            if message_id.is_empty() || seen {
+                                *disclosures
+                                    .entry(disclosure_key("claude_unmatched_type", block_type))
+                                    .or_insert(0) += 1;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -9809,7 +10276,18 @@ mod tests {
         assert_eq!(session.metrics.tokens_input, 40);
         assert_eq!(session.metrics.tokens_output, 10);
         assert_eq!(session.metrics.tokens_cache_r, 7);
-        assert_eq!(session.metrics.model_used, "MODEL_PLACEHOLDER_M16");
+        assert_eq!(
+            session.metrics.model_used, "gemini-3.1-pro",
+            "rm-1907: the MODEL_PLACEHOLDER_M16 enum now resolves through the ccusage-mirrored placeholder table (was the verbatim enum spelling at the rm-720 base)"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:id_resolved:model_placeholder_m16"),
+            Some(&1),
+            "rm-1907: the resolution is disclosed, not silent"
+        );
         assert_eq!(
             session.metrics.source_tool, "antigravity_cli",
             "the lane still claims the file"

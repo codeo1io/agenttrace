@@ -1,0 +1,15 @@
+{
+  "trajectoryId": "a10c0a11-0000-4000-8000-00000000aa02",
+  "steps": [
+    {
+      "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+      "status": "COMPLETED",
+      "metadata": {"createdAt": "2026-10-14T08:10:05Z"},
+      "plannerResponse": {
+        "response": "Named numeric carrier with a catalog row.",
+        "usageStats": {"inputTokens": 700, "outputTokens": 300},
+        "modelConfigId": 246
+      }
+    }
+  ]
+}

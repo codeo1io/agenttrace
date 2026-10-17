@@ -1,0 +1,15 @@
+{
+  "trajectoryId": "a10c0a11-0000-4000-8000-00000000aa03",
+  "steps": [
+    {
+      "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+      "status": "COMPLETED",
+      "metadata": {"createdAt": "2026-10-14T08:20:05Z"},
+      "plannerResponse": {
+        "response": "Unmapped numeric carrier (ccusage #1897).",
+        "usageStats": {"inputTokens": 400, "outputTokens": 200},
+        "modelConfigId": 1277
+      }
+    }
+  ]
+}

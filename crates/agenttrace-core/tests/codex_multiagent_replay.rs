@@ -279,8 +279,8 @@ fn concurrent_spawn_child_is_left_intact_and_disclosed() {
 /// content-based, so a mixed zstd-parent / plain-child corpus also ties.
 #[test]
 fn zstd_rollout_family_reconciles_like_the_uncompressed_twin() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/codex-multiagent-v2-zstd");
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-multiagent-v2-zstd");
     let parent_path = dir.join("parent.jsonl");
     let child_path = dir.join("child.jsonl");
 
@@ -297,8 +297,7 @@ fn zstd_rollout_family_reconciles_like_the_uncompressed_twin() {
         );
     }
 
-    let parent =
-        agenttrace_core::parse_file(&parent_path).expect("zstd parent decodes and parses");
+    let parent = agenttrace_core::parse_file(&parent_path).expect("zstd parent decodes and parses");
     let child = agenttrace_core::parse_file(&child_path).expect("zstd child decodes and parses");
     assert_eq!(
         parent.metrics.tokens_input + child.metrics.tokens_input,
@@ -313,7 +312,8 @@ fn zstd_rollout_family_reconciles_like_the_uncompressed_twin() {
     assert_eq!(stats.tokens_input_dropped, 1_400);
     let counts: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
     assert_eq!(
-        counts, vec![1_400, 300],
+        counts,
+        vec![1_400, 300],
         "zstd family reconciles to the same attribution as the twin"
     );
     assert_eq!(child_adjusted_counters(&sessions[1]), Some(1));
