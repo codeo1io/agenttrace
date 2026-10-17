@@ -522,6 +522,15 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
                     opencode_admission.capped_bytes as usize,
                 );
             }
+            // rm-732: non-regular entries (FIFOs, symlinks, devices)
+            // refused at the dirent — same loss channel as the cap, so
+            // --doctor folds them with the other skip classes.
+            if opencode_admission.non_file_skipped > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_non_files_skipped".to_string(),
+                    opencode_admission.non_file_skipped,
+                );
+            }
             return Ok(session);
         }
         if let Some(events) = parse_cursor_export(&value) {
@@ -6450,7 +6459,7 @@ fn parse_opencode_storage_session(
     // stat-capped away — bail into the unsupported lane only when we have no
     // such explanation, so a fully-capped session still parses and carries its
     // disclosure instead of masquerading as a foreign format.
-    if messages.is_empty() && admission.capped_files == 0 {
+    if messages.is_empty() && admission.capped_files == 0 && admission.non_file_skipped == 0 {
         bail!("opencode: no messages found for session {}", session_id);
     }
     sort_opencode_records(&mut messages);
@@ -6484,7 +6493,7 @@ fn parse_opencode_storage_session(
     }
     // rm-1437: same relaxation as the messages gate — a fully stat-capped
     // corpus legitimately yields no parseable events; disclose, don't bail.
-    if body.is_empty() && admission.capped_files == 0 {
+    if body.is_empty() && admission.capped_files == 0 && admission.non_file_skipped == 0 {
         bail!("opencode: no parseable events for session {}", session_id);
     }
 
@@ -6528,12 +6537,14 @@ fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
 struct OpencodeAdmissionStats {
     capped_files: usize,
     capped_bytes: u64,
+    non_file_skipped: usize,
 }
 
 impl OpencodeAdmissionStats {
     fn accumulate(&mut self, other: OpencodeAdmissionStats) {
         self.capped_files += other.capped_files;
         self.capped_bytes += other.capped_bytes;
+        self.non_file_skipped += other.non_file_skipped;
     }
 }
 
@@ -6555,6 +6566,26 @@ fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionS
         if path.is_dir() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
+        // rm-732 (parser-side admission, cycle-3 batch): admission must
+        // validate file KIND, not just size. A planted FIFO stat-reports
+        // len 0 — it passes the rm-1437 cap check and then wedges the
+        // single-threaded scan forever on the blocking open (assess PoC:
+        // `timeout 25 … --overview` rc=124, no message, no recovery until
+        // the fifo is removed), and a symlink to an endless source
+        // (e.g. /dev/zero) defeats the metadata cap entirely because
+        // `metadata` FOLLOWS links. `DirEntry::file_type` reads the
+        // directory entry itself — no follow, no open — so every
+        // non-regular entry is refused and disclosed before ANY file is
+        // touched. (The walk-side admission in discovery.rs stays
+        // rm-212's lane.)
+        let is_regular = entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false);
+        if !is_regular {
+            admission.non_file_skipped += 1;
+            continue;
+        }
         // rm-1437: stat before read — over-cap transcripts are skipped and
         // disclosed instead of being admitted into memory.
         let file_len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
@@ -6563,9 +6594,23 @@ fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionS
             admission.capped_bytes += file_len;
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        // rm-732: the cap must hold even when the entry lies or grows
+        // between stat and read — read at most cap+1 bytes and re-check
+        // instead of an unbounded read_to_string (a regular file swapped
+        // for a growing one mid-scan must not become an unbounded read).
+        let Ok(file) = std::fs::File::open(&path) else {
             continue;
         };
+        let mut raw = String::new();
+        let mut bounded = std::io::Read::take(file, OPENCODE_TRANSCRIPT_READ_CAP_BYTES + 1);
+        if std::io::Read::read_to_string(&mut bounded, &mut raw).is_err() {
+            continue;
+        }
+        if raw.len() as u64 > OPENCODE_TRANSCRIPT_READ_CAP_BYTES {
+            admission.capped_files += 1;
+            admission.capped_bytes += raw.len() as u64;
+            continue;
+        }
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
@@ -7171,7 +7216,9 @@ struct ClineUsageState {
     usage: BTreeMap<String, i64>,
     carriers: i64,
     negative_clamped: i64,
+    saturated_fields: i64,
     unparsed_fields: i64,
+    duplicate_carriers: i64,
     cost_carriers: i64,
     reported_cost: f64,
     last_ts: String,
@@ -7179,6 +7226,10 @@ struct ClineUsageState {
 
 /// One absorbed metrics carrier; fields present-but-unparseable count
 /// into `unparsed_fields` instead of being invented.
+/// `saturated_fields` (rm-046, cycle-3 batch) counts narrowings that
+/// clamped at the i64 bound — out-of-range input is evidence of usage,
+/// not of zero, so it saturates AND discloses instead of silently
+/// casting.
 struct ClineCarrier {
     input: Option<i64>,
     output: Option<i64>,
@@ -7186,16 +7237,39 @@ struct ClineCarrier {
     cache_write: Option<i64>,
     cost: Option<f64>,
     unparsed_fields: i64,
+    saturated_fields: i64,
 }
 
-fn cline_metric_i64(value: Option<&Value>) -> Option<i64> {
-    match value? {
-        Value::Number(number) => number
-            .as_i64()
-            .or_else(|| number.as_u64().and_then(|v| i64::try_from(v).ok()))
-            .or_else(|| number.as_f64().filter(|v| v.is_finite()).map(|v| v as i64)),
-        Value::String(text) => text.trim().parse::<i64>().ok(),
-        _ => None,
+/// rm-046 (F2 arm, cycle-3 batch): the numeric narrowing into i64 is
+/// CHECKED, never a bare `as` cast — `as` saturates SILENTLY (a hostile
+/// `tokensIn` of 1e30 recorded as 9223372036854775807 with zero
+/// disclosure, poisoning every downstream aggregate). Out-of-range
+/// finite numbers still saturate at the i64 bound (a token count is
+/// evidence of usage; refusing it would hide spend), but the saturation
+/// is returned so the carrier discloses it as
+/// `cline_metrics_saturated_fields`. In-range values keep the landed
+/// truncation semantics.
+fn cline_metric_i64(value: Option<&Value>) -> (Option<i64>, bool) {
+    match value {
+        None => (None, false),
+        Some(Value::Number(number)) => {
+            if let Some(value) = number.as_i64() {
+                return (Some(value), false);
+            }
+            if let Some(value) = number.as_u64().and_then(|value| i64::try_from(value).ok()) {
+                return (Some(value), false);
+            }
+            match number.as_f64().filter(|value| value.is_finite()) {
+                // i64::MAX as f64 rounds up to 2^63: at-or-above is out
+                // of range; -2^63 itself is representable, so only
+                // strictly-below saturates on the negative side.
+                Some(value) if value >= i64::MAX as f64 => (Some(i64::MAX), true),
+                Some(value) if value < i64::MIN as f64 => (Some(i64::MIN), true),
+                other => (other.map(|value| value as i64), false),
+            }
+        }
+        Some(Value::String(text)) => (text.trim().parse::<i64>().ok(), false),
+        _ => (None, false),
     }
 }
 
@@ -7225,14 +7299,21 @@ fn cline_carrier_from_object(object: &Value) -> Option<ClineCarrier> {
     if !TOKEN_KEYS.iter().any(|key| fields.contains_key(*key)) {
         return None;
     }
-    let token = |key: &str| -> Option<i64> { cline_metric_i64(fields.get(key)) };
+    let mut saturated_fields = 0;
+    let mut token = |key: &str| -> Option<i64> {
+        let (value, saturated) = cline_metric_i64(fields.get(key));
+        if saturated {
+            saturated_fields += 1;
+        }
+        value
+    };
     let input = token("tokensIn").or_else(|| token("inputTokens"));
     let output = token("tokensOut").or_else(|| token("outputTokens"));
     let cache_read = token("cacheReads").or_else(|| token("cacheReadTokens"));
     let cache_write = token("cacheWrites").or_else(|| token("cacheWriteTokens"));
     let mut unparsed_fields = 0;
     for key in TOKEN_KEYS {
-        if fields.contains_key(key) && cline_metric_i64(fields.get(key)).is_none() {
+        if fields.contains_key(key) && cline_metric_i64(fields.get(key)).0.is_none() {
             unparsed_fields += 1;
         }
     }
@@ -7247,6 +7328,7 @@ fn cline_carrier_from_object(object: &Value) -> Option<ClineCarrier> {
         cache_write,
         cost,
         unparsed_fields,
+        saturated_fields,
     })
 }
 
@@ -7274,6 +7356,7 @@ fn cline_absorb_carrier(state: &mut ClineUsageState, carrier: ClineCarrier, ts: 
     state.carriers += 1;
     state.last_ts = ts.to_string();
     state.unparsed_fields += carrier.unparsed_fields;
+    state.saturated_fields += carrier.saturated_fields;
     let input = cline_clamped(state, carrier.input.unwrap_or(0));
     let output = cline_clamped(state, carrier.output.unwrap_or(0));
     let cache_read = cline_clamped(state, carrier.cache_read.unwrap_or(0));
@@ -7300,6 +7383,55 @@ fn cline_absorb_carrier(state: &mut ClineUsageState, carrier: ClineCarrier, ts: 
     }
 }
 
+/// rm-1430 residual (F1, cycle-3 batch): the identity a carrier is
+/// deduped on — the owning message's (text, timestamp) plus the
+/// NORMALIZED evidence the carrier would add. None and Some(0) add the
+/// same zero, so they normalize together: the Roo text spelling and
+/// the Cline CLI `metrics` spelling of ONE response (which differ in
+/// which cache legs they spell explicitly) produce the same key.
+fn cline_carrier_evidence_key(message_key: &str, carrier: &ClineCarrier) -> String {
+    let cost = carrier
+        .cost
+        .map(|cost| format!("{cost:.6}"))
+        .unwrap_or_else(|| "0.000000".to_string());
+    format!(
+        "{message_key}\0{}\0{}\0{}\0{}\0{cost}\0{}\0{}",
+        carrier.input.unwrap_or(0),
+        carrier.output.unwrap_or(0),
+        carrier.cache_read.unwrap_or(0),
+        carrier.cache_write.unwrap_or(0),
+        carrier.unparsed_fields,
+        carrier.saturated_fields,
+    )
+}
+
+/// rm-1430 residual (F1, cycle-3 batch): a carrier absorbs ONCE per
+/// (owning message identity, evidence). A re-emitted `ui_messages`
+/// entry — a replayed/journal-doubled store — or ONE message carrying
+/// the same response's usage in both syntaxes (text-is-metrics JSON
+/// and the sibling `metrics` object) is a single response's usage:
+/// per-occurrence absorption double-billed it (assess PoCs 2000/400/
+/// $0.02 recorded where the truth is 1000/200/$0.01, while the text
+/// lane's `cline_event_key` already collapsed the duplicate turns).
+/// Evidence that DIFFERS is distinct evidence and still counts — the
+/// dedup never undercounts — and the suppression is disclosed as
+/// `cline_metrics_duplicate_carriers` (informational channel, never
+/// parse loss).
+fn cline_absorb_carrier_once(
+    state: &mut ClineUsageState,
+    seen: &mut BTreeSet<String>,
+    message_key: &str,
+    carrier: ClineCarrier,
+    ts: &str,
+) {
+    let key = cline_carrier_evidence_key(message_key, &carrier);
+    if seen.insert(key) {
+        cline_absorb_carrier(state, carrier, ts);
+    } else {
+        state.duplicate_carriers += 1;
+    }
+}
+
 /// Fold absorbed carriers through a session_meta usage event — the
 /// native-lane pattern analyze() folds (pi `recorded_cost_usd`
 /// precedent) — appended after the text stream so text events are
@@ -7320,6 +7452,21 @@ fn cline_usage_event(state: &ClineUsageState, model: &str) -> Option<Event> {
         disclosure_counters.insert(
             "cline_metrics_unparsed_fields".to_string(),
             state.unparsed_fields,
+        );
+    }
+    // rm-046: an out-of-range narrowing that clamped at the i64 bound.
+    if state.saturated_fields > 0 {
+        disclosure_counters.insert(
+            "cline_metrics_saturated_fields".to_string(),
+            state.saturated_fields,
+        );
+    }
+    // rm-1430 residual: evidence re-stated by a duplicated entry or a
+    // dual-syntax message, suppressed so it cannot double-bill.
+    if state.duplicate_carriers > 0 {
+        disclosure_counters.insert(
+            "cline_metrics_duplicate_carriers".to_string(),
+            state.duplicate_carriers,
         );
     }
     let mut wire_metadata = BTreeMap::new();
@@ -8378,6 +8525,9 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
     };
     let mut events = Vec::new();
     let mut usage_state = ClineUsageState::default();
+    // rm-1430 residual: carriers absorb once per (message identity,
+    // evidence) — see cline_absorb_carrier_once.
+    let mut seen_carriers = BTreeSet::new();
     for message in messages {
         let Some(message) = message.as_object() else {
             continue;
@@ -8393,13 +8543,29 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
         // rm-1430: absorb usage carriers — a say entry whose text is a
         // JSON metrics object, and/or a sibling `metrics` object (Cline
         // CLI envelope). Text events are unaffected: metrics presence
-        // never alters the text stream.
+        // never alters the text stream. The carrier identity rides the
+        // message's (text, timestamp) — the same core cline_event_key
+        // pins for text events — so a re-emitted entry or a dual-syntax
+        // message collapses to one absorption.
+        let message_key = format!("{text}\0{ts}");
         if let Some(carrier) = message.get("metrics").and_then(cline_carrier_from_object) {
-            cline_absorb_carrier(&mut usage_state, carrier, &ts);
+            cline_absorb_carrier_once(
+                &mut usage_state,
+                &mut seen_carriers,
+                &message_key,
+                carrier,
+                &ts,
+            );
         }
         if !text.is_empty() {
             if let Some(carrier) = cline_text_metrics_carrier(text) {
-                cline_absorb_carrier(&mut usage_state, carrier, &ts);
+                cline_absorb_carrier_once(
+                    &mut usage_state,
+                    &mut seen_carriers,
+                    &message_key,
+                    carrier,
+                    &ts,
+                );
             }
         }
         if text.is_empty() {
@@ -10788,6 +10954,157 @@ mod tests {
         assert_eq!(session.metrics.tokens_input, 3);
         assert_eq!(session.metrics.cost_estimated, 0.0001);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cline_out_of_range_metrics_saturate_and_disclose() {
+        // rm-046 F2 arm: the numeric narrowing into i64 is CHECKED, never
+        // a bare `as` cast — `as` saturates SILENTLY (hostile tokensIn of
+        // 1e30 recorded as 9223372036854775807 with zero disclosure,
+        // poisoning every downstream aggregate). The value still
+        // saturates at the i64 bound (a token count is evidence of
+        // usage; refusing it would hide spend) AND the lane discloses
+        // cline_metrics_saturated_fields.
+        let doc = serde_json::json!({
+            "sessionId": "sat-1", "agent": "cli",
+            "messages": [
+                {"id":"m1","role":"assistant","ts":1700000300,
+                 "content":[{"type":"text","text":"x"}],
+                 "metrics":{"inputTokens":1e30,"outputTokens":200,"cost":0.01}},
+                {"id":"m2","role":"assistant","ts":1700000301,
+                 "content":[{"type":"text","text":"y"}],
+                 "metrics":{"inputTokens":18446744073709551615u64,"outputTokens":10}}
+            ]
+        });
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("out-of-range carriers still fold (saturated)");
+        assert_eq!(
+            meta.usage.get("input_tokens"),
+            Some(&i64::MAX),
+            "1e30 nets to the i64 bound, never a silent wrap"
+        );
+        assert_eq!(meta.usage.get("output_tokens"), Some(&210));
+        assert_eq!(
+            meta.recorded_cost_usd,
+            Some(0.01),
+            "the in-range cost on the same carrier still records"
+        );
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_saturated_fields"),
+            Some(&2),
+            "both out-of-range narrowings (f64 1e30 and u64::MAX) must be disclosed"
+        );
+    }
+
+    #[test]
+    fn cline_duplicate_ui_messages_entry_counts_usage_once() {
+        // rm-1430 F1 residual (shape a): the SAME ui_messages entry
+        // emitted twice is one response's usage — the text lane already
+        // dedups it through cline_event_key; the carrier lane must too.
+        // Assess PoC: 2000/400/$0.02 recorded where the truth is
+        // 1000/200/$0.01. A DISTINCT later carrier still counts (the
+        // dedup may never undercount different evidence).
+        let doc = serde_json::json!([
+            {"ts":1700000001,"type":"say","say":"text",
+             "text":"{\"cost\":0.01,\"tokensIn\":1000,\"tokensOut\":200}"},
+            {"ts":1700000001,"type":"say","say":"text",
+             "text":"{\"cost\":0.01,\"tokensIn\":1000,\"tokensOut\":200}"},
+            {"ts":1700000009,"type":"say","say":"text",
+             "text":"{\"cost\":0.02,\"tokensIn\":50,\"tokensOut\":5}"}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("carriers fold");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&1050));
+        assert_eq!(meta.usage.get("output_tokens"), Some(&205));
+        assert!(
+            (meta.recorded_cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "both distinct carriers' costs record: {:?}",
+            meta.recorded_cost_usd
+        );
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_carriers_parsed"),
+            Some(&2),
+            "the duplicated entry's carrier is suppressed: 2 distinct carriers, not 3"
+        );
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_duplicate_carriers"),
+            Some(&1),
+            "the suppression is disclosed, never silent"
+        );
+    }
+
+    #[test]
+    fn cline_dual_syntax_message_counts_usage_once() {
+        // rm-1430 F1 residual (shape b): ONE message carrying the SAME
+        // response's usage in both syntaxes — text-is-metrics JSON (Roo
+        // spelling) and the sibling `metrics` object (Cline CLI
+        // spelling) — absorbs once. Per-occurrence absorption
+        // double-billed it (assess cline-dual PoC 2000/400/$0.02 where
+        // the truth is 1000/200/$0.01).
+        let doc = serde_json::json!([
+            {"ts":1700000001,"type":"say","say":"text",
+             "text":"{\"cost\":0.01,\"tokensIn\":1000,\"tokensOut\":200}",
+             "metrics":{"inputTokens":1000,"outputTokens":200,"cacheReadTokens":0,"cacheWriteTokens":0,"cost":0.01}}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("the dual-syntax message folds");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&1000));
+        assert_eq!(meta.usage.get("output_tokens"), Some(&200));
+        assert_eq!(meta.recorded_cost_usd, Some(0.01));
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_carriers_parsed"),
+            Some(&1)
+        );
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_duplicate_carriers"),
+            Some(&1),
+            "the restated evidence is disclosed as duplicate"
+        );
+    }
+
+    #[test]
+    fn cline_distinct_dual_syntax_evidence_still_counts() {
+        // Never-undercount pin: when the two syntaxes on one message
+        // carry DIFFERENT values they are distinct evidence — both
+        // absorb. The dedup keys on identical evidence, not on message
+        // presence.
+        let doc = serde_json::json!([
+            {"ts":1700000001,"type":"say","say":"text",
+             "text":"{\"cost\":0.01,\"tokensIn\":1000,\"tokensOut\":200}",
+             "metrics":{"inputTokens":1500,"outputTokens":300,"cost":0.02}}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("both distinct carriers fold");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&2500));
+        assert_eq!(meta.usage.get("output_tokens"), Some(&500));
+        assert!(
+            (meta.recorded_cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "both distinct carriers' costs record: {:?}",
+            meta.recorded_cost_usd
+        );
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_duplicate_carriers"),
+            None,
+            "distinct evidence is never suppressed"
+        );
     }
 
     #[test]

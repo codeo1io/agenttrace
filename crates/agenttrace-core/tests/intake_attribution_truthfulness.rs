@@ -481,3 +481,119 @@ fn assistant_relabels_stay_authoritative() {
         .contains_key("model_label_non_assistant_ignored"));
     assert_ne!(session.metrics.model_used, "multiple");
 }
+
+/// rm-1430 residual F1 (end-to-end, run 5186d5ac cycle-3 batch): the
+/// Cline/Roo carrier lane dedups by evidence identity. A replayed
+/// `ui_messages` entry — the assess `cline-dup` PoC — recorded
+/// 2000/400/$0.02 where the truth is one response's 1000/200/$0.01;
+/// the text lane already collapsed the duplicate (`cline_event_key`),
+/// so the doubled usage contradicted the session's own turn count.
+/// The carrier lane now absorbs once per (message identity, evidence)
+/// and discloses `cline_metrics_duplicate_carriers` on the
+/// informational channel — never as parse loss.
+#[test]
+fn cline_task_dir_duplicate_entry_records_usage_once() {
+    let dir = std::env::temp_dir().join(format!("at_rm1430_dup_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = concat!(
+        r#"{"ts":1700000001,"type":"say","say":"text","#,
+        r#""text":"{\"cost\":0.01,\"tokensIn\":1000,\"tokensOut\":200}"}"#,
+    );
+    std::fs::write(dir.join("ui_messages.json"), format!("[{entry},{entry}]")).unwrap();
+    // Bare ui_messages store — the assess `cline-dup` PoC shape. No
+    // api_conversation_history: every event here comes from the
+    // journal, so the turn count must reflect ONE response.
+    std::fs::write(
+        dir.join("task_metadata.json"),
+        r#"{"task":"Do the thing","workDir":"/tmp","created":1700000000000,"status":"completed"}"#,
+    )
+    .unwrap();
+
+    let session = parse_file(&dir).expect("cline task dir parses");
+
+    assert_eq!(
+        session.metrics.tokens_input, 1000,
+        "the duplicated entry's usage counts ONCE (assess PoC doubled it to 2000)"
+    );
+    assert_eq!(session.metrics.tokens_output, 200);
+    assert_eq!(session.metrics.cost_estimated, 0.01);
+    assert_eq!(
+        session.metrics.assistant_turns, 1,
+        "the duplicated entry is ONE turn (the text lane already collapsed it); pre-fix usage said 2 responses' worth of tokens"
+    );
+    assert_eq!(
+        session.metrics.provenance.tokens, "reported_by_agent",
+        "the lane-truth flip survives: reported, not estimated"
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("cline_metrics_carriers_parsed"),
+        Some(&1)
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("cline_metrics_duplicate_carriers"),
+        Some(&1),
+        "the deduped re-emission is disclosed: {:?}",
+        session.metrics.disclosure_counters
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// rm-046 F2 arm (end-to-end): out-of-range metric numbers saturate at
+/// the i64 bound and DISCLOSE — the pre-fix bare `as` cast recorded
+/// 1e30 tokens as 9223372036854775807 with no counter anywhere, so a
+/// poisoned rollup was indistinguishable from a real one. Refusing the
+/// value instead would hide spend; saturate-and-disclose keeps the
+/// upper-bound evidence and makes the anomaly visible to `--doctor`.
+#[test]
+fn cline_task_dir_out_of_range_metrics_saturate_disclosed() {
+    let dir = std::env::temp_dir().join(format!("at_rm046_sat_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("ui_messages.json"),
+        concat!(
+            "[",
+            r#"{"ts":1700000000,"type":"say","say":"user_feedback","text":"do the thing"},"#,
+            r#"{"ts":1700000001,"type":"say","say":"text","text":"{\"cost\":0.01,\"tokensIn\":1e30,\"tokensOut\":200}"}"#,
+            "]"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("api_conversation_history.json"),
+        r#"[{"role":"user","content":"do the thing"},{"role":"assistant","content":"done"}]"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("task_metadata.json"),
+        r#"{"task":"Do the thing","workDir":"/tmp","created":1700000000000,"status":"completed"}"#,
+    )
+    .unwrap();
+
+    let session = parse_file(&dir).expect("cline task dir parses");
+
+    assert_eq!(
+        session.metrics.tokens_input,
+        i64::MAX,
+        "the hostile count saturates at the bound, never a silent wrap or a refusal"
+    );
+    assert_eq!(session.metrics.tokens_output, 200);
+    assert_eq!(session.metrics.cost_estimated, 0.01);
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("cline_metrics_saturated_fields"),
+        Some(&1),
+        "the saturation is disclosed: {:?}",
+        session.metrics.disclosure_counters
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
