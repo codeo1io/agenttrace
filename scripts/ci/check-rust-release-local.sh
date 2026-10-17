@@ -4,6 +4,34 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+# rm-241 repo-side arm (run ce9309d9 cycle 1, batch "battery-truth
+# hygiene"): collision-proof default target dir. The fleet hazard
+# (assess f4cb5f63 F1: sibling runs sharing one CARGO_TARGET_DIR fed a
+# gate a stale PRE-rm-1881 test binary while reporting green) enters
+# through the environment; cargo's own default (<repo>/target) is safe
+# but cold — it dies with every swept worktree. Default — only when
+# CARGO_TARGET_DIR is UNSET — to a repo-root+HEAD-namespaced dir under
+# the user cache: same worktree+HEAD stays warm across runs, different
+# worktrees (or HEADs) never write one dir, and an explicitly exported
+# CARGO_TARGET_DIR always wins. Every child gate invoked below
+# inherits the export, so all lanes build and probe one target dir.
+if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
+  at_head="$(git rev-parse HEAD 2>/dev/null || true)"
+  at_cache_home="${XDG_CACHE_HOME:-${HOME:-}/.cache}"
+  if [[ -n "$at_head" && -n "${HOME:-}" && -d "$at_cache_home" ]]; then
+    # git hash-object for portability (sha256sum is absent on macOS runners)
+    at_ns="$(printf '%s:%s' "$repo_root" "$at_head" | git hash-object --stdin | cut -c1-16)"
+    export CARGO_TARGET_DIR="$at_cache_home/agenttrace-dev/target/at-$at_ns"
+  fi
+else
+  case "$CARGO_TARGET_DIR" in
+    */agenttrace-dev/target/at-*) ;;
+    *)
+      echo "check-rust-release-local: note: ambient CARGO_TARGET_DIR=$CARGO_TARGET_DIR looks like shared layout — it can serve stale sibling artifacts (rm-241); unset it to use the per-worktree namespaced default" >&2
+      ;;
+  esac
+fi
+
 # rm-1408: fleet CI runs cargo with incremental compilation inherited
 # from the caller's ambient CARGO_INCREMENTAL. An ambient
 # CARGO_INCREMENTAL=1 breaks this gate two ways: every invocation
@@ -28,7 +56,10 @@ export CARGO_INCREMENTAL=0
 out_parent="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-rust-release-local}"
 mkdir -p "$out_parent"
 out_dir="$(mktemp -d "$out_parent/release-local.XXXXXX")"
-bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
+# rm-241: follow the target dir resolved above (ambient CARGO_TARGET_DIR
+# or the namespaced default) — never a hardcoded repo/target, which in
+# shared layouts points at a stale stranger build.
+bin="${AGENTTRACE_BIN:-${CARGO_TARGET_DIR:-$repo_root/target}/release/agenttrace}"
 
 fail() {
   echo "check-rust-release-local: $*" >&2

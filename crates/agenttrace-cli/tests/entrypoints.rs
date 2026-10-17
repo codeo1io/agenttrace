@@ -1672,12 +1672,102 @@ fn scratch_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{stem}-{}-{seq}{ext}", std::process::id()))
 }
 
+/// rm-1955 (run ce9309d9 cycle 1, batch "battery-truth hygiene"):
+/// teardown-on-drop handle around the rm-1882 unique scratch path.
+/// rm-1882 made the PATH unique; this makes the artifact EPHEMERAL —
+/// the file/dir is removed when the test ends, success or panic, so
+/// repeat battery runs accumulate nothing under TMPDIR (the fleet's
+/// fresh-TMPDIR-per-run layout was masking the accumulation). The
+/// dead pre-uniqueness `rm -rf` prologues (a pid+seq path can never
+/// pre-exist) and the manual epilogue removes both fold into the
+/// guard's Drop.
+struct Scratch {
+    path: std::path::PathBuf,
+}
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        Self {
+            path: scratch_path(name),
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for Scratch {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // symlink_metadata: never follow — a symlinked scratch unlinks
+        // the link itself, not its target.
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.is_dir() => {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+            Ok(_) => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+fn scratch(name: &str) -> Scratch {
+    Scratch::new(name)
+}
+
+#[test]
+fn scratch_sandboxes_tear_down_and_never_accumulate() {
+    // rm-1955 zero-accumulation repeat-run check: two live handles
+    // never share a path (rm-1882 uniqueness, re-pinned here), and
+    // dropping a handle removes its artifact whether it ended up a
+    // file or a directory — run twice to prove repeat runs leave
+    // nothing behind.
+    for round in 0..2 {
+        let dir = scratch("at-rm1955-residue-dir");
+        let file = scratch("at-rm1955-residue-file.jsonl");
+        let dir_path = dir.path().to_path_buf();
+        let file_path = file.path().to_path_buf();
+        assert_ne!(
+            dir_path, file_path,
+            "live scratch paths must stay unique (rm-1882)"
+        );
+        std::fs::create_dir_all(&dir_path).expect("mkdir scratch dir");
+        std::fs::write(&file_path, b"probe").expect("seed scratch file");
+        drop(dir);
+        drop(file);
+        assert!(
+            !dir_path.exists(),
+            "round {round}: scratch dir must be gone at drop"
+        );
+        assert!(
+            !file_path.exists(),
+            "round {round}: scratch file must be gone at drop"
+        );
+    }
+}
+
 #[test]
 fn stdin_dash_empty_input_fails_like_an_empty_file() {
     // rm-503: empty stdin is the empty-session error class (rc1), the
     // same failure an empty named file produces — not a hang, not a
     // zero-session success.
-    let empty = scratch_path("agenttrace-stdin-empty-probe.jsonl");
+    let empty = scratch("agenttrace-stdin-empty-probe.jsonl");
     std::fs::write(&empty, b"").expect("write empty probe file");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
@@ -1706,7 +1796,6 @@ fn stdin_dash_empty_input_fails_like_an_empty_file() {
         .output()
         .expect("run empty-file baseline");
     assert_eq!(Some(1), via_file.status.code());
-    let _ = std::fs::remove_file(&empty);
 }
 
 /// rm-503 cap arm (run 80e8beb6 cycle 1, batch "bounded inputs,
@@ -2428,11 +2517,11 @@ fn error_prefix_is_not_doubled_for_non_session_positional() {
     // rm-1882 integration completion: landed HEAD-side (34442197) as a
     // pure fixed literal after the run's census base — same class the
     // merge lands the fix for; gains the pid+seq components.
-    let dir = scratch_path("agenttrace-rm1434-not-a-session");
+    let dir = scratch("agenttrace-rm1434-not-a-session");
     std::fs::create_dir_all(&dir).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .arg("--overview")
-        .arg(&dir)
+        .arg(dir.path())
         .output()
         .expect("run agenttrace with a non-session positional");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2446,7 +2535,6 @@ fn error_prefix_is_not_doubled_for_non_session_positional() {
         expected,
         "single prefix, rest of the message unchanged"
     );
-    let _ = std::fs::remove_dir(&dir);
 }
 
 // rm-1434 guard: the printer owns the "Error: " prefix — no bail!/
@@ -3014,8 +3102,7 @@ fn cli_quota_view_clamps_a_future_skewed_corpus() {
     // billed $0.0045 against an honest $1.52. The cutoff must clamp
     // at the newest plausible instant, the guard firing must ride
     // the json, and the real events must still bill.
-    let sandbox = scratch_path("at-quota-future-clamp-cli");
-    let _ = std::fs::remove_dir_all(&sandbox);
+    let sandbox = scratch("at-quota-future-clamp-cli");
     std::fs::create_dir_all(&sandbox).expect("sandbox dir");
     let journal = sandbox.join("future-skew.jsonl");
     let body = concat!(
@@ -3070,8 +3157,6 @@ fn cli_quota_view_clamps_a_future_skewed_corpus() {
         text_stdout.contains("2026-10-12"),
         "the text lane renders the clamped cutoff: {text_stdout}"
     );
-
-    let _ = std::fs::remove_dir_all(&sandbox);
 }
 
 #[test]

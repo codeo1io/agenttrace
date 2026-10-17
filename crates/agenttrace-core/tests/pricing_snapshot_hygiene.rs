@@ -19,6 +19,20 @@
 //! movement conscious: a refresh that introduces genuinely-absent
 //! rows flips `absent_*` off zero and must update this pin (and the
 //! fallback disclosure expectations) deliberately, not silently.
+//!
+//! rm-1954 (run ce9309d9 cycle 1, batch "battery-truth hygiene"):
+//! cache_rate_census() resolves through the same public lane that
+//! PREFERS a machine pricing cache (`$AGENTTRACE_SESSION_CACHE_DIR/
+//! pricing.json` or the default user-cache location) over the bundled
+//! snapshot — and the catalog initializes once per process, so
+//! ambient host cache state would silently re-point this census
+//! (assess f4cb5f63 F2). The census arm below therefore runs inside
+//! `support::with_isolated_pricing_env` (fresh scratch session cache,
+//! scratch HOME, and the AGENTTRACE_PRICING_FILE override cleared),
+//! making the pinned counts deterministic battery truth. The wildcard
+//! arm reads the bundle FILE directly and needs no guard.
+
+mod support;
 
 #[test]
 fn vendored_pricing_bundle_carries_no_wildcard_keys() {
@@ -45,9 +59,15 @@ fn vendored_pricing_bundle_carries_no_wildcard_keys() {
 
 #[test]
 fn vendored_pricing_bundle_cache_rate_census_is_pinned() {
+    support::with_isolated_pricing_env(cache_rate_census_body);
+}
+
+fn cache_rate_census_body() {
     // rm-1508: classify the bundle through the real ingest — the
     // process catalog of a test binary with no AGENTTRACE_PRICING_FILE
-    // is exactly the bundled snapshot plus the vendored SKU rows.
+    // is exactly the bundled snapshot plus the vendored SKU rows
+    // (rm-1954: guaranteed by the isolation guard wrapping this body,
+    // not by host state).
     let census = agenttrace_core::cache_rate_census();
     assert!(
         census.models > 1000,

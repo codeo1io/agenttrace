@@ -4,6 +4,78 @@
 
 ### Added
 
+- catalog-census suites are deterministic battery truth, immune to the
+  machine pricing cache (rm-1954, run ce9309d9 cycle 1, batch
+  "battery-truth hygiene"): the pricing catalog resolves through the
+  PUBLIC lane, which PREFERS a machine pricing cache
+  (`$AGENTTRACE_SESSION_CACHE_DIR/pricing.json`, or the default
+  user-cache location under HOME when unset) over the bundled
+  snapshot — and initializes once per process on first lookup — so a
+  developer host with a mutated `~/.cache/agenttrace/pricing.json`
+  silently re-pointed the pinned census arms (the cycle-1 assess
+  f4cb5f63 F2 PoC: `fireworks_ai/minimax-m3` with a mutated window
+  flipped `bundled_catalog_window_sweep_serves_own_rows` red,
+  `left: Some(524345)` vs `right: Some(512000)`, re-confirmed red on
+  the pristine wall pre-patch). Every catalog-lane arm in
+  `regional_pricing_contract` (all 7) and the
+  `vendored_pricing_bundle_cache_rate_census_is_pinned` arm in
+  `pricing_snapshot_hygiene` now run inside a new shared
+  `tests/support` guard — `with_isolated_pricing_env` — which
+  serializes its users behind one lock (the catalog singleton
+  initializes under the isolated env whatever test runs first),
+  points the session cache at a fresh empty scratch, relocates HOME to
+  a scratch, and clears `XDG_CACHE_HOME` and the
+  `AGENTTRACE_PRICING_FILE` operator override, restoring everything on
+  drop; the PoC stays standing as a spawned-probe fixture
+  (`mutated_machine_cache_does_not_flip_the_census`) that seeds poison
+  at every default machine-cache location under a scratch HOME and
+  asserts BOTH legs: guarded the census serves the bundled row,
+  unguarded the poison still wins (cache preference is real product
+  behavior — if the unguarded leg ever turns green the threat model
+  changed and the fixture, not the isolation, gets re-adjudicated).
+
+- test scratch paths tear down on drop, not on operator memory
+  (rm-1955, same batch): the two `scratch_path` helpers (rm-1882,
+  entrypoints + formula_lane_contract) made test artifacts unique but
+  eternal — every battery run leaked its scratch dirs/files under
+  TMPDIR (the formula lane's two doc-guard tests leaked with NO
+  teardown at all; the entrypoints sites still carried dead
+  pre-uniqueness `rm -rf` prologues plus manual epilogues that a
+  panicking assert skipped). A `Scratch` RAII handle now wraps the
+  path — file or directory, removed at drop via `symlink_metadata`
+  (never following a symlink), success or panic — and all five call
+  sites fold into it. A `scratch_sandboxes_tear_down_and_never_accumulate`
+  arm pins the contract twice-over: two live handles never share a
+  path (rm-1882 uniqueness re-pinned), and repeat rounds leave nothing
+  behind; both suites were verified residue-free under a private
+  TMPDIR after the change.
+
+- cargo-invoking repo gates default to a per-worktree namespaced
+  CARGO_TARGET_DIR (rm-241 repo-side arm, same batch): the cycle-1
+  assess F1 showed the fleet's shared CARGO_TARGET_DIR can feed a
+  gate a sibling's STALE pre-fix test binary while reporting green
+  (1260/0 over a binary missing the rm-1881 arms). The four
+  cargo-running gates (`check-cargo-manifests`, `check-rust-release-local`,
+  `record-demo`, `record-real-marketing`) now default — ONLY when
+  CARGO_TARGET_DIR is unset — to
+  `<user-cache>/agenttrace-dev/target/at-<16hex(repo:HEAD)>`: same
+  worktree+HEAD stays warm across runs, different worktrees (or
+  HEADs) never write one directory, and an explicitly exported
+  CARGO_TARGET_DIR always wins (with a stderr note when it looks like
+  shared fleet layout, the rm-241 trap, naming the escape). The two
+  probe-binary gates (`conformance/run.sh`, `check-docs-commands`)
+  resolve their binary from the target dir cargo actually used — the
+  exported CARGO_TARGET_DIR when set (repo `./target` would be a
+  stale stranger there), the repo default otherwise, byte-identical
+  to the old behavior in CI where the env is unset; `AGENTTRACE_BIN`
+  still outranks everything. Verified live: trace-level proof the
+  namespaced default is exported and a planted fake shared dir is
+  never referenced (marker mtime untouched), explicit-env-wins with
+  the note firing, the full conformance pack and the full
+  docs-commands gate passing against a binary resolved via
+  CARGO_TARGET_DIR, and the not-found arm still failing loudly naming
+  the exact path it searched.
+
 - `--doctor` completes honestly on real homes (rm-367 stages (b)(c)(d), run
   ff5c1cd8 cycle 4): the doctor walk now runs under a per-root wall-clock
   budget (default 60s, `AGENTTRACE_DOCTOR_ROOT_BUDGET_MS`) with a per-root
