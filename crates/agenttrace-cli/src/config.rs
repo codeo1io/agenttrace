@@ -643,6 +643,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)] // fixtures use driveless "/xdg" paths: Path::is_absolute()
     #[test]
     fn user_config_path_table_covers_empty_env_fallbacks() {
         use std::ffi::OsStr;
@@ -1025,6 +1026,7 @@ mod tests {
     }
 }
 
+#[cfg(unix)] // driveless absolute fixtures are unix-only
 #[test]
 fn user_config_path_ignores_relative_xdg_config_home() {
     // rm-248: the XDG Base Directory Specification says a relative
