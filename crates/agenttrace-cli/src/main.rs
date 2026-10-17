@@ -4866,6 +4866,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_output_refuses_special_files_instead_of_materializing_them() {
         // rm-250 residual (cycle 1): a fifo destination is refused with
