@@ -2046,6 +2046,20 @@ fn validate_explicit_dir(dir_arg: Option<&str>) {
         eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
         std::process::exit(2);
     }
+    // rm-249: existing-but-unreadable directories used to slip this
+    // check (exists + is_dir both pass) and produce a silently EMPTY
+    // session list. Probe readability exactly the way discovery will
+    // use it and refuse with a class-specific, actionable error.
+    if let Err(error) = std::fs::read_dir(path) {
+        let kind = if error.kind() == std::io::ErrorKind::PermissionDenied {
+            "permission denied"
+        } else {
+            "unreadable"
+        };
+        eprintln!("agenttrace: -d/--dir is {kind}: {dir} ({error})");
+        eprintln!("- inspect: directory read/execute bits or mount health");
+        std::process::exit(2);
+    }
 }
 
 /// rm-1012: the positional-scan-root twin of `validate_explicit_dir`
@@ -2062,6 +2076,18 @@ fn validate_positional_dir(dir: &str) {
     }
     if !path.is_dir() {
         eprintln!("agenttrace: positional scan root is not a directory: {dir}");
+        std::process::exit(2);
+    }
+    // rm-249: same readability probe as `validate_explicit_dir` — a
+    // root that cannot be listed must fail loudly, not scan empty.
+    if let Err(error) = std::fs::read_dir(path) {
+        let kind = if error.kind() == std::io::ErrorKind::PermissionDenied {
+            "permission denied"
+        } else {
+            "unreadable"
+        };
+        eprintln!("agenttrace: positional scan root is {kind}: {dir} ({error})");
+        eprintln!("- inspect: directory read/execute bits or mount health");
         std::process::exit(2);
     }
 }

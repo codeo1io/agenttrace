@@ -3,7 +3,7 @@ use crate::sqlite_sessions::{
     load_sqlite_backed_sessions_reported_bounded, SqlitePartialDb, SqliteScanBudget,
 };
 use crate::{
-    cache_dir::user_cache_dir, cached_session, find_session_files, known_session_dirs,
+    cache_dir::user_cache_dir, cached_session, known_session_dirs,
     load_session_cache, parse_file, save_session_cache, store_session, Session, SqliteIngestReport,
     VERSION,
 };
@@ -138,6 +138,12 @@ pub struct DoctorReport {
     /// the pre-rm-1534 report.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub future_timestamp_sessions: usize,
+    /// rm-249 disclosure: directories the discovery walk could NOT
+    /// read (permissions, I/O), as a capped sample plus counts.
+    /// 0-clean: an all-clean walk serializes and renders exactly as
+    /// before the field existed.
+    #[serde(default, skip_serializing_if = "DoctorWalkReport::is_clean")]
+    pub unreadable_walk: DoctorWalkReport,
     /// Parse-time journal disclosures aggregated over scanned sessions
     /// (rm-436/rm-437, pi-family journals): `pi_usage_entry:<kind>`,
     /// `pi_branches`, `pi_entry_skipped:<type>`,
@@ -313,6 +319,9 @@ struct DoctorDiscovery {
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
     opencode_fork_excluded: usize,
+    /// rm-249: walk refusals for disclosure (empty when the walk was
+    /// clean or in demo mode).
+    walk_disclosure: crate::discovery::WalkDisclosure,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -340,16 +349,18 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
+            walk_disclosure: crate::discovery::WalkDisclosure::default(),
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, opencode_fork_excluded) = if dir.is_none() {
-        find_reportable_session_files(None)
+    let (files, opencode_fork_excluded, walk_disclosure) = if dir.is_none() {
+        find_reportable_session_files_with_disclosure(None)
     } else {
-        (find_session_files(dir), 0)
+        let (files, disclosure) = crate::discovery::find_session_files_with_disclosure(dir);
+        (files, 0, disclosure)
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
@@ -392,6 +403,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        walk_disclosure,
     }
 }
 
@@ -416,6 +428,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        walk_disclosure,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -520,6 +533,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         project_decode,
         zero_usage,
         future_timestamp_sessions,
+        unreadable_walk: DoctorWalkReport::from(walk_disclosure),
         disclosures,
         dropped_lines,
         directories,
@@ -826,8 +840,20 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
 }
 
 fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
+    let (files, opencode_fork_excluded, _walk_disclosure) =
+        find_reportable_session_files_with_disclosure(dir);
+    (files, opencode_fork_excluded)
+}
+
+/// rm-249: [`find_reportable_session_files`] plus the walk-refusal
+/// disclosure so `--doctor` can report directories it could not read
+/// instead of presenting them as absent.
+fn find_reportable_session_files_with_disclosure(
+    dir: Option<&Path>,
+) -> (Vec<PathBuf>, usize, crate::discovery::WalkDisclosure) {
     if dir.is_some() {
-        return (find_session_files(dir), 0);
+        let (files, disclosure) = crate::discovery::find_session_files_with_disclosure(dir);
+        return (files, 0, disclosure);
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
     // inventory aggregates through the SAME loader primitive the CLI
@@ -843,12 +869,12 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, opencode_fork_excluded) =
-        crate::discovery::find_session_files_cached(None, &mut cache, true);
+    let ((files, opencode_fork_excluded), walk_disclosure) =
+        crate::discovery::find_session_files_cached_with_disclosure(None, &mut cache, true);
     // A cache write failure must never fail the doctor (the cache is
     // an optimization; the inventory answer is already correct).
     let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, opencode_fork_excluded)
+    (files, opencode_fork_excluded, walk_disclosure)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite
@@ -1090,6 +1116,32 @@ fn doctor_directories(
         );
     }
     dirs
+}
+
+/// rm-249: the discovery walk's refusal disclosure, surfaced in the
+/// doctor report so an unreadable directory stops presenting as an
+/// absent one. Sample is capped (see
+/// [`crate::discovery::WALK_DISCLOSURE_SAMPLE_CAP`]); refusals beyond
+/// the cap are counted, not listed.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DoctorWalkReport {
+    pub dirs: Vec<String>,
+    pub dirs_truncated: usize,
+    pub entries: usize,
+}
+
+impl DoctorWalkReport {
+    fn from(disclosure: crate::discovery::WalkDisclosure) -> Self {
+        Self {
+            dirs: disclosure.unreadable_dirs,
+            dirs_truncated: disclosure.unreadable_dirs_truncated,
+            entries: disclosure.unreadable_entries,
+        }
+    }
+
+    fn is_clean(&self) -> bool {
+        self.dirs.is_empty() && self.dirs_truncated == 0 && self.entries == 0
+    }
 }
 
 /// rm-904: counts subagent transcripts whose parent transcript is not
