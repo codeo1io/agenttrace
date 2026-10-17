@@ -201,7 +201,7 @@ jobs:
               else
                 echo "conformance gate: gated surface untouched — pack still runs (guards silent token drift)"
               fi
-              echo "$CHANGED" | sed 's/^/  changed: /'
+              printf '%s\n' "$CHANGED" | sed 's/^/  changed: /'
             else
               echo "conformance gate: diff unavailable on this shallow checkout — pack runs unconditionally"
             fi
