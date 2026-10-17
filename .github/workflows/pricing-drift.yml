@@ -114,7 +114,16 @@ jobs:
             exit 1
           fi
 
-          git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs
+          # The svg card footer pins the bundled snapshot date (catalog_source
+          # derives it from the bundle), so a refresh moves the golden fixtures'
+          # footer lines — regenerate them and re-run the suite without the env
+          # to prove the byte-compare holds (rm-176 cure, 2026-10-17; without
+          # this the next master CI run reds svg_card_contract after an
+          # automated refresh). Ubuntu runners ship rustup + stable toolchain.
+          UPDATE_CARD_GOLDEN=1 cargo test --locked -p agenttrace-core --test svg_card_contract
+          cargo test --locked -p agenttrace-core --test svg_card_contract
+
+          git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs crates/agenttrace-core/tests/fixtures/svg-card
           git commit -m "chore(pricing): refresh bundled snapshot to $new_date (pricing-drift gate)"
 
           counts="$(grep -E 'costed-chat models' refresh-check.txt | tr -s ' ' | tr '\n' ';')"

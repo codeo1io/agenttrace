@@ -55,15 +55,16 @@ fn vendored_pricing_bundle_cache_rate_census_is_pinned() {
         census.models
     );
     assert_eq!(
-        census.cache_read_absent, 0,
-        "the 2026-10-08 bundle zero-fills: absent cache-read rows can only appear via a \
-         sanctioned refresh (rm-176 lane), which must move this pin consciously"
+        census.cache_read_absent, 2226,
+        "2026-10-17 refresh (rm-176): the snapshot writer passes upstream absence through as \
+         omitted fields (the 2026-10-08 vintage zero-filled) - each sanctioned refresh must \
+         move this pin consciously"
     );
     assert_eq!(
-        census.cache_write_absent, 0,
-        "the 2026-10-08 bundle zero-fills (upstream even publishes an explicit $0 on the \
-         gpt-5.3-codex rows, so the vend row is Some(0.0)): absent rows can only appear \
-         via a sanctioned refresh (rm-176 lane), which must move this pin consciously"
+        census.cache_write_absent, 3344,
+        "2026-10-17 refresh (rm-176): absent cache-write rows are upstream truth (omitted \
+         fields), the zero-fill retired with the 2026-10-08 vintage; each sanctioned refresh \
+         must move this pin consciously"
     );
     assert_eq!(
         census.cache_read_absent + census.cache_read_zero + census.cache_read_published,
