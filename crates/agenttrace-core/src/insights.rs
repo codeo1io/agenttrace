@@ -1151,7 +1151,11 @@ mod tests {
         let root = unique_decode_root("shadow");
         let fixture = root.join(format!("agenttrace-project-{}", std::process::id()));
         let repo = fixture.join("src").join("my-repo");
-        fs::create_dir_all(&repo).expect("create repo");
+        // The repo fixture owns its git-root boundary: on hosts whose
+        // TMPDIR lives inside a real git worktree (hermes delegate hosts),
+        // a repo-less fixture lets `find_git_root` escape to the HOST repo
+        // and the attribution flips to it (run e1427a8d full_tests).
+        fs::create_dir_all(repo.join(".git")).expect("create repo");
         fs::create_dir_all(root.join("agenttrace")).expect("plant shadow ancestor");
         let encoded = repo.to_string_lossy().replace('/', "-");
         let transcript = root.join("projects").join(&encoded).join("session.jsonl");
@@ -1265,7 +1269,10 @@ mod tests {
         let root = unique_decode_root("misattr");
         let base = root.join("misattr");
         let true_repo = base.join("my-repo");
-        fs::create_dir_all(&true_repo).expect("create true repo");
+        // Same git-root boundary ownership as the shadow test above: the
+        // marker keeps `find_git_root` from escaping to a host worktree
+        // when TMPDIR itself is inside one.
+        fs::create_dir_all(true_repo.join(".git")).expect("create true repo");
         let decoy = base.join("my").join("repo");
         fs::create_dir_all(&decoy).expect("plant decoy");
         let encoded = true_repo.to_string_lossy().replace('/', "-");
