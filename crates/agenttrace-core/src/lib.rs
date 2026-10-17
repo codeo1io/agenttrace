@@ -58,16 +58,18 @@ pub use governance::{
 pub use history::{history_path, merge_preserved_history, preserve_derived_history};
 pub use insights::{
     compare_session_outcome, data_health, data_health_scoped, filter_sessions,
-    project_decode_status, project_name, report_scope, resolve_project, session_capability,
+    future_admission_bound, project_decode_status, project_name, report_scope, resolve_project,
+    session_admitted_since, session_beyond_future_grace, session_capability,
     session_matches_time_range, DataHealth, ProjectDecodeStatus, ProjectIdentity, ReportScope,
-    SessionComparison, SourceScope, TimeRange,
+    SessionComparison, SourceScope, TimeRange, FUTURE_ADMISSION_GRACE_SECS,
 };
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
-    cache_rate_census, list_pricing, lookup_context_window, lookup_price, lookup_price_tiered,
-    pricing_cache_path, pricing_source, pricing_source_for, provider_for,
-    render_model_pricing_list, render_test_match, update_pricing, CacheRateCensus, Price,
+    cache_rate_census, catalog_identity, has_specific_price, list_pricing, lookup_context_window,
+    lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source, pricing_source_for,
+    provider_for, render_model_pricing_list, render_test_match, update_pricing, CacheRateCensus,
+    Price,
 };
 pub use reports::{
     add_baseline_comparison, guard_formula_json_leaves, report_compare, report_compare_json,
@@ -2346,6 +2348,23 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     metrics
 }
 
+/// rm-1534: render a whole-second span as a human phrase for the
+/// `future_timestamp` anomaly detail ("8000 years", "3 days") —
+/// exact numbers, no precision theater beyond whole units.
+fn humantime_span(seconds: i64) -> String {
+    if seconds >= 365 * 24 * 3600 {
+        format!("~{} years", seconds / (365 * 24 * 3600))
+    } else if seconds >= 24 * 3600 {
+        format!("~{} days", seconds / (24 * 3600))
+    } else if seconds >= 3600 {
+        format!("~{} hours", seconds / 3600)
+    } else if seconds >= 60 {
+        format!("~{} minutes", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 pub fn detect_anomalies(metrics: &Metrics) -> Vec<Anomaly> {
     let mut anomalies = Vec::new();
     // rm-726: implausible token magnitudes are a first-class anomaly
@@ -2383,6 +2402,43 @@ pub fn detect_anomalies(metrics: &Metrics) -> Vec<Anomaly> {
             severity: "high".to_string(),
             detail: magnitude_facts.join("; "),
         });
+    }
+    // rm-1534: far-future timestamps are a first-class anomaly class.
+    // A single corrupted clock (the year-9999 PoC) used to sail
+    // through as HEALTH 100 with zero anomalies AND pollute every
+    // forward --range window via the lower-bound-only admission
+    // predicate (insights::session_admitted_since). Admission now
+    // carries the same upper bound (now + the 24h grace — see
+    // insights::FUTURE_ADMISSION_GRACE_SECS), and this class makes
+    // the condition visible on the session itself wherever it is
+    // still listed (--range all): same anchor the admission predicate
+    // uses (session_end where known, else start — the shared
+    // session_last_activity basis), so the anomaly and the exclusion
+    // can never disagree about which timestamp spoke.
+    let future_anchor = {
+        let start = parse_ts(&metrics.session_start);
+        let end = parse_ts(&metrics.session_end);
+        match (start, end) {
+            (Some(start), Some(end)) => Some(start.max(end)),
+            (Some(start), None) => Some(start),
+            (None, Some(end)) => Some(end),
+            (None, None) => None,
+        }
+    };
+    if let Some(anchor) = future_anchor {
+        let bound = crate::insights::future_admission_bound(Utc::now());
+        if anchor > bound {
+            anomalies.push(Anomaly {
+                kind: "future_timestamp".to_string(),
+                severity: "high".to_string(),
+                detail: format!(
+                    "session activity reaches {} — {} beyond now; ranged views exclude it (bound: now + {}h)",
+                    anchor.to_rfc3339(),
+                    humantime_span((anchor.timestamp() - Utc::now().timestamp()).max(0)),
+                    crate::insights::FUTURE_ADMISSION_GRACE_SECS / 3600
+                ),
+            });
+        }
     }
     if !metrics.gaps_sec.is_empty() {
         let mut gaps = metrics.gaps_sec.clone();

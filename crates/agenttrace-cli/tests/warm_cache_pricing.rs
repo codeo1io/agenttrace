@@ -11,12 +11,20 @@ use std::process::Command;
 //
 // The fixture is synthesized here (tempdir) rather than copied from the
 // campaign PoC corpus: one Claude-lane journal whose single assistant
-// message reports exactly 1M input / 1M output tokens for
-// claude-sonnet-4-20250514, and an override file pricing that model at
-// $1.0/M in and $2.0/M out — so the override-priced cost is exactly 3.0,
-// independent of the bundled catalog (and refresh-proof).
+// message reports exactly 1M input / 1M output tokens, and an override
+// file pricing that model at $1.0/M in and $2.0/M out — so the
+// override-priced cost is exactly 3.0, independent of the bundled
+// catalog (and refresh-proof).
+//
+// rm-1532 discipline: the model is one the primary LiteLLM catalog
+// carries FIRST-PARTY (a current dated sonnet). A dated id the
+// catalog lacks first-party rows for (claude-sonnet-4-20250514)
+// prices through the embedded models.dev extract, whose provenance
+// label is not "bundled" — this test's cold-run pin would then assert
+// on the wrong catalog's behavior. First-party pricing for the gap
+// ids is pinned separately (first_party_pricing_extract_contract.rs).
 
-const MODEL: &str = "claude-sonnet-4-20250514";
+const MODEL: &str = "claude-sonnet-4-5-20250929";
 
 fn fixture_journal() -> String {
     format!(

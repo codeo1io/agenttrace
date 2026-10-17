@@ -86,6 +86,17 @@ pub struct DoctorReport {
     /// zeros; the share is surfaced so a present-zero corpus never reads
     /// as clean.
     pub zero_usage: DoctorZeroUsageReport,
+    /// rm-1534: sessions whose last activity sits beyond
+    /// `now` + `insights::FUTURE_ADMISSION_GRACE_SECS` (24h), counted
+    /// across both doctor lanes (walk-parsed files and the sqlite-backed
+    /// corpus). The row keeps the doctor's inventory honest about
+    /// ranged-view exclusions — `--range today` drops these sessions
+    /// (counted + disclosed as `future_timestamp_sessions`), and the
+    /// sessions themselves carry a `future_timestamp` anomaly wherever
+    /// they still render. 0-count-clean: zero renders identically to
+    /// the pre-rm-1534 report.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub future_timestamp_sessions: usize,
     /// Parse-time journal disclosures aggregated over scanned sessions
     /// (rm-436/rm-437, pi-family journals): `pi_usage_entry:<kind>`,
     /// `pi_branches`, `pi_entry_skipped:<type>`,
@@ -339,6 +350,13 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
     }
 }
 
+/// rm-1534: `skip_serializing_if` arm for the future-timestamp
+/// census — zero stays out of the JSON so clean corpora render
+/// byte-identically to the pre-rm-1534 report.
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     // rm-367(b): the scan disclosure's clock covers the whole pass,
     // discovery included (the sqlite lane runs inside discovery).
@@ -373,6 +391,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     let DoctorScanState {
         mut project_decode,
         zero_usage,
+        future_timestamp_sessions,
         disclosure_fold,
         // scanned_sessions is consumed inside doctor_directories by the
         // rm-904 linkage pass — nothing here needs the corpus again.
@@ -452,6 +471,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sqlite_partial_dbs: sqlite_ingest.partial_dbs.clone(),
         project_decode,
         zero_usage,
+        future_timestamp_sessions,
         disclosures,
         dropped_lines,
         directories,
@@ -832,6 +852,12 @@ struct DoctorScanState {
     project_decode: DoctorProjectDecodeReport,
     zero_usage: DoctorZeroUsageReport,
     disclosure_fold: DoctorDisclosureFold,
+    /// rm-1534: sessions whose last activity sits beyond
+    /// now+grace (the `future_timestamp` anomaly class) across BOTH
+    /// doctor lanes — the walk-parsed files and the sqlite-backed
+    /// corpus — counted once here so the doctor row and the
+    /// disclosure fold agree.
+    future_timestamp_sessions: usize,
     // rm-367/rm-904 accumulator (folded into the rm-862 scan state at
     // the integration of run 5eb82325, after both landed on this wall
     // post-base): every session a directory report parses or a cache
@@ -903,6 +929,7 @@ fn doctor_directories(
         let DoctorScanState {
             project_decode,
             zero_usage,
+            future_timestamp_sessions: _,
             disclosure_fold,
             scanned_sessions,
         } = scan;
@@ -989,6 +1016,27 @@ fn doctor_directories(
         &mut scan.scanned_sessions,
         &mut scan.disclosure_fold.disclosures,
     );
+    // rm-1534: census over the full scanned corpus (both lanes) —
+    // the count rides the parsed session's own `future_timestamp`
+    // anomaly, so the doctor, `--sessions`, and the ranged views all
+    // name the same sessions. 0-count-clean: the row and the
+    // disclosure key appear only when there is something to name.
+    scan.future_timestamp_sessions = scan
+        .scanned_sessions
+        .iter()
+        .filter(|session| {
+            session
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.kind == "future_timestamp")
+        })
+        .count();
+    if scan.future_timestamp_sessions > 0 {
+        scan.disclosure_fold.disclosures.insert(
+            "future_timestamp_sessions".to_string(),
+            scan.future_timestamp_sessions,
+        );
+    }
     dirs
 }
 
@@ -1245,6 +1293,18 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
             report.zero_usage.events
         ));
     }
+    // rm-1534: far-future sessions get a repair pointer, not just a
+    // count — the usual cause is a machine clock years off (or a
+    // journal written by one), and the fix is at the source: the
+    // ranged views already exclude + disclose, but the operator
+    // should also learn WHY.
+    if report.future_timestamp_sessions > 0 {
+        recommendations.push(format!(
+            "{} session(s) carry activity timestamps beyond now+{}h (future_timestamp): ranged views exclude them; check the recording machine's clock and the journal's timestamps at the source.",
+            report.future_timestamp_sessions,
+            crate::insights::FUTURE_ADMISSION_GRACE_SECS / 3600
+        ));
+    }
     // rm-607: sibling sqlite databases suppressed as duplicates are
     // disclosed, not silently skipped — the numbers are honest but the
     // user should learn their backups are inside the discovery glob.
@@ -1372,6 +1432,16 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
         "Zero-usage reports: {} session(s), {} event(s) counted as measured zeros (rm-408)\n",
         report.zero_usage.sessions, report.zero_usage.events
     ));
+    // rm-1534: the future-timestamp census names what ranged views
+    // exclude — twin discipline with the zero-usage row above: an
+    // excluded class gets a visible count, never a silent drop.
+    // 0-count-clean: healthy corpora render identically.
+    if report.future_timestamp_sessions > 0 {
+        out.push_str(&format!(
+            "Future timestamps: {} session(s) with activity beyond now+{}h (rm-1534) — excluded from ranged views, disclosed here and as `future_timestamp` anomalies\n",
+            report.future_timestamp_sessions, crate::insights::FUTURE_ADMISSION_GRACE_SECS / 3600
+        ));
+    }
     for sample in &report.zero_usage.samples {
         out.push_str(&format!("    {}\n", guard_formula_cell(sample)));
     }

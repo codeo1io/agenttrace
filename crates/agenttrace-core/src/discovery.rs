@@ -72,6 +72,13 @@ pub struct LoadReport {
     /// count is disclosed so "SUBAGENTS 0" never reads as "no
     /// subagent work happened".
     pub unlinked_subagents: usize,
+    /// rm-1534: sessions excluded because their last activity sits
+    /// beyond `now` + `insights::FUTURE_ADMISSION_GRACE_SECS` (only
+    /// counted when a range is active). Kept here so the
+    /// `data_health` disclosure channel (`future_timestamp_sessions`)
+    /// can report the exclusion instead of dropping sessions silently
+    /// from every ranged view.
+    pub future_excluded_sessions: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -614,6 +621,22 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // rm-799: the call returns the orphan count (children whose parent
     // transcript is absent from the loaded corpus) for disclosure.
     let unlinked_subagents = crate::subagents::attribute_subagents(&mut sessions);
+    // rm-1534: count the sessions the future bound is about to exclude
+    // (activity beyond now+grace) BEFORE the retain drops them — the
+    // count rides LoadReport into `data_health` as the
+    // `future_timestamp_sessions` disclosure (rm-727 twin discipline:
+    // counted and disclosed, never a silent drop). Only meaningful
+    // when a range is active; `--range all` keeps future sessions
+    // visible by design (the anomaly class is the disclosure there).
+    let now = chrono::Utc::now();
+    let future_excluded_sessions = if options.since.is_some() {
+        sessions
+            .iter()
+            .filter(|session| crate::insights::session_beyond_future_grace(session, now))
+            .count()
+    } else {
+        0
+    };
     sessions.retain(|session| {
         // Sessions with an unknown start time stay visible (unknown-time
         // bucket, N7) instead of being silently dropped from ranged views;
@@ -627,8 +650,11 @@ pub fn load_sessions_with_progress_from_cache_mode(
         // leniently-parsed start) at or after the cutoff, the same
         // basis the sqlite lanes and session_matches_time_range use,
         // so an overnight session no longer vanishes from `--range
-        // today` on any lane.
-        crate::insights::session_admitted_since(session, options.since)
+        // today` on any lane. rm-1534: the predicate is bounded ABOVE
+        // by now+grace when a range is active — a far-future session
+        // (year-9999 PoC) is excluded + disclosed here instead of
+        // polluting every forward window.
+        crate::insights::session_admitted_since(session, options.since, now)
             && matches_project_filter(session, &options.project)
             && matches_filter(&session.metrics.source_tool, &options.source)
             && matches_filter(&session.metrics.model_used, &options.model)
@@ -653,6 +679,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         first_parse_failure,
         parse_failure_paths,
         unlinked_subagents,
+        future_excluded_sessions,
     }
 }
 
