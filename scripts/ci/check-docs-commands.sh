@@ -12,7 +12,9 @@ fail() {
 # AGENTTRACE_BIN still overrides for A/B against a pinned build.
 repo_root="$(git rev-parse --show-toplevel)" \
   || fail "must run inside the agenttrace repository (or set AGENTTRACE_BIN)"
-bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
+# rm-1925: honor CARGO_TARGET_DIR layouts for the built binary (rm-391
+# follow-up); AGENTTRACE_BIN still wins.
+bin="${AGENTTRACE_BIN:-${CARGO_TARGET_DIR:-$repo_root/target}/release/agenttrace}"
 out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 
 # rm-241 (cycle 3): split "not built yet" from "built but not

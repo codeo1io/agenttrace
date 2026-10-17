@@ -193,8 +193,12 @@ impl CapturedStatusline {
 /// removes it by explicit path alongside the other cache artifacts
 /// (rm-086: the session-cache artifact registry owns that set).
 pub fn statusline_capture_path() -> PathBuf {
+    // rm-1921: only an ABSOLUTE AGENTTRACE_SESSION_CACHE_DIR binds — a
+    // relative root would resolve against the CWD and plant the capture
+    // file beside whatever directory the CLI ran in (empty also stays
+    // inert; cache_dir.rs rm-248 guard family).
     if let Some(dir) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").map(PathBuf::from) {
-        if !dir.as_os_str().is_empty() {
+        if dir.is_absolute() {
             return dir.join("statusline.jsonl");
         }
     }
@@ -4575,5 +4579,32 @@ mod tests {
                 "no non-layout control survives either order: {rendered:?}"
             );
         }
+    }
+
+    #[test]
+    fn statusline_capture_path_ignores_relative_session_cache_env() {
+        // rm-1921: a relative override would plant statusline.jsonl in the
+        // CWD; it must stay inert and fall back to the user cache ladder,
+        // while an absolute value still binds.
+        let _env = crate::test_env::lock_env();
+        std::env::set_var("HOME", "/rm-1921-statusline-home");
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+        let default_path = statusline_capture_path();
+        assert_eq!(
+            default_path,
+            PathBuf::from("/rm-1921-statusline-home/.cache/agenttrace/statusline.jsonl")
+        );
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", "rel-cache");
+        assert_eq!(
+            statusline_capture_path(),
+            default_path,
+            "rm-1921: a relative override must stay inert — it would plant statusline.jsonl in the CWD"
+        );
+        let absolute = std::env::temp_dir().join("rm-1921-statusline-override");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &absolute);
+        assert_eq!(statusline_capture_path(), absolute.join("statusline.jsonl"));
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::remove_var("HOME");
     }
 }

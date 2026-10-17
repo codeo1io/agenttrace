@@ -85,12 +85,24 @@ pub struct LoadProgress {
 }
 
 pub fn known_session_dirs() -> Vec<KnownSessionDir> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    // rm-1921: HOME must be absolute for the same reason as every primary
+    // below — a relative base would graft the whole discovery surface onto
+    // whatever directory the CLI happened to run in.
+    let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+    else {
         return Vec::new();
     };
     let env_home = |name: &str, fallback: PathBuf| {
+        // rm-1921: empty or relative values are inert (treated as unset) —
+        // guard-join absolute values only, mirroring the cache_dir.rs
+        // rm-248 filter, so discovery results are CWD-independent.
         std::env::var_os(name)
-            .filter(|value| !value.is_empty())
+            .filter(|value| {
+                let path = std::path::Path::new(value);
+                !value.is_empty() && path.is_absolute()
+            })
             .map(PathBuf::from)
             .unwrap_or(fallback)
     };
@@ -1236,15 +1248,20 @@ fn open_code_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
             });
         }
     };
+    // rm-1921: OPENCODE_DATA_DIR / XDG_DATA_HOME guard-join ABSOLUTE values
+    // only (empty or relative values are inert, treated as unset — the
+    // cache_dir.rs rm-248 filter family), so a relative value cannot graft
+    // the OpenCode lane onto whatever directory the CLI ran in.
     if let Some(data_dir) = std::env::var_os("OPENCODE_DATA_DIR").map(PathBuf::from) {
-        if !data_dir.as_os_str().is_empty() {
+        if data_dir.is_absolute() {
             add("OpenCode", data_dir);
         }
     }
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
-        if !data_home.as_os_str().is_empty() {
-            add("OpenCode", data_home.join("opencode").join("storage"));
-        }
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|data_home| data_home.is_absolute());
+    if let Some(data_home) = xdg_data_home {
+        add("OpenCode", data_home.join("opencode").join("storage"));
     } else {
         add(
             "OpenCode",
@@ -1277,8 +1294,10 @@ fn cline_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
 }
 
 fn user_config_dir(home: &Path) -> PathBuf {
+    // rm-1921: a relative XDG_CONFIG_HOME stays inert (platform default
+    // wins) — it would otherwise graft the Cline lane onto the CWD.
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
-        if !dir.as_os_str().is_empty() {
+        if dir.is_absolute() {
             return dir;
         }
     }

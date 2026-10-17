@@ -4,7 +4,9 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
+# rm-1925: honor CARGO_TARGET_DIR layouts for the built binary (rm-391
+# follow-up); AGENTTRACE_BIN still wins.
+bin="${AGENTTRACE_BIN:-${CARGO_TARGET_DIR:-$repo_root/target}/release/agenttrace}"
 out_dir="${AGENTTRACE_REAL_CLI_OUT:-/tmp/agenttrace-real-cli-smoke-$(date +%Y%m%d%H%M%S)}"
 source_dir="${AGENTTRACE_REAL_CLI_DIR:-$HOME/.pi/agent/sessions}"
 query="${AGENTTRACE_REAL_CLI_QUERY:-error}"

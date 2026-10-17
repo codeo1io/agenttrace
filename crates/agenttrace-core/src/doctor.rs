@@ -1144,6 +1144,16 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
             );
         }
     }
+    // rm-1921: a relative AGENTTRACE_SESSION_CACHE_DIR is inert (see
+    // session_cache::session_cache_path) — disclose the ignored value so
+    // the operator learns why the cache did not move.
+    if let Some(value) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR") {
+        if !value.is_empty() && !std::path::Path::new(&value).is_absolute() {
+            out.push_str(
+                "  note: AGENTTRACE_SESSION_CACHE_DIR is set to a relative path and is ignored; a relative cache root would resolve against the CWD (rm-1921).\n",
+            );
+        }
+    }
     out.push_str(&format!(
         "  {} parsed session cache entries, {} reusable for this scan, {} cached directory listings\n",
         report.cache_entries, report.cached_valid, report.cache_dirs
@@ -1345,7 +1355,10 @@ fn load_session_cache_report() -> SessionCacheReport {
 
 fn session_cache_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").map(PathBuf::from) {
-        if !dir.as_os_str().is_empty() {
+        // rm-1921: a relative value stays inert — it would resolve against
+        // the CWD and plant the cache beside whatever directory the CLI ran
+        // in. Guard-join absolute values only (cache_dir.rs rm-248 family).
+        if dir.is_absolute() {
             return dir.join("sessions.json");
         }
     }
@@ -1469,6 +1482,35 @@ mod tests {
         assert!(report.cache_limits.contains("entries<=1500"));
         assert!(doctor_report_text(&report).contains("entry bound from env"));
         std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+    }
+
+    #[test]
+    fn session_cache_override_must_be_absolute_rm_1921() {
+        // rm-1921: a relative override must stay inert (user-cache fallback)
+        // and the text report must disclose the ignored value.
+        let _env = crate::test_env::lock_env();
+        std::env::set_var("HOME", "/rm-1921-doctor-home");
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+        let default_path = session_cache_path();
+        assert_eq!(
+            default_path,
+            PathBuf::from("/rm-1921-doctor-home/.cache/agenttrace/sessions.json")
+        );
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", "rel-cache");
+        assert_eq!(
+            session_cache_path(),
+            default_path,
+            "rm-1921: a relative override must stay inert"
+        );
+        let report = build_doctor_report(None, true);
+        let text = doctor_report_text(&report);
+        assert!(
+            text.contains("AGENTTRACE_SESSION_CACHE_DIR is set to a relative path"),
+            "doctor must disclose the ignored relative override: {text}"
+        );
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::remove_var("HOME");
     }
 
     #[test]
