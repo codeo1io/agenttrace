@@ -162,7 +162,11 @@ fn hostile_project_ids_cannot_escape_the_store() {
         &root,
         "sess_1",
         &format!(
-            r#"{{"id": "sess_1", "slug": "hostile", "projectID": "{absolute_id}", "title": "Hostile", "time": {{"created": 1764750000000, "updated": 1764750004000}}}}"#
+            // JSON-escape the id: a windows absolute path carries backslashes,
+            // and a raw \U is not a valid JSON escape (the doc would fail to
+            // parse before admission ever saw the hostile value).
+            r#"{{"id": "sess_1", "slug": "hostile", "projectID": "{}", "title": "Hostile", "time": {{"created": 1764750000000, "updated": 1764750004000}}}}"#,
+            absolute_id.replace('\\', "\\\\")
         ),
     );
     write_message(&root, "sess_1");

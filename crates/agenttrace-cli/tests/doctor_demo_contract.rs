@@ -364,8 +364,12 @@ fn doctor_json_lane_escapes_spoofing_controls_in_failure_samples() {
     );
     // Fast path: the clean sample rides verbatim — escaping never
     // touches clean strings, so clean output stays byte-identical.
+    // (JSON string literals escape `\` per serde; on Windows the
+    // clean path carries backslashes, so compare the JSON-encoded
+    // form — on unix the replace is a no-op and the pin is unchanged.)
+    let clean_path_json = clean_path.replace('\\', "\\\\");
     assert!(
-        stdout.contains(clean_path.as_str()),
+        stdout.contains(clean_path_json.as_str()),
         "clean names must ride the json lane verbatim: {stdout}"
     );
 

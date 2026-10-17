@@ -181,14 +181,21 @@ fn catalog_identity_folds_the_extract_bytes() {
         identity.as_str(),
         "identity is stable within a build"
     );
-    let digest = identity
-        .rsplit("-d")
-        .next()
-        .unwrap_or_default()
-        .trim_start_matches('d');
+    // rsplit_tail on "-d" mis-splits when the PRIMARY hash itself
+    // contains "-d" followed by more hex (observed on windows-latest:
+    // primary 5882a2c2192fa1b7 + digest dd9f197aca85ae77 — rsplit
+    // returned the digest-after-"d" tail "d9f..."). Split from the
+    // RIGHT once, keep the exact tail, and pin the full shape:
+    // <16-hex primary>-d<16-hex digest>.
+    let tail = identity.rsplit_once("-d").map(|(_, digest)| digest);
     assert!(
-        identity.contains("-d") && !digest.is_empty() && digest.len() == 16,
-        "identity must carry the extract digest suffix (-dXXXXXXXXXXXXXXXX), got {identity:?}"
+        matches!(tail, Some(digest) if digest.len() == 16 && digest.bytes().all(|b| b.is_ascii_hexdigit())),
+        "identity must be <16-hex primary>-d<16-hex extract digest>, got {identity:?}"
+    );
+    let (primary, _) = identity.split_once("-d").expect("split once on -d");
+    assert!(
+        primary.len() == 16 && primary.bytes().all(|b| b.is_ascii_hexdigit()),
+        "primary half of the identity must be 16 hex chars, got {primary:?}"
     );
 }
 

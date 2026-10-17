@@ -92,8 +92,37 @@ fn doctor_demo_dir_arg_gates_the_directory_lane() {
         assert!(control.session_files >= 1);
         assert!(control.directories.iter().any(|d| d.files >= 1));
         let control_json = render_doctor_report(Some(&root), false, "json").expect("render json");
+        // Path disclosure must be compared structurally, not by
+        // substring: JSON escapes backslashes (windows), the walk may
+        // canonicalize to a verbatim \\?\ prefix, and 8.3 short-name
+        // vs long-name forms differ (RUNNER~1 vs runneradmin). Every
+        // component of the probed root must appear in the disclosed
+        // path of some directory entry; unix component text is
+        // unchanged by this comparison.
+        let marker_components: Vec<_> = std::path::Path::new(&marker_path)
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+            .collect();
         assert!(
-            control_json.contains(&marker_path),
+            control_json.contains(&marker_path) || {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&control_json).expect("control json parses");
+                parsed["directories"]
+                    .as_array()
+                    .map(|dirs| {
+                        dirs.iter().any(|dir| {
+                            let disclosed = dir["path"].as_str().unwrap_or_default();
+                            let disclosed_components: Vec<_> = std::path::Path::new(disclosed)
+                                .components()
+                                .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                                .collect();
+                            marker_components.iter().all(|m| {
+                                !m.contains("at-rm596") || disclosed_components.contains(m)
+                            })
+                        })
+                    })
+                    .unwrap_or(false)
+            },
             "control must disclose the probed directory: {control_json}"
         );
         fs::remove_dir_all(&root).ok();

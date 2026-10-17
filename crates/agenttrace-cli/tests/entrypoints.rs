@@ -870,6 +870,7 @@ fn statusline_host_mode_never_fails_the_host() {
     let _ = std::fs::remove_dir_all(cache);
 }
 
+#[cfg(target_os = "linux")] // /dev/full exists only on Linux; macOS lacks it (ENOENT)
 #[test]
 fn statusline_host_mode_survives_stdout_write_failure() {
     // Review F2 (cycle 7): the host contract is exit 0 for any input —
@@ -2567,6 +2568,7 @@ fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(target_os = "linux")] // /dev/full (ENOSPC) exists only on Linux
 #[test]
 fn error_stderr_carries_the_anyhow_cause_chain() {
     // rm-610: the top-level handler printed `Error: {err}`, and
@@ -2890,7 +2892,10 @@ fn output_flag_refusal_names_the_directory_and_target() {
         "error must name the requested -o target: {stderr}"
     );
     assert!(
-        stderr.contains("File exists"),
+        // unix strerror: "File exists"; windows: "Cannot create a file
+        // when that file already exists." — the disclosed-cause contract
+        // is the OS message naming the collision, not its spelling.
+        stderr.contains("exists"),
         "the OS cause stays disclosed (rm-610): {stderr}"
     );
 

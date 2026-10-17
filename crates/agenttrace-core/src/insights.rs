@@ -282,6 +282,12 @@ pub fn resolve_project(session: &Session) -> ProjectIdentity {
     }
 }
 
+#[cfg(test)]
+fn identity_root_rendering(path: &std::path::Path) -> String {
+    // Mirror the '/'-joined identity rendering for assertion sites.
+    resolved_from_path(&path.to_string_lossy()).root
+}
+
 fn resolved_from_path(raw: &str) -> ProjectIdentity {
     if raw.is_empty() || raw.starts_with("history:") {
         return ProjectIdentity {
@@ -301,7 +307,32 @@ fn resolved_from_path(raw: &str) -> ProjectIdentity {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("unknown")
         .to_string();
-    let root = root.to_string_lossy().to_string();
+    // '/'-joined identity: platform-stable project ids (a unix-recorded
+    // corpus replayed on windows must not grow backslash ids). RootDir
+    // renders as the leading '/' (never doubled); prefix components keep
+    // their own spelling (C:\, \\?\C:\).
+    let root = {
+        let mut text = String::new();
+        for component in root.components() {
+            match component {
+                std::path::Component::RootDir => {
+                    if !text.ends_with('/') {
+                        text.push('/');
+                    }
+                }
+                _ => {
+                    let part = component.as_os_str().to_string_lossy();
+                    if !part.is_empty() {
+                        if !text.is_empty() && !text.ends_with('/') {
+                            text.push('/');
+                        }
+                        text.push_str(&part);
+                    }
+                }
+            }
+        }
+        text
+    };
     ProjectIdentity {
         id: root.clone(),
         display_name,
@@ -1141,6 +1172,8 @@ mod tests {
         ))
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn projects_group_worktrees_and_decode_agent_dirs() {
         // rm-382: hermetic fixture — unique root, no `agenttrace` component
@@ -1212,6 +1245,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn decode_ignores_shadow_directories_at_plausible_ancestors() {
         // rm-382 regression (assess N2): with TMPDIR=/home/agent/.hermes/
@@ -1243,7 +1278,7 @@ mod tests {
         assert_eq!(decoded.display_name, "my-repo");
         assert_eq!(
             decoded.root,
-            lexical_normalize(&repo).to_string_lossy().to_string()
+            identity_root_rendering(&lexical_normalize(&repo))
         );
         // The shadow never even becomes a disclosed candidate.
         assert!(matches!(
@@ -1256,6 +1291,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn truncated_encoded_names_keep_a_stable_identity() {
         // rm-240 residual: encoded names over 200 chars are truncated to 200
@@ -1332,6 +1369,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn decode_prefers_the_longest_verified_path_over_a_decoy_split() {
         // rm-381 regression, assess PoC triple (delegate/172562a8…-scratch/
@@ -1365,7 +1404,7 @@ mod tests {
         assert_eq!(with_decoy.display_name, "my-repo");
         assert_eq!(
             with_decoy.root,
-            lexical_normalize(&true_repo).to_string_lossy().to_string()
+            identity_root_rendering(&lexical_normalize(&true_repo))
         );
         // The alternative the old decoder would have descended into is
         // disclosed as shadowed.
@@ -1414,12 +1453,14 @@ mod tests {
         assert_eq!(resolved.display_name, "my-repo");
         assert_eq!(
             resolved.root,
-            lexical_normalize(&repo).to_string_lossy().to_string()
+            identity_root_rendering(&lexical_normalize(&repo))
         );
 
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn decode_tolerates_literal_dashes_and_empty_components() {
         // A literal '-' inside a component name encodes exactly like a path
