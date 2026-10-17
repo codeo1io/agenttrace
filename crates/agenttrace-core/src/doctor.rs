@@ -1,3 +1,4 @@
+use crate::codex_state::{scan_codex_state, CodexRolloutTotal, CodexStateScan};
 use crate::reports::guard_formula_cell;
 use crate::sqlite_sessions::{
     load_sqlite_backed_sessions_reported_bounded, SqlitePartialDb, SqliteScanBudget,
@@ -171,6 +172,20 @@ pub struct DoctorReport {
     /// the per-db/lane wall-clock budget (kept sessions disclosed).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sqlite_partial_dbs: Vec<SqlitePartialDb>,
+    /// rm-1986 (run 2b30a694 cycle 3): codex per-thread state cross-check
+    /// — `~/.codex/state_*.sqlite` (or `CODEX_HOME`) opened with strictly
+    /// sidecar-safe `mode=ro&immutable=1` URIs (db, `-wal`, `-shm`
+    /// fingerprinted unchanged by the contract test), `threads.tokens_used`
+    /// compared against the rollout-derived totals (`tokens_input +
+    /// `tokens_output + `tokens_reasoning`, tolerance band max(100 tokens,
+    /// 2% of derived)). Rollouts stay canonical: this lane is a disclosed
+    /// cross-check (disagreement counter + samples) plus subagent
+    /// attribution counts (`threads.source` `subagent:*`,
+    /// `thread_spawn_edges`), never a replacement session source. Absent
+    /// (unserialized) when no state file exists, so hosts without codex
+    /// render byte-identically.
+    #[serde(default, skip_serializing_if = "CodexStateScan::is_absent")]
+    pub codex_state: CodexStateScan,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
     /// `agenttrace statusline` has been configured as the statusLine
@@ -393,8 +408,10 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         zero_usage,
         future_timestamp_sessions,
         disclosure_fold,
-        // scanned_sessions is consumed inside doctor_directories by the
-        // rm-904 linkage pass — nothing here needs the corpus again.
+        // The rm-904 linkage pass consumes the corpus inside the walk;
+        // the codex state lane (rm-1986) re-reads it afterwards for the
+        // tokens_used cross-check.
+        scanned_sessions,
         ..
     } = scan;
     let DoctorDisclosureFold {
@@ -414,6 +431,34 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             opencode_fork_excluded_total,
         );
     }
+    // rm-1986 (run 2b30a694 cycle 3): codex per-thread state cross-check.
+    // Host-derived lane — skipped under --demo and for custom dirs (the
+    // rm-596 single-demo gate rule); rollouts stay canonical.
+    let codex_state = if demo || dir.is_some() {
+        CodexStateScan::default()
+    } else {
+        let home = std::env::var_os("CODEX_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex"))
+            });
+        match home {
+            Some(home) if home.is_dir() => {
+                let rollouts: Vec<CodexRolloutTotal> = scanned_sessions
+                    .iter()
+                    .filter(|s| s.metrics.source_tool == "codex_cli")
+                    .map(|s| CodexRolloutTotal {
+                        path: s.path.clone().into(),
+                        derived_tokens: s.metrics.tokens_input
+                            + s.metrics.tokens_output
+                            + s.metrics.tokens_reasoning,
+                    })
+                    .collect();
+                scan_codex_state(&home, &rollouts)
+            }
+            _ => CodexStateScan::default(),
+        }
+    };
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -475,6 +520,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         disclosures,
         dropped_lines,
         directories,
+        codex_state,
         statusline: doctor_statusline_report(demo),
         pricing: format!(
             "LiteLLM snapshot {} (bundled, {} models, {})",
@@ -1411,6 +1457,38 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
         report.statusline.path, statusline_state
     ));
     out.push_str(&format!("Pricing snapshot: {}\n", report.pricing));
+    if !report.codex_state.is_absent() {
+        let cs = &report.codex_state;
+        out.push_str(&format!(
+            "Codex state cross-check (rm-1986): {} state DB(s) in {} — {} parsed, {} failed\n",
+            cs.files_found, cs.home, cs.files_parsed, cs.files_failed
+        ));
+        out.push_str(&format!(
+            "  threads: {} total, {} matched to parsed rollouts, {} unmatched, {} subagent, {} spawn edges\n",
+            cs.threads_total,
+            cs.threads_matched,
+            cs.threads_unmatched,
+            cs.subagent_threads,
+            cs.spawn_edges_total
+        ));
+        if cs.tokens_used_disagreements > 0 {
+            out.push_str(&format!(
+                "  tokens_used DISAGREEMENTS: {} (codex state vs rollout-derived {}; tolerance max({} tokens, {}%))\n",
+                cs.tokens_used_disagreements,
+                crate::codex_state::DERIVED_TOKENS_FORMULA,
+                crate::codex_state::DISAGREEMENT_ABS_TOLERANCE,
+                crate::codex_state::DISAGREEMENT_REL_TOLERANCE_PCT
+            ));
+            for sample in &cs.disagreement_samples {
+                out.push_str(&format!("    - {sample}\n"));
+            }
+        } else {
+            out.push_str("  tokens_used: agrees with rollout-derived totals within tolerance\n");
+        }
+        for sample in &cs.failure_samples {
+            out.push_str(&format!("    ! {sample}\n"));
+        }
+    }
     for failure in &report.sqlite_read_failures {
         out.push_str(&format!(
             "Sqlite session source unreadable: {} ({}) — {}\n",

@@ -21,3 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+
+[dev-dependencies]
+# Same crates/versions as the main dependencies: the codex_state contract
+# tests build sqlite fixtures and assert json shape (no new compilation).
+rusqlite.workspace = true
+serde_json.workspace = true
