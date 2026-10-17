@@ -646,6 +646,37 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
                     opencode_admission.unreadable_dirs,
                 );
             }
+            // rm-1871: session-wide budget disclosures ride the same
+            // loss-class channel (the file's data did not enter the parse).
+            if opencode_admission.budget_capped_files > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_budget_files_capped".to_string(),
+                    opencode_admission.budget_capped_files,
+                );
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_budget_bytes_capped".to_string(),
+                    opencode_admission.budget_capped_bytes as usize,
+                );
+            }
+            // rm-1870: id rejections are loss-class disclosures too.
+            if opencode_admission.rejected_session_ids > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_session_id_rejected".to_string(),
+                    opencode_admission.rejected_session_ids,
+                );
+            }
+            if opencode_admission.rejected_message_ids > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_message_id_rejected".to_string(),
+                    opencode_admission.rejected_message_ids,
+                );
+            }
+            if opencode_admission.rejected_part_ids > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_part_id_rejected".to_string(),
+                    opencode_admission.rejected_part_ids,
+                );
+            }
             return Ok(session);
         }
         if let Some(events) = parse_cursor_export(&value) {
@@ -6737,15 +6768,37 @@ fn parse_opencode_storage_session(
     let storage_root = opencode_storage_root_from_session_file(path)
         .with_context(|| format!("opencode: unsupported storage path {path}"))?;
     let mut admission = OpencodeAdmissionStats::default();
-    let (mut messages, message_admission) =
-        read_opencode_records(&storage_root.join("message").join(session_id));
-    admission.accumulate(message_admission);
+    let mut budget = OpencodeReadBudget::default();
+    let mut messages = Vec::new();
+    // rm-1870: the session doc's id IS the directory name it was discovered
+    // under (`storage/session/<id>/<id>.json`). An id that is not a single
+    // safe path component, or that fails that identity, must never flow
+    // into the message join — reject the whole message walk with
+    // disclosure (the header still parses; the session is exactly as if no
+    // messages existed).
+    let session_stem = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if !opencode_component_id(session_id) || session_id != session_stem {
+        admission.rejected_session_ids += 1;
+    } else {
+        let (messages_read, message_admission) = read_opencode_records(
+            &storage_root.join("message").join(session_id),
+            "message",
+            &mut budget,
+        );
+        messages = messages_read;
+        admission.accumulate(message_admission);
+    }
     // rm-1437/rm-1866: an empty event set is explained when every
     // transcript was stat-capped OR lost to a read/parse failure — bail
     // into the unsupported lane only when we have no such explanation, so
     // a fully-capped or fully-unreadable session still parses and carries
     // its disclosure instead of masquerading as a foreign format.
-    if messages.is_empty() && !admission.explains_empty() {
+    // rm-1870/rm-1871 widen the explanation set: id rejections and
+    // session-budget caps count too.
+    if messages.is_empty() && !admission.admission_explains_empty() {
         bail!("opencode: no messages found for session {}", session_id);
     }
     sort_opencode_records(&mut messages);
@@ -6773,14 +6826,16 @@ fn parse_opencode_storage_session(
             &model,
             message_fold,
             &mut admission,
+            &mut budget,
         );
         add_usage(&mut usage, &part_usage);
         body.extend(events);
     }
     // rm-1437/rm-1866: same relaxation as the messages gate — a corpus
     // fully stat-capped or lost to read/parse failures legitimately yields
-    // no parseable events; disclose, don't bail.
-    if body.is_empty() && !admission.explains_empty() {
+    // no parseable events; disclose, don't bail. rm-1870/rm-1871: same
+    // for id rejections and session-budget caps.
+    if body.is_empty() && !admission.admission_explains_empty() {
         bail!("opencode: no parseable events for session {}", session_id);
     }
 
@@ -6884,6 +6939,11 @@ fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
 /// classes and data-health confidence degrades honestly (the rm-526 loss
 /// channel — a skipped transcript is lost data, not a value-preserving
 /// adjustment, so it does NOT ride `disclosure_counters`).
+///
+/// rm-1870/rm-1871 extend the same channel: ids rejected by the admission
+/// identity gate and files skipped by the session-wide read budget are
+/// loss-class disclosures too (the record's data did not enter the parse),
+/// so they ride `line_skips` beside the per-file caps.
 #[derive(Debug, Default, Clone, Copy)]
 struct OpencodeAdmissionStats {
     capped_files: usize,
@@ -6896,6 +6956,15 @@ struct OpencodeAdmissionStats {
     unreadable_files: usize,
     unparseable_files: usize,
     unreadable_dirs: usize,
+    /// rm-1871: files the session-wide read budget skipped whole.
+    budget_capped_files: usize,
+    /// rm-1871: honest excess disclosure for those skips.
+    budget_capped_bytes: u64,
+    /// rm-1870: ids rejected by component-safety or stem-identity
+    /// admission, per lane (a rejected record is exactly a skipped file).
+    rejected_session_ids: usize,
+    rejected_message_ids: usize,
+    rejected_part_ids: usize,
 }
 
 impl OpencodeAdmissionStats {
@@ -6905,17 +6974,27 @@ impl OpencodeAdmissionStats {
         self.unreadable_files += other.unreadable_files;
         self.unparseable_files += other.unparseable_files;
         self.unreadable_dirs += other.unreadable_dirs;
+        self.budget_capped_files += other.budget_capped_files;
+        self.budget_capped_bytes += other.budget_capped_bytes;
+        self.rejected_session_ids += other.rejected_session_ids;
+        self.rejected_message_ids += other.rejected_message_ids;
+        self.rejected_part_ids += other.rejected_part_ids;
     }
 
-    /// rm-1866 (extending the rm-1437 relaxation): transcript-side losses
-    /// are an explanation for an empty event set — caps AND read/parse
-    /// losses. Bailing into the unsupported lane is only honest when we
-    /// have no such explanation.
-    fn explains_empty(&self) -> bool {
+    /// rm-1866 + rm-1870/rm-1871 (extending the rm-1437 relaxation):
+    /// whether any admission decision — per-file cap, session-wide
+    /// budget, id rejection, or a transcript read/parse loss — explains
+    /// an empty event set. Bailing into the unsupported lane is only
+    /// honest when we have no such explanation.
+    fn admission_explains_empty(&self) -> bool {
         self.capped_files > 0
             || self.unreadable_files > 0
             || self.unparseable_files > 0
             || self.unreadable_dirs > 0
+            || self.budget_capped_files > 0
+            || self.rejected_session_ids > 0
+            || self.rejected_message_ids > 0
+            || self.rejected_part_ids > 0
     }
 }
 
@@ -6926,7 +7005,51 @@ impl OpencodeAdmissionStats {
 /// matches the fleet's transcript-side read caps.
 const OPENCODE_TRANSCRIPT_READ_CAP_BYTES: u64 = 10 * 1024 * 1024;
 
-fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionStats) {
+/// rm-1871: session-wide admission budget — the rm-1437 per-file cap bound
+/// ONE file, not the scan (N under-cap files admitted N×cap bytes; the
+/// c0a4e32f assess measured RSS scaling 15.1→32.4→51.3 MiB on a 3-file
+/// corpus). Enforced on the READ side across every file of one session
+/// scan, bytes AND records, so a file that grows between stat and read
+/// (the same assess's TOCTOU probe) still cannot push a byte past the
+/// budget: the reader is bounded and an over-bound file is discarded
+/// whole — a truncated transcript is never parsed.
+const OPENCODE_TOTAL_READ_CAP_BYTES: u64 = 64 * 1024 * 1024;
+const OPENCODE_TOTAL_RECORD_CAP: usize = 8192;
+
+/// rm-1871: the remaining session-wide admission budget threaded through
+/// every `read_opencode_records` call of one session scan (message lane +
+/// all part lanes share one pool, so the bound is on the whole scan).
+#[derive(Debug)]
+struct OpencodeReadBudget {
+    bytes_remaining: u64,
+    records_remaining: usize,
+}
+
+impl Default for OpencodeReadBudget {
+    fn default() -> Self {
+        Self {
+            bytes_remaining: OPENCODE_TOTAL_READ_CAP_BYTES,
+            records_remaining: OPENCODE_TOTAL_RECORD_CAP,
+        }
+    }
+}
+
+/// rm-1870: doc-supplied ids flow into filesystem joins
+/// (`storage/message/<id>`, `storage/part/<id>`), so an absolute id
+/// REPLACES the join base (`Path::join` semantics) and any separator
+/// traverses out of the lane. A trustworthy id is a single safe path
+/// component — non-empty, no separators, no NUL, no `:` (portability: a
+/// Windows drive/prefix component must never replace the base), and
+/// neither `.` nor `..`.
+fn opencode_component_id(id: &str) -> bool {
+    !id.is_empty() && !id.contains(['/', '\\', '\0', ':']) && id != "." && id != ".."
+}
+
+fn read_opencode_records(
+    dir: &Path,
+    lane: &str,
+    budget: &mut OpencodeReadBudget,
+) -> (Vec<OpenCodeRecord>, OpencodeAdmissionStats) {
     let mut admission = OpencodeAdmissionStats::default();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -6966,9 +7089,58 @@ fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionS
             admission.capped_bytes += file_len;
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            // rm-1866: a readable-failed transcript is lost data — count
-            // and disclose it, never swallow it.
+        // rm-1871: the session-wide budget is checked before the open and
+        // then ENFORCED ON THE READ — `take` bounds the reader so a live
+        // writer racing the stat (the TOCTOU probe) still cannot push a
+        // byte past the budget. `allow + 1` distinguishes "file exactly at
+        // the bound" (admit; it is complete) from "one byte beyond"
+        // (discard whole; a truncated transcript is never parsed).
+        if budget.bytes_remaining == 0 || budget.records_remaining == 0 {
+            admission.budget_capped_files += 1;
+            admission.budget_capped_bytes += file_len;
+            continue;
+        }
+        let allow = budget
+            .bytes_remaining
+            .min(OPENCODE_TRANSCRIPT_READ_CAP_BYTES);
+        // rm-1866 (re-anchored under the rm-1871 bounded reader): a file
+        // that cannot be opened is lost data — count and disclose it,
+        // never swallow it.
+        let Ok(file) = std::fs::File::open(&path) else {
+            admission.unreadable_files += 1;
+            continue;
+        };
+        let mut bytes = Vec::new();
+        let read = {
+            use std::io::Read;
+            let mut limited = std::io::BufReader::new(file).take(allow.saturating_add(1));
+            limited.read_to_end(&mut bytes)
+        };
+        if read.is_err() {
+            // rm-1866: same lost-file contract for the read itself.
+            admission.unreadable_files += 1;
+            continue;
+        }
+        if bytes.len() as u64 > allow {
+            // Larger at read time than the bound that admitted it — either
+            // it grew past the per-file cap mid-read or it crossed the
+            // remaining session budget. Disclose under whichever bound is
+            // tighter here.
+            let now_len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            if allow == OPENCODE_TRANSCRIPT_READ_CAP_BYTES {
+                admission.capped_files += 1;
+                admission.capped_bytes += now_len;
+            } else {
+                admission.budget_capped_files += 1;
+                admission.budget_capped_bytes += now_len.max(bytes.len() as u64);
+            }
+            continue;
+        }
+        // rm-1866: bytes that are not UTF-8 are lost data too — the old
+        // `read_to_string` failed there and disclosed the unreadable file,
+        // so the bounded reader keeps the same accounting instead of
+        // dropping the file silently.
+        let Ok(raw) = String::from_utf8(bytes) else {
             admission.unreadable_files += 1;
             continue;
         };
@@ -6977,6 +7149,26 @@ fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionS
             admission.unparseable_files += 1;
             continue;
         };
+        // rm-1870: stem-identity admission — the layout rule applies to the
+        // lanes whose file names ARE the ids the joins rely on: message
+        // docs (`storage/message/<sessID>/<msgID>.json`, the stem feeds the
+        // part join) and the session doc. Part docs are named by TYPE
+        // (`part_text.json` carrying id `part_user_text`) — their ids never
+        // flow into a filesystem join, so they are admitted on component
+        // safety alone (checked live against the repo fixture in
+        // tests/discovery_contract.rs::rust_parses_opencode_storage_session).
+        let id = string(doc.get("id")).unwrap_or("");
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if !opencode_component_id(id) || (lane == "message" && id != stem) {
+            if lane == "message" {
+                admission.rejected_message_ids += 1;
+            } else {
+                admission.rejected_part_ids += 1;
+            }
+            continue;
+        }
+        budget.bytes_remaining = budget.bytes_remaining.saturating_sub(raw.len() as u64);
+        budget.records_remaining = budget.records_remaining.saturating_sub(1);
         records.push(OpenCodeRecord { path, doc });
     }
     (records, admission)
@@ -6997,12 +7189,21 @@ fn parse_opencode_message(
     model: &str,
     message_fold: OpencodeTokensFold,
     admission: &mut OpencodeAdmissionStats,
+    budget: &mut OpencodeReadBudget,
 ) -> (Vec<Event>, BTreeMap<String, i64>) {
     let role = string(msg.get("role")).unwrap_or("");
     let ts = opencode_time_from_map(msg.get("time"), &["created", "start"]);
     let msg_id = string(msg.get("id")).unwrap_or("");
+    // rm-1870: defense in depth at the join site itself — admitted message
+    // records already carry stem-validated single-component ids (the
+    // read-time gate), but the join is where the arbitrary-read escape
+    // lived, so it never trusts an id that is not a safe component.
+    if !opencode_component_id(msg_id) {
+        admission.rejected_message_ids += 1;
+        return (Vec::new(), BTreeMap::new());
+    }
     let (mut parts, part_admission) =
-        read_opencode_records(&storage_root.join("part").join(msg_id));
+        read_opencode_records(&storage_root.join("part").join(msg_id), "part", budget);
     admission.accumulate(part_admission);
     sort_opencode_records(&mut parts);
 
