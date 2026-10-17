@@ -23,7 +23,32 @@ require_json() {
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir"
 
-"$bin" --doctor -f json >"$out_dir/doctor.json"
+# rm-1939: every invocation below must be hermetic. The doctor step
+# used to run `--doctor -f json` under the OPERATOR's ambient HOME, so
+# on a real fleet the gate's first step scanned the operator's entire
+# session corpus (live-proven twice at the 300s CI timeout with >3GB
+# read and zero output) and persisted its parses into the operator's
+# real session cache (the rm-367 doctor-persist behavior). Pin
+# HOME/XDG/AGENTTRACE_SESSION_CACHE_DIR to a scratch home inside the
+# gate's own out_dir (the doctor_honesty_contract sandbox pattern) —
+# the empty scratch home exercises the doctor's honest-zero lane — and
+# bound the doctor probe itself, so a regression back to an unbounded
+# walk fails loudly here instead of red-by-timeout in CI.
+gate_home="$out_dir/doctor-home"
+mkdir -p "$gate_home" "$out_dir/doctor-cache"
+export HOME="$gate_home"
+export XDG_CONFIG_HOME="$gate_home/.config"
+export XDG_CACHE_HOME="$gate_home/.cache"
+export XDG_DATA_HOME="$gate_home/.local/share"
+export AGENTTRACE_SESSION_CACHE_DIR="$out_dir/doctor-cache"
+
+set +e
+timeout 60 "$bin" --doctor -f json >"$out_dir/doctor.json"
+doctor_status=$?
+set -e
+if [[ "$doctor_status" -ne 0 ]]; then
+  fail "doctor probe failed (exit $doctor_status) — under the pinned scratch HOME it must finish bounded (124 = timeout, i.e. an unbounded-walk regression)"
+fi
 require_file "$out_dir/doctor.json"
 require_json "$out_dir/doctor.json"
 

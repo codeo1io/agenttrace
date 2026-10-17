@@ -2032,6 +2032,42 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
     })
 }
 
+/// rm-299 fence: the fingerprint a cache ENTRY is keyed to. For
+/// opencode session docs it FOLDS IN the referenced project doc's
+/// stat (`storage/project/<id>.json`, re-derived through the same
+/// validated path the attribution intake uses) — that sidecar feeds
+/// the session's project attribution at parse time, but editing it
+/// never moves the session doc's own mtime/size, so a warm entry kept
+/// serving the stale project forever (live-proven: cold `/srv/alpha` →
+/// sidecar edited to `/srv/beta` → warm still alpha until the cache
+/// was wiped). The fold makes a sidecar edit invalidate the entry
+/// exactly like an edit of the session file itself; a sidecar
+/// appearing or disappearing flips it the same way. Every other lane
+/// fingerprints its file alone, byte-identically to before.
+///
+/// The on-disk entry shape is unchanged (the same two integers), so
+/// this is deliberately NOT a SESSION_CACHE_SCHEMA_VERSION bump (the
+/// rm-230/rm-831 convention keys on parse semantics changing the
+/// served report for unchanged files): entries written before the
+/// fold mismatch once and re-parse — the same self-healing a stat
+/// change already gets — and a warm hit under an unchanged sidecar
+/// serves the identical session.
+fn effective_entry_fingerprint(path: &Path, metadata: &fs::Metadata) -> FileFingerprint {
+    let mut fingerprint = FileFingerprint {
+        mod_time: file_mod_time_nanos(metadata),
+        size: metadata.len() as i64,
+    };
+    if let Some(sidecar) = crate::parser::opencode_project_sidecar(path) {
+        if let Ok(sidecar_metadata) = fs::metadata(&sidecar) {
+            fingerprint.mod_time = fingerprint
+                .mod_time
+                .wrapping_add(file_mod_time_nanos(&sidecar_metadata));
+            fingerprint.size = fingerprint.size.wrapping_add(sidecar_metadata.len() as i64);
+        }
+    }
+    fingerprint
+}
+
 pub fn load_session_cache() -> SessionCache {
     let path = session_cache_path();
     sweep_orphaned_temps(&path, ORPHAN_TEMP_MAX_AGE);
@@ -2436,7 +2472,8 @@ pub(crate) fn cached_file_mod_time_if_fresh(
 ) -> Option<i64> {
     let key = cache_key(path);
     let header = cached_entry_header(&key, cache)?;
-    if header.size == metadata.len() as i64 && header.mod_time == file_mod_time_nanos(metadata) {
+    let live = effective_entry_fingerprint(path, metadata);
+    if header.size == live.size && header.mod_time == live.mod_time {
         return Some(header.mod_time);
     }
     delete_cached_session_key(&key, cache);
@@ -3046,12 +3083,13 @@ pub fn store_session(
     cache: &mut SessionCache,
 ) -> anyhow::Result<()> {
     let metadata = fs::metadata(path)?;
+    let fingerprint = effective_entry_fingerprint(path, &metadata);
     let key = cache_key(path);
     cache.entries.insert(
         key.clone(),
         CacheEntry {
-            mod_time: file_mod_time_nanos(&metadata),
-            size: metadata.len() as i64,
+            mod_time: fingerprint.mod_time,
+            size: fingerprint.size,
             session: GoSession::from_session(session),
         },
     );
@@ -3401,7 +3439,8 @@ fn is_fresh(path: &Path, entry: &CacheEntryHeader) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
-    entry.size == metadata.len() as i64 && entry.mod_time == file_mod_time_nanos(&metadata)
+    let live = effective_entry_fingerprint(path, &metadata);
+    entry.size == live.size && entry.mod_time == live.mod_time
 }
 
 #[cfg(unix)]

@@ -694,9 +694,28 @@ fn git_root(path: &Path) -> Option<PathBuf> {
 const GIT_ROOT_MAX_DEPTH: usize = 64;
 
 fn find_git_root(path: &Path) -> Option<PathBuf> {
+    // rm-381 fence: a RELATIVE path has no process-independent anchor —
+    // walking it stats `src/.git`, `../x/.git`… against the PROCESS
+    // cwd, and the walk's last step (the empty path) probes a bare
+    // `.git`, silently asking whether the directory agenttrace happens
+    // to run from is a repo (live-proven: the same relative cwd
+    // attributed `unknown` from a git-root cwd and `src` from a plain
+    // dir). The opencode intake refuses relative directories outright;
+    // this walk refuses them for every other lane too, so a relative
+    // cwd resolves as its lexical `cwd` self — never as whatever repo
+    // surrounds the operator's terminal.
+    if !path.is_absolute() {
+        return None;
+    }
     let mut current = if path.is_dir() { path } else { path.parent()? };
     let mut depth = 0;
     loop {
+        // Belt to the entry guard: an absolute walk can never reach the
+        // empty path (the parent of `/` is None), but if one ever does,
+        // a bare-`.git` probe is the process cwd's repo — refuse it.
+        if current.as_os_str().is_empty() {
+            return None;
+        }
         let marker = current.join(".git");
         if marker.is_dir() {
             return Some(current.to_path_buf());

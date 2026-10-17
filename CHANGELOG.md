@@ -2,16 +2,6 @@
 
 ## Unreleased
 
-### Fixed
-
-- antigravity: numeric `modelConfigId` values (JSON numbers, e.g. 1417/1277/1050) no longer silently drop model identity. They now attribute to their stringified id, map to the proven model name when one is known (1417 → `gemini-4-argon`), and every numeric sighting is disclosed via the new `antigravity_model:numeric_id` counter (rm-1864).
-- opencode: transcript read/parse failures are no longer silent. Unreadable files, unparseable JSON, and unreadable container dirs are counted per class and surfaced in `--doctor`/`Metrics::line_skips` (`opencode_transcript_files_unreadable`, `opencode_transcript_files_unparseable`, `opencode_transcript_dirs_unreadable`); a fully-lost corpus now parses with its disclosure instead of masquerading as "unsupported session format" (rm-1866).
-- opencode: session `directory` (and the `projectID` project doc's `directory`) now feeds session/project attribution — sessions attribute to their real project instead of "unknown"; the unknown fallback stays disclosed when neither is present (rm-1865).
-- opencode: a session doc's `projectID` is validated before the project doc is resolved — ids containing `/` or `\` or starting with `..` used to escape the opencode store through `Path::join` semantics (an absolute id replaced the base path outright), letting a planted session doc import any `*.json` on the machine as its project attribution; the project doc is now also stat-capped before reading (review F1 on rm-1865).
-- opencode: read-dir failures that fire mid-enumeration are counted into `opencode_transcript_dirs_unreadable` instead of being silently dropped by the iterator flatten (review F4 on rm-1866).
-- antigravity: float-spelled numeric model ids (`1417.0`) canonicalize to their integer spelling so proven mappings (`1417` → `gemini-4-argon`) still apply; fractional spellings keep their raw disclosed spelling (review F5 on rm-1864).
-- session cache: the schema advances 64 → 67 with this batch (attribution, read-loss disclosure, and numeric model ids all change the served report for unchanged files), so warm caches built beforehand regenerate once on the next scan (review F2).
-
 ### Added
 
 - terminal-spoofing sanitization covers the invisible zero-width Cf family, and the
@@ -433,6 +423,70 @@
 
 ### Fixed
 
+- The CHANGELOG structure gate is green again at HEAD (rm-1938, run
+  3b722c4e cycle 2, batch "standing-red cure + gate hermeticity +
+  opencode attribution fences"): the 2026-10-16 antigravity/opencode
+  landing re-introduced a second `### Fixed` heading at the top of
+  `[Unreleased]` — the exact duplication class the rm-1036 gate exists
+  to catch, so every push since carried a red `Changelog structure
+  gate` lane in CI (scripts/ci/check-changelog-structure.sh, wired at
+  ci.yml:83). The heading's seven bullets fold verbatim under the
+  surviving `### Fixed` section (entry multiset preserved: 0 removed,
+  0 added), so first-per-kind changelog consumers see every entry
+  again.
+- The demo/report output-contract gate no longer walks the operator's
+  real HOME (rm-1939, same batch): scripts/ci/check-output-contract.sh
+  ran `agenttrace --doctor -f json` under the ambient environment, so
+  on a real fleet the gate's first step scanned the operator's entire
+  session corpus — live-proven twice at the 300s CI timeout with
+  >3GB read and zero output — and persisted its parses into the
+  operator's real session cache (the rm-367 doctor-persist behavior).
+  Every invocation in the gate now runs under a scratch HOME/XDG
+  pinned inside the gate's own out_dir (the doctor_honesty_contract
+  sandbox pattern), and the doctor probe itself is bounded by
+  `timeout 60` with a named failure, so a regression back to an
+  unbounded walk fails loudly at the gate instead of red-by-timeout in
+  CI. The empty scratch home exercises the doctor's honest-zero lane;
+  the demo/-o/gate-failure truth lanes are unchanged.
+- opencode: a relative `directory` (session doc or project doc) no
+  longer makes project attribution depend on the process cwd (rm-381
+  fence, same batch): a relative spelling rode the session cwd
+  verbatim, and `resolve_project`'s git-root walk resolved it against
+  the directory agenttrace happened to run from — live-proven, the
+  same `"directory": "src"` doc attributed `unknown` when the scan ran
+  from a git root (the walk's empty-path step probes a bare `.git`)
+  and `src` when it ran from a plain directory. The intake now
+  requires an absolute `directory` on both arms; a relative spelling
+  degrades to the disclosed unknown fallback — identical from every
+  cwd — and is counted through the new `cwd_relative:opencode`
+  disclosure counter. Belt to the fence: `find_git_root` refuses
+  relative paths outright (any lane), so no relative cwd can ever
+  resolve through the process cwd again.
+- opencode: editing a project doc now invalidates the warm cache entry
+  that attributes its sessions (rm-299 fence, same batch):
+  `storage/project/<id>.json` is a sidecar the parse reads for
+  attribution, but its edits never move the session doc's own
+  mtime/size, so a warm entry kept serving the stale project
+  indefinitely — live-proven cold `/srv/alpha` → sidecar edited to
+  `/srv/beta` → warm scans still reported alpha until the cache was
+  wiped. The session-cache entry fingerprint now folds the sidecar's
+  stat into the session file's (both at store and at the freshness
+  check), so a sidecar edit invalidates the entry exactly like an edit
+  of the session file itself; a sidecar appearing or disappearing
+  flips it the same way. The on-disk entry shape is unchanged (the
+  same two integers) — entries written before the fold mismatch once
+  and re-parse, the same self-healing a stat change already gets,
+  which is why this is deliberately NOT a SESSION_CACHE_SCHEMA_VERSION
+  bump (the rm-230/rm-831 convention keys on parse semantics changing
+  the served report; a warm hit under an unchanged sidecar serves the
+  identical session).
+- antigravity: numeric `modelConfigId` values (JSON numbers, e.g. 1417/1277/1050) no longer silently drop model identity. They now attribute to their stringified id, map to the proven model name when one is known (1417 → `gemini-4-argon`), and every numeric sighting is disclosed via the new `antigravity_model:numeric_id` counter (rm-1864).
+- opencode: transcript read/parse failures are no longer silent. Unreadable files, unparseable JSON, and unreadable container dirs are counted per class and surfaced in `--doctor`/`Metrics::line_skips` (`opencode_transcript_files_unreadable`, `opencode_transcript_files_unparseable`, `opencode_transcript_dirs_unreadable`); a fully-lost corpus now parses with its disclosure instead of masquerading as "unsupported session format" (rm-1866).
+- opencode: session `directory` (and the `projectID` project doc's `directory`) now feeds session/project attribution — sessions attribute to their real project instead of "unknown"; the unknown fallback stays disclosed when neither is present (rm-1865).
+- opencode: a session doc's `projectID` is validated before the project doc is resolved — ids containing `/` or `\` or starting with `..` used to escape the opencode store through `Path::join` semantics (an absolute id replaced the base path outright), letting a planted session doc import any `*.json` on the machine as its project attribution; the project doc is now also stat-capped before reading (review F1 on rm-1865).
+- opencode: read-dir failures that fire mid-enumeration are counted into `opencode_transcript_dirs_unreadable` instead of being silently dropped by the iterator flatten (review F4 on rm-1866).
+- antigravity: float-spelled numeric model ids (`1417.0`) canonicalize to their integer spelling so proven mappings (`1417` → `gemini-4-argon`) still apply; fractional spellings keep their raw disclosed spelling (review F5 on rm-1864).
+- session cache: the schema advances 64 → 67 with this batch (attribution, read-loss disclosure, and numeric model ids all change the served report for unchanged files), so warm caches built beforehand regenerate once on the next scan (review F2).
 - The install-runtime gate no longer hardcodes the installer's pinned default ref (assess F1, run 79fe78c0 cycle 3, batch "canonical CI truth"; adoption of salvage 9b2a7a1 U4 — the identical derive-from-install.sh shape was executed in parallel by sibling run `a64735b75a46` cycle 3 and folds here by title, one entry): `scripts/ci/check-install-runtime.sh` grepped the literal `^ref=v0.9.0$` (test D) plus `^clone --branch v0.9.0$` and `pinned ref v0.9.0` (test E) while install.sh's `AGENTTRACE_SOURCE_REF` default has been `v0.10.1` since 2026-10-05 — so the wired `Install runtime verification` CI lane was permanently red, masking every future regression it exists to catch. The gate now DERIVES the expected default from install.sh's own `REF="${AGENTTRACE_SOURCE_REF:-…}"` line and fails loudly if that line moves or changes shape: tests D and E track the pin by construction, and every future bump stays green-or-loud instead of silently re-staling. The default lanes also pin `AGENTTRACE_SOURCE_REF` empty (rm-1394 acceptance 4, review 6cbb259b F2): an operator's ambient export otherwise leaked through `env` into install.sh, the receipt recorded the override, and the derived-default assertion false-reds — the override lanes stay covered deliberately by tests F/H/I. The installer itself is untouched — the pin was always the correct side (it matches the newest release, which `check-install-ref-drift.sh` already ties to the newest CHANGELOG heading).
 - `--fetch` before the `statusline`/`mcp` keywords now fails loudly instead of
   being silently swallowed (rm-558, run aa36ecb0 cycle 3): the offline

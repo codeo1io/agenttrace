@@ -6610,8 +6610,12 @@ fn parse_opencode_storage_session(
     // every other lane's cwd) so session_from_events attributes the
     // session to its project — resolve_project prefers cwd — with the
     // unknown fallback still disclosed when neither is present.
-    let directory_raw = opencode_session_directory(&storage_root, session);
+    let (directory_raw, relative_dropped) = opencode_session_directory(&storage_root, session);
     let (directory, cwd_truncated) = cap_session_cwd(&directory_raw);
+    let mut cwd_disclosures = cwd_truncation_disclosure("opencode", cwd_truncated);
+    if relative_dropped > 0 {
+        cwd_disclosures.insert("cwd_relative:opencode".to_string(), relative_dropped as i64);
+    }
 
     let mut events = Vec::new();
     if model != "unknown" || usage_has_values(&usage) || !directory.is_empty() {
@@ -6620,7 +6624,7 @@ fn parse_opencode_storage_session(
             model_used: model,
             source_tool: "opencode".to_string(),
             cwd: directory.clone(),
-            disclosure_counters: cwd_truncation_disclosure("opencode", cwd_truncated),
+            disclosure_counters: cwd_disclosures,
             usage: if usage_has_values(&usage) {
                 usage
             } else {
@@ -6634,20 +6638,59 @@ fn parse_opencode_storage_session(
     Ok(events)
 }
 
-/// rm-1865: decode the session's working directory for project
-/// attribution — the doc's `directory` first, then the project doc
-/// referenced by `projectID` (`storage/project/<id>.json`, v1 store
+/// rm-1865 + rm-381 fence: decode the session's working directory for
+/// project attribution — the doc's `directory` first, then the project
+/// doc referenced by `projectID` (`storage/project/<id>.json`, v1 store
 /// layout). A failed project-doc lookup degrades to the disclosed
 /// unknown-project fallback rather than a hard error.
-fn opencode_session_directory(storage_root: &Path, session: &Map<String, Value>) -> String {
+///
+/// rm-381 fence: a `directory` that is not ABSOLUTE is dropped and
+/// counted in the returned `relative_dropped` instead of riding the
+/// session cwd. A relative spelling has no anchor the parse knows, and
+/// feeding it on made attribution depend on the PROCESS cwd
+/// (live-proven: the same `"directory": "src"` doc attributed
+/// `unknown` when agenttrace ran from a git root — the ancestor walk's
+/// empty-path step probes a bare `.git` against the process cwd — and
+/// `src` when it ran from a plain directory). The honest answer is the
+/// disclosed unknown fallback, identical from every cwd.
+fn opencode_session_directory(
+    storage_root: &Path,
+    session: &Map<String, Value>,
+) -> (String, usize) {
+    let mut relative_dropped = 0usize;
     if let Some(dir) = string(session.get("directory")) {
         if !dir.is_empty() {
-            return dir.to_string();
+            if Path::new(dir).is_absolute() {
+                return (dir.to_string(), relative_dropped);
+            }
+            relative_dropped += 1;
         }
     }
+    let Some(directory) = opencode_project_doc_directory(storage_root, session) else {
+        return (String::new(), relative_dropped);
+    };
+    if directory.is_empty() {
+        return (String::new(), relative_dropped);
+    }
+    if Path::new(&directory).is_absolute() {
+        return (directory, relative_dropped);
+    }
+    // A relative project-doc directory is the same unanchored spelling
+    // the doc arm refuses — and there is no further fallback to try.
+    (String::new(), relative_dropped + 1)
+}
+
+/// The validated `storage/project/<id>.json` path a session doc's
+/// `projectID` resolves to, or None when the id is absent or hostile.
+/// Shared by the attribution intake and — via
+/// [`opencode_project_sidecar`] — the rm-299 warm-cache fingerprint.
+fn opencode_validated_project_doc(
+    storage_root: &Path,
+    session: &Map<String, Value>,
+) -> Option<PathBuf> {
     let project_id = string(session.get("projectID")).unwrap_or("");
     if project_id.is_empty() {
-        return String::new();
+        return None;
     }
     // Review F1 (2026-10-16): projectID is hostile-writable session-doc
     // input joined into a filesystem path, and `Path::join` is not a
@@ -6659,11 +6702,24 @@ fn opencode_session_directory(storage_root: &Path, session: &Map<String, Value>)
     // segments; anything else degrades to the disclosed unknown-project
     // fallback instead of reading outside the store.
     if project_id.contains('/') || project_id.contains('\\') || project_id.starts_with("..") {
-        return String::new();
+        return None;
     }
-    let project_doc = storage_root
-        .join("project")
-        .join(format!("{project_id}.json"));
+    Some(
+        storage_root
+            .join("project")
+            .join(format!("{project_id}.json")),
+    )
+}
+
+/// The project doc's `directory` for this session — None on every
+/// failed lookup (absent or hostile id; missing, oversized, unreadable
+/// or unparseable doc), Some(empty) when the doc simply carries no
+/// `directory`.
+fn opencode_project_doc_directory(
+    storage_root: &Path,
+    session: &Map<String, Value>,
+) -> Option<String> {
+    let project_doc = opencode_validated_project_doc(storage_root, session)?;
     // Review F1 (rm-1437 discipline): stat before read — an oversized
     // project doc is skipped rather than admitted into memory, degrading
     // to the unknown-project fallback like every other failed lookup.
@@ -6672,15 +6728,49 @@ fn opencode_session_directory(storage_root: &Path, session: &Map<String, Value>)
         .unwrap_or(0)
         > OPENCODE_TRANSCRIPT_READ_CAP_BYTES
     {
-        return String::new();
+        return None;
     }
     let Ok(raw) = std::fs::read_to_string(&project_doc) else {
-        return String::new();
+        return None;
     };
     let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&raw) else {
-        return String::new();
+        return None;
     };
-    string(doc.get("directory")).unwrap_or("").to_string()
+    Some(string(doc.get("directory")).unwrap_or("").to_string())
+}
+
+/// rm-299 fence: the project doc whose stat belongs in this session
+/// file's cache fingerprint (see `effective_entry_fingerprint` in
+/// session_cache.rs). The sidecar feeds the session's project
+/// attribution at parse time, but editing it never moves the session
+/// doc's own mtime/size — so a warm entry kept serving the stale
+/// project forever (live-proven: cold `/srv/alpha` → sidecar edited to
+/// `/srv/beta` → warm still alpha until the cache was wiped). None
+/// when the session doc has no usable project doc; a sidecar appearing
+/// later still flips the fingerprint the first time it resolves.
+pub(crate) fn opencode_project_sidecar(session_file: &Path) -> Option<PathBuf> {
+    let path = session_file.to_str()?;
+    if !is_opencode_storage_session_file(path) {
+        return None;
+    }
+    let storage_root = opencode_storage_root_from_session_file(path)?;
+    // Same rm-1437 discipline as the intake: stat-cap the doc before
+    // the read — a hostile "session doc" the size of the disk must not
+    // be admitted into memory just to fingerprint it.
+    if std::fs::metadata(session_file)
+        .map(|meta| meta.len())
+        .unwrap_or(u64::MAX)
+        > OPENCODE_TRANSCRIPT_READ_CAP_BYTES
+    {
+        return None;
+    }
+    let Ok(raw) = std::fs::read_to_string(session_file) else {
+        return None;
+    };
+    let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&raw) else {
+        return None;
+    };
+    opencode_validated_project_doc(&storage_root, &doc)
 }
 
 fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
