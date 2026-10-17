@@ -4779,11 +4779,11 @@ mod tests {
     fn workbuddy_basis_disclosure_end_to_end_from_fixtures() {
         // Fixture shape mirrors real workbuddy transcripts: message-level
         // usage under the detector's type/sessionId/cwd keys.
-        let mismatch = std::fs::read_to_string(concat!(
+        let mismatch = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../testdata/workbuddy/usage-basis-mismatch.jsonl"
         ))
-        .expect("fixture");
+        .to_string();
         let session = parse_raw_session("wb-mismatch", "wb-mismatch.jsonl", &mismatch)
             .expect("parses as workbuddy");
         assert_eq!(session.metrics.source_tool, "workbuddy");
@@ -4814,11 +4814,11 @@ mod tests {
             "rm-600: the 1500>1000 clamp must be disclosed"
         );
 
-        let inclusive = std::fs::read_to_string(concat!(
+        let inclusive = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../testdata/workbuddy/usage-basis-inclusive.jsonl"
         ))
-        .expect("fixture");
+        .to_string();
         let session = parse_raw_session("wb-inclusive", "wb-inclusive.jsonl", &inclusive)
             .expect("parses as workbuddy");
         assert_eq!(

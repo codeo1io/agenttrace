@@ -4,6 +4,8 @@
 
 ### Added
 
+- codex: migrated `.jsonl.zst` rollouts (codex ≥ 0.162 renames cold rollouts) are now discovered during walk — name-gated (`rollout-*.jsonl.zst`) and scoped to codex trees only, with session names held stable across the migration (`.jsonl.zst` → `.jsonl` keeps its pre-migration identity) and a directory-listing walk-version bump so stale warm listings refresh once (rm-1941, run 122b213a98a1 cycle 1; sibling lineage rm-1527@d2355d7 owns the same subject — reconcile by title).
+- pricing: the Daybreak family is priced — `daybreak-red-latest`/`gpt-daybreak-red-latest` at $12.5/$75 per Mtok and `daybreak-blue-latest`/`gpt-daybreak-blue-latest` at $4/$20 (codex 0.163.0 enables Daybreak by default; LiteLLM carries the rates, no cache prices published yet so cache rates stay 0.0) (rm-176 arm, run 122b213a98a1 cycle 1).
 - terminal-spoofing sanitization covers the invisible zero-width Cf family, and the
   machine lanes stay lossless (rm-933 slice 3, run ff7615be cycle 3; review fix 6f85e2c9): the shared
   predicate split into directional (`is_bidi_format_control`, unchanged set) and
@@ -468,6 +470,8 @@
 
 ### Fixed
 
+- cache: a transiently unreadable session root no longer wipes the warm cache — `prune_dead_entries` now removes an entry only on confirmed `NotFound`; EACCES/other stat failures keep the entry and count `stat_uncertain` (one unreadable-root run used to drop every entry and force a full re-parse once readable again) (rm-1943, run 122b213a98a1 cycle 1).
+- tests: the six repo-file reads that baked `env!("CARGO_MANIFEST_DIR")` at runtime are now compile-time `include_str!` embeds — shared-target fleets no longer false-red when cargo reuses a sibling worktree's binary whose baked path no longer exists (`cargo test -p agenttrace --bin agenttrace` was 111/1 red against a swept worktree's path; now green without a private target dir) (rm-1944, run 122b213a98a1 cycle 1).
 - antigravity: numeric `modelConfigId` values (JSON numbers, e.g. 1417/1277/1050) no longer silently drop model identity. They now attribute to their stringified id, map to the proven model name when one is known (1417 → `gemini-4-argon`), and every numeric sighting is disclosed via the new `antigravity_model:numeric_id` counter (rm-1864).
 - opencode: transcript read/parse failures are no longer silent. Unreadable files, unparseable JSON, and unreadable container dirs are counted per class and surfaced in `--doctor`/`Metrics::line_skips` (`opencode_transcript_files_unreadable`, `opencode_transcript_files_unparseable`, `opencode_transcript_dirs_unreadable`); a fully-lost corpus now parses with its disclosure instead of masquerading as "unsupported session format" (rm-1866).
 - opencode: session `directory` (and the `projectID` project doc's `directory`) now feeds session/project attribution — sessions attribute to their real project instead of "unknown"; the unknown fallback stays disclosed when neither is present (rm-1865).

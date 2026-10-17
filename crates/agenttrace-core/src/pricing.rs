@@ -1920,6 +1920,54 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 ..Default::default()
             },
         ),
+        // rm-176 arm (run 122b213a98a1, 2026-10-17): codex 0.163.0 enables the
+        // Daybreak family BY DEFAULT for eligible accounts (upstream #53701/
+        // #53717); LiteLLM publishes daybreak-red-latest / gpt-daybreak-red-
+        // latest at $12.5/$75 per Mtok and daybreak-blue-latest /
+        // gpt-daybreak-blue-latest at $4/$20. No cache prices are published
+        // yet — cw/cr stay 0.0 until the catalog carries them (a 0.0 cache
+        // rate prices cached tokens at the input rate, which for an
+        // unpublished price is the honest floor).
+        (
+            "daybreak-red-latest",
+            Price {
+                input: 12.5,
+                output: 75.0,
+                cw: 0.0,
+                cr: 0.0,
+                ..Default::default()
+            },
+        ),
+        (
+            "gpt-daybreak-red-latest",
+            Price {
+                input: 12.5,
+                output: 75.0,
+                cw: 0.0,
+                cr: 0.0,
+                ..Default::default()
+            },
+        ),
+        (
+            "daybreak-blue-latest",
+            Price {
+                input: 4.0,
+                output: 20.0,
+                cw: 0.0,
+                cr: 0.0,
+                ..Default::default()
+            },
+        ),
+        (
+            "gpt-daybreak-blue-latest",
+            Price {
+                input: 4.0,
+                output: 20.0,
+                cw: 0.0,
+                cr: 0.0,
+                ..Default::default()
+            },
+        ),
         (
             "gpt-5.1",
             Price {
@@ -2459,6 +2507,38 @@ mod tests {
             "provenance sidecar must be owner-only (got {meta_mode:o})"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builtin_fallback_includes_daybreak_family() {
+        // rm-176 arm (run 122b213a98a1): codex 0.163.0 enables Daybreak BY
+        // DEFAULT — without builtin entries the family priced at the
+        // unpriced fallback. LiteLLM 2026-10-17: red $12.5/$75, blue $4/$20
+        // per Mtok; no cache prices published yet (cw/cr pinned 0.0).
+        let prices = builtin_pricing();
+        let red = prices
+            .get("daybreak-red-latest")
+            .expect("daybreak-red-latest must be priced");
+        assert_eq!(red.input, 12.5);
+        assert_eq!(red.output, 75.0);
+        let blue = prices
+            .get("daybreak-blue-latest")
+            .expect("daybreak-blue-latest must be priced");
+        assert_eq!(blue.input, 4.0);
+        assert_eq!(blue.output, 20.0);
+        for alias in ["gpt-daybreak-red-latest", "gpt-daybreak-blue-latest"] {
+            let priced = prices
+                .get(alias)
+                .unwrap_or_else(|| panic!("missing alias {alias}"));
+            assert_eq!(
+                priced.input,
+                prices[alias.strip_prefix("gpt-").unwrap()].input
+            );
+            assert_eq!(
+                priced.output,
+                prices[alias.strip_prefix("gpt-").unwrap()].output
+            );
+        }
     }
 
     #[test]
@@ -3212,8 +3292,11 @@ mod tests {
     #[test]
     fn privacy_disclosure_names_the_pricing_download_url() {
         let privacy =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../PRIVACY.md"))
-                .expect("PRIVACY.md readable");
+            // rm-1944 (run 122b213a98a1): compile-time content embed —
+            // see upstream.rs privacy test for the swept-worktree
+            // shared-target failure mode this removes.
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../PRIVACY.md"))
+                .to_string();
         assert!(
             privacy.contains(PRICING_URL),
             "PRIVACY.md must enumerate the --update-pricing download URL {PRICING_URL}"

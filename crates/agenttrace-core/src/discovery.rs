@@ -589,6 +589,7 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
         dir,
         0,
         max_depth,
+        is_codex_walk_root(dir),
         &mut items,
         &mut visited,
         &mut file_targets,
@@ -725,6 +726,7 @@ fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<Pat
         dir,
         0,
         max_depth,
+        is_codex_walk_root(dir),
         cache,
         &mut items,
         &mut visited,
@@ -847,6 +849,7 @@ fn walk_session_files_cached(
     dir: &Path,
     depth: usize,
     max_depth: usize,
+    codex_tree: bool,
     cache: &mut SessionCache,
     items: &mut Vec<PathBuf>,
     visited: &mut SymlinkTargets,
@@ -890,6 +893,7 @@ fn walk_session_files_cached(
                     &child,
                     depth + 1,
                     max_depth,
+                    codex_tree,
                     cache,
                     items,
                     visited,
@@ -929,7 +933,7 @@ fn walk_session_files_cached(
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !is_session_file_name(&name) {
+        if !is_session_file_name(&name) && !(codex_tree && is_codex_migrated_rollout_name(&name)) {
             continue;
         }
         // rm-212: only regular files (symlinks included) are session
@@ -962,6 +966,7 @@ fn walk_session_files_cached(
             &child,
             depth + 1,
             max_depth,
+            codex_tree,
             cache,
             items,
             visited,
@@ -970,10 +975,12 @@ fn walk_session_files_cached(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // rm-1941: codex_tree threads the root-scoped zst admission
 fn walk_session_files(
     dir: &Path,
     depth: usize,
     max_depth: usize,
+    codex_tree: bool,
     items: &mut Vec<(PathBuf, SystemTime)>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
@@ -1009,12 +1016,20 @@ fn walk_session_files(
             if !visited.admit(&path) {
                 continue;
             }
-            walk_session_files(&path, depth + 1, max_depth, items, visited, file_targets);
+            walk_session_files(
+                &path,
+                depth + 1,
+                max_depth,
+                codex_tree,
+                items,
+                visited,
+                file_targets,
+            );
             continue;
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !is_session_file_name(&name) {
+        if !is_session_file_name(&name) && !(codex_tree && is_codex_migrated_rollout_name(&name)) {
             continue;
         }
         // rm-212: only regular files (symlinks included) are session
@@ -1084,6 +1099,34 @@ fn time_from_unix_nanos(nanos: i64) -> SystemTime {
         return SystemTime::UNIX_EPOCH;
     }
     SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(nanos as u64)
+}
+
+/// rm-1941 (run 122b213a98a1): codex >=0.162 migrates cold rollouts to
+/// `.jsonl.zst` names (upstream #28187). `is_session_file_name` stays
+/// extension-strict by design — the zstd lane for content-compressed
+/// files under plain `.jsonl` names is magic-gated at parse time and
+/// must keep rejecting stray `.zst` names — so the walker admits the
+/// migrated tail only inside a codex tree. The sibling lineage's
+/// rm-1527 (d2355d7) owns the same subject; reconcile by title.
+fn is_codex_migrated_rollout_name(name: &str) -> bool {
+    name.starts_with("rollout-") && name.ends_with(".jsonl.zst")
+}
+
+fn is_codex_walk_root(dir: &Path) -> bool {
+    if dir
+        .components()
+        .any(|component| component.as_os_str() == ".codex")
+    {
+        return true;
+    }
+    let Some(canonical_dir) = fs::canonicalize(dir).ok() else {
+        return false;
+    };
+    known_session_dirs().iter().any(|known| {
+        known.name.contains("Codex")
+            && fs::canonicalize(&known.path)
+                .is_ok_and(|canonical_known| canonical_dir.starts_with(canonical_known))
+    })
 }
 
 pub fn is_session_file_name(name: &str) -> bool {

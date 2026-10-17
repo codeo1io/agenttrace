@@ -1712,8 +1712,15 @@ mod tests {
     #[test]
     fn privacy_disclosure_lists_every_network_touch() {
         let privacy =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../PRIVACY.md"))
-                .expect("PRIVACY.md readable");
+            // rm-1944 (run 122b213a98a1): content-embed at compile time.
+            // A runtime read through the baked CARGO_MANIFEST_DIR
+            // resolves against the BUILD worktree's path, and a shared
+            // CARGO_TARGET_DIR can reuse a sibling's stale test binary
+            // long after that worktree was swept — the read then fails
+            // NotFound even though the tree is healthy (live flake:
+            // 111/1 on `cargo test -p agenttrace --bin agenttrace`).
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../PRIVACY.md"))
+                .to_string();
 
         // The npm registry probe URL, constructor-derived from the const.
         assert!(

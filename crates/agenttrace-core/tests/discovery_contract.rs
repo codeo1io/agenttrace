@@ -4453,3 +4453,72 @@ fn antigravity_sibling_roots_are_discovered_and_disclosed() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+#[test]
+fn codex_walk_admits_migrated_zst_rollouts_with_stable_names() {
+    // rm-1941 (run 122b213a98a1): codex >=0.162 migrates cold rollouts to
+    // `.jsonl.zst` names. RED at HEAD: `is_session_file_name` admits only
+    // `.jsonl`/`.json`, so the migrated twin was invisible to a default
+    // scan (assess probe: a dir holding one plain and one compressed twin
+    // walked to exactly 1 session). The migrated admission is scoped to
+    // codex trees; stray `.jsonl.zst` names elsewhere stay invisible.
+    let root = temp_root("agenttrace-codex-zst-admission");
+    let home = root.join("home");
+    let cache = root.join("cache");
+    let rollout_dir = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("10")
+        .join("17");
+    fs::create_dir_all(&rollout_dir).expect("create codex sessions dir");
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-zstd/migrated-pair");
+    fs::copy(
+        fixture_dir.join("rollout-2026-10-16-101530-a1b2c3.jsonl"),
+        rollout_dir.join("rollout-2026-10-16-101530-a1b2c3.jsonl"),
+    )
+    .expect("copy plain rollout");
+    fs::copy(
+        fixture_dir.join("rollout-2026-10-16-101530-a1b2c3.jsonl.zst"),
+        rollout_dir.join("rollout-2026-10-16-101530-a1b2c3.jsonl.zst"),
+    )
+    .expect("copy compressed rollout");
+    // scope guard: a stray `.jsonl.zst` outside a codex tree must stay
+    // invisible to the default walk.
+    fs::write(
+        home.join("rollout-stray.jsonl.zst"),
+        fs::read(fixture_dir.join("rollout-2026-10-16-101530-a1b2c3.jsonl.zst"))
+            .expect("read compressed"),
+    )
+    .expect("write stray");
+
+    with_home_and_cache(&home, &cache, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(
+            sessions.len(),
+            2,
+            "both the plain and the migrated .jsonl.zst rollout must be admitted: {:?}",
+            sessions
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        for session in &sessions {
+            assert_eq!(
+                session.name, "rollout-2026-10-16-101530-a1b2c3",
+                "migration must not rename the session (pre-migration stem kept stable)"
+            );
+        }
+        assert!(
+            sessions.iter().any(|session| session
+                .path
+                .ends_with("rollout-2026-10-16-101530-a1b2c3.jsonl.zst"))
+                && sessions.iter().any(|session| session
+                    .path
+                    .ends_with("rollout-2026-10-16-101530-a1b2c3.jsonl")),
+            "both twins must be admitted (plain + migrated .jsonl.zst)"
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+}

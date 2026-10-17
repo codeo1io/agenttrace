@@ -8796,6 +8796,18 @@ fn apply_cline_metadata_timestamps(events: &mut [Event], metadata: &Map<String, 
 }
 
 fn session_name(path: &Path) -> String {
+    // rm-1941 (run 122b213a98a1): a codex-migrated `.jsonl.zst` rollout
+    // must keep the pre-migration session name — `file_stem` strips only
+    // the `.zst` tail, which would rename the session when the codex
+    // migration lands mid-history and split one rollout into two names
+    // across the migration boundary.
+    if let Some(base) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".jsonl.zst"))
+    {
+        return base.to_string();
+    }
     path.file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or("session")
@@ -9141,11 +9153,11 @@ mod tests {
         // totals below are the fixture's live-measured post-fix values,
         // and the scrub is metrics-neutral against the unsanitized
         // original.
-        let raw = std::fs::read_to_string(concat!(
+        let raw = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/codex-custom-tools/rollout.jsonl"
         ))
-        .expect("vendored codex custom-tools fixture ships with the crate");
+        .to_string();
         let session = parse_raw_session("codex", "rollout.jsonl", &raw).expect("rollout parses");
         assert_eq!(session.metrics.source_tool, "codex_cli");
         assert_eq!(session.metrics.model_used, "glm-5.2");
@@ -11479,11 +11491,11 @@ mod tests {
         // every record was dropped by the empty->None gate and the
         // session fell back to text-estimate totals (132) instead of the
         // reported 563,628.
-        let raw = std::fs::read_to_string(concat!(
+        let raw = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/kimi-cli/wire.jsonl"
         ))
-        .expect("official kimi wire fixture ships with the crate");
+        .to_string();
         let session = parse_raw_session("kimi", "wire-official-fixture.jsonl", &raw)
             .expect("kimi session parses");
         assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");

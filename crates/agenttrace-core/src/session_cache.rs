@@ -1063,7 +1063,11 @@ const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 /// load instead of being filtered. The batch's own 3 -> 4 bump re-bases
 /// onto the already-landed v4 lane (rm-732) per the same convention one
 /// lane up.
-const DIR_LISTING_WALK_VERSION: i64 = 5;
+// rm-1941 (run 122b213a98a1): codex walk trees now admit
+// `.jsonl.zst` migrated rollout names (codex >=0.162 migration, upstream
+// #28187) — stale warm listings would keep hiding them, so bump the walk
+// version to invalidate every stored directory listing once.
+const DIR_LISTING_WALK_VERSION: i64 = 6;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")
@@ -1093,6 +1097,12 @@ pub struct SessionCache {
     /// `schema_invalidations` member at save time (bounded by
     /// `MAX_SCHEMA_INVALIDATION_RECORDS`).
     schema_invalidations: Vec<Value>,
+    /// rm-1943 (run 122b213a98a1): prune checks whose stat did not resolve
+    /// definitively (EACCES/EPERM/EIO … on a live-but-unreadable path).
+    /// Those entries are KEPT — `exists()` flattened those errors to
+    /// "file gone" and one unreadable-root run wiped the entire warm
+    /// cache — and this counter is the disclosure that a skip happened.
+    stat_uncertain: usize,
     dirty: bool,
 }
 
@@ -2210,17 +2220,34 @@ pub fn load_session_cache() -> SessionCache {
 /// listings whose directory is gone), marking the cache dirty so the
 /// next save persists the smaller snapshot. Returns how many entries
 /// were pruned (pass-8 F8-3).
+/// rm-1943 (run 122b213a98a1): a transient stat failure (an unreadable
+/// parent directory, EPERM, EIO …) must not be read as "file gone" —
+/// `Path::exists()` flattens every error to `false`, so one run against
+/// an unreadable root wiped the entire warm cache (live repro: 100
+/// entries -> 0 -> full re-parse once readable again). Only a confirmed
+/// NotFound prunes; every other error keeps the entry and bumps
+/// `stat_uncertain`.
+fn path_is_dead(path: &Path) -> Option<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Some(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Err(_) => None,
+    }
+}
+
 fn prune_dead_entries(cache: &mut SessionCache) -> usize {
     let mut pruned = 0;
-    let dead_paths: Vec<String> = cache
-        .raw_entries
-        .keys()
-        .chain(cache.entries.keys())
+    let mut uncertain = 0;
+    let mut dead_paths: Vec<String> = Vec::new();
+    for path in cache.raw_entries.keys().chain(cache.entries.keys()) {
         // Keys may be losslessly-encoded non-UTF-8 paths (rm-041) —
         // decode before asking the filesystem.
-        .filter(|path| !path_from_key(path).exists())
-        .cloned()
-        .collect();
+        match path_is_dead(&path_from_key(path)) {
+            Some(true) => dead_paths.push(path.clone()),
+            Some(false) => {}
+            None => uncertain += 1,
+        }
+    }
     for path in dead_paths {
         if cache.entries.remove(&path).is_some() | cache.raw_entries.remove(&path).is_some() {
             // Remember the prune so the save-side merge under the
@@ -2230,17 +2257,20 @@ fn prune_dead_entries(cache: &mut SessionCache) -> usize {
             pruned += 1;
         }
     }
-    let dead_dirs: Vec<String> = cache
-        .dirs
-        .keys()
-        .filter(|dir| !path_from_key(dir).exists())
-        .cloned()
-        .collect();
+    let mut dead_dirs: Vec<String> = Vec::new();
+    for dir in cache.dirs.keys() {
+        match path_is_dead(&path_from_key(dir)) {
+            Some(true) => dead_dirs.push(dir.clone()),
+            Some(false) => {}
+            None => uncertain += 1,
+        }
+    }
     for dir in dead_dirs {
         cache.dirs.remove(&dir);
         cache.removed_dirs.insert(dir);
         pruned += 1;
     }
+    cache.stat_uncertain += uncertain;
     if pruned > 0 {
         cache.dirty = true;
     }
@@ -4922,6 +4952,100 @@ mod tests {
             None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_keeps_entries_when_stat_fails_on_unreadable_root() {
+        // rm-1943 (run 122b213a98a1): `Path::exists()` flattens every stat
+        // error to `false`, so one run while a session root was
+        // transiently unreadable (EACCES on the parent — live repro:
+        // 100 warm entries -> 0 -> full re-parse once readable again)
+        // treated every live file as deleted. Pruning must remove an
+        // entry only on a confirmed NotFound; any other stat error KEEPS
+        // the entry and counts a `stat_uncertain` skip. (Windows lacks
+        // the chmod permission dial, so the uncertain arm is unix-only.)
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-prune-eacces-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_file = sessions_dir.join("rollout-2026-10-16T10-15-30-a1b2c3.jsonl");
+        fs::write(&session_file, b"{}\n").expect("write session file");
+
+        let mut cache = SessionCache {
+            path: root.join("sessions.json"),
+            ..SessionCache::default()
+        };
+        let key = cache_key(&session_file);
+        let session = GoSession {
+            name: "rollout-2026-10-16T10-15-30-a1b2c3".to_string(),
+            path: session_file.to_string_lossy().to_string(),
+            ..GoSession::default()
+        };
+        cache.entries.insert(
+            key.clone(),
+            CacheEntry {
+                mod_time: 900_000,
+                size: 2,
+                session,
+            },
+        );
+
+        // Baseline: a readable root keeps the entry.
+        let mut probe = cache.clone();
+        prune_dead_entries(&mut probe);
+        assert_eq!(probe.entries.len(), 1, "readable root must keep the entry");
+        assert_eq!(probe.stat_uncertain, 0);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o000))
+                .expect("chmod 000 sessions dir");
+            let mut probe = cache.clone();
+            prune_dead_entries(&mut probe);
+            assert_eq!(
+                probe.entries.len(),
+                1,
+                "an unreadable parent must NOT be read as file-gone (rm-1943 wipe)"
+            );
+            assert!(
+                probe.stat_uncertain >= 1,
+                "the uncertain stat must be disclosed, not silently swallowed"
+            );
+            // The dirs listing for the unreadable dir survives too.
+            let mut probe = cache.clone();
+            probe.dirs.insert(
+                sessions_dir.to_string_lossy().to_string(),
+                DirCacheEntry {
+                    mod_time: 1,
+                    dir_size: None,
+                    files: Vec::new(),
+                    dirs: Vec::new(),
+                    fork_parents: BTreeMap::new(),
+                },
+            );
+            prune_dead_entries(&mut probe);
+            assert_eq!(
+                probe.dirs.len(),
+                1,
+                "dir listings survive an unreadable parent"
+            );
+            fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o755))
+                .expect("restore sessions dir");
+        }
+
+        // Confirmed deletion (stat -> NotFound) still prunes.
+        fs::remove_file(&session_file).expect("remove session file");
+        let mut probe = cache.clone();
+        prune_dead_entries(&mut probe);
+        assert_eq!(probe.entries.len(), 0, "a confirmed NotFound must prune");
+        assert!(probe.removed.contains(&key), "the prune must be journaled");
+        drop(cache);
         let _ = fs::remove_dir_all(root);
     }
 
