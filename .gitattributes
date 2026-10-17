@@ -2,3 +2,4 @@
 # Byte-exact vendored transcripts: a CRLF-rewritten fixture breaks the
 # starts_with control-line pin on Windows checkouts (os-default autocrlf).
 crates/agenttrace-core/tests/fixtures/**/*.jsonl binary
+crates/agenttrace-core/tests/fixtures/svg-card/*.svg binary
