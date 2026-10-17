@@ -35,13 +35,33 @@ fn session_doc(root: &Path, session_id: &str) -> PathBuf {
     ))
 }
 
+fn json_escape(text: &str) -> String {
+    // A windows absolute id (C:\Users\...) interpolated raw makes INVALID
+    // JSON (\U is not an escape) and the whole doc then bails 'unsupported
+    // session format' before admission ever runs. Escape it properly.
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn write_session_doc(root: &Path, file_id: &str, doc_id: &str, title: &str) -> PathBuf {
     let path = session_doc(root, file_id);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         &path,
         format!(
-            r#"{{"id": "{doc_id}", "slug": "admission", "projectID": "prj_1", "title": "{title}", "time": {{"created": 1764750000000, "updated": 1764750004000}}}}"#
+            r#"{{"id": "{}", "slug": "admission", "projectID": "prj_1", "title": "{title}", "time": {{"created": 1764750000000, "updated": 1764750004000}}}}"#,
+            json_escape(doc_id)
         ),
     )
     .unwrap();
@@ -68,7 +88,8 @@ fn write_message_with_id(root: &Path, session_id: &str, file_stem: &str, doc_id:
     fs::write(
         dir.join(format!("{file_stem}.json")),
         format!(
-            r#"{{"id": "{doc_id}", "sessionID": "{session_id}", "role": "user", "time": {{"created": 1764750001000}}}}"#
+            r#"{{"id": "{}", "sessionID": "{session_id}", "role": "user", "time": {{"created": 1764750001000}}}}"#,
+            json_escape(doc_id)
         ),
     )
     .unwrap();
