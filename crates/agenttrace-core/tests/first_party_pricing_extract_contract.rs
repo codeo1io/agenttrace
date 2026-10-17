@@ -114,16 +114,28 @@ fn extract_ids_are_specific_prices_not_fallbacks() {
 fn reseller_qualified_ids_keep_their_reseller_rows() {
     // The session itself scoped these ids to a reseller lane: the
     // extract must NOT override an explicit qualification (it speaks
-    // only for the bare first-party form).
+    // only for the bare first-party form). Through the 2026-10-17
+    // refresh (rm-176 fuse defusal, run 389e223a cycle 1) the
+    // openrouter/* namespace left the bundle — adjudicated by the 466
+    // dated drop-notes in scripts/pricing/snapshot-drops.txt — so the
+    // qualified id now falls through the rm-1053 ladder to the
+    // surviving reseller twin (`vercel_ai_gateway/anthropic/
+    // claude-sonnet-4`, which forwards the same $3/M list rate the
+    // openrouter row carried). The pinned invariant is unchanged: a
+    // qualified id attributes to a RESELLER row and prices through
+    // the LiteLLM catalog, never through the extract. The provider
+    // literal is bundle-vintage — re-pin it with the next snapshot
+    // refresh, in lockstep with pricing_snapshot_hygiene.rs.
     let openrouter = lookup_price("openrouter/claude-sonnet-4-20250514");
     assert!(
         (openrouter.input - 3.0).abs() < 1e-9,
-        "the openrouter row forwards the same list input rate"
+        "the reseller twin forwards the same list input rate"
     );
     assert_eq!(
         provider_for("openrouter/claude-sonnet-4-20250514").as_deref(),
-        Some("openrouter"),
-        "a reseller-qualified id attributes to the reseller"
+        Some("vercel_ai_gateway"),
+        "a reseller-qualified id attributes to the reseller twin that \
+         survived the 2026-10-17 openrouter purge"
     );
     assert!(
         !pricing_source_for("openrouter/claude-sonnet-4-20250514")
