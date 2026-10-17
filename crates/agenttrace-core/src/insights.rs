@@ -276,6 +276,12 @@ pub fn resolve_project(session: &Session) -> ProjectIdentity {
     }
 }
 
+#[cfg(test)]
+fn identity_root_rendering(path: &std::path::Path) -> String {
+    // Mirror the '/'-joined identity rendering for assertion sites.
+    resolved_from_path(&path.to_string_lossy()).root
+}
+
 fn resolved_from_path(raw: &str) -> ProjectIdentity {
     if raw.is_empty() || raw.starts_with("history:") {
         return ProjectIdentity {
@@ -1255,7 +1261,7 @@ mod tests {
         assert_eq!(decoded.display_name, "my-repo");
         assert_eq!(
             decoded.root,
-            lexical_normalize(&repo).to_string_lossy().to_string()
+            identity_root_rendering(&lexical_normalize(&repo))
         );
         // The shadow never even becomes a disclosed candidate.
         assert!(matches!(
@@ -1381,7 +1387,7 @@ mod tests {
         assert_eq!(with_decoy.display_name, "my-repo");
         assert_eq!(
             with_decoy.root,
-            lexical_normalize(&true_repo).to_string_lossy().to_string()
+            identity_root_rendering(&lexical_normalize(&true_repo))
         );
         // The alternative the old decoder would have descended into is
         // disclosed as shadowed.
@@ -1430,7 +1436,7 @@ mod tests {
         assert_eq!(resolved.display_name, "my-repo");
         assert_eq!(
             resolved.root,
-            lexical_normalize(&repo).to_string_lossy().to_string()
+            identity_root_rendering(&lexical_normalize(&repo))
         );
 
         let _ = fs::remove_dir_all(root);
