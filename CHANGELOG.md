@@ -4,6 +4,37 @@
 
 ### Added
 
+- Duplicate journals, subagent-artifact ghosts, and negative recorded
+  costs stop inflating or inventing totals (rm-1886, rm-1887, rm-1888,
+  run 77ca5de0 cycle 5, batch "count-honesty ledger"): a journal copied
+  byte-identical into a second directory — a backup mirror, a synced
+  machine, the same session stored twice — parsed as a second full
+  session, so session counts and every cost/token rollup banked the same
+  spend twice with no disclosure; a parent run's `subagent-artifacts/`
+  companion transcripts re-stated child spend the parent journal already
+  owned and minted phantom sessions; and a journal whose recorded
+  `cost.total` went negative (a refund line seen in the wild) failed the
+  recorded-cost gate and fell through to the estimator, reporting an
+  invented positive cost as if agent-reported. Admission now
+  content-signatures every candidate — (exact byte size, FNV-1a-64 of
+  the raw bytes), memoized in the session cache so warm reruns stay
+  metadata-only with no cache wipe — and admits one survivor per
+  signature (newest mtime in a directory wins, deterministic); discovery
+  skips any path carrying a `subagent-artifacts` path component (segment
+  match, so a user's own `subagent-artifacts.jsonl` journal stays
+  admissible); and negative recorded costs are rejected and counted,
+  with estimation as the explicit fallback. Reported numbers CHANGE on
+  corpora that carried duplicates or ghosts — fewer sessions, lower
+  totals — and nothing suppresses silently:
+  `duplicate_session_files` (with named survivor <- suppressed pairs in
+  `--audit`), `subagent_artifact_files`, and
+  `recorded_costs_negative_rejected` ride the disclosed-facts channel on
+  doctor, overview, and audit. Docs rider (rm-1892): usage-card.md's dead
+  pricing link is retargeted to the README pricing anchor, and the new
+  relative-link gate (scripts/ci/check-docs-links.sh, wired into ci.yml)
+  pins every relative Markdown link against the tree — broken relative
+  links 1 -> 0, asserted by fixture and contract test.
+
 - Cline/Roo usage metrics carriers are consumed, not zeroed (rm-1430, run
   a3f96656 cycle 3): Cline journals record per-response usage — as a say
   entry whose text is a JSON object (`cost`/`tokensIn`/`tokensOut`/

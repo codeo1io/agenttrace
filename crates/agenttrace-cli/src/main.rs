@@ -758,7 +758,15 @@ fn run() -> anyhow::Result<()> {
                 "Note: --limit no longer bounds governance reports; it caps list views. Use --sample N for bounded, disclosed sampling."
             );
         }
-        let matched = prepare_cli_view(load_sessions(&args)?, &args)?;
+        // rm-1886/rm-1887/rm-1888 (run 77ca5de0 cycle 5): the audit
+        // report discloses what aggregation admission suppressed and
+        // what the recorded-cost gates rejected, so a cost audit over
+        // a corpus with copies or artifact mirrors explains its own
+        // denominators.
+        let (matched, load_report) =
+            load_sessions_report(&args).and_then(|(sessions, report)| {
+                prepare_cli_view(sessions, &args).map(|matched| (matched, report))
+            })?;
         if matched.is_empty() {
             bail!("No sessions match the requested filters");
         }
@@ -773,7 +781,9 @@ fn run() -> anyhow::Result<()> {
             _ => (matched, None),
         };
         let value = if args.audit {
-            serde_json::to_value(cost_audit(&sessions))?
+            let mut value = serde_json::to_value(cost_audit(&sessions))?;
+            attach_admission_disclosures(&mut value, &load_report, &sessions);
+            value
         } else if args.recommend {
             serde_json::json!({
                 "recommendations": serde_json::to_value(recommendations(&sessions))?,
@@ -1419,6 +1429,69 @@ fn audit_coverage_phrase(value: &serde_json::Value) -> String {
             phrase
         }
         _ => String::new(),
+    }
+}
+
+/// rm-1886/rm-1887/rm-1888 (run 77ca5de0 cycle 5, "count-honesty
+/// ledger"): the `--audit` report carries what aggregation admission
+/// SUPPRESSED before enumeration (artifact mirror files, content
+/// duplicates) and what the recorded-cost gates REJECTED (negative
+/// totals), under the same keys the loader/doctor lanes use — so a
+/// cost audit over a corpus with copies or pi-subagents mirrors
+/// explains its own denominators instead of reading as a complete
+/// corpus. Keys appear only when they fired (the disclosure-channel
+/// convention: absent = nothing happened).
+fn attach_admission_disclosures(
+    value: &mut serde_json::Value,
+    report: &Option<LoadReport>,
+    sessions: &[Session],
+) {
+    let Some(report) = report else {
+        return;
+    };
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    if report.subagent_artifact_files > 0 {
+        map.insert(
+            "subagent_artifact_files".to_string(),
+            serde_json::json!(report.subagent_artifact_files),
+        );
+    }
+    if report.duplicate_session_files > 0 {
+        map.insert(
+            "duplicate_session_files".to_string(),
+            serde_json::json!(report.duplicate_session_files),
+        );
+        map.insert(
+            "duplicate_session_file_pairs".to_string(),
+            serde_json::json!(report
+                .duplicate_session_file_pairs
+                .iter()
+                .take(5)
+                .map(|(survivor, suppressed)| format!(
+                    "{} <- {}",
+                    survivor.display(),
+                    suppressed.display()
+                ))
+                .collect::<Vec<_>>()),
+        );
+    }
+    let negative_rejected: usize = sessions
+        .iter()
+        .filter_map(|session| {
+            session
+                .metrics
+                .disclosure_counters
+                .get("recorded_costs_negative_rejected")
+                .copied()
+        })
+        .sum();
+    if negative_rejected > 0 {
+        map.insert(
+            "recorded_costs_negative_rejected".to_string(),
+            serde_json::json!(negative_rejected),
+        );
     }
 }
 

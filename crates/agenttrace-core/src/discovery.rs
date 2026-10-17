@@ -8,7 +8,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -49,6 +49,21 @@ pub struct LoadReport {
     /// channel can report the exclusion instead of dropping sessions
     /// silently.
     pub opencode_fork_excluded: usize,
+    /// rm-1887 (run 77ca5de0 cycle 5, "count-honesty ledger"):
+    /// pi-subagents artifact mirror files (`subagent-artifacts/`
+    /// subtree) excluded from aggregation — each re-states child
+    /// spend the parent rollup lane does not attribute, so banking
+    /// them double-counts. Kept here so the disclosure channel can
+    /// report "skipped, not zero".
+    pub subagent_artifact_files: usize,
+    /// rm-1886: byte-identical session files at distinct paths
+    /// suppressed as content duplicates (size + fast-hash signature) —
+    /// copies that double-banked every aggregate.
+    pub duplicate_session_files: usize,
+    /// rm-1886: first suppressed pairs (survivor, suppressed copy),
+    /// capped at five, naming the paths so an operator can tell a
+    /// copy from a coincidence.
+    pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
     /// rm-835 (minted campaign-locally as rm-695 by run f7f81aea, rebound
     /// at integration — the landed wall already holds an rm-695): how many
     /// discovered files failed to parse (the parse share of `skipped`,
@@ -335,6 +350,19 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
             }
         }
     }
+    // rm-1887/rm-1886: aggregation admission mirrors the cached walk —
+    // artifact mirrors skipped, byte-identical copies deduped — so the
+    // uncached lane counts the same corpus (full reads; the memo is a
+    // cache-lane warm-run optimization only). The `-d` arm above keeps
+    // every file (rm-548 stance).
+    all.retain(|path| !is_subagent_artifact_path(path));
+    let mut signatures: HashSet<(i64, u64)> = HashSet::new();
+    all.retain(|path| {
+        // Unreadable: keep (the parse lane owns and discloses those).
+        content_signature(path)
+            .map(|signature| signatures.insert(signature))
+            .unwrap_or(true)
+    });
     sort_paths_by_mod_time(all)
 }
 
@@ -372,7 +400,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
     mut on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
     let mut sessions = Vec::new();
-    let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
+    let (files, suppressed) = find_session_files_cached(dir, cache, true);
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
@@ -486,7 +514,10 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // zero after the rm-791 supersession (its parent_id rows are
     // retained, attributed children), but the lane-level sum keeps the
     // shared carrier honest for both lanes.
-    let mut opencode_fork_excluded = json_fork_excluded;
+    let mut opencode_fork_excluded = suppressed.opencode_fork_excluded;
+    let subagent_artifact_files = suppressed.subagent_artifact_files;
+    let duplicate_session_files = suppressed.duplicate_session_files;
+    let duplicate_session_file_pairs = suppressed.duplicate_session_file_pairs;
     if dir.is_none() {
         let (sqlite_sessions, ingest) =
             crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
@@ -553,6 +584,9 @@ pub fn load_sessions_with_progress_from_cache_mode(
         cache_hits,
         sqlite: sqlite_ingest,
         opencode_fork_excluded,
+        subagent_artifact_files,
+        duplicate_session_files,
+        duplicate_session_file_pairs,
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
@@ -597,19 +631,112 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
     items.into_iter().map(|item| item.0).collect()
 }
 
+/// rm-1887/rm-1886 (run 77ca5de0 cycle 5, "count-honesty ledger"):
+/// what AGGREGATION admission suppressed before enumeration, so the
+/// disclosure channel can report each class — never silently. The
+/// explicit-directory lane (`-d`) keeps every file (rm-548 stance:
+/// the exclusions are aggregation rules, not parse blocks) and
+/// reports a zero-valued struct.
+#[derive(Debug, Clone, Default)]
+pub struct SuppressedSessions {
+    /// rm-548: opencode fork copies (session info docs whose
+    /// `parentID` is set) re-emitting their parent's history.
+    pub opencode_fork_excluded: usize,
+    /// rm-1887: pi-subagents artifact files — mirror transcripts a
+    /// child run writes under a `subagent-artifacts/` subtree, whose
+    /// spend the parent's rollup lane does not attribute, so banking
+    /// them as standalone sessions double-counts (fleet-corroborated,
+    /// 4 shapes; upstream ccusage #1698/#1714 same lane). Their spend
+    /// reads "skipped, not zero".
+    pub subagent_artifact_files: usize,
+    /// rm-1886: byte-identical session files at distinct paths
+    /// suppressed as content duplicates (size + fast hash), because a
+    /// copy that re-emits the same events double-banks every
+    /// aggregate it feeds.
+    pub duplicate_session_files: usize,
+    /// rm-1886: first suppressed pairs (survivor, suppressed copy),
+    /// capped at [`MAX_DUPLICATE_PAIR_SAMPLES`]; the full count rides
+    /// `duplicate_session_files`.
+    pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+}
+
+/// rm-1886: cap on the named duplicate pairs carried for disclosure —
+/// a pathological corpus (hundreds of copies) must not flood doctor
+/// output; the count stays exact and the samples name the shape.
+const MAX_DUPLICATE_PAIR_SAMPLES: usize = 5;
+
+/// rm-1887: the pi-subagents orchestration writes each child run's
+/// mirror transcripts and event streams under a `subagent-artifacts`
+/// path segment (`subagent-artifacts/<run>_<agent>/_transcript.jsonl`,
+/// `subagent-artifacts/outputs/call_<id>/events.jsonl`, …). Those
+/// bytes re-state child spend the parent journal already owns, so
+/// discovery admits none of them as sessions — the path segment is
+/// the stable marker across all four observed artifact shapes
+/// (message-only, mixed, event-stream mirror, async `events.jsonl`).
+/// Segment-match, not suffix: a user's own journal named
+/// `subagent-artifacts.jsonl` stays admissible.
+pub(crate) fn is_subagent_artifact_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == std::ffi::OsStr::new("subagent-artifacts"))
+}
+
+/// rm-1886: content signature — (raw byte size, FNV-1a-64 of the raw
+/// bytes). Byte-identical journals share it across paths; a one-byte
+/// edit does not. FNV-1a is not cryptographic, but it does not need
+/// to be: the adversary is accidental duplication, and the signature
+/// is only ever an admission gate — parse still validates whatever it
+/// admits. Hash collision on distinct journals of equal size would
+/// suppress a real session, so the 64-bit space plus exact size keeps
+/// that at operational zero (and a suppressed pair is named in the
+/// disclosure, so it is observable if it ever happened).
+fn content_signature(path: &Path) -> Option<(i64, u64)> {
+    let bytes = fs::read(path).ok()?;
+    Some((bytes.len() as i64, fnv1a64(&bytes)))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// rm-1886 memoized content signature: served from the parent
+/// directory's cached listing when the cache vouches for the file's
+/// fingerprint (see [`session_cache::cached_content_signature`]),
+/// else hashed once and persisted so warm runs stop re-reading every
+/// journal to prove what the cache already vouches for.
+fn content_signature_cached(path: &Path, cache: &mut SessionCache) -> Option<(i64, u64)> {
+    if let Some(signature) = crate::session_cache::cached_content_signature(path, cache) {
+        return Some(signature);
+    }
+    let signature = content_signature(path)?;
+    crate::session_cache::store_content_signature(path, signature.0, signature.1, cache);
+    Some(signature)
+}
+
 pub(crate) fn find_session_files_cached(
     dir: Option<&Path>,
     cache: &mut SessionCache,
     skip_sqlite_backed: bool,
-) -> (Vec<PathBuf>, usize) {
+) -> (Vec<PathBuf>, SuppressedSessions) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return (vec![dir.to_path_buf()], 0);
+            return (vec![dir.to_path_buf()], SuppressedSessions::default());
         }
         // rm-548: an explicitly requested directory keeps every file —
         // a forked copy loaded by explicit path still renders (the
-        // exclusion is an aggregation rule, not a parse block).
-        return (collect_session_files_cached(dir, cache), 0);
+        // exclusion is an aggregation rule, not a parse block). Same
+        // stance for rm-1886 content duplicates and rm-1887 artifact
+        // mirrors: `-d` is the inspection lane.
+        return (
+            collect_session_files_cached(dir, cache),
+            SuppressedSessions::default(),
+        );
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
@@ -632,6 +759,18 @@ pub(crate) fn find_session_files_cached(
             }
         }
     }
+    let mut suppressed = SuppressedSessions::default();
+    // rm-1887: pi-subagents artifact mirrors are not sessions — their
+    // spend re-states what the parent journal owns. Segment-level skip
+    // BEFORE the fork probe: artifacts need no fork marker read.
+    all.retain(|path| {
+        if is_subagent_artifact_path(path) {
+            suppressed.subagent_artifact_files += 1;
+            false
+        } else {
+            true
+        }
+    });
     // rm-548: opencode fork copies (session info docs whose `parentID`
     // is set) re-emit their parent's history, so aggregating them
     // double-counts usage. Drop them before enumeration and return the
@@ -640,16 +779,46 @@ pub(crate) fn find_session_files_cached(
     // cached dir listing (fingerprint-keyed, see
     // `opencode_session_fork_parent_cached`) so warm runs stop
     // re-reading every storage session info doc on discovery.
-    let mut opencode_fork_excluded = 0usize;
     all.retain(|path| {
         if opencode_session_fork_parent_cached(path, cache).is_some() {
-            opencode_fork_excluded += 1;
+            suppressed.opencode_fork_excluded += 1;
             false
         } else {
             true
         }
     });
-    (sort_paths_by_cache(all, cache), opencode_fork_excluded)
+    // rm-1886: content dedup at admission — a byte-identical journal
+    // at a second path re-emits the same events and double-banks every
+    // aggregate it feeds. First-seen survivor wins (deterministic: the
+    // walk yields sorted per-directory files, roots in registration
+    // order); a file whose bytes cannot be read is KEPT — the parse
+    // lane owns unreadable files and discloses them, dedup must not
+    // silently drop what it cannot verify. Unreadable-file stance
+    // keeps this pass observable: suppressed copies are counted and
+    // the first pairs named.
+    let mut deduped: Vec<PathBuf> = Vec::with_capacity(all.len());
+    let mut signatures: HashMap<(i64, u64), PathBuf> = HashMap::new();
+    for path in all {
+        let Some(signature) = content_signature_cached(&path, cache) else {
+            deduped.push(path);
+            continue;
+        };
+        match signatures.entry(signature) {
+            std::collections::hash_map::Entry::Occupied(survivor) => {
+                suppressed.duplicate_session_files += 1;
+                if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
+                    suppressed
+                        .duplicate_session_file_pairs
+                        .push((survivor.get().clone(), path));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(path.clone());
+                deduped.push(path);
+            }
+        }
+    }
+    (sort_paths_by_cache(deduped, cache), suppressed)
 }
 
 /// rm-548: an opencode storage session doc (`.../storage/session/info/

@@ -8,9 +8,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const PLANTED_SESSION: &str = concat!(
+// rm-596 fixture note (rm-1886, run 77ca5de0 cycle 5): the two
+// planted journals carry DISTINCT bytes — admission now collapses
+// byte-identical copies into one session (content-signature ledger),
+// and this test's control arm asserts >= 2 sessions on the planted
+// corpus. The demo-gate subject of this test needs two REAL
+// sessions, not one double-banked one.
+const PLANTED_SESSION_1: &str = concat!(
     "{\"role\":\"session_meta\",\"timestamp\":\"2026-05-01T09:00:00Z\",\"ModelUsed\":\"claude-sonnet-4-5\"}\n",
     "{\"role\":\"meta\",\"ModelUsed\":\"claude-sonnet-4-5\",\"Usage\":{\"input_tokens\":120,\"output_tokens\":30}}\n",
+);
+const PLANTED_SESSION_2: &str = concat!(
+    "{\"role\":\"session_meta\",\"timestamp\":\"2026-05-01T10:00:00Z\",\"ModelUsed\":\"claude-sonnet-4-5\"}\n",
+    "{\"role\":\"meta\",\"ModelUsed\":\"claude-sonnet-4-5\",\"Usage\":{\"input_tokens\":130,\"output_tokens\":40}}\n",
 );
 
 fn planted_home(marker: &str) -> (PathBuf, PathBuf) {
@@ -24,8 +34,13 @@ fn planted_home(marker: &str) -> (PathBuf, PathBuf) {
         .join("projects")
         .join(format!("home-agent-{marker}"));
     fs::create_dir_all(&projects).expect("create planted projects dir");
-    for name in ["session-1.jsonl", "session-2.jsonl"] {
-        fs::write(projects.join(name), PLANTED_SESSION).expect("plant session file");
+    // keyed to file NAME so the two planted journals stay
+    // content-distinct (see the fixture note above).
+    for (name, contents) in [
+        ("session-1.jsonl", PLANTED_SESSION_1),
+        ("session-2.jsonl", PLANTED_SESSION_2),
+    ] {
+        fs::write(projects.join(name), contents).expect("plant session file");
     }
     let cache = root.join("cache");
     fs::create_dir_all(&cache).expect("create sandbox cache dir");

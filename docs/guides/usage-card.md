@@ -44,7 +44,7 @@ filename.
   session spanning midnight shows as one bar on its closing day rather than
   spread across its span; per-event-day bucketing is a recorded follow-up.
 - Costs are the same estimates the other renderers report (see
-  [pricing](../pricing.md) for the snapshot model). The footer states the
+  [pricing](../../README.md#pricing) for the snapshot model). The footer states the
   pricing source so a stale snapshot is visible at a glance.
 - Model, project, and scope strings are control-byte sanitized and entity
   escaped before they reach the document — a session named

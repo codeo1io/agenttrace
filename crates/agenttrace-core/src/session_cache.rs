@@ -1116,6 +1116,20 @@ struct DirCacheEntry {
     /// serialize byte-identically.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     fork_parents: BTreeMap<String, (FileFingerprint, Option<String>)>,
+    /// rm-1886 (run 77ca5de0 cycle 5, "count-honesty ledger"): memoized
+    /// raw-byte content signatures for this listing's files — file key
+    /// -> (fingerprint at hashing time, FNV-1a-64 of the raw bytes).
+    /// Admission-level content dedup (a byte-identical copy of a journal
+    /// at another path is not a second session) needs every candidate
+    /// file's bytes hashed on every load; the memo keeps warm runs from
+    /// re-reading journals the cache already vouches for. Absent
+    /// (listings written before the field existed) re-hashes once and
+    /// stores; a fingerprint mismatch (the file changed) re-hashes too,
+    /// so the memo can never mask mutated content. Per-directory like
+    /// `fork_parents`, so it retires with the listing; empty on
+    /// untouched journals so they serialize byte-identically.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    content_sigs: BTreeMap<String, (FileFingerprint, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -2298,6 +2312,7 @@ pub(crate) fn store_dir_listing(
             files: files.iter().map(|path| cache_key(path)).collect(),
             dirs: dirs.iter().map(|path| cache_key(path)).collect(),
             fork_parents: BTreeMap::new(),
+            content_sigs: BTreeMap::new(),
         },
     );
     cache.dirty = true;
@@ -2352,6 +2367,56 @@ pub(crate) fn store_fork_parent_probe(
                 size: metadata.len() as i64,
             },
             parent,
+        ),
+    );
+    cache.dirty = true;
+}
+
+/// rm-1886 (run 77ca5de0 cycle 5, "count-honesty ledger"): memoized
+/// raw-byte content signature for one candidate session file, served
+/// from the parent directory's cached listing — `(byte size,
+/// FNV-1a-64 of the raw bytes)`. `None` = no usable memo (hash never
+/// run, no listing for the parent directory, or the file's fingerprint
+/// moved — a rewritten journal re-hashes, so the memo can never mask
+/// mutated content). Callers hash the file and persist with
+/// [`store_content_signature`]. Used by admission-level content dedup:
+/// a byte-identical journal at a second path is not a second session,
+/// and warm runs must not re-read every journal to prove it.
+pub(crate) fn cached_content_signature(path: &Path, cache: &SessionCache) -> Option<(i64, u64)> {
+    let entry = cache.dirs.get(&cache_key(path.parent()?))?;
+    let (fingerprint, sig) = entry.content_sigs.get(&cache_key(path))?;
+    let metadata = fs::metadata(path).ok()?;
+    if fingerprint.mod_time == file_mod_time_nanos(&metadata)
+        && fingerprint.size == metadata.len() as i64
+    {
+        Some((fingerprint.size, *sig))
+    } else {
+        None
+    }
+}
+
+/// rm-1886: persist one content signature onto the parent directory's
+/// cached listing (see [`cached_content_signature`]). When the parent
+/// directory has no cached listing the result is simply not persisted
+/// — the signature is still correct for this run.
+pub(crate) fn store_content_signature(path: &Path, size: i64, sig: u64, cache: &mut SessionCache) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    let Some(entry) = cache.dirs.get_mut(&cache_key(dir)) else {
+        return;
+    };
+    entry.content_sigs.insert(
+        cache_key(path),
+        (
+            FileFingerprint {
+                mod_time: file_mod_time_nanos(&metadata),
+                size,
+            },
+            sig,
         ),
     );
     cache.dirty = true;
@@ -3999,6 +4064,7 @@ mod tests {
             files: Vec::new(),
             dirs: Vec::new(),
             fork_parents: BTreeMap::new(),
+            content_sigs: BTreeMap::new(),
         };
         cache
             .dirs
@@ -4554,6 +4620,7 @@ mod tests {
                     files: vec!["f".repeat(120); 6],
                     dirs: Vec::new(),
                     fork_parents: BTreeMap::new(),
+                    content_sigs: BTreeMap::new(),
                 },
             );
         }
@@ -4649,6 +4716,7 @@ mod tests {
                 files: vec!["f".repeat(120); 6],
                 dirs: Vec::new(),
                 fork_parents: BTreeMap::new(),
+                content_sigs: BTreeMap::new(),
             },
         );
         let projected = serialized_doc_size(&cache);
@@ -4744,6 +4812,7 @@ mod tests {
                     files: vec![format!("file-{i}-{}.jsonl", "f".repeat(60)); 4],
                     dirs: Vec::new(),
                     fork_parents: BTreeMap::new(),
+                    content_sigs: BTreeMap::new(),
                 },
             );
         }

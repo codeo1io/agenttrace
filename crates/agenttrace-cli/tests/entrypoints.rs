@@ -3153,3 +3153,108 @@ fn cli_quota_view_reports_plan_windows_and_guards_its_lane() {
         String::from_utf8_lossy(&range.stderr)
     );
 }
+
+#[test]
+fn count_honesty_disclosures_in_cli_lanes() {
+    // rm-1886/rm-1887/rm-1888 (run 77ca5de0 cycle 5, "count-honesty
+    // ledger"): the --audit JSON report explains its own denominators —
+    // what aggregation admission SUPPRESSED (pi-subagents artifact
+    // mirrors, byte-identical journal copies with named survivor <-
+    // suppressed pairs) and what the recorded-cost gate REJECTED
+    // (negative totals). Pinned end to end through the real binary on
+    // the same fixture shape as `count_honesty_admission.rs` in
+    // agenttrace-core; every env var is scoped to the subprocess so
+    // the host corpus and the shared fleet session cache are never
+    // read or written.
+    let home = std::env::temp_dir().join(format!(
+        "agenttrace-count-honesty-cli-{}",
+        std::process::id()
+    ));
+    let sessions = home.join(".pi/agent/sessions");
+    let pi_journal = |total: &str| {
+        format!(
+            concat!(
+                r#"{{"id": "00000000-0000-4000-8000-000000000001", "timestamp": "2026-10-04T07:16:46.634Z", "type": "session", "version": 3, "cwd": "/redacted/project"}}"#,
+                "\n",
+                r#"{{"id": "00000000-0000-4000-8000-000000000002", "parentId": "00000000-0000-4000-8000-000000000001", "timestamp": "2026-10-04T07:16:46.700Z", "type": "session_info", "name": "redacted-session"}}"#,
+                "\n",
+                r#"{{"id": "00000000-0000-4000-8000-000000000003", "timestamp": "2026-10-04T07:16:47.000Z", "message": {{"role": "user", "content": [{{"type": "text", "text": "hello"}}], "timestamp": "2026-10-04T07:16:47.000Z"}}, "type": "message"}}"#,
+                "\n",
+                r#"{{"id": "00000000-0000-4000-8000-000000000004", "timestamp": "2026-10-04T07:16:48.000Z", "message": {{"role": "assistant", "content": [{{"type": "text", "text": "hi there"}}], "timestamp": "2026-10-04T07:16:48.000Z", "usage": {{"input": 500, "output": 1000, "cacheRead": 25000, "cacheWrite": 5000, "totalTokens": 31500, "cost": {{"input": 0.0015, "output": 0.006, "cacheRead": 0.0, "cacheWrite": 0.0, "total": {0}}}}}}}, "model": "claude-sonnet-4-20250514", "type": "message"}}"#,
+                "\n"
+            ),
+            total
+        )
+    };
+    let write = |rel: &str, contents: &str| {
+        let path = sessions.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(&path, contents).expect("write fixture");
+        path
+    };
+    // One real journal banked twice: byte-identical copies at two
+    // paths (alpha survives, beta is the disclosed copy).
+    let journal = pi_journal("0.0038");
+    write("alpha/a.jsonl", &journal);
+    let beta = write("beta/b.jsonl", &journal);
+    // A pi-subagents artifact mirror under the path segment — child
+    // spend the parent owns; skipped, never banked.
+    write(
+        "proj/subagent-artifacts/run1_w/_transcript.jsonl",
+        &pi_journal("0.0090"),
+    );
+    // A negative recorded cost (-5.0): rejected, never folded.
+    write("gamma/neg.jsonl", &pi_journal("-5.0"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--audit", "-f", "json", "--range", "all"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("AGENTTRACE_SESSION_CACHE_DIR", home.join("session-cache"))
+        .output()
+        .expect("run agenttrace --audit");
+    assert!(
+        output.status.success(),
+        "audit must succeed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("audit report is JSON");
+    assert_eq!(
+        value["subagent_artifact_files"], 1,
+        "the artifact-mirror skip is disclosed in the audit denominator"
+    );
+    assert_eq!(
+        value["duplicate_session_files"], 1,
+        "the suppressed copy is counted"
+    );
+    let pairs = value["duplicate_session_file_pairs"]
+        .as_array()
+        .expect("named pairs ride the duplicate disclosure");
+    assert_eq!(pairs.len(), 1, "one pair, capped shape");
+    let pair = pairs[0].as_str().expect("pair renders as a string");
+    assert!(
+        pair.contains("a.jsonl")
+            && pair.contains("beta")
+            && pair.contains("<-")
+            && pair.ends_with(beta.file_name().expect("name").to_string_lossy().as_ref()),
+        "the pair names survivor <- suppressed: {pair}"
+    );
+    assert_eq!(
+        value["recorded_costs_negative_rejected"], 1,
+        "the negative recorded cost rejection is disclosed"
+    );
+    // The denominators the disclosures explain: two admitted sessions
+    // (the alpha survivor and the negative-cost journal, which parses
+    // and prices from the catalog after its recorded block was
+    // rejected) — the mirror and the copy are NOT sessions.
+    assert_eq!(
+        value["total_sessions"], 2,
+        "admitted sessions: survivor + negative-cost journal only; got {}",
+        value["total_sessions"]
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

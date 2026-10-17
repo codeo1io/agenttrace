@@ -2539,7 +2539,7 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                 // model of its own) and disclosed per kind so
                 // compaction and branch_summary stay separable.
                 let usage = oh_my_pi_usage(obj.get("usage"));
-                let recorded_cost_usd = oh_my_pi_recorded_cost_usd(obj.get("usage"));
+                let recorded_cost_usd = oh_my_pi_recorded_cost_usd(obj.get("usage"), &mut counters);
                 if usage
                     .as_ref()
                     .is_some_and(|u| u.contains_key("cache_write_1h_tokens"))
@@ -2585,7 +2585,7 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                     .map(str::to_string)
                     .unwrap_or_else(|| model.clone());
                 let usage = oh_my_pi_usage(obj.get("usage"));
-                let recorded_cost_usd = oh_my_pi_recorded_cost_usd(obj.get("usage"));
+                let recorded_cost_usd = oh_my_pi_recorded_cost_usd(obj.get("usage"), &mut counters);
                 // F3 (review 37f970af): this standalone arm is the
                 // THIRD oh_my_pi_usage call site — count its 1h-tier
                 // blocks exactly like the message and compaction arms
@@ -2735,14 +2735,32 @@ fn pi_source_for_path(path: &str) -> String {
 /// entries (rm-436) and message-level `message.usage` blocks
 /// (rm-253). Returned only when finite and non-negative; anything
 /// else is treated as absent (rm-436): a missing or corrupt cost must
-/// not silently zero real spend.
-fn oh_my_pi_recorded_cost_usd(usage: Option<&Value>) -> Option<f64> {
+/// not silently zero real spend. rm-1888 (run 77ca5de0 cycle 5,
+/// "count-honesty ledger", mirroring `cline_metrics_negative_clamped`'
+/// clamp disclosure): a finite NEGATIVE total (credits, an adjustment,
+/// a gateway reflection bug — observed in the wild) used to fail this
+/// gate silently and fall back to the catalog estimate with no trace;
+/// every rejection now mints the shared counter key
+/// `recorded_costs_negative_rejected` (the lib.rs recorded-cost fold
+/// mints the same key for every other lane, so doctor/audit report ONE
+/// number per corpus). Non-finite totals stay the rm-1500 family's
+/// concern (silent reject, disclosed there).
+fn oh_my_pi_recorded_cost_usd(
+    usage: Option<&Value>,
+    counters: &mut BTreeMap<String, i64>,
+) -> Option<f64> {
     let total = usage?
         .as_object()?
         .get("cost")?
         .as_object()?
         .get("total")?
         .as_f64()?;
+    if total.is_finite() && total < 0.0 {
+        *counters
+            .entry("recorded_costs_negative_rejected".to_string())
+            .or_insert(0) += 1;
+        return None;
+    }
     (total.is_finite() && total >= 0.0).then_some(total)
 }
 
@@ -2846,7 +2864,7 @@ fn oh_my_pi_message_events(
     // repair) and mark the cost so analyze() prices the block at
     // face value instead of the catalog rate.
     let usage = oh_my_pi_usage(message.get("usage"));
-    let recorded_cost_usd = oh_my_pi_recorded_cost_usd(message.get("usage"));
+    let recorded_cost_usd = oh_my_pi_recorded_cost_usd(message.get("usage"), counters);
     // rm-990 (cycle 2, run b5affead): pi persists the cancelled-run
     // signal on the aborted assistant message itself as
     // `stopReason:"aborted"` (live wire census, 2026-10-12: 211 lines

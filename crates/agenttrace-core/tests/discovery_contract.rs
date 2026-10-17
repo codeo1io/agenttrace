@@ -2034,11 +2034,22 @@ fn seed_openclaw_session(state: &std::path::Path, provider: &str) -> std::path::
         .join(provider)
         .join("9af1c0de-5e17-4b2a-8d64-3f1a2b3c4d5e");
     fs::create_dir_all(&session_dir).expect("create openclaw session dir");
-    fs::copy(
-        generated_fixture("openclaw-wrapper.json"),
-        session_dir.join("session.json"),
-    )
-    .expect("seed openclaw wrapper session");
+    // rm-1886 fixture note (run 77ca5de0 cycle 5): each planted copy
+    // must be content-DISTINCT — admission collapses byte-identical
+    // copies into one session, and the sibling/legacy-root tests pin
+    // ROOT ENUMERATION (both state dirs register), not dedup. The
+    // nonce rides the user message so the wire shape is untouched.
+    let wrapper = fs::read_to_string(generated_fixture("openclaw-wrapper.json"))
+        .expect("read openclaw wrapper fixture");
+    let nonce = state
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "state".into());
+    let wrapper = wrapper.replace(
+        "\"content\":\"inspect\"",
+        &format!("\"content\":\"inspect {nonce}\""),
+    );
+    fs::write(session_dir.join("session.json"), wrapper).expect("seed openclaw wrapper session");
     session_dir
 }
 
@@ -4405,7 +4416,15 @@ fn antigravity_sibling_roots_are_discovered_and_disclosed() {
         let dir = home.join(root);
         fs::create_dir_all(&dir).expect("create sibling conversations dir");
         let path = dir.join(format!("conv-{index}.trajectory.json"));
-        fs::write(&path, &sidecar).expect("write trajectory sidecar");
+        // rm-1886 fixture note (run 77ca5de0 cycle 5): each sibling
+        // root's sidecar must be content-DISTINCT — the admission
+        // ledger collapses byte-identical copies into one session, and
+        // this test pins FAMILY-ROOT coverage, not dedup.
+        let payload = sidecar.replace(
+            "11111111-2222-3333-4444-555555555555",
+            &format!("11111111-2222-3333-4444-{index:012}"),
+        );
+        fs::write(&path, &payload).expect("write trajectory sidecar");
         planted.push(path);
     }
     with_home(&home, || {

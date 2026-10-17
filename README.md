@@ -307,6 +307,18 @@ buckets as the estimate formula (input/output/cache-write/cache-read), so
 and a 1h-dominated gateway block can suppress less than its true catalog
 cost — the counter is a lower bound until tier-aware pricing lands (rm-176).
 
+<a id="pricing"></a>
+
+### Pricing
+
+Every session is priced from the vendored pricing-catalog snapshots bundled
+with the binary — a snapshot model, so reports are reproducible offline and
+`--update-pricing` is what moves the snapshot (it refreshes from the upstream
+sources, then reports the drift). Per-model rate overrides ride
+`pricing-overrides.json` (see the sample above) with the precedence chain
+`--pricing-file` > config files > `AGENTTRACE_PRICING_FILE`; every guide
+that mentions pricing links here.
+
 ### Flags go before the session path
 
 `agenttrace` keeps Go-`flag`-compatible argument parsing: option flags are

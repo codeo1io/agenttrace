@@ -91,6 +91,13 @@ pub struct DoctorReport {
     /// matched the discovery glob.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sqlite_duplicate_dbs: Vec<crate::sqlite_sessions::SqliteDuplicateDb>,
+    /// rm-1886 (run 77ca5de0 cycle 5, "count-honesty ledger"): first
+    /// content-duplicate pairs suppressed at admission, rendered
+    /// `survivor <- suppressed copy` — capped at five, the exact count
+    /// rides `disclosures["duplicate_session_files"]`. Empty when no
+    /// byte-identical copies were found.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_session_file_pairs: Vec<String>,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
     /// `agenttrace statusline` has been configured as the statusLine
@@ -173,6 +180,10 @@ pub fn render_doctor_report(
 /// rm-548: the JSON storage lane's opencode fork-exclusion count (fork
 /// copies dropped from the auto-discovery inventory) rides here too,
 /// so the doctor discloses the same exclusion the loader does.
+/// rm-1887/rm-1886 (run 77ca5de0 cycle 5, "count-honesty ledger"):
+/// the aggregation admission classes the loader suppressed ride here
+/// too — artifact mirrors skipped, content duplicates deduped — so
+/// doctor and loader agree on what the corpus excludes.
 struct DoctorDiscovery {
     cache: SessionCacheReport,
     cache_size_bytes: u64,
@@ -180,6 +191,9 @@ struct DoctorDiscovery {
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
     opencode_fork_excluded: usize,
+    subagent_artifact_files: usize,
+    duplicate_session_files: usize,
+    duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -207,16 +221,22 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
+            subagent_artifact_files: 0,
+            duplicate_session_files: 0,
+            duplicate_session_file_pairs: Vec::new(),
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, opencode_fork_excluded) = if dir.is_none() {
+    let (files, suppressed) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
-        (find_session_files(dir), 0)
+        (
+            find_session_files(dir),
+            crate::discovery::SuppressedSessions::default(),
+        )
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
@@ -243,7 +263,10 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         files,
         sessions,
         sqlite_ingest,
-        opencode_fork_excluded,
+        opencode_fork_excluded: suppressed.opencode_fork_excluded,
+        subagent_artifact_files: suppressed.subagent_artifact_files,
+        duplicate_session_files: suppressed.duplicate_session_files,
+        duplicate_session_file_pairs: suppressed.duplicate_session_file_pairs,
     }
 }
 
@@ -255,6 +278,9 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        subagent_artifact_files,
+        duplicate_session_files,
+        duplicate_session_file_pairs,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -300,6 +326,24 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             opencode_fork_excluded_total,
         );
     }
+    // rm-1887: same-key discipline for the artifact-mirror skip — the
+    // loader's LoadReport counter and the doctor's disclosure must
+    // agree, so the spend reads "skipped, not zero" on both surfaces.
+    if subagent_artifact_files > 0 {
+        disclosures.insert(
+            "subagent_artifact_files".to_string(),
+            subagent_artifact_files,
+        );
+    }
+    // rm-1886: content-duplicate suppression, same-key discipline; the
+    // named pairs ride their own field (capped at five, the count stays
+    // exact) so the disclosure stays a counter map.
+    if duplicate_session_files > 0 {
+        disclosures.insert(
+            "duplicate_session_files".to_string(),
+            duplicate_session_files,
+        );
+    }
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -320,6 +364,13 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions: files.len() + sessions.len(),
         session_files: files.len(),
         sqlite_duplicate_dbs: sqlite_ingest.duplicate_dbs,
+        duplicate_session_file_pairs: duplicate_session_file_pairs
+            .iter()
+            .take(5)
+            .map(|(survivor, suppressed)| {
+                format!("{} <- {}", survivor.display(), suppressed.display())
+            })
+            .collect(),
         project_decode,
         zero_usage,
         disclosures,
@@ -623,9 +674,14 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
+fn find_reportable_session_files(
+    dir: Option<&Path>,
+) -> (Vec<PathBuf>, crate::discovery::SuppressedSessions) {
     if dir.is_some() {
-        return (find_session_files(dir), 0);
+        return (
+            find_session_files(dir),
+            crate::discovery::SuppressedSessions::default(),
+        );
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
     // inventory aggregates through the SAME loader primitive the CLI
@@ -641,12 +697,11 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, opencode_fork_excluded) =
-        crate::discovery::find_session_files_cached(None, &mut cache, true);
+    let (files, suppressed) = crate::discovery::find_session_files_cached(None, &mut cache, true);
     // A cache write failure must never fail the doctor (the cache is
     // an optimization; the inventory answer is already correct).
     let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, opencode_fork_excluded)
+    (files, suppressed)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite
@@ -1090,6 +1145,27 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
             duplicate_paths.join(", ")
         ));
     }
+    // rm-1887: artifact mirrors skipped from aggregation are disclosed
+    // so their child spend reads "skipped, not zero" — the parent
+    // rollup lane does not attribute it, and a reader should learn
+    // WHY the corpus shrank instead of trusting a silent drop.
+    if let Some(&count) = report.disclosures.get("subagent_artifact_files") {
+        if count > 0 {
+            recommendations.push(format!(
+                "{} pi-subagents artifact file(s) were skipped: each mirrors child spend its parent session already owns, so counting them would double-bank. Delete stale subagent-artifacts subtrees you no longer need.",
+                count
+            ));
+        }
+    }
+    // rm-1886: byte-identical journal copies suppressed at admission.
+    if let Some(&count) = report.disclosures.get("duplicate_session_files") {
+        if count > 0 {
+            recommendations.push(format!(
+                "{} byte-identical session file copy/copies were counted once (content signature match); keep ONE canonical copy per journal so tooling that ignores content identity stays honest.",
+                count
+            ));
+        }
+    }
     if demo {
         recommendations.push(
             "Demo sessions are bundled in memory, so cache reuse does not apply in this mode."
@@ -1207,6 +1283,21 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
                     guard_formula_cell(&db.path),
                     db.duplicate_sessions
                 ))
+                .collect::<String>()
+        ));
+    }
+    if !report.duplicate_session_file_pairs.is_empty() {
+        out.push_str(&format!(
+            "Duplicate session files (rm-1886): {}\n{}",
+            report
+                .disclosures
+                .get("duplicate_session_files")
+                .copied()
+                .unwrap_or(report.duplicate_session_file_pairs.len()),
+            report
+                .duplicate_session_file_pairs
+                .iter()
+                .map(|pair| format!("    {}\n", guard_formula_cell(pair)))
                 .collect::<String>()
         ));
     }
