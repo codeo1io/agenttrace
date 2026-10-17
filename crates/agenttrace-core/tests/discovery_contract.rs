@@ -2561,7 +2561,7 @@ fn rust_discovers_antigravity_conversation_sidecars_but_not_the_store() {
     .expect("write trajectory sidecar");
     fs::write(
         conversations.join("store.db"),
-        b"SQLite format 3 binary store",
+        b"SQLite format 3binary store",
     )
     .expect("write sqlite store");
     fs::write(conversations.join("blob.pb"), b"protobuf bytes").expect("write pb blob");
@@ -3289,6 +3289,7 @@ fn symlinked_session_file_aliases_across_directories_are_collected_once() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)] // hardlinks + /-split path expectations; Windows aliasing semantics differ
 #[test]
 fn hardlinked_session_file_aliases_are_collected_once() {
     // Canonical paths differ for hardlinks; only the shared inode makes
@@ -3852,6 +3853,7 @@ fn seed_opencode_storage_forks(home: &std::path::Path) -> std::path::PathBuf {
         .join("storage")
 }
 
+#[cfg(unix)] // hardlinks + /-split path expectations; Windows aliasing semantics differ
 #[test]
 fn opencode_json_fork_copies_excluded_from_aggregation_and_disclosed() {
     let root = temp_root("agenttrace-opencode-fork-json");
@@ -4373,6 +4375,7 @@ fn warm_replay_revalidates_file_kind_for_stored_listings() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)] // hardlinks + /-split path expectations; Windows aliasing semantics differ
 #[test]
 fn antigravity_sibling_roots_are_discovered_and_disclosed() {
     // rm-947: the ecosystem-default antigravity root family (ccusage
@@ -4812,6 +4815,7 @@ fn cline_canonical_session_supersedes_legacy_task_dir_duplicate() {
     let _ = fs::remove_dir_all(&cache);
 }
 
+#[cfg(unix)] // relative-path composition vs component-splitting: drive-relative semantics differ on Windows
 #[test]
 fn cline_cli_gates_hold_for_relative_custom_dir_paths() {
     // rm-1881 arm b regression pin: the canonical-root gates must hold
@@ -4885,6 +4889,7 @@ fn cline_cli_gates_hold_for_relative_custom_dir_paths() {
     let _ = fs::remove_dir_all(&cache);
 }
 
+#[cfg(unix)] // relative-path composition vs component-splitting: drive-relative semantics differ on Windows
 #[test]
 fn cline_cli_gates_hold_for_a_relative_env_store_root() {
     // Review F2 regression pin: `CLINE_SESSION_DATA_DIR` can be typed
