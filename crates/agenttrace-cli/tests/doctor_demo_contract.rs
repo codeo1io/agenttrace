@@ -267,3 +267,117 @@ fn doctor_positional_path_is_honored_as_scan_root() {
     .ok();
     fs::remove_dir_all(&own_cache).ok();
 }
+
+#[test]
+fn doctor_json_lane_escapes_spoofing_controls_in_failure_samples() {
+    // rm-1917 (run 3f0151d0, assess cbe6c127 F1 PoC): the doctor
+    // `--format json` arm was the ONLY report emission skipping
+    // dispatch_sanitize, so a transcript-store filename carrying
+    // directional/invisible Cf controls (PoC corpus
+    // `bad<U+202E><U+2060>name.jsonl`) rode `failure_samples` raw —
+    // core doctor.rs pushes the unparsed file's path (:889) and the
+    // sqlite lanes' reason/sample strings (:983/:986) into the report,
+    // and serde leaves Cf chars unescaped, so the machine-readable
+    // document reordered adjacent text in every downstream renderer
+    // while the text lane already substituted U+FFFD. The arm now
+    // routes BOTH stdout and the `-o` artifact through the dispatch
+    // choke point: json mode composes escape_spoofing_json — lossless
+    // (`\uXXXX` decodes back to the exact char, pinned below) and a
+    // no-op for clean names (the fast-path pin at the end).
+    let root = std::env::temp_dir().join(format!("at-rm1917-cli-{}", std::process::id()));
+    let home = root.join("home");
+    let cache = root.join("cache");
+    let corpus = root.join("corpus");
+    fs::create_dir_all(&home).expect("home dir");
+    fs::create_dir_all(&cache).expect("cache dir");
+    fs::create_dir_all(&corpus).expect("corpus dir");
+    // A file whose NAME carries the PoC controls and whose body cannot
+    // parse: the doctor records the path in failure_samples.
+    let poisoned_name = format!("bad\u{202E}\u{2060}name-{}.jsonl", std::process::id());
+    fs::write(corpus.join(&poisoned_name), "not a journal\n").expect("plant poisoned name");
+    // Control: a clean-named unparsable file must ride VERBATIM —
+    // clean documents stay byte-identical under the escape.
+    fs::write(corpus.join("clean-bad.jsonl"), "not a journal\n").expect("plant clean name");
+    let clean_path = corpus.join("clean-bad.jsonl").to_string_lossy().to_string();
+    let artifact = root.join("doctor.json");
+
+    let run = |format: &str, out: Option<&Path>| -> (Option<i32>, String, String) {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+        cmd.arg("--doctor")
+            .arg("-f")
+            .arg(format)
+            .arg("--dir")
+            .arg(&corpus)
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", &cache)
+            .env_remove("AGENTTRACE_SESSION_CACHE_DIR")
+            .env_remove("XDG_CONFIG_HOME");
+        if let Some(path) = out {
+            cmd.arg("-o").arg(path);
+        }
+        let output = cmd.output().expect("spawn agenttrace");
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).expect("utf8 stdout"),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+
+    // stdout + `-o` artifact: no raw Cf control, the lossless escape
+    // text present, the document still parses, and the sample DECODES
+    // back to the exact poisoned path.
+    let (code, stdout, stderr) = run("json", Some(&artifact));
+    assert_eq!(Some(0), code, "doctor failed: {stderr}");
+    assert!(!stdout.contains('\u{202E}'), "raw RLO rode the json lane");
+    assert!(!stdout.contains('\u{2060}'), "raw WJ rode the json lane");
+    assert!(
+        stdout.contains("\\u202E") && stdout.contains("\\u2060"),
+        "the lossless escape text must carry the poisoned name: {stdout}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("escaped doctor json still parses");
+    let samples: Vec<String> = report["directories"]
+        .as_array()
+        .expect("directories")
+        .iter()
+        .flat_map(|dir| {
+            dir["failure_samples"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|sample| sample.as_str().map(str::to_string))
+        })
+        .collect();
+    let expected = corpus.join(&poisoned_name).to_string_lossy().to_string();
+    assert!(
+        samples.iter().any(|sample| sample == &expected),
+        "the sample must decode back to the exact path (lossless): {samples:?} vs {expected:?}"
+    );
+    let artifact_text = fs::read_to_string(&artifact).expect("read -o artifact");
+    assert!(
+        !artifact_text.contains('\u{202E}') && !artifact_text.contains('\u{2060}'),
+        "the -o artifact carried a raw Cf control"
+    );
+    assert!(
+        artifact_text.contains("\\u202E"),
+        "the -o artifact must carry the escape text too (rm-656 embedding lane)"
+    );
+    // Fast path: the clean sample rides verbatim — escaping never
+    // touches clean strings, so clean output stays byte-identical.
+    assert!(
+        stdout.contains(clean_path.as_str()),
+        "clean names must ride the json lane verbatim: {stdout}"
+    );
+
+    // Contrast pin: the text lane keeps its landed rm-936 behavior —
+    // substitution, not escapes (this batch must not touch it).
+    let (code, text, _) = run("text", None);
+    assert_eq!(Some(0), code, "doctor text lane must succeed");
+    assert!(!text.contains('\u{202E}'), "raw RLO rode the text lane");
+    assert!(
+        text.contains('\u{FFFD}'),
+        "text lane substitutes U+FFFD (rm-936, unchanged)"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
