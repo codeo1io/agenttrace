@@ -2564,6 +2564,16 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
         use std::os::unix::fs::FileTypeExt;
         if let Ok(meta) = fs::symlink_metadata(target) {
             let kind = meta.file_type();
+            // rm-534 rider: `-o <dir>` must refuse with the truthful cause.
+            // Without this arm the refusal fell through to the regular-file
+            // lane and rendered EISDIR as "Permission denied (os error 13)".
+            if kind.is_dir() {
+                bail!(
+                    "refusing to write -o {}: it is a directory; pass a file \
+                     path instead",
+                    requested.display()
+                );
+            }
             if kind.is_fifo() || kind.is_socket() || kind.is_block_device() {
                 bail!(
                     "refusing to write -o {}: it is a fifo/socket/block device; \

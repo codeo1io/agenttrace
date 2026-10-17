@@ -27,6 +27,11 @@ pub struct TranscriptScanSummary {
     pub files_considered: usize,
     pub scanned_files: usize,
     pub scanned_bytes: u64,
+    /// rm-1872 residual arm: files whose raw bytes carried the zstd frame
+    /// magic and were decoded before the text scan. `scanned_bytes` counts
+    /// DECODED bytes, not disk bytes, so compressed sessions report the
+    /// text size actually searched.
+    pub scanned_compressed: usize,
     pub skipped_missing: usize,
     pub skipped_unreadable: usize,
     pub skipped_oversized: usize,
@@ -42,6 +47,7 @@ impl TranscriptScanSummary {
             files_considered: 0,
             scanned_files: 0,
             scanned_bytes: 0,
+            scanned_compressed: 0,
             skipped_missing: 0,
             skipped_unreadable: 0,
             skipped_oversized: 0,
@@ -62,6 +68,12 @@ impl TranscriptScanSummary {
             "{} file(s) scanned ({} bytes)",
             self.scanned_files, self.scanned_bytes
         )];
+        if self.scanned_compressed > 0 {
+            parts.push(format!(
+                "{} compressed (zstd-decoded)",
+                self.scanned_compressed
+            ));
+        }
         for (label, count) in [
             ("missing", self.skipped_missing),
             ("unreadable", self.skipped_unreadable),
@@ -327,6 +339,7 @@ fn write_transcript_summary_json(out: &mut String, scan: &TranscriptScanSummary)
         ("files_considered", scan.files_considered.to_string()),
         ("scanned_files", scan.scanned_files.to_string()),
         ("scanned_bytes", scan.scanned_bytes.to_string()),
+        ("scanned_compressed", scan.scanned_compressed.to_string()),
         ("skipped_missing", scan.skipped_missing.to_string()),
         ("skipped_unreadable", scan.skipped_unreadable.to_string()),
         ("skipped_oversized", scan.skipped_oversized.to_string()),
@@ -538,7 +551,22 @@ fn transcript_evidence(
     let read = bytes.len() as u64;
     *budget_left -= read;
     scan.scanned_files += 1;
-    scan.scanned_bytes += read;
+    // rm-1872 residual arm: decode compressed bytes before the text scan so
+    // search sees the same text the parse lane did. The budget above stays
+    // disk-bytes; the scanned counters below report decoded text bytes.
+    let was_compressed = bytes.starts_with(&crate::parser::ZSTD_FRAME_MAGIC);
+    let bytes = match crate::parser::decode_session_bytes_if_zstd(bytes, path) {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            scan.skipped_unreadable += 1;
+            scan.scanned_files -= 1;
+            return (Vec::new(), "skipped: unreadable (zstd decode)".to_string());
+        }
+    };
+    if was_compressed {
+        scan.scanned_compressed += 1;
+    }
+    scan.scanned_bytes += bytes.len() as u64;
 
     // Lossy decode: a torn multibyte tail must not abort the scan.
     let content = String::from_utf8_lossy(&bytes);
