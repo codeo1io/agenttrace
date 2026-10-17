@@ -8,7 +8,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 68;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 69;
+// Bumped 68 -> 69 (run 4eeea89188b245068a569ba76f8caa71 cycle 2
+// "truth of the default surfaces", rm-1553: the claude identity
+// capture (orgIdentifier/loginEmail) is now capped at capture
+// (SESSION_IDENTITY_BYTE_CAP, parser.rs) with an org_truncated:*
+// disclosure counter riding the session_meta carrier. Cached rows
+// written before this rung may hold UNCAPPED org strings — the bump
+// regenerates them so a warm row can never serve an unbounded key a
+// re-parse would cap. (If the fleet ceiling has moved above 68 by
+// the commit gate, re-mint this rung above the ceiling per the
+// landed-rung convention below.)
 // Bumped 67 -> 68 (integration of run 4f2af62e5b7e4541be0a73d732be56d9
 // cycle 1 "Claude org-dimension truth", rm-1405 LEAD reap + attribution
 // separation; candidate 915ddbb @ base dade9cd, conflict case

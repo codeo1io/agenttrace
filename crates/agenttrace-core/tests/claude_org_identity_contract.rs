@@ -106,6 +106,56 @@ fn no_org_corpus_is_zero_delta() {
     );
 }
 
+/// rm-1553: a hostile journal must not pin unbounded org identity
+/// strings onto `Session` — the capture caps at capture
+/// (SESSION_IDENTITY_BYTE_CAP) and discloses per field via
+/// org_truncated:* counters on the same carrier. Zero-noise: sane
+/// identities cap nothing and mint no counters (asserted on the
+/// healthy fixture below).
+#[test]
+fn hostile_org_identity_is_capped_and_disclosed() {
+    // Same envelope shape as the fixtures, with a multi-megabyte
+    // orgIdentifier and loginEmail — built inline, never on disk.
+    let hostile_org = "x".repeat(5 * 1024 * 1024);
+    let hostile_email = "y".repeat(5 * 1024 * 1024);
+    let raw = format!(
+        "{{\"session\":{{\"identity\":{{\"orgIdentifier\":\"{hostile_org}\",\"loginEmail\":\"{hostile_email}\"}},\"cwd\":\"/work/projects/shared\"}},\"type\":\"user\",\"timestamp\":\"2026-10-17T10:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"
+    );
+    let hostile_session = session("hostile-org.jsonl", &raw);
+    assert!(
+        !hostile_session.org.is_empty() && hostile_session.org.len() <= 4096,
+        "org identity must be captured but bounded, got {} bytes",
+        hostile_session.org.len()
+    );
+    assert!(
+        !hostile_session.org_email.is_empty() && hostile_session.org_email.len() <= 4096,
+        "loginEmail must be captured but bounded, got {} bytes",
+        hostile_session.org_email.len()
+    );
+    let counters = &hostile_session.metrics.disclosure_counters;
+    assert_eq!(
+        counters.get("org_truncated:org:claude"),
+        Some(&1),
+        "org truncation must be disclosed on the carrier"
+    );
+    assert_eq!(
+        counters.get("org_truncated:email:claude"),
+        Some(&1),
+        "email truncation must be disclosed on the carrier"
+    );
+
+    // Zero-noise control: the healthy fixture caps nothing.
+    let healthy = session("org-9f2a-example.jsonl", ORG_ALPHA);
+    let healthy_counters = &healthy.metrics.disclosure_counters;
+    assert_eq!(
+        healthy_counters.get("org_truncated:org:claude"),
+        None,
+        "sane identity must mint no truncation counter"
+    );
+    assert_eq!(healthy_counters.get("org_truncated:email:claude"), None);
+    assert_eq!(healthy.org, "org-9f2a-example");
+}
+
 #[test]
 fn report_renders_by_org_when_present() {
     let alpha = session("org-9f2a-example", ORG_ALPHA);

@@ -2895,11 +2895,16 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         // disclosure-worthy gap; the disclosure counter
         // `claude_org_identity:*` (journal basis vs config-dir
         // fallback) carries that signal instead. Sessions and cost
-        // only, like by_branch.
+        // only, like by_branch — including the rm-1500 skip-while-counting
+        // discipline: a non-finite session cost is counted in
+        // non_finite_costs and skipped, never folded into the org bucket
+        // (rm-1549).
         if !session.org.is_empty() {
             let org_entry = overview.by_org.entry(session.org.clone()).or_default();
             org_entry.sessions += 1;
-            org_entry.cost += session.metrics.cost_estimated;
+            if cost_finite {
+                org_entry.cost += session_cost;
+            }
         }
 
         for anomaly in &session.anomalies {

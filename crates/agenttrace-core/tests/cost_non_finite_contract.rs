@@ -89,6 +89,54 @@ fn non_finite_cost_is_excluded_from_every_group_fold() {
     }
 }
 
+/// rm-1549: the by_org facet follows the same skip-while-counting
+/// discipline as every other cost facet — a poisoned session must not
+/// poison its org bucket, and healthy spend in the same org stays visible.
+#[test]
+fn non_finite_cost_is_excluded_from_by_org_fold() {
+    let mut sessions = demo_sessions().expect("demo sessions parse");
+    let idx = sessions.len() - 1;
+    let healthy_cost = sessions[idx].metrics.cost_estimated;
+    assert!(
+        healthy_cost.is_finite(),
+        "demo corpus must have finite costs to poison"
+    );
+    // Pin an org onto the poisoned session and (when the corpus allows) a
+    // healthy sibling in the SAME org, so the bucket provably mixes the two.
+    let sibling = idx.saturating_sub(1);
+    sessions[idx].org = "acme".to_string();
+    let (expected_sessions, expected_cost) = if sibling != idx {
+        sessions[sibling].org = "acme".to_string();
+        (2, sessions[sibling].metrics.cost_estimated)
+    } else {
+        (1, 0.0)
+    };
+    sessions[idx].metrics.cost_estimated = f64::NAN;
+
+    let overview = compute_overview(&sessions);
+    assert_eq!(
+        overview.non_finite_costs, 1,
+        "the poisoned org session must be counted, not silently dropped"
+    );
+    for (name, group) in overview.by_org.iter() {
+        assert!(
+            group.cost.is_finite(),
+            "by_org[{name}] folded a non-finite cost ({})",
+            group.cost
+        );
+    }
+    let acme = overview.by_org.get("acme").expect("org bucket must exist");
+    assert_eq!(
+        acme.sessions, expected_sessions,
+        "both org-carrying sessions must be counted"
+    );
+    assert!(
+        (acme.cost - expected_cost).abs() < 1e-9,
+        "by_org['acme'] must carry only the finite sibling spend ({expected_cost}), got {}",
+        acme.cost
+    );
+}
+
 #[test]
 fn format_cost_renders_non_finite_as_a_null_marker_not_zero() {
     for poisoned in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {

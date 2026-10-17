@@ -22,7 +22,7 @@
 //! home first (doctor_honesty_contract.rs `with_home` pattern), so no
 //! fixture entry can reach the operator's real cache.
 
-use agenttrace_core::build_doctor_report;
+use agenttrace_core::{build_doctor_report, doctor_report_text};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -205,6 +205,96 @@ fn root_size_cap_keeps_first_file_and_discloses_the_rest() {
             .expect("scan_partial disclosure");
         assert_eq!(partial.files_skipped_size, 1);
     });
+}
+
+#[test]
+fn budget_truncated_scan_discloses_on_the_text_lane() {
+    // rm-1550: the TEXT renderer (the CLI's DEFAULT format) must
+    // disclose truncation with the same facts the JSON lane carries —
+    // a truncated scan previously presented partial counts as
+    // complete on plain `--doctor` (no `-f json`). Zero-noise pairing:
+    // a healthy scan renders with none of the disclosure lines, so
+    // clean-env gate outputs stay byte-identical.
+    let home = temp_home("textdisclose");
+    let corpus = planted_two_file_corpus("textdisclose");
+    with_home_and_budget(&home, &[("AGENTTRACE_DOCTOR_ROOT_BUDGET_MS", "0")], || {
+        let report = build_doctor_report(Some(&corpus), false);
+        let partial = report
+            .scan_partial
+            .as_ref()
+            .expect("scan_partial disclosure");
+        assert_eq!(partial.files_skipped_budget, 2, "budget skipped both files");
+        let text = doctor_report_text(&report);
+        assert!(
+            text.contains("Scan budget: TRUNCATED"),
+            "text lane names the truncation: {text}"
+        );
+        assert!(
+            text.contains("partial, not complete"),
+            "counts are framed as partial: {text}"
+        );
+        assert!(
+            text.contains("2 skipped on root budget"),
+            "the skip fact is visible: {text}"
+        );
+    });
+    with_home_and_budget(&home, &[], || {
+        let report = build_doctor_report(Some(&corpus), false);
+        assert!(
+            report.scan_partial.is_none(),
+            "healthy scan has no truncation"
+        );
+        let text = doctor_report_text(&report);
+        assert!(!text.contains("Scan budget"), "zero-noise on healthy scans");
+        assert!(!text.contains("TRUNCATED"));
+        assert!(!text.contains("partial, not complete"));
+    });
+}
+
+#[test]
+fn unparsable_budget_knob_discloses_the_fallback_on_both_lanes() {
+    // rm-1554: a typo'd AGENTTRACE_DOCTOR_* value must disclose the
+    // variable name and the raw value on the disclosures surface
+    // (rendered on BOTH the text and JSON lanes) instead of silently
+    // running the default — the operator asking for a tighter or
+    // looser bound gets the truth. Valid and unset knobs stay
+    // byte-identical (zero-noise pairing below).
+    //
+    // Pin lives here rather than doctor_honesty_contract.rs because
+    // this file's harness already owns the AGENTTRACE_DOCTOR_* key
+    // list under the env lock (a knob mutation in the honesty file
+    // would race its sibling builds).
+    let home = temp_home("envfallback");
+    with_home_and_budget(&home, &[("AGENTTRACE_DOCTOR_DB_BUDGET_MS", "25s")], || {
+        let report = build_doctor_report(None, false);
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            json.contains("doctor_env_fallback:AGENTTRACE_DOCTOR_DB_BUDGET_MS=25s"),
+            "JSON discloses the knob and the raw value: {json}"
+        );
+        let text = doctor_report_text(&report);
+        assert!(
+            text.contains("doctor_env_fallback:AGENTTRACE_DOCTOR_DB_BUDGET_MS=25s"),
+            "text lane (the CLI default) discloses it too: {text}"
+        );
+        let count = report
+            .disclosures
+            .get("doctor_env_fallback:AGENTTRACE_DOCTOR_DB_BUDGET_MS=25s")
+            .copied();
+        assert_eq!(count, Some(1), "one read of this knob per pass");
+    });
+    with_home_and_budget(
+        &home,
+        &[("AGENTTRACE_DOCTOR_DB_BUDGET_MS", "25000")],
+        || {
+            let report = build_doctor_report(None, false);
+            let json = serde_json::to_string(&report).expect("serialize");
+            assert!(
+                !json.contains("doctor_env_fallback"),
+                "valid knobs stay silent: {json}"
+            );
+        },
+    );
 }
 
 #[test]
