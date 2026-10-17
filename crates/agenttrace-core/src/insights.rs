@@ -295,7 +295,32 @@ fn resolved_from_path(raw: &str) -> ProjectIdentity {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("unknown")
         .to_string();
-    let root = root.to_string_lossy().to_string();
+    // '/'-joined identity: platform-stable project ids (a unix-recorded
+    // corpus replayed on windows must not grow backslash ids). RootDir
+    // renders as the leading '/' (never doubled); prefix components keep
+    // their own spelling (C:\, \\?\C:\).
+    let root = {
+        let mut text = String::new();
+        for component in root.components() {
+            match component {
+                std::path::Component::RootDir => {
+                    if !text.ends_with('/') {
+                        text.push('/');
+                    }
+                }
+                _ => {
+                    let part = component.as_os_str().to_string_lossy();
+                    if !part.is_empty() {
+                        if !text.is_empty() && !text.ends_with('/') {
+                            text.push('/');
+                        }
+                        text.push_str(&part);
+                    }
+                }
+            }
+        }
+        text
+    };
     ProjectIdentity {
         id: root.clone(),
         display_name,
