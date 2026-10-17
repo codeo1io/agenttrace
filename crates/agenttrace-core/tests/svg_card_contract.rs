@@ -176,11 +176,32 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
     );
     // The demo corpus's fixed timestamps are far from today; if the card
     // were anchored to `Utc::now()` today's date would leak in.
+    // rm-176 cure (2026-10-17): the pricing footer legitimately stamps the
+    // BUNDLED snapshot date — data metadata, deterministic per bundle, not
+    // wall-clock. Strip that one token before the leak assertion so a
+    // same-day snapshot refresh cannot false-trip the corpus-clock contract.
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     assert!(
-        !card.contains(&today),
+        !strip_snapshot_date(&card).contains(&today),
         "wall-clock date leaked into a corpus-anchored card"
     );
+}
+
+// Replaces each `snapshot <date>` token (pricing footer) with a fixed
+// placeholder. The snapshot date is a property of the bundled catalog, so
+// it is exempt from the wall-clock leak check; every other date in the card
+// (axis ticks, sparkline anchors) remains guarded.
+fn strip_snapshot_date(svg: &str) -> String {
+    const MARKER: &str = "snapshot ";
+    let mut out = svg.to_string();
+    while let Some(i) = out.find(MARKER) {
+        let rest = &out[i + MARKER.len()..];
+        match rest.find(" (") {
+            Some(j) => out.replace_range(i..i + MARKER.len() + j, "snapshot <date>"),
+            None => break,
+        }
+    }
+    out
 }
 
 #[test]
