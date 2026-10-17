@@ -4453,3 +4453,125 @@ fn antigravity_sibling_roots_are_discovered_and_disclosed() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+/// rm-1541 (run 480d4916 cycle 1): codex stable >=0.162 migrates cold
+/// rollouts under `~/.codex/{sessions,archived_sessions}` to
+/// `.jsonl.zst` (ccusage #1890; migration live since the 2026-10-14
+/// codex update), while `is_session_file_name` admitted only
+/// `.jsonl`/`.json` — the default walk stood in the migrated file's own
+/// directory and dropped it BY NAME, silently shorting every scan. The
+/// admission is scoped to codex-family walk roots (a `.codex` path
+/// component or a walk root under a registered Codex dir): never a
+/// global relaxation. Session names derive from the base path, so a
+/// rollout keeps its identity across the migration (ccusage precedent:
+/// IDs use the plain `.jsonl` path).
+#[test]
+fn codex_zst_migrated_rollouts_are_admitted_with_stable_names() {
+    let stem = "rollout-2026-10-16-101530-a1b2c3";
+    let pair_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-zstd/migrated-pair");
+    let plain = pair_dir.join(format!("{stem}.jsonl"));
+    let migrated = pair_dir.join(format!("{stem}.jsonl.zst"));
+    let migrated_bytes = fs::read(&migrated).expect("read migrated fixture");
+    assert_eq!(
+        &migrated_bytes[..4],
+        &[0x28, 0xB5, 0x2F, 0xFD],
+        "fixture guard: the migrated twin must really be a zstd frame"
+    );
+
+    let root = temp_root("agenttrace-codex-zst-admission");
+    let codex_day = root
+        .join("home")
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("10")
+        .join("16");
+    fs::create_dir_all(&codex_day).expect("create codex session day dir");
+    fs::copy(&plain, codex_day.join(format!("{stem}.jsonl"))).expect("seed plain rollout");
+    fs::copy(&migrated, codex_day.join(format!("{stem}.jsonl.zst")))
+        .expect("seed migrated rollout");
+
+    with_home_and_cache(&root.join("home"), &root.join("cache"), || {
+        // Explicit walk over the codex tree: discovery must admit BOTH
+        // files (2 rows post-fix; at base the migrated twin is dropped
+        // by name and this yields 1).
+        let sessions =
+            load_sessions_from_dir(Some(&root.join("home").join(".codex").join("sessions")));
+        assert_eq!(
+            sessions.len(),
+            2,
+            "the migrated .jsonl.zst twin must be admitted alongside the plain rollout: {:?}",
+            sessions.iter().map(|s| s.path.clone()).collect::<Vec<_>>()
+        );
+        // Identity across the migration: same stem, same session name —
+        // the .jsonl.zst tail leaves no residual `.jsonl` behind.
+        for session in &sessions {
+            assert_eq!(
+                session.name, stem,
+                "both spellings derive the pre-migration stem: {}",
+                session.path
+            );
+        }
+        // The compressed lane discloses its hit on the migrated row —
+        // visible, not silent.
+        let zst_row = sessions
+            .iter()
+            .find(|s| s.path.ends_with(".jsonl.zst"))
+            .expect("the migrated row carries its real path");
+        assert_eq!(
+            zst_row
+                .metrics
+                .disclosure_counters
+                .get("codex_compressed_rollouts_decoded"),
+            Some(&1),
+            "compressed admission is disclosed: {:?}",
+            zst_row.metrics.disclosure_counters
+        );
+
+        // rm-1541 coverage leg: a walk rooted ABOVE `.codex` (e.g.
+        // `-d $HOME`) inherits the family flag on descent — the migrated
+        // twin nested under a registered Codex root (archived_sessions,
+        // within the generic 4-deep budget) is admitted there too.
+        let archived = root.join("home").join(".codex").join("archived_sessions");
+        fs::create_dir_all(&archived).expect("create codex archived_sessions dir");
+        fs::copy(&plain, archived.join(format!("{stem}.jsonl")))
+            .expect("seed archived plain rollout");
+        fs::copy(&migrated, archived.join(format!("{stem}.jsonl.zst")))
+            .expect("seed archived migrated rollout");
+        let nested = load_sessions_from_dir(Some(&root.join("home")));
+        assert_eq!(
+            nested.len(),
+            2,
+            "a walk over the whole home still admits both twins through the nested .codex tree: {:?}",
+            nested.iter().map(|s| s.path.clone()).collect::<Vec<_>>()
+        );
+        for session in &nested {
+            assert_eq!(
+                session.name, stem,
+                "the nested walk derives the same stem: {}",
+                session.path
+            );
+        }
+    });
+
+    // Scope guard: the extension is scoped to codex-family roots, never
+    // a global relaxation — a `.jsonl.zst` under a non-codex tree (here a
+    // pi-shaped sessions dir) stays invisible to the walk.
+    let other = root
+        .join("other-home")
+        .join(".pi")
+        .join("agent")
+        .join("sessions");
+    fs::create_dir_all(&other).expect("create non-codex sessions dir");
+    fs::copy(&migrated, other.join(format!("{stem}.jsonl.zst"))).expect("seed non-codex zst");
+    let admitted = find_session_files(Some(&root.join("other-home")));
+    assert!(
+        admitted
+            .iter()
+            .all(|path| !path.to_string_lossy().ends_with(".jsonl.zst")),
+        "non-codex roots must not admit .jsonl.zst: {admitted:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

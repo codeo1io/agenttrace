@@ -467,7 +467,15 @@ the config file or the `AGENTTRACE_SESSION_CACHE_ENTRIES` environment
 variable (both clamped to [1, 1,000,000], default 20,000) — `--doctor`
 discloses the bound actually in force, which layer supplied it, and how
 many session files the last scan re-parsed from source instead of the
-cache. Cache files are written owner-only (`0600` on Unix) and
+cache. `--doctor`'s own scan is budgeted so a huge corpus cannot wedge
+the probe: `AGENTTRACE_DOCTOR_ROOT_BUDGET_MS` (per-root wall clock,
+default 60,000), `AGENTTRACE_DOCTOR_ROOT_MAX_BYTES` (per-root bytes,
+default 536,870,912 = 512 MiB), `AGENTTRACE_DOCTOR_DB_BUDGET_MS` (per
+SQLite database, default 25,000), and `AGENTTRACE_DOCTOR_SQLITE_TOTAL_BUDGET_MS`
+(whole sqlite lane, default 90,000). Each budget that actually bound a
+scan is disclosed in the report, so a partial probe is visible — see
+[docs/maintainers/test-flake-prevention.md](docs/maintainers/test-flake-prevention.md)
+for the isolation guidance behind them. Cache files are written owner-only (`0600` on Unix) and
 compacted through transient `.tmp.<pid>.<seq>` siblings that the next cache
 load reclaims if a crash leaves one behind (see PRIVACY.md). The command
 never fails the host — bad or empty input still
