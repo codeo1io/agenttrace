@@ -1388,15 +1388,28 @@ fn open_code_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
 }
 
 fn cline_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
-    vec![KnownSessionDir {
-        name: "Cline".to_string(),
-        path: user_config_dir(home)
-            .join("Code")
-            .join("User")
-            .join("globalStorage")
-            .join("saoudrizwan.claude-dev")
-            .join("tasks"),
-    }]
+    vec![
+        KnownSessionDir {
+            name: "Cline".to_string(),
+            path: user_config_dir(home)
+                .join("Code")
+                .join("User")
+                .join("globalStorage")
+                .join("saoudrizwan.claude-dev")
+                .join("tasks"),
+        },
+        // rm-1435: the shipped cline CLI persisted store root (fixture
+        // `metadata.messagesPath`, cli-v3.0.73+ released 2026-10-17):
+        // `~/.cline/data/sessions/<id>/{session.json,<id>.messages.json}`.
+        // The store files parse through the same cline lane as the VS Code
+        // task dirs (file gate + `session.json` manifest fallback in
+        // parser.rs); filenames inside the id dirs are pinned upstream by
+        // the fixtures, and the generic walker admission reaches them.
+        KnownSessionDir {
+            name: "Cline".to_string(),
+            path: home.join(".cline").join("data").join("sessions"),
+        },
+    ]
 }
 
 fn user_config_dir(home: &Path) -> PathBuf {
