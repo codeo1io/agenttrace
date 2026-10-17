@@ -522,6 +522,38 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
                     opencode_admission.capped_bytes as usize,
                 );
             }
+            // fog rm-1871: transcripts dropped for read/decode/stat reasons
+            // count on the same rm-526 loss channel as the cap — a skip the
+            // doctor cannot distinguish from an empty dir is a hidden
+            // channel (assess corpus-f4: silent 150600 tokens).
+            if opencode_admission.unreadable_files > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_files_unreadable".to_string(),
+                    opencode_admission.unreadable_files,
+                );
+            }
+            if opencode_admission.undecodable_files > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_files_undecodable".to_string(),
+                    opencode_admission.undecodable_files,
+                );
+            }
+            // fog rm-1867: special files (fifo/device) rejected before the
+            // read so a size-0 entry can no longer wedge or unbound it.
+            if opencode_admission.non_regular_files > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_files_nonregular".to_string(),
+                    opencode_admission.non_regular_files,
+                );
+            }
+            // fog rm-1870: fan-out ids rejected for containment — the
+            // transcripts they point at were never read.
+            if opencode_admission.unsafe_id_rejects > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_fanout_ids_rejected".to_string(),
+                    opencode_admission.unsafe_id_rejects,
+                );
+            }
             return Ok(session);
         }
         if let Some(events) = parse_cursor_export(&value) {
@@ -6443,14 +6475,26 @@ fn parse_opencode_storage_session(
     let storage_root = opencode_storage_root_from_session_file(path)
         .with_context(|| format!("opencode: unsupported storage path {path}"))?;
     let mut admission = OpencodeAdmissionStats::default();
-    let (mut messages, message_admission) =
-        read_opencode_records(&storage_root.join("message").join(session_id));
-    admission.accumulate(message_admission);
+    let mut messages = Vec::new();
+    if is_safe_opencode_id(session_id) {
+        let (read, message_admission) =
+            read_opencode_records(&storage_root.join("message").join(session_id));
+        messages = read;
+        admission.accumulate(message_admission);
+    } else {
+        // fog rm-1870 (id containment): the doc-supplied session id joins
+        // into the filesystem — an absolute or `..`-carrying id escapes the
+        // storage root (Path::join replaces the base for an absolute
+        // component), so a hostile id's fan-out is rejected and disclosed,
+        // never read.
+        admission.unsafe_id_rejects += 1;
+    }
     // rm-1437: an empty event set is expected when every transcript was
-    // stat-capped away — bail into the unsupported lane only when we have no
-    // such explanation, so a fully-capped session still parses and carries its
-    // disclosure instead of masquerading as a foreign format.
-    if messages.is_empty() && admission.capped_files == 0 {
+    // skipped for a disclosed reason (stat cap, unreadable/undecodable,
+    // non-regular, unsafe id) — bail into the unsupported lane only when we
+    // have no such explanation, so a fully-skipped session still parses and
+    // carries its disclosure instead of masquerading as a foreign format.
+    if messages.is_empty() && !admission.had_skips() {
         bail!("opencode: no messages found for session {}", session_id);
     }
     sort_opencode_records(&mut messages);
@@ -6484,7 +6528,7 @@ fn parse_opencode_storage_session(
     }
     // rm-1437: same relaxation as the messages gate — a fully stat-capped
     // corpus legitimately yields no parseable events; disclose, don't bail.
-    if body.is_empty() && admission.capped_files == 0 {
+    if body.is_empty() && !admission.had_skips() {
         bail!("opencode: no parseable events for session {}", session_id);
     }
 
@@ -6528,13 +6572,48 @@ fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
 struct OpencodeAdmissionStats {
     capped_files: usize,
     capped_bytes: u64,
+    /// fog rm-1867: fifo/device entries — size-0 special files that the stat
+    /// cap never sees; rejected before the read, never admitted.
+    non_regular_files: usize,
+    /// fog rm-1871: stat (dangling symlink, permissions) or read failures —
+    /// fail closed with a counter, never cap-passed via a zeroed length.
+    unreadable_files: usize,
+    /// fog rm-1871: files that read but did not decode as JSON objects.
+    undecodable_files: usize,
+    /// fog rm-1870: fan-out ids rejected for containment (absolute or
+    /// `..`-carrying) — their directories were never listed.
+    unsafe_id_rejects: usize,
 }
 
 impl OpencodeAdmissionStats {
     fn accumulate(&mut self, other: OpencodeAdmissionStats) {
         self.capped_files += other.capped_files;
         self.capped_bytes += other.capped_bytes;
+        self.non_regular_files += other.non_regular_files;
+        self.unreadable_files += other.unreadable_files;
+        self.undecodable_files += other.undecodable_files;
+        self.unsafe_id_rejects += other.unsafe_id_rejects;
     }
+
+    /// True when any fan-out record was skipped for a disclosed reason — an
+    /// empty event set is then explained, so the caller parses with its
+    /// disclosure instead of bailing into the unsupported lane.
+    fn had_skips(&self) -> bool {
+        self.capped_files > 0
+            || self.non_regular_files > 0
+            || self.unreadable_files > 0
+            || self.undecodable_files > 0
+            || self.unsafe_id_rejects > 0
+    }
+}
+
+/// fog rm-1870 (id containment): the storage fan-out joins doc-supplied ids
+/// into the filesystem (`message/<sessionID>`, `part/<msgID>`), and
+/// `Path::join` lets an ABSOLUTE component replace the base while `..`
+/// components walk out of the storage root. A fan-out id must therefore be
+/// a single path component: non-empty, no separators, not `.`/`..`.
+fn is_safe_opencode_id(id: &str) -> bool {
+    !id.is_empty() && !id.contains('/') && !id.contains('\\') && id != "." && id != ".."
 }
 
 /// rm-1437: per-file read cap for opencode message/part transcripts, mirroring
@@ -6557,16 +6636,41 @@ fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionS
         }
         // rm-1437: stat before read — over-cap transcripts are skipped and
         // disclosed instead of being admitted into memory.
-        let file_len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        //
+        // fog rm-1867 (regular-file-only admission): a fifo or device
+        // reports st_size 0 and sails under this stat cap — reading a fifo
+        // wedges the parse forever, and a device feeds it without bound
+        // (/dev/zero; the discovery walk already rejects this class). The
+        // metadata call follows symlinks, so a link to a regular transcript
+        // stays admitted, and it is taken ONCE — the length the cap checks
+        // is the length of the file that is then read.
+        //
+        // fog rm-1871 (fail-closed stat): a stat failure (dangling symlink,
+        // permissions) skips WITH a counter below — it must never cap-pass
+        // through a zeroed length.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            admission.unreadable_files += 1;
+            continue;
+        };
+        if !meta.is_file() {
+            admission.non_regular_files += 1;
+            continue;
+        }
+        let file_len = meta.len();
         if file_len > OPENCODE_TRANSCRIPT_READ_CAP_BYTES {
             admission.capped_files += 1;
             admission.capped_bytes += file_len;
             continue;
         }
         let Ok(raw) = std::fs::read_to_string(&path) else {
+            // fog rm-1871: unreadable after admission — count, never drop
+            // silently.
+            admission.unreadable_files += 1;
             continue;
         };
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&raw) else {
+            // fog rm-1871: undecodable — count, never drop silently.
+            admission.undecodable_files += 1;
             continue;
         };
         records.push(OpenCodeRecord { path, doc });
@@ -6593,8 +6697,21 @@ fn parse_opencode_message(
     let role = string(msg.get("role")).unwrap_or("");
     let ts = opencode_time_from_map(msg.get("time"), &["created", "start"]);
     let msg_id = string(msg.get("id")).unwrap_or("");
-    let (mut parts, part_admission) =
-        read_opencode_records(&storage_root.join("part").join(msg_id));
+    // fog rm-1870 (id containment): the second hop joins the message's own
+    // id into `part/` — the same single-component rule as the session hop.
+    // An EMPTY id names no part directory at all (it would join the part
+    // root itself), so it simply does not fan out and discloses nothing.
+    let (mut parts, part_admission) = if is_safe_opencode_id(msg_id) {
+        read_opencode_records(&storage_root.join("part").join(msg_id))
+    } else {
+        (
+            Vec::new(),
+            OpencodeAdmissionStats {
+                unsafe_id_rejects: usize::from(!msg_id.is_empty()),
+                ..OpencodeAdmissionStats::default()
+            },
+        )
+    };
     admission.accumulate(part_admission);
     sort_opencode_records(&mut parts);
 

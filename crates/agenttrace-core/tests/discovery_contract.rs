@@ -500,12 +500,23 @@ fn unicode_escape_hostile_file_does_not_kill_directory_scans() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("testdata/generated/adversarial");
-    let sessions = load_sessions_from_dir(Some(&dir));
-    assert!(
-        sessions.len() >= 3,
-        "clean neighbors must survive a hostile unicode file, got {}",
-        sessions.len()
-    );
+    // This scan saves a session cache at the env-resolved path. Run it
+    // through with_session_cache like every other load_sessions_from_dir
+    // caller in this binary: without the env lock the save can land in a
+    // concurrently-running env-isolated test's cache dir (process-global
+    // env vars; the lock_env mutex only covers helper users) — observed
+    // as the adversarial fixtures merging into
+    // rust_writes_and_reuses_go_compatible_session_cache's cache and
+    // flipping its doctor cache_entries assertion from 1 to 5.
+    let root = temp_root("agenttrace-adversarial-dir-scan");
+    with_session_cache(&root.join("cache"), || {
+        let sessions = load_sessions_from_dir(Some(&dir));
+        assert!(
+            sessions.len() >= 3,
+            "clean neighbors must survive a hostile unicode file, got {}",
+            sessions.len()
+        );
+    });
 }
 
 #[test]
@@ -519,29 +530,38 @@ fn generated_adversarial_corpus_stays_bounded_and_non_negative() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("testdata/generated/adversarial");
-    let sessions = load_sessions_from_dir(Some(&dir));
-    assert!(
-        sessions.len() >= 3,
-        "expected the adversarial corpus to yield sessions, got {}",
-        sessions.len()
-    );
-    let mut grand_total = 0i64;
-    for session in &sessions {
-        let tokens = total_tokens(session);
+    // Same isolation as the hostile-unicode dir scan above: the corpus
+    // scan saves a session cache at the env-resolved path and, without
+    // the env lock, its save can race a concurrently-running
+    // env-isolated test's cache dir (observed as foreign adversarial
+    // fixture entries flipping a sibling test's doctor cache_entries
+    // assertion from 1 to 5).
+    let root = temp_root("agenttrace-adversarial-corpus");
+    with_session_cache(&root.join("cache"), || {
+        let sessions = load_sessions_from_dir(Some(&dir));
         assert!(
-            tokens >= 0,
-            "session {} reported negative tokens {tokens}",
-            session.name
+            sessions.len() >= 3,
+            "expected the adversarial corpus to yield sessions, got {}",
+            sessions.len()
         );
-        assert!(session.metrics.cost_estimated.is_finite());
-        assert!(session.metrics.cost_estimated >= 0.0);
-        grand_total = grand_total.saturating_add(tokens);
-    }
-    assert_eq!(
-        grand_total,
-        i64::MAX,
-        "saturated sessions must pin the ceiling"
-    );
+        let mut grand_total = 0i64;
+        for session in &sessions {
+            let tokens = total_tokens(session);
+            assert!(
+                tokens >= 0,
+                "session {} reported negative tokens {tokens}",
+                session.name
+            );
+            assert!(session.metrics.cost_estimated.is_finite());
+            assert!(session.metrics.cost_estimated >= 0.0);
+            grand_total = grand_total.saturating_add(tokens);
+        }
+        assert_eq!(
+            grand_total,
+            i64::MAX,
+            "saturated sessions must pin the ceiling"
+        );
+    });
 }
 
 #[test]

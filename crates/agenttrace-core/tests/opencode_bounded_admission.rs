@@ -9,6 +9,19 @@
 //!     surviving output,
 //!  3. the part lane (per-message `part/<id>/`) is bounded and disclosed too,
 //!     and both lanes accumulate into one counter pair.
+//!
+//! The cycle-4 intake-hardening arms extend the same admission ledger:
+//!  4. fog rm-1870 (id containment): a doc-supplied id that is not a single
+//!     path component (absolute, `..`-carrying) must never be joined into the
+//!     filesystem — its fan-out is rejected and disclosed, never read;
+//!  5. fog rm-1867 (regular-file-only admission): fifos and devices report
+//!     st_size 0 and sail under the stat cap — they are rejected with a
+//!     counter instead of wedging the read or feeding it without bound;
+//!     a symlink to a regular transcript stays admitted;
+//!  6. fog rm-1871 (fail-closed stat + disclosure): a stat failure (dangling
+//!     symlink, permissions) skips WITH a counter instead of cap-passing via a
+//!     zeroed length, and read/decode failures are counted instead of dropped
+//!     silently next to the cap counters.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -198,6 +211,315 @@ fn over_cap_part_transcript_is_disclosed_and_lanes_accumulate() {
             .unwrap_or(0)
             > 2 * CAP_BYTES,
         "both over-cap files' bytes must be disclosed: {skips:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// fog rm-1870 (id containment): the storage fan-out joins doc-supplied ids
+// (`message/<sessionID>`, `part/<msgID>`) into the filesystem. `Path::join`
+// lets an ABSOLUTE component replace the base and `..` components walk out
+// of the storage root, so a hostile id could exfiltrate transcripts from
+// entirely outside the scan root (assess F1 PoCs: escaped part text became
+// the session title and `--search` hit). A hostile id's fan-out must be
+// rejected and disclosed — never read.
+// ---------------------------------------------------------------------------
+
+fn write_containment_session(root: &Path, file_stem: &str, id: &str) -> PathBuf {
+    let dir = root.join("opencode/storage/session/p1");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{file_stem}.json"));
+    fs::write(
+        &path,
+        format!(
+            r#"{{"id": "{id}", "slug": "containment", "projectID": "prj_1", "title": "Containment probe", "model": {{"id": "claude-sonnet-4-5"}}, "time": {{"created": 1764750000000, "updated": 1764750004000}}}}"#
+        ),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn absolute_session_id_is_rejected_with_disclosure_and_no_escape() {
+    let parent = std::env::temp_dir().join(format!("at_rm1870_abs_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&parent);
+    let root = parent.join("scan");
+    // The escape target lives entirely OUTSIDE the scan root.
+    let leak = parent.join("leak-abs");
+    fs::create_dir_all(&leak).unwrap();
+    let session_file = write_containment_session(&root, "abs", &leak.to_string_lossy());
+    fs::write(
+        leak.join("m1.json"),
+        r#"{"id": "m1", "sessionID": "whatever", "role": "user", "content": "SECRET-PAYLOAD-ABS-LANE", "tokens": {"input": 777777, "output": 777}, "time": {"created": 1764750001000}}"#,
+    )
+    .unwrap();
+
+    let session = parse_file(&session_file)
+        .expect("the session still parses — the hostile fan-out is skipped, not fatal");
+
+    let skips = &session.metrics.line_skips;
+    assert_eq!(
+        skips.get("opencode_fanout_ids_rejected"),
+        Some(&1),
+        "the absolute id's fan-out must be rejected and disclosed: {skips:?}"
+    );
+    assert_eq!(
+        session.metrics.tokens_input, 0,
+        "tokens from outside the storage root must never be folded"
+    );
+    let _ = fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn dotdot_session_id_cannot_hop_out_of_the_storage_root() {
+    let parent = std::env::temp_dir().join(format!("at_rm1870_dd_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&parent);
+    let root = parent.join("scan");
+    // scan/opencode/storage/message/../../../../leak-msg resolves to the
+    // sibling of the scan root — four components outside the storage root.
+    let leak = parent.join("leak-msg");
+    fs::create_dir_all(&leak).unwrap();
+    let session_file = write_containment_session(&root, "dd", "../../../../leak-msg");
+    fs::write(
+        leak.join("m1.json"),
+        r#"{"id": "m1", "sessionID": "whatever", "role": "user", "content": "SECRET-PAYLOAD-DD-LANE", "tokens": {"input": 888888, "output": 888}, "time": {"created": 1764750001000}}"#,
+    )
+    .unwrap();
+
+    let session = parse_file(&session_file).expect("the session still parses with its disclosure");
+
+    let skips = &session.metrics.line_skips;
+    assert_eq!(
+        skips.get("opencode_fanout_ids_rejected"),
+        Some(&1),
+        "the dotdot id's fan-out must be rejected and disclosed: {skips:?}"
+    );
+    assert_eq!(
+        session.metrics.tokens_input, 0,
+        "tokens from outside the storage root must never be folded"
+    );
+    let _ = fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn hostile_message_id_cannot_hop_to_parts_outside_the_storage_root() {
+    let parent = std::env::temp_dir().join(format!("at_rm1870_hop_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&parent);
+    let root = parent.join("scan");
+    // Safe session id, hostile SECOND hop: the message's own id points the
+    // part fan-out outside the storage root (the assess F1 double-hop shape).
+    let leak = parent.join("leak-part");
+    fs::create_dir_all(&leak).unwrap();
+    let session_file = write_containment_session(&root, "hop", "sess_1");
+    let message_dir = root.join("opencode/storage/message/sess_1");
+    fs::create_dir_all(&message_dir).unwrap();
+    // No message-level tokens: the escaped step-finish part would be the
+    // ONLY usage source (the rm-619 rescue), so its 999999 input is the
+    // exfiltration signal.
+    fs::write(
+        message_dir.join("m1.json"),
+        r#"{"id": "../../../../leak-part", "sessionID": "sess_1", "role": "user", "content": "hi", "time": {"created": 1764750001000}}"#,
+    )
+    .unwrap();
+    fs::write(
+        leak.join("p1.json"),
+        r#"{"id": "p1", "type": "step-finish", "tokens": {"input": 999999, "output": 999999}, "time": {"created": 1764750001500}}"#,
+    )
+    .unwrap();
+
+    let session = parse_file(&session_file).expect("the session still parses with its disclosure");
+
+    let skips = &session.metrics.line_skips;
+    assert_eq!(
+        skips.get("opencode_fanout_ids_rejected"),
+        Some(&1),
+        "the hostile part hop must be rejected and disclosed: {skips:?}"
+    );
+    assert!(
+        session.metrics.tokens_input < 1000,
+        "escaped part usage must never fold (got {})",
+        session.metrics.tokens_input
+    );
+    let _ = fs::remove_dir_all(&parent);
+}
+
+// ---------------------------------------------------------------------------
+// fog rm-1867 (regular-file-only admission) + fog rm-1871 (fail-closed stat
+// and skip disclosure): a fifo reports st_size 0 and wedges the read forever;
+// a device symlink reports st_size 0 and feeds `read_to_string` without
+// bound; a dangling symlink stat fails and — pre-fix — cap-PASSED via the
+// zeroed length; undecodable files were dropped silently next to the cap
+// counters. Every skip class is now counted on the rm-526 loss channel.
+// ---------------------------------------------------------------------------
+
+fn write_intake_session(root: &Path) -> PathBuf {
+    let session_dir = root.join("opencode/storage/session/sess_1");
+    let message_dir = root.join("opencode/storage/message/sess_1");
+    let part_dir = root.join("opencode/storage/part/m1");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::create_dir_all(&message_dir).unwrap();
+    fs::create_dir_all(&part_dir).unwrap();
+    let session_file = session_dir.join("sess_1.json");
+    fs::write(
+        &session_file,
+        r#"{"id": "sess_1", "slug": "intake", "projectID": "prj_1", "title": "Intake probe", "model": {"id": "claude-sonnet-4-5"}, "time": {"created": 1764750000000, "updated": 1764750004000}}"#,
+    )
+    .unwrap();
+    session_file
+}
+
+fn write_good_message(message_dir: &Path, stem: &str, id: &str, input: i64, output: i64) {
+    fs::write(
+        message_dir.join(format!("{stem}.json")),
+        format!(
+            r#"{{"id": "{id}", "sessionID": "sess_1", "role": "user", "content": "query", "tokens": {{"input": {input}, "output": {output}}}, "time": {{"created": 1764750001000}}}}"#
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn undecodable_transcript_is_counted_not_silent() {
+    let root = std::env::temp_dir().join(format!("at_rm1871_dec_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let session_file = write_intake_session(&root);
+    let message_dir = root.join("opencode/storage/message/sess_1");
+    write_good_message(&message_dir, "m1", "m1", 100, 10);
+    fs::write(message_dir.join("bad.json"), "{ not json at all").unwrap();
+
+    let session = parse_file(&session_file).unwrap();
+
+    let skips = &session.metrics.line_skips;
+    assert_eq!(
+        skips.get("opencode_transcript_files_undecodable"),
+        Some(&1),
+        "the undecodable transcript must be disclosed: {skips:?}"
+    );
+    assert_eq!(
+        session.metrics.tokens_input, 100,
+        "the good message still folds"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_stat_fails_closed_with_disclosure() {
+    let root = std::env::temp_dir().join(format!("at_rm1871_dang_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let session_file = write_intake_session(&root);
+    let message_dir = root.join("opencode/storage/message/sess_1");
+    write_good_message(&message_dir, "m1", "m1", 100, 10);
+    write_good_message(&message_dir, "m2", "m2", 200, 20);
+    std::os::unix::fs::symlink("nowhere-at-all.json", message_dir.join("dang.json")).unwrap();
+
+    let session = parse_file(&session_file).unwrap();
+
+    let skips = &session.metrics.line_skips;
+    assert_eq!(
+        skips.get("opencode_transcript_files_unreadable"),
+        Some(&1),
+        "the dangling symlink must stat-fail CLOSED with a counter: {skips:?}"
+    );
+    assert_eq!(
+        session.metrics.tokens_input, 300,
+        "only the good messages fold (the assess corpus-f4 shape: 150600 with zero doctor visibility)"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn device_symlink_transcript_is_rejected_with_disclosure() {
+    let root = std::env::temp_dir().join(format!("at_rm1867_dev_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let session_file = write_intake_session(&root);
+    let message_dir = root.join("opencode/storage/message/sess_1");
+    write_good_message(&message_dir, "m1", "m1", 100, 10);
+    // /dev/null reports st_size 0 — it sailed under the stat cap just like
+    // /dev/zero (whose unbounded feed is proven at the CLI PoC level); the
+    // device kind must be rejected with a counter.
+    std::os::unix::fs::symlink("/dev/null", message_dir.join("z.json")).unwrap();
+
+    let session = parse_file(&session_file).unwrap();
+
+    let skips = &session.metrics.line_skips;
+    assert_eq!(
+        skips.get("opencode_transcript_files_nonregular"),
+        Some(&1),
+        "the device must be rejected with a counter: {skips:?}"
+    );
+    assert_eq!(
+        session.metrics.tokens_input, 100,
+        "the good message still folds"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_transcript_is_rejected_with_disclosure_instead_of_wedging() {
+    let root = std::env::temp_dir().join(format!("at_rm1867_fifo_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let session_file = write_intake_session(&root);
+    let message_dir = root.join("opencode/storage/message/sess_1");
+    write_good_message(&message_dir, "m1", "m1", 100, 10);
+    let fifo = message_dir.join("fifo.json");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo fixture");
+
+    // Pre-fix this WEDGED forever (assess NF1: timeout 8, rc=124, no message,
+    // no disclosure) — the test hanging IS the red.
+    let session = parse_file(&session_file).unwrap();
+
+    let skips = &session.metrics.line_skips;
+    assert_eq!(
+        skips.get("opencode_transcript_files_nonregular"),
+        Some(&1),
+        "the fifo must be rejected with a counter: {skips:?}"
+    );
+    assert_eq!(
+        session.metrics.tokens_input, 100,
+        "the good message still folds"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_to_regular_transcript_stays_admitted() {
+    let root = std::env::temp_dir().join(format!("at_rm1867_link_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let session_file = write_intake_session(&root);
+    let message_dir = root.join("opencode/storage/message/sess_1");
+    write_good_message(&message_dir, "m1", "m1", 100, 10);
+    // A regular transcript reachable through a symlink is legitimate storage
+    // — the file-kind check must follow links, not reject them.
+    fs::write(
+        root.join("real-message.json"),
+        r#"{"id": "m9", "sessionID": "sess_1", "role": "assistant", "tokens": {"input": 50, "output": 20}, "time": {"created": 1764750002000}}"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../../../../real-message.json",
+        message_dir.join("link.json"),
+    )
+    .unwrap();
+
+    let session = parse_file(&session_file).unwrap();
+
+    let skips = &session.metrics.line_skips;
+    assert!(
+        !skips.contains_key("opencode_transcript_files_nonregular")
+            && !skips.contains_key("opencode_transcript_files_unreadable"),
+        "a symlink to a regular transcript is not a skip class: {skips:?}"
+    );
+    assert_eq!(
+        session.metrics.tokens_input, 150,
+        "the linked regular transcript still folds"
     );
     let _ = fs::remove_dir_all(&root);
 }
