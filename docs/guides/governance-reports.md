@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 68 and the SQLite snapshot is schema 13; the
+The session cache is schema 69 and the SQLite snapshot is schema 13; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -446,7 +446,19 @@ the run minted 64 → 65 at its base dade9cd, aliasing this tree's
 landed 65 — the opencode summary_diffs rung above — so this
 integration, conflict case 306ad63f60a14196a928fedc08f5785f, re-bases
 it onto the advanced ceiling as 67 → 68, keeping 66 free for run
-abb3b091's in-flight mint, one invalidation either way)
+abb3b091's in-flight mint, one invalidation either way,
+and to 69 when the claude lane began disclosing unmatched wire kinds —
+`claude_unmatched_type:{kind}` counters riding the lane's one-carrier
+meta event for the v2.1.300 request-reproduction records and the
+previously-silent known kinds (run 7fd83ab2 cycle 2, rm-1522, review
+3ea62c4d F1 → fix 282d5474; minted 64 → 65 straight at the run's
+base e130845c on its own landed ceiling 64, aliasing this tree's
+landed 65 and sitting below the landed 68 ceiling — so this
+integration, conflict case cded886e63e946aab0631f9c5e0e9f2e, re-bases
+it onto the advanced ceiling as 68 → 69 per the landed-rung-keeps-
+numeral convention, keeping 66 free for run abb3b091's in-flight
+mint, one invalidation either way; the SQLite snapshot stays 13 —
+no snapshot semantics moved)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

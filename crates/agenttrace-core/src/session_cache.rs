@@ -8,7 +8,34 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 68;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 69;
+// Bumped 68 -> 69 (integration of run 7fd83ab2fd7f4ea090b5d540983a0abb
+// cycle 2 'evidence-lane paste-safety + claude-lane format-compat',
+// rm-1522, review 3ea62c4d F1 -> fix 282d5474; candidate e9c1c77 @
+// base e130845c, conflict case cded886e63e946aab0631f9c5e0e9f2e): the
+// claude lane began disclosing unmatched wire kinds —
+// claude_unmatched_type:{kind} counters riding the lane's one-carrier
+// meta event (+1 events_total for journals with genuine disclosures) —
+// for the v2.1.300 request_reproduction records and the previously-
+// silent known kinds. A parse-shape change: a warm pre-rung entry
+// replays the pre-change parse, so the never-silent disclosure the
+// unit exists to guarantee never materializes for an upgraded fleet
+// (proven live by the review on a v64-warmed store: --doctor zero
+// hits over warm, the counter present cold). Bumped per the rm-230
+// convention so cached claude journals regenerate and disclose. SEAM:
+// the run minted its bump 64 -> 65 straight at its base e130845c on
+// the run's own landed ceiling 64, but this tree had since landed 65
+// (run b01c2b6abe28's rm-1509 opencode summary_diffs rung, below),
+// 67 (run 6d2a1d8d's newest-lanes mint, below, which left 66 free
+// for run abb3b091's uncommitted sibling mint) and 68 (run
+// 4f2af62e's Claude org-dimension rung, below) — so per the
+// landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c) the
+// landed rungs keep their numerals and this integration lands the
+// claude-unmatched-type rung as 69, the lowest rung unique above
+// the ceiling, one invalidation either way; 66 stays free. No
+// SQLite snapshot rung rode the batch; the landed 13 (run b01c2b6a,
+// below) remains the snapshot ceiling. Entries regenerate once on
+// next scan.
 // Bumped 67 -> 68 (integration of run 4f2af62e5b7e4541be0a73d732be56d9
 // cycle 1 "Claude org-dimension truth", rm-1405 LEAD reap + attribution
 // separation; candidate 915ddbb @ base dade9cd, conflict case
