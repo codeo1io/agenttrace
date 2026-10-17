@@ -1684,10 +1684,35 @@ where
                 write_stdout(&keyword_help_text(&keyword))?;
                 std::process::exit(0);
             }
+            // rm-558 (F5 arm): a token that is not on the clap surface
+            // is a typo first — say "unknown flag" instead of letting
+            // the order-guard mask it, but keep the keyword context so
+            // both facts are named.
+            if !is_known_cli_flag(flag) {
+                bail!(
+                    "unknown flag `{}` (dropped: `{tail}`); it follows the `{keyword}` \
+                     keyword, so clap never saw it and cannot report the typo — check \
+                     the spelling; `{keyword}` takes no flags after it — place flags \
+                     before the keyword, or run `agenttrace {keyword} --help`",
+                    flag.to_string_lossy()
+                );
+            }
             bail!(
                 "flag `{}` follows the `{keyword}` keyword and would be silently dropped \
                  (dropped: `{tail}`); `{keyword}` takes no flags after it — place flags \
                  before the keyword, or run `agenttrace {keyword} --help`",
+                flag.to_string_lossy()
+            );
+        }
+        // rm-558 (F5 arm): same truth split on the session-path lane —
+        // `agenttrace sessions --snice foo` used to report an ordering
+        // problem for a flag that does not exist; name the unknown
+        // flag AND the positional context.
+        if !is_known_cli_flag(flag) {
+            bail!(
+                "unknown flag `{}` (dropped: `{tail}`); it follows the positional \
+                 session path, so clap never saw it and cannot report the typo — check \
+                 the spelling, or place known flags before the positional path",
                 flag.to_string_lossy()
             );
         }
@@ -1801,6 +1826,49 @@ fn keyword_help_text(keyword: &str) -> String {
 fn is_go_flag_positional(arg: &OsString) -> bool {
     let text = arg.to_string_lossy();
     text == "-" || !text.starts_with('-')
+}
+
+/// rm-558 (F5 arm, run 63488b83 cycle 4): is a dropped `-`-prefixed
+/// token a flag the CLI actually knows? Derived from the clap surface
+/// — the same authority the `flag_takes_value` canary pins — so the
+/// dropped-tail diagnostics can separate "you typo'd a flag" (clap
+/// would have rejected it as unknown anyway, but the shim errors
+/// first and must not mislabel it) from "a real flag sat after the
+/// positional" (an ordering error only). Dashes normalize Go-style:
+/// `-format` and `--format` are the same known flag; a single-dash
+/// single-character token matches shorts (`-f`); `=`-attached values
+/// are stripped before the lookup.
+fn is_known_cli_flag(token: &OsString) -> bool {
+    use clap::CommandFactory;
+
+    let text = token.to_string_lossy();
+    let (single_dash, name) = if let Some(rest) = text.strip_prefix("--") {
+        (false, rest.split('=').next().unwrap_or(""))
+    } else if let Some(rest) = text.strip_prefix('-') {
+        (true, rest.split('=').next().unwrap_or(""))
+    } else {
+        return false;
+    };
+    if name.is_empty() {
+        // Bare `-`/`--`: the former is a positional, the latter is the
+        // end-of-flags marker — neither is a flag name to diagnose.
+        return false;
+    }
+    let mut short = None;
+    if single_dash && name.chars().count() == 1 {
+        short = name.chars().next();
+    }
+    for argument in Args::command().get_arguments() {
+        if argument.get_long().is_some_and(|long| long == name) {
+            return true;
+        }
+        if short.is_some_and(|flag| argument.get_short() == Some(flag)) {
+            return true;
+        }
+    }
+    // clap's built-in `--help` rides the surface even when the help
+    // argument is customized away; keep the diagnostic truthful.
+    name == "help" || short == Some('h')
 }
 
 fn flag_takes_value(arg: &OsString) -> bool {
@@ -4402,6 +4470,87 @@ mod tests {
         assert!(
             message.contains("`-f json`"),
             "names the dropped tail: {message}"
+        );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_names_unknown_flags_after_the_positional_path() {
+        // rm-558 (F5 arm, run 63488b83 cycle 4): the order-guard fired
+        // for ANY flag-looking token after a consuming positional, so
+        // a typo'd flag reported an ordering problem ("flag `--snice`
+        // follows the positional session path") exactly like a real
+        // misplaced flag — the unknown-flag truth was masked. A
+        // dropped token that is NOT on the clap surface must say so,
+        // with the positional context still named.
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("session.jsonl"),
+            OsString::from("--snice"),
+            OsString::from("foo"),
+        ])
+        .expect_err("unknown flags after the positional must be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown flag `--snice`"),
+            "names the unknown flag: {message}"
+        );
+        assert!(
+            message.contains("positional session path"),
+            "keeps the positional context: {message}"
+        );
+        assert!(
+            message.contains("`--snice foo`"),
+            "names the dropped tail: {message}"
+        );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_keeps_the_order_diagnostic_for_known_flags() {
+        // The other half of rm-558's truth split: a REAL flag after
+        // the positional is an ordering error, not a typo — clap
+        // would have accepted `--format` placed earlier, so the
+        // message stays the order-guard wording and never calls a
+        // clap-surface flag unknown.
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("session.jsonl"),
+            OsString::from("--format"),
+            OsString::from("json"),
+        ])
+        .expect_err("known flags after the positional must stay rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("follows the positional session path"),
+            "known flags keep the order-guard wording: {message}"
+        );
+        assert!(
+            !message.contains("unknown flag"),
+            "a clap-surface flag is never called unknown: {message}"
+        );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_names_unknown_flags_after_a_keyword_host() {
+        // Same truth for the keyword hosts (rm-505 family): a typo
+        // after `mcp` is a typo, not merely a flag-after-keyword
+        // ordering issue — name both facts.
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("mcp"),
+            OsString::from("--snice"),
+        ])
+        .expect_err("unknown flags after a keyword must be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown flag `--snice`"),
+            "names the unknown flag: {message}"
+        );
+        assert!(
+            message.contains("`mcp` keyword"),
+            "keeps the keyword context: {message}"
         );
     }
 

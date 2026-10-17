@@ -3063,6 +3063,70 @@ struct QuotaWindow {
     sessions_contributing: usize,
 }
 
+/// rm-1950 (run 63488b83 cycle 4): plan blocks tile forward from the
+/// corpus first-use anchor in fixed 5-hour steps — the claude-max-
+/// class billing-block shape, as opposed to the calendar clock.
+const QUOTA_BLOCK_SPAN_HOURS: i64 = 5;
+
+/// rm-1950: emission ceiling for the block sequence. A long-lived
+/// corpus anchors thousands of blocks and `-f json` must stay
+/// human-sized; the TRAILING blocks carry the quota-relevant tail,
+/// and the full count plus a truncation basis are disclosed so the
+/// cut is a disclosure, never a silent edit.
+const QUOTA_BLOCKS_EMITTED_MAX: usize = 48;
+
+/// rm-1950 (run 63488b83 cycle 4): the user-declared plan profile the
+/// quota view reconciles against — Subscription-plan-aware
+/// accounting. Every field is USER-ASSERTED (config
+/// `five_hour_limit_usd` / `weekly_limit_usd` / `weekly_model_allowances`
+/// / `plan_effective_utc`, or `--five-hour-limit` / `--weekly-limit`):
+/// agenttrace reads no credentials and no vendor plan data, so the
+/// profile is a declaration, never a measurement. `basis` carries the
+/// provenance sentence the JSON prints verbatim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaPlanProfile {
+    /// Declared five-hour block cap in USD.
+    pub five_hour_usd: Option<f64>,
+    /// Declared weekly cap in USD.
+    pub weekly_usd: Option<f64>,
+    /// Declared per-model weekly allowances in USD, keyed by the exact
+    /// `model_used` label the corpus carries.
+    pub weekly_model_allowances: BTreeMap<String, f64>,
+    /// Declared plan activation instant: corpus spend strictly before
+    /// it is excluded from every cap comparison and disclosed
+    /// separately (spend that predates the plan never bills the plan).
+    pub effective_utc: Option<DateTime<Utc>>,
+    /// Provenance sentence emitted as `limits.basis`.
+    pub basis: String,
+}
+
+impl Default for QuotaPlanProfile {
+    fn default() -> Self {
+        Self {
+            five_hour_usd: None,
+            weekly_usd: None,
+            weekly_model_allowances: BTreeMap::new(),
+            effective_utc: None,
+            basis: "unknown: no plan profile declared — set five_hour_limit_usd / \
+                    weekly_limit_usd / weekly_model_allowances / plan_effective_utc in the \
+                    config lane, or pass --five-hour-limit / --weekly-limit; agenttrace \
+                    reads no credentials and never invents plan data"
+                .to_string(),
+        }
+    }
+}
+
+impl QuotaPlanProfile {
+    /// Whether any cap or allowance is declared — the gate for the
+    /// reconciliation block (a declared activation date alone declares
+    /// nothing to reconcile against).
+    pub fn declares_any(&self) -> bool {
+        self.five_hour_usd.is_some()
+            || self.weekly_usd.is_some()
+            || !self.weekly_model_allowances.is_empty()
+    }
+}
+
 /// The corpus cutoff: the newest instant any loaded session can place
 /// a cost on — the last event timestamp when the parse carried one
 /// (fresh parses), else the parsed `session_end` (warm-cache rows,
@@ -3125,12 +3189,34 @@ fn quota_cutoff(sessions: &[Session]) -> (Option<DateTime<Utc>>, usize) {
 /// placeable time at all — the caller counts it as unplaced and bills
 /// it at zero rather than guessing.
 fn quota_cost_share(metrics: &Metrics, start: &DateTime<Utc>, end: &DateTime<Utc>) -> Option<f64> {
+    quota_cost_share_at_or_after(metrics, start, end, None)
+}
+
+/// rm-1950: the share generalization the plan reconciliation needs —
+/// identical to [`quota_cost_share`] but only the part of the cost at
+/// or after `at_or_after` counts, so corpus spend that predates a
+/// declared plan activation can be split out of every cap comparison
+/// on the SAME attribution basis the windows already use (never a
+/// second, drifting attribution).
+fn quota_cost_share_at_or_after(
+    metrics: &Metrics,
+    start: &DateTime<Utc>,
+    end: &DateTime<Utc>,
+    at_or_after: Option<&DateTime<Utc>>,
+) -> Option<f64> {
     if !metrics.timestamps.is_empty() {
         let total = metrics.timestamps.len();
         let inside = metrics
             .timestamps
             .iter()
-            .filter(|ts| **ts >= *start && **ts <= *end)
+            .filter(|ts| {
+                **ts >= *start
+                    && **ts <= *end
+                    && match at_or_after {
+                        Some(floor) => **ts >= *floor,
+                        None => true,
+                    }
+            })
             .count();
         return Some(inside as f64 / total as f64);
     }
@@ -3144,30 +3230,51 @@ fn quota_cost_share(metrics: &Metrics, start: &DateTime<Utc>, end: &DateTime<Utc
     if span_ms <= 0 {
         // Instant (or inverted) span: the whole cost rides the single
         // instant the row does carry.
-        return Some(if first >= *start && first <= *end {
-            1.0
-        } else {
-            0.0
-        });
+        return Some(
+            if first >= *start
+                && first <= *end
+                && match at_or_after {
+                    Some(floor) => first >= *floor,
+                    None => true,
+                }
+            {
+                1.0
+            } else {
+                0.0
+            },
+        );
     }
-    let overlap_ms = (last.min(*end) - first.max(*start)).num_milliseconds();
-    Some(overlap_ms.clamp(0, span_ms) as f64 / span_ms as f64)
+    // Span share: the portion of the session's span that lies inside
+    // the window AND at-or-after the floor.
+    let lo_ms = first
+        .max(*start)
+        .max(at_or_after.copied().unwrap_or(first))
+        .timestamp_millis();
+    let hi_ms = last.min(*end).timestamp_millis();
+    let overlap_ms = (hi_ms - lo_ms).clamp(0, span_ms);
+    Some(overlap_ms as f64 / span_ms as f64)
 }
 
 /// Fold one rolling window: every session contributes its cost times
 /// its [`quota_cost_share`] inside the window, so spend is TTL-correct
 /// — a session's cost leaves the window as its events age out, which
-/// is the rolling analog of a plan-window reset.
-fn quota_window(
+/// is the rolling analog of a plan-window reset. rm-1950: the fold is
+/// parameterized by an explicit `[start, end]` and an optional
+/// at-or-after floor, so the plan reconciliation (blocks, pre-plan
+/// exclusion) reuses the one attribution discipline instead of growing
+/// a second one.
+fn quota_window_fold(
     sessions: &[Session],
-    cutoff: DateTime<Utc>,
-    span: chrono::Duration,
-) -> QuotaWindow {
-    let start = cutoff - span;
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    at_or_after: Option<DateTime<Utc>>,
+) -> (f64, usize) {
     let mut spend_usd = 0.0;
     let mut sessions_contributing = 0;
     for session in sessions {
-        if let Some(share) = quota_cost_share(&session.metrics, &start, &cutoff) {
+        if let Some(share) =
+            quota_cost_share_at_or_after(&session.metrics, &start, &end, at_or_after.as_ref())
+        {
             if share > 0.0 {
                 sessions_contributing += 1;
             }
@@ -3178,6 +3285,16 @@ fn quota_window(
             }
         }
     }
+    (spend_usd, sessions_contributing)
+}
+
+fn quota_window(
+    sessions: &[Session],
+    cutoff: DateTime<Utc>,
+    span: chrono::Duration,
+) -> QuotaWindow {
+    let start = cutoff - span;
+    let (spend_usd, sessions_contributing) = quota_window_fold(sessions, start, cutoff, None);
     QuotaWindow {
         start,
         end: cutoff,
@@ -3224,6 +3341,308 @@ fn quota_window_json(window: &QuotaWindow, span: chrono::Duration) -> serde_json
     })
 }
 
+/// rm-1950: the corpus first-use instant — the earliest time any
+/// loaded session can place cost on (earliest event timestamp, else
+/// the parsed `session_start` of a warm-cache row). The block
+/// sequence anchors HERE, never at calendar midnight and never at a
+/// provider block ledger agenttrace cannot read.
+fn quota_first_use(sessions: &[Session]) -> Option<DateTime<Utc>> {
+    sessions
+        .iter()
+        .filter_map(|session| {
+            session
+                .metrics
+                .timestamps
+                .iter()
+                .min()
+                .copied()
+                .or_else(|| parse_ts(&session.metrics.session_start))
+        })
+        .min()
+}
+
+/// The index of the block containing `cutoff`, tiling forward from
+/// `anchor` in fixed [`QUOTA_BLOCK_SPAN_HOURS`] steps.
+fn quota_current_block_index(anchor: DateTime<Utc>, cutoff: DateTime<Utc>) -> u64 {
+    let step_ms = chrono::Duration::hours(QUOTA_BLOCK_SPAN_HOURS).num_milliseconds() as u64;
+    let elapsed_ms = (cutoff - anchor).num_milliseconds().max(0) as u64;
+    elapsed_ms / step_ms
+}
+
+/// The `[start, end)` bounds of block `index` in the sequence anchored
+/// at `anchor`. Out-of-range millisecond arithmetic degenerates to the
+/// cutoff (unreachable for in-range `DateTime`s: `anchor` and `cutoff`
+/// are both valid instants, so every step between them fits i64).
+fn quota_block_bounds(
+    anchor: DateTime<Utc>,
+    index: u64,
+    cutoff: DateTime<Utc>,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    let step_ms = chrono::Duration::hours(QUOTA_BLOCK_SPAN_HOURS).num_milliseconds();
+    let start_ms = anchor.timestamp_millis() + step_ms * (index as i64);
+    let start = chrono::DateTime::from_timestamp_millis(start_ms).unwrap_or(cutoff);
+    let end = chrono::DateTime::from_timestamp_millis(start_ms + step_ms).unwrap_or(cutoff);
+    (start, end)
+}
+
+/// rm-1950 (run 63488b83 cycle 4): the five-hour billing-block
+/// sequence — plan-window truth shaped like the provider's blocks
+/// (first-use anchored, fixed 5h tiles) rather than the trailing
+/// rolling window. Each block bills sessions with the SAME
+/// attribution discipline as the rolling windows, clamped at the
+/// corpus cutoff so the rm-1402 clock-skew guard holds block-side
+/// too: a block never bills a discarded future timestamp. Long
+/// sequences emit the trailing [`QUOTA_BLOCKS_EMITTED_MAX`] blocks
+/// with the full count and a truncation basis disclosed.
+fn quota_blocks_json(
+    sessions: &[Session],
+    cutoff: DateTime<Utc>,
+    anchor: DateTime<Utc>,
+) -> serde_json::Value {
+    let current_index = quota_current_block_index(anchor, cutoff);
+    let blocks_total = current_index + 1;
+    let emitted_total = (blocks_total as usize).min(QUOTA_BLOCKS_EMITTED_MAX) as u64;
+    let first_index = blocks_total - emitted_total;
+    let mut blocks = Vec::with_capacity(emitted_total as usize);
+    for index in first_index..blocks_total {
+        let (start, end) = quota_block_bounds(anchor, index, cutoff);
+        // The last block is mid-flight: clamp its billing at the
+        // cutoff (nothing after the cutoff exists in this corpus).
+        let (spend_usd, sessions_contributing) =
+            quota_window_fold(sessions, start, end.min(cutoff), None);
+        blocks.push(serde_json::json!({
+            "block_index": index,
+            "start_utc": quota_ts(&start),
+            "end_utc": quota_ts(&end),
+            "spend_usd": round4(spend_usd),
+            "sessions_contributing": sessions_contributing,
+        }));
+    }
+    let (current_start, current_end) = quota_block_bounds(anchor, current_index, cutoff);
+    let truncated = blocks_total > QUOTA_BLOCKS_EMITTED_MAX as u64;
+    let truncation_basis: serde_json::Value = truncated
+        .then(|| {
+            serde_json::Value::String(format!(
+                "only the trailing {} blocks are emitted (first-use anchor to cutoff spans {} \
+                 blocks); blocks_total carries the full sequence count",
+                QUOTA_BLOCKS_EMITTED_MAX, blocks_total
+            ))
+        })
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "anchor_utc": quota_ts(&anchor),
+        "anchor_basis": "corpus first-use — the earliest placeable event timestamp or \
+             session_start across the loaded corpus (clamped at the cutoff); never calendar \
+             midnight, and never the provider's own block ledger, which is not knowable \
+             without credentials — agenttrace never reads any. The sequence tiles forward \
+             from that anchor in fixed 5h steps.",
+        "block_span_hours": QUOTA_BLOCK_SPAN_HOURS,
+        "blocks_total": blocks_total,
+        "blocks_emitted": emitted_total,
+        "truncated": truncated,
+        "truncation_basis": truncation_basis,
+        "blocks": blocks,
+        "current_block_index": current_index,
+        "current_block_start_utc": quota_ts(&current_start),
+        "current_block_resets_at_utc": quota_ts(&current_end),
+        "spend_basis": "each block bills sessions pro rata by the same attribution as the \
+             rolling windows (event-timestamp share, or warm-cache start/end span share), \
+             clamped at the corpus cutoff — a block never bills timestamps the rm-1402 \
+             clock-skew guard discarded",
+    })
+}
+
+/// One cap reconciliation: observed plan-covered spend vs a declared
+/// limit, with the overage priced at API rates (the corpus's own
+/// cost basis) — never presented as a vendor invoice.
+fn quota_cap_json(window_basis: &str, observed_usd: f64, limit_usd: Option<f64>) -> serde_json::Value {
+    match limit_usd {
+        Some(limit_usd) => {
+            let within = observed_usd <= limit_usd;
+            serde_json::json!({
+                "window_basis": window_basis,
+                "observed_usd": round4(observed_usd),
+                "limit_usd": limit_usd,
+                "within": within,
+                "headroom_usd": round4(limit_usd - observed_usd),
+                "overage_at_api_rates_usd": round4((observed_usd - limit_usd).max(0.0)),
+                "units_basis": "observed_usd is API-rate cost_estimated (the corpus's priced \
+                     truth) on the plan-covered share; overage_at_api_rates_usd is the \
+                     API-rate cost above the declared cap, not a vendor invoice",
+            })
+        }
+        None => serde_json::json!({
+            "window_basis": window_basis,
+            "observed_usd": round4(observed_usd),
+            "limit_usd": serde_json::Value::Null,
+            "within": serde_json::Value::Null,
+            "headroom_usd": serde_json::Value::Null,
+            "overage_at_api_rates_usd": serde_json::Value::Null,
+        }),
+    }
+}
+
+/// rm-1950 (run 63488b83 cycle 4): the plan reconciliation — observed
+/// corpus truth vs the declared [`QuotaPlanProfile`]. The five-hour
+/// arm compares against the CURRENT first-use-anchored block (the
+/// plan's billing-block shape), the weekly arm against the trailing
+/// 7d window; per-model allowances reconcile on the exact
+/// `model_used` label; pre-plan spend is excluded from every
+/// comparison and disclosed. No profile declared, or no corpus
+/// cutoff: the block is null-with-basis, never invented numbers.
+fn quota_reconciliation_json(
+    sessions: &[Session],
+    cutoff: Option<DateTime<Utc>>,
+    anchor: Option<DateTime<Utc>>,
+    plan: &QuotaPlanProfile,
+) -> serde_json::Value {
+    let Some(cutoff) = cutoff else {
+        return serde_json::json!({
+            "basis": "none: the corpus carries no plausible cutoff — there is no window \
+                 to reconcile a plan against",
+            "five_hour": serde_json::Value::Null,
+            "weekly": serde_json::Value::Null,
+            "models": serde_json::Value::Null,
+            "unmatched_models": serde_json::Value::Null,
+            "pre_plan": serde_json::Value::Null,
+        });
+    };
+    if !plan.declares_any() {
+        return serde_json::json!({
+            "basis": "none: no plan profile declared — declare five_hour_limit_usd / \
+                 weekly_limit_usd / weekly_model_allowances / plan_effective_utc in the \
+                 config lane (or --five-hour-limit / --weekly-limit) to reconcile observed \
+                 spend against plan truth",
+            "five_hour": serde_json::Value::Null,
+            "weekly": serde_json::Value::Null,
+            "models": serde_json::Value::Null,
+            "unmatched_models": serde_json::Value::Null,
+            "pre_plan": serde_json::Value::Null,
+        });
+    }
+    let effective = plan.effective_utc;
+    let anchor = anchor.map_or(cutoff, |first_use| first_use.min(cutoff));
+    let current_index = quota_current_block_index(anchor, cutoff);
+    let (block_start, block_end) = quota_block_bounds(anchor, current_index, cutoff);
+    let block_effective_end = block_end.min(cutoff);
+    let weekly_start = cutoff - chrono::Duration::days(7);
+    let (block_covered, _) =
+        quota_window_fold(sessions, block_start, block_effective_end, effective);
+    let (block_full, _) = quota_window_fold(sessions, block_start, block_effective_end, None);
+    let (week_covered, _) = quota_window_fold(sessions, weekly_start, cutoff, effective);
+    let (week_full, _) = quota_window_fold(sessions, weekly_start, cutoff, None);
+
+    let block_basis = format!(
+        "current 5h block #{} [{} → {}] anchored at corpus first-use (see five_hour_blocks) \
+         — the plan's billing-block shape, NOT the trailing rolling five_hour window",
+        current_index,
+        quota_ts(&block_start),
+        quota_ts(&block_effective_end)
+    );
+    let weekly_basis =
+        "trailing 7d rolling window ending at the corpus cutoff";
+
+    let mut models = serde_json::Map::new();
+    let mut unmatched: Vec<String> = Vec::new();
+    if !plan.weekly_model_allowances.is_empty() {
+        for (label, allowance) in &plan.weekly_model_allowances {
+            let mut observed = 0.0;
+            for session in sessions
+                .iter()
+                .filter(|session| session.metrics.model_used == *label)
+            {
+                if let Some(share) = quota_cost_share_at_or_after(
+                    &session.metrics,
+                    &weekly_start,
+                    &cutoff,
+                    effective.as_ref(),
+                ) {
+                    if session.metrics.cost_estimated.is_finite() {
+                        observed += session.metrics.cost_estimated * share;
+                    }
+                }
+            }
+            models.insert(
+                label.clone(),
+                quota_cap_json(weekly_basis, observed, Some(*allowance)),
+            );
+        }
+        // Corpus models with weekly spend and no declared allowance:
+        // disclosed, never silently folded into another model's cap.
+        let mut seen = std::collections::BTreeSet::new();
+        for session in sessions {
+            let label = session.metrics.model_used.as_str();
+            if label.is_empty()
+                || plan.weekly_model_allowances.contains_key(label)
+                || !seen.insert(label.to_string())
+            {
+                continue;
+            }
+            if let Some(share) =
+                quota_cost_share_at_or_after(&session.metrics, &weekly_start, &cutoff, None)
+            {
+                if share > 0.0 {
+                    unmatched.push(label.to_string());
+                }
+            }
+        }
+    }
+    let models_value = if models.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(models)
+    };
+    let unmatched_value = if models_value.is_null() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Array(
+            unmatched
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        )
+    };
+
+    let pre_plan = match effective {
+        Some(effective) => serde_json::json!({
+            "effective_utc": quota_ts(&effective),
+            "basis": "spend strictly before the declared plan activation is excluded from \
+                 every observed_usd above (the plan-covered share); the excluded amounts \
+                 are disclosed per window as full-window spend minus plan-covered share",
+            "excluded_usd": {
+                "five_hour_block": round4(block_full - block_covered),
+                "weekly": round4(week_full - week_covered),
+            },
+        }),
+        None => serde_json::json!({
+            "effective_utc": serde_json::Value::Null,
+            "basis": "no plan activation date declared (plan_effective_utc) — corpus spend \
+                 that predates the plan cannot be separated, so pre-plan spend still \
+                 counts against every cap",
+            "excluded_usd": serde_json::Value::Null,
+        }),
+    };
+
+    serde_json::json!({
+        "basis": "user-declared plan profile reconciled against corpus truth — agenttrace \
+             reads no credentials and does not verify the declaration against any vendor \
+             plan",
+        "five_hour": quota_cap_json(&block_basis, block_covered, plan.five_hour_usd),
+        "weekly": quota_cap_json(weekly_basis, week_covered, plan.weekly_usd),
+        "models": models_value,
+        "unmatched_models": unmatched_value,
+        "pre_plan": pre_plan,
+    })
+}
+
+fn quota_limits_json(plan: &QuotaPlanProfile) -> serde_json::Value {
+    serde_json::json!({
+        "five_hour_usd": plan.five_hour_usd,
+        "weekly_usd": plan.weekly_usd,
+        "basis": plan.basis,
+    })
+}
+
 /// rm-201 (run 12a73275 cycle 4): the `--quota` report value —
 /// plan-window truth from the local corpus alone. The two plan
 /// windows (5h, 7d) are ROLLING spans that end at the corpus cutoff,
@@ -3231,14 +3650,22 @@ fn quota_window_json(window: &QuotaWindow, span: chrono::Duration) -> serde_json
 /// 7am-UTC Monday reset) are not knowable without credentials, which
 /// agenttrace never reads; the JSON says so in `corpus.window_anchor`
 /// instead of inventing them. Spend is TTL-correct per session (see
-/// [`quota_cost_share`]), limits are disclosed-unknown (`limits` is
-/// null with its basis — a config-provided limit is a later extension
-/// arm), and the cutoff itself is disclosed so a stale corpus cannot
-/// masquerade as a live quota. Schema `agenttrace.quota/1` is stable:
-/// the README "Quota view" section documents every key.
-pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
+/// [`quota_cost_share`]).
+///
+/// rm-1950 (run 63488b83 cycle 4): the reserved seam is filled —
+/// `limits.five_hour_usd`/`weekly_usd` carry a user-declared
+/// [`QuotaPlanProfile`] (config lane or flags) with its basis, the
+/// `five_hour_blocks` sequence tiles 5h billing blocks forward from
+/// the corpus first-use anchor (plan-shaped truth, distinct from the
+/// trailing windows), and `reconciliation` compares plan-covered
+/// observed spend against the declared caps with per-model
+/// allowances and pre-plan exclusion disclosed. Undeclared stays
+/// null-with-basis, never invented. Schema `agenttrace.quota/1` is
+/// stable: the README "Quota view" section documents every key.
+pub fn quota_report(sessions: &[Session], plan: &QuotaPlanProfile) -> serde_json::Value {
     let (cutoff, future_discarded) = quota_cutoff(sessions);
     let (event_basis, span_basis, unplaced) = quota_attribution_census(sessions);
+    let first_use = quota_first_use(sessions);
     let (five_hour, weekly) = match cutoff {
         Some(cutoff) => (
             quota_window(sessions, cutoff, chrono::Duration::hours(5)),
@@ -3249,11 +3676,14 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
                 "schema": "agenttrace.quota/1",
                 "five_hour": serde_json::Value::Null,
                 "weekly": serde_json::Value::Null,
-                "limits": {
-                    "five_hour_usd": null,
-                    "weekly_usd": null,
-                    "basis": "unknown: agenttrace reads no credentials and no plan data; config-provided limits are a later extension",
-                },
+                "five_hour_blocks": serde_json::Value::Null,
+                "limits": quota_limits_json(plan),
+                "reconciliation": quota_reconciliation_json(
+                    sessions,
+                    None,
+                    first_use,
+                    plan,
+                ),
                 "corpus": {
                     "sessions": sessions.len(),
                     "cutoff_utc": serde_json::Value::Null,
@@ -3270,15 +3700,14 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
             })
         }
     };
+    let anchor = first_use.map_or(five_hour.start, |first_use| first_use.min(five_hour.end));
     serde_json::json!({
         "schema": "agenttrace.quota/1",
         "five_hour": quota_window_json(&five_hour, chrono::Duration::hours(5)),
         "weekly": quota_window_json(&weekly, chrono::Duration::days(7)),
-        "limits": {
-            "five_hour_usd": null,
-            "weekly_usd": null,
-            "basis": "unknown: agenttrace reads no credentials and no plan data; config-provided limits are a later extension",
-        },
+        "five_hour_blocks": quota_blocks_json(sessions, five_hour.end, anchor),
+        "limits": quota_limits_json(plan),
+        "reconciliation": quota_reconciliation_json(sessions, Some(five_hour.end), Some(anchor), plan),
         "corpus": {
             "sessions": sessions.len(),
             "cutoff_utc": quota_ts(&five_hour.end),
@@ -3297,11 +3726,17 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
 
 /// Render the `--quota` view (rm-201). `-f json` emits the stable
 /// `agenttrace.quota/1` schema; the default text lane emits the same
-/// numbers as a compact human summary. Any other format is rejected
+/// numbers as a compact human summary. rm-1950: both lanes take the
+/// user-declared [`QuotaPlanProfile`] — block sequence, limits, and
+/// reconciliation render from it. Any other format is rejected
 /// loudly — the quota view has no csv/markdown/html rendering, and a
 /// silent text fallback would look like a supported one.
-pub fn render_quota_view(format: &str, sessions: &[Session]) -> anyhow::Result<String> {
-    let report = quota_report(sessions);
+pub fn render_quota_view(
+    format: &str,
+    sessions: &[Session],
+    plan: &QuotaPlanProfile,
+) -> anyhow::Result<String> {
+    let report = quota_report(sessions, plan);
     match format {
         "json" => Ok(format!(
             "{}\n",
@@ -3358,10 +3793,118 @@ fn render_quota_text(report: &serde_json::Value) -> String {
             ));
         }
     }
-    out.push_str(
-        "  limits          unknown — agenttrace reads no credentials and knows no plan limits\n",
-    );
+    // rm-1950: the first-use-anchored block sequence — plan-shaped
+    // truth, distinct from the trailing windows above.
+    if let Some(blocks) = report["five_hour_blocks"].as_object() {
+        let current = blocks["current_block_index"].as_u64().unwrap_or(0);
+        let block = blocks["blocks"].as_array().and_then(|list| {
+            list.iter()
+                .find(|block| block["block_index"].as_u64() == Some(current))
+        });
+        if let Some(block) = block {
+            let mut line = format!(
+                "  5h blocks       first-use anchor {}; block #{} {} → {}  spend ${:.4} across {} session(s)",
+                blocks["anchor_utc"].as_str().unwrap_or("?"),
+                current,
+                block["start_utc"].as_str().unwrap_or("?"),
+                block["end_utc"].as_str().unwrap_or("?"),
+                block["spend_usd"].as_f64().unwrap_or(0.0),
+                block["sessions_contributing"],
+            );
+            if blocks["truncated"].as_bool().unwrap_or(false) {
+                line.push_str(&format!(
+                    "  (trailing {} of {} blocks)",
+                    blocks["blocks_emitted"],
+                    blocks["blocks_total"]
+                ));
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    let limits = &report["limits"];
+    match (
+        limits["five_hour_usd"].as_f64(),
+        limits["weekly_usd"].as_f64(),
+    ) {
+        (Some(five_hour), Some(weekly)) => out.push_str(&format!(
+            "  limits          five-hour ${five_hour:.4} / weekly ${weekly:.4} (user-declared plan profile — not verified against any vendor plan)\n"
+        )),
+        (Some(five_hour), None) => out.push_str(&format!(
+            "  limits          five-hour ${five_hour:.4} (user-declared; weekly not declared)\n"
+        )),
+        (None, Some(weekly)) => out.push_str(&format!(
+            "  limits          weekly ${weekly:.4} (user-declared; five-hour not declared)\n"
+        )),
+        (None, None) => out.push_str(
+            "  limits          unknown — no plan profile declared; agenttrace reads no credentials and knows no plan limits\n",
+        ),
+    }
+    // rm-1950: the plan reconciliation (caps, model allowances,
+    // pre-plan exclusion) renders only when a profile is declared.
+    let reconciliation = &report["reconciliation"];
+    let cap_parts: Vec<String> = [
+        ("5h block", "five_hour"),
+        ("7d", "weekly"),
+    ]
+    .into_iter()
+    .filter_map(|(label, key)| {
+        reconciliation[key]
+            .as_object()
+            .map(|cap| format!("{label} {}", quota_cap_text(cap)))
+    })
+    .collect();
+    if !cap_parts.is_empty() {
+        out.push_str(&format!("  vs plan         {}\n", cap_parts.join("; ")));
+    }
+    if let Some(models) = reconciliation["models"].as_object() {
+        let mut line = String::from("  model allowances");
+        for (label, cap) in models {
+            if let Some(cap) = cap.as_object() {
+                line.push_str(&format!(" {label} {}", quota_cap_text(cap)));
+            }
+        }
+        if let Some(unmatched) = reconciliation["unmatched_models"].as_array() {
+            let labels: Vec<&str> = unmatched.iter().filter_map(|value| value.as_str()).collect();
+            if !labels.is_empty() {
+                line.push_str(&format!("; unmatched corpus models: {}", labels.join(", ")));
+            }
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if let Some(pre_plan) = reconciliation["pre_plan"].as_object() {
+        match pre_plan["excluded_usd"].as_object() {
+            Some(excluded) => out.push_str(&format!(
+                "  pre-plan        effective {}; excluded ${:.4} (5h block) / ${:.4} (7d)\n",
+                pre_plan["effective_utc"].as_str().unwrap_or("?"),
+                excluded["five_hour_block"].as_f64().unwrap_or(0.0),
+                excluded["weekly"].as_f64().unwrap_or(0.0),
+            )),
+            None => out.push_str(
+                "  pre-plan        no activation date declared — pre-plan corpus spend cannot be separated and still counts against every cap\n",
+            ),
+        }
+    }
     out
+}
+
+/// One reconciliation cap rendered compactly for the text lane:
+/// `$observed of $limit (within, headroom $x)` / `(OVER by $x at API
+/// rates)` / `$observed (no cap declared)`.
+fn quota_cap_text(cap: &serde_json::Map<String, serde_json::Value>) -> String {
+    let observed = cap["observed_usd"].as_f64().unwrap_or(0.0);
+    match cap["limit_usd"].as_f64() {
+        Some(limit) if observed <= limit => format!(
+            "${observed:.4} of ${limit:.4} (within, headroom ${:.4})",
+            limit - observed
+        ),
+        Some(limit) => format!(
+            "${observed:.4} of ${limit:.4} (OVER by ${:.4} at API rates)",
+            observed - limit
+        ),
+        None => format!("${observed:.4} (no cap declared)"),
+    }
 }
 
 pub fn evaluate_overview_gate(
@@ -5182,7 +5725,7 @@ mod quota_tests {
                 2.0,
             ),
         ];
-        let report = quota_report(&sessions);
+        let report = quota_report(&sessions, &QuotaPlanProfile::default());
         assert_eq!(report["schema"], "agenttrace.quota/1");
         assert_eq!(report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z");
         let five = &report["five_hour"];
@@ -5221,7 +5764,7 @@ mod quota_tests {
                 0.5,
             ),
         ];
-        let report = quota_report(&sessions);
+        let report = quota_report(&sessions, &QuotaPlanProfile::default());
         assert_eq!(report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z");
         assert_eq!(report["five_hour"]["spend_usd"], 5.5);
         assert_eq!(report["five_hour"]["sessions_contributing"], 2);
@@ -5236,11 +5779,11 @@ mod quota_tests {
     fn quota_empty_and_unplaced_corpus_discloses_instead_of_guessing() {
         // Empty corpus: no cutoff, undefined windows — never a zero-cost
         // window that would masquerade as a measured quota.
-        let report = quota_report(&[]);
+        let report = quota_report(&[], &QuotaPlanProfile::default());
         assert!(report["corpus"]["cutoff_utc"].is_null());
         assert!(report["five_hour"].is_null());
         assert!(report["weekly"].is_null());
-        let text = render_quota_view("text", &[]).expect("text lane renders");
+        let text = render_quota_view("text", &[], &QuotaPlanProfile::default()).expect("text lane renders");
         assert!(
             text.contains("no session carries placeable time"),
             "empty render says so: {text}"
@@ -5249,7 +5792,7 @@ mod quota_tests {
         // A session with cost but no placeable time at all: counted,
         // disclosed, billed at zero.
         let unplaced = vec![quota_session("nowhen", &[], 9.0)];
-        let report = quota_report(&unplaced);
+        let report = quota_report(&unplaced, &QuotaPlanProfile::default());
         assert_eq!(report["corpus"]["sessions"], 1);
         assert_eq!(report["corpus"]["attribution"]["unplaced"], 1);
         assert!(report["five_hour"].is_null(), "cutoff stays null");
@@ -5258,7 +5801,7 @@ mod quota_tests {
     #[test]
     fn quota_render_lanes_and_schema_stability() {
         let sessions = vec![quota_session("solo", &["2026-10-12T10:30:00Z"], 0.0105)];
-        let json = render_quota_view("json", &sessions).expect("json lane renders");
+        let json = render_quota_view("json", &sessions, &QuotaPlanProfile::default()).expect("json lane renders");
         let parsed: serde_json::Value =
             serde_json::from_str(json.trim()).expect("json lane is valid JSON");
         assert_eq!(parsed["schema"], "agenttrace.quota/1");
@@ -5283,7 +5826,7 @@ mod quota_tests {
                 "window key {key}"
             );
         }
-        let text = render_quota_view("text", &sessions).expect("text lane renders");
+        let text = render_quota_view("text", &sessions, &QuotaPlanProfile::default()).expect("text lane renders");
         assert!(text.starts_with("Quota view"), "text lane: {text}");
         assert!(
             text.contains("$0.0105"),
@@ -5294,7 +5837,7 @@ mod quota_tests {
             "limits stay disclosed-unknown: {text}"
         );
         // Unsupported formats are loud, not silent text fallbacks.
-        let err = render_quota_view("csv", &sessions).unwrap_err();
+        let err = render_quota_view("csv", &sessions, &QuotaPlanProfile::default()).unwrap_err();
         assert!(
             err.to_string().contains("-f text and -f json only"),
             "format guard names the supported lanes: {err}"
@@ -5329,7 +5872,7 @@ mod quota_tests {
                 0.0045,
             ),
         ];
-        let report = quota_report(&sessions);
+        let report = quota_report(&sessions, &QuotaPlanProfile::default());
         assert_eq!(
             report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z",
             "the cutoff is the newest timestamp at-or-before now, never the 2099 skew"
@@ -5374,14 +5917,14 @@ mod quota_tests {
                 7.0,
             ),
         ];
-        let report = quota_report(&sessions);
+        let report = quota_report(&sessions, &QuotaPlanProfile::default());
         assert!(
             report["corpus"]["cutoff_utc"].is_null(),
             "no plausible cutoff"
         );
         assert_eq!(report["corpus"]["future_discarded_sessions"], 2);
         assert!(report["five_hour"].is_null() && report["weekly"].is_null());
-        let text = render_quota_view("text", &sessions).expect("text lane renders");
+        let text = render_quota_view("text", &sessions, &QuotaPlanProfile::default()).expect("text lane renders");
         assert!(
             text.contains("no session carries placeable time"),
             "fully future corpus renders the undefined-cutoff lane: {text}"
@@ -5407,11 +5950,335 @@ mod quota_tests {
                 1.0,
             ),
         ];
-        let report = quota_report(&sessions);
-        assert_eq!(report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z");
-        assert_eq!(report["corpus"]["future_discarded_sessions"], 1);
-        // 6h span, 5h window overlap: $6.00 x 5/6 = $5.00, weekly $6.00.
-        assert_eq!(report["five_hour"]["spend_usd"], 5.0);
-        assert_eq!(report["weekly"]["spend_usd"], 6.0);
+    #[test]
+    fn quota_blocks_anchor_at_first_use_not_calendar() {
+        // rm-1950: the block sequence anchors at the corpus FIRST-USE
+        // instant and tiles forward in fixed 5h steps — never calendar
+        // midnight. Anchor 06:00; cutoff 10:30 lands INSIDE block 0
+        // [06:00 → 11:00], which must diverge from the trailing 5h
+        // rolling window [05:30 → 10:30]: the 05:45 event bills the
+        // rolling window but not the block.
+        let sessions = vec![
+            quota_session("early", &["2026-10-12T05:45:00Z"], 4.0),
+            quota_session(
+                "first-use",
+                &["2026-10-12T06:00:00Z", "2026-10-12T07:00:00Z"],
+                1.0,
+            ),
+            quota_session("later", &["2026-10-12T10:30:00Z"], 2.0),
+        ];
+        let report = quota_report(&sessions, &QuotaPlanProfile::default());
+        let blocks = &report["five_hour_blocks"];
+        assert_eq!(blocks["anchor_utc"], "2026-10-12T06:00:00Z");
+        assert_eq!(blocks["block_span_hours"], 5);
+        assert_eq!(blocks["blocks_total"], 1);
+        assert_eq!(blocks["blocks_emitted"], 1);
+        assert_eq!(blocks["truncated"], false);
+        assert_eq!(blocks["current_block_index"], 0);
+        assert_eq!(blocks["blocks"][0]["start_utc"], "2026-10-12T06:00:00Z");
+        assert_eq!(blocks["blocks"][0]["end_utc"], "2026-10-12T11:00:00Z");
+        assert_eq!(blocks["blocks"][0]["spend_usd"], 3.0);
+        assert_eq!(
+            blocks["current_block_resets_at_utc"],
+            "2026-10-12T11:00:00Z"
+        );
+        // The two window shapes DIVERGE mid-block: the trailing window
+        // starts 05:30 and bills the 05:45 event; the block does not.
+        assert_eq!(
+            report["five_hour"]["window_start_utc"],
+            "2026-10-12T05:30:00Z"
+        );
+        assert_eq!(report["five_hour"]["spend_usd"], 7.0);
+        assert_eq!(blocks["blocks"][0]["spend_usd"], 3.0);
+    }
+
+    #[test]
+    fn quota_block_boundary_straddle_splits_spend() {
+        // rm-1950: a session whose events straddle a block boundary
+        // bills BOTH blocks pro rata (event-timestamp share), and the
+        // block containing the cutoff is current.
+        let sessions = vec![
+            quota_session(
+                "straddler",
+                &["2026-10-12T06:00:00Z", "2026-10-12T11:30:00Z"],
+                2.0,
+            ),
+            quota_session("after", &["2026-10-12T11:30:00Z"], 1.0),
+        ];
+        let report = quota_report(&sessions, &QuotaPlanProfile::default());
+        let blocks = &report["five_hour_blocks"];
+        assert_eq!(blocks["anchor_utc"], "2026-10-12T06:00:00Z");
+        assert_eq!(blocks["blocks_total"], 2);
+        assert_eq!(blocks["current_block_index"], 1);
+        // Block 0 [06:00 → 11:00): one of the straddler's two events.
+        assert_eq!(blocks["blocks"][0]["spend_usd"], 1.0);
+        assert_eq!(blocks["blocks"][0]["end_utc"], "2026-10-12T11:00:00Z");
+        // Block 1 [11:00 → 16:00): the other straddler event + $1.00.
+        assert_eq!(blocks["blocks"][1]["spend_usd"], 2.0);
+        assert_eq!(blocks["blocks"][1]["start_utc"], "2026-10-12T11:00:00Z");
+        assert_eq!(
+            blocks["current_block_resets_at_utc"],
+            "2026-10-12T16:00:00Z"
+        );
+        // Nothing is invented or lost: the blocks partition the spend.
+        let total: f64 = blocks["blocks"]
+            .as_array()
+            .expect("blocks array")
+            .iter()
+            .map(|block| block["spend_usd"].as_f64().unwrap_or(0.0))
+            .sum();
+        assert!((total - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quota_restart_pair_sums_across_the_block_boundary() {
+        // rm-037 fixture arm via rm-1950: a usage-restart (claude-code
+        // 2.1.302 usage-restart lane) splits ONE conversation into two
+        // journal rows — the restart row re-begins usage accounting at
+        // its own timestamps. Both rows must bill the block sequence:
+        // pre-batch only the single trailing window existed, and a
+        // boundary falling BETWEEN the rows was invisible.
+        let sessions = vec![
+            quota_session("seed", &["2026-10-12T06:15:00Z"], 0.0),
+            quota_session(
+                "conv-restart-a",
+                &["2026-10-12T10:00:00Z", "2026-10-12T10:40:00Z"],
+                0.60,
+            ),
+            quota_session("conv-restart-b", &["2026-10-12T11:30:00Z"], 0.40),
+        ];
+        let report = quota_report(&sessions, &QuotaPlanProfile::default());
+        let blocks = &report["five_hour_blocks"];
+        // Anchor at the seed's 06:15; boundary 11:15 falls between the
+        // restart rows.
+        assert_eq!(blocks["anchor_utc"], "2026-10-12T06:15:00Z");
+        assert_eq!(blocks["current_block_index"], 1);
+        assert_eq!(blocks["blocks"][0]["spend_usd"], 0.60);
+        assert_eq!(blocks["blocks"][1]["spend_usd"], 0.40);
+        // Both views carry the whole conversation — the block view's
+        // value is WHERE the boundary sits, not a different total.
+        assert_eq!(report["weekly"]["spend_usd"], 1.0);
+        let total: f64 = blocks["blocks"]
+            .as_array()
+            .expect("blocks array")
+            .iter()
+            .map(|block| block["spend_usd"].as_f64().unwrap_or(0.0))
+            .sum();
+        assert!((total - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quota_blocks_truncate_with_disclosure() {
+        // rm-1950: a long-lived corpus anchors hundreds of blocks; the
+        // JSON emits the trailing 48 with the full count and a
+        // truncation basis — the cut is disclosed, never silent.
+        let sessions = vec![
+            quota_session("ancient", &["2026-10-01T00:00:00Z"], 0.25),
+            quota_session("recent", &["2026-10-12T10:30:00Z"], 1.0),
+        ];
+        let report = quota_report(&sessions, &QuotaPlanProfile::default());
+        let blocks = &report["five_hour_blocks"];
+        assert_eq!(blocks["anchor_utc"], "2026-10-01T00:00:00Z");
+        // (11d 10.5h) / 5h = 54.9 → block 54 contains the cutoff.
+        assert_eq!(blocks["current_block_index"], 54);
+        assert_eq!(blocks["blocks_total"], 55);
+        assert_eq!(blocks["blocks_emitted"], 48);
+        assert_eq!(blocks["truncated"], true);
+        assert!(
+            blocks["truncation_basis"]
+                .as_str()
+                .expect("truncation basis")
+                .contains("trailing 48"),
+            "discloses the cut"
+        );
+        let emitted = blocks["blocks"].as_array().expect("blocks array");
+        assert_eq!(emitted.len(), 48);
+        assert_eq!(emitted[0]["block_index"], 55 - 48);
+        // The current (trailing) block bills the recent session; the
+        // ancient row is outside every emitted block.
+        let current = emitted
+            .iter()
+            .find(|block| block["block_index"].as_u64() == Some(54))
+            .expect("current block emitted");
+        assert_eq!(current["spend_usd"], 1.0);
+    }
+
+    #[test]
+    fn quota_plan_limits_reconcile_against_declared_caps() {
+        // rm-1950: the reserved `limits` seam — a declared profile
+        // fills the values, reconciles observed spend against the
+        // caps (overage priced at API rates, never a vendor invoice),
+        // and undeclared stays null-with-basis exactly as before.
+        let sessions = vec![quota_session("solo", &["2026-10-12T10:30:00Z"], 3.0)];
+
+        let under = QuotaPlanProfile {
+            five_hour_usd: Some(5.0),
+            weekly_usd: Some(40.0),
+            basis: "test profile".to_string(),
+            ..Default::default()
+        };
+        let report = quota_report(&sessions, &under);
+        assert_eq!(report["limits"]["five_hour_usd"], 5.0);
+        assert_eq!(report["limits"]["weekly_usd"], 40.0);
+        assert_eq!(report["limits"]["basis"], "test profile");
+        let five = &report["reconciliation"]["five_hour"];
+        assert_eq!(five["observed_usd"], 3.0);
+        assert_eq!(five["limit_usd"], 5.0);
+        assert_eq!(five["within"], true);
+        assert_eq!(five["headroom_usd"], 2.0);
+        assert_eq!(five["overage_at_api_rates_usd"], 0.0);
+        let weekly = &report["reconciliation"]["weekly"];
+        assert_eq!(weekly["observed_usd"], 3.0);
+        assert_eq!(weekly["within"], true);
+
+        // Over the cap: within=false, overage at API rates, NEGATIVE
+        // headroom (the honest signed number).
+        let over = QuotaPlanProfile {
+            five_hour_usd: Some(2.0),
+            ..Default::default()
+        };
+        let report = quota_report(&sessions, &over);
+        let five = &report["reconciliation"]["five_hour"];
+        assert_eq!(five["within"], false);
+        assert_eq!(five["headroom_usd"], -1.0);
+        assert_eq!(five["overage_at_api_rates_usd"], 1.0);
+        assert_eq!(report["reconciliation"]["weekly"]["limit_usd"], serde_json::Value::Null);
+        assert_eq!(report["reconciliation"]["weekly"]["within"], serde_json::Value::Null);
+
+        // No profile: the reserved seam stays null-with-basis and the
+        // reconciliation is null-with-basis (never invented numbers).
+        let report = quota_report(&sessions, &QuotaPlanProfile::default());
+        assert_eq!(report["limits"]["five_hour_usd"], serde_json::Value::Null);
+        assert_eq!(report["limits"]["weekly_usd"], serde_json::Value::Null);
+        assert!(
+            report["limits"]["basis"]
+                .as_str()
+                .expect("basis")
+                .starts_with("unknown: no plan profile declared"),
+            "undeclared basis names the declaration path"
+        );
+        assert_eq!(
+            report["reconciliation"]["five_hour"],
+            serde_json::Value::Null
+        );
+        assert_eq!(report["reconciliation"]["models"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn quota_plan_pre_plan_spend_is_excluded_and_disclosed() {
+        // rm-1950: corpus spend STRICTLY before a declared plan
+        // activation is excluded from every cap comparison on the same
+        // attribution basis, and disclosed per window; without a
+        // declared activation the exclusion is impossible and the
+        // basis says so.
+        let sessions = vec![
+            quota_session("old", &["2026-10-12T10:00:00Z"], 1.0),
+            quota_session("new", &["2026-10-12T10:30:00Z"], 2.0),
+        ];
+        let plan = QuotaPlanProfile {
+            weekly_usd: Some(10.0),
+            effective_utc: Some(parse_ts("2026-10-12T10:15:00Z").expect("ts")),
+            ..Default::default()
+        };
+        let report = quota_report(&sessions, &plan);
+        let pre_plan = &report["reconciliation"]["pre_plan"];
+        assert_eq!(pre_plan["effective_utc"], "2026-10-12T10:15:00Z");
+        assert_eq!(pre_plan["excluded_usd"]["weekly"], 1.0);
+        assert_eq!(pre_plan["excluded_usd"]["five_hour_block"], 1.0);
+        // Observed is the PLAN-COVERED share only: $2.00, not $3.00.
+        assert_eq!(report["reconciliation"]["weekly"]["observed_usd"], 2.0);
+        assert_eq!(report["reconciliation"]["weekly"]["within"], true);
+        // No declared activation: nothing can be separated.
+        let opaque = QuotaPlanProfile {
+            weekly_usd: Some(10.0),
+            ..Default::default()
+        };
+        let report = quota_report(&sessions, &opaque);
+        assert_eq!(
+            report["reconciliation"]["weekly"]["observed_usd"],
+            3.0
+        );
+        let pre_plan = &report["reconciliation"]["pre_plan"];
+        assert_eq!(pre_plan["effective_utc"], serde_json::Value::Null);
+        assert_eq!(pre_plan["excluded_usd"], serde_json::Value::Null);
+        assert!(pre_plan["basis"].as_str().expect("basis").contains("cannot be separated"));
+    }
+
+    #[test]
+    fn quota_plan_model_allowances_reconcile_and_disclose_unmatched() {
+        // rm-1950: per-model weekly allowances reconcile on the EXACT
+        // model_used label; corpus models with weekly spend and no
+        // declared allowance are listed, never silently folded into
+        // another model's cap.
+        let mut sonnet = quota_session("sonnet", &["2026-10-12T10:00:00Z"], 1.5);
+        sonnet.metrics.model_used = "claude-sonnet-4".to_string();
+        let mut opus = quota_session("opus", &["2026-10-12T10:30:00Z"], 2.5);
+        opus.metrics.model_used = "claude-opus-4-1".to_string();
+        let sessions = vec![sonnet, opus];
+        let mut allowances = std::collections::BTreeMap::new();
+        allowances.insert("claude-sonnet-4".to_string(), 2.0);
+        let plan = QuotaPlanProfile {
+            weekly_usd: Some(20.0),
+            weekly_model_allowances: allowances,
+            ..Default::default()
+        };
+        let report = quota_report(&sessions, &plan);
+        let model = &report["reconciliation"]["models"]["claude-sonnet-4"];
+        assert_eq!(model["observed_usd"], 1.5);
+        assert_eq!(model["limit_usd"], 2.0);
+        assert_eq!(model["within"], true);
+        assert_eq!(model["overage_at_api_rates_usd"], 0.0);
+        let unmatched = report["reconciliation"]["unmatched_models"]
+            .as_array()
+            .expect("unmatched list");
+        assert_eq!(unmatched.len(), 1);
+        assert_eq!(unmatched[0], "claude-opus-4-1");
+        // The aggregate weekly cap still sees the whole corpus.
+        assert_eq!(report["reconciliation"]["weekly"]["observed_usd"], 4.0);
+    }
+
+    #[test]
+    fn quota_plan_text_lane_renders_blocks_limits_and_reconciliation() {
+        // rm-1950: the text lane must carry the same truth — the
+        // block line, declared limits, the vs-plan line, model
+        // allowances, and the pre-plan disclosure.
+        let mut sonnet = quota_session("sonnet", &["2026-10-12T10:00:00Z"], 1.5);
+        sonnet.metrics.model_used = "claude-sonnet-4".to_string();
+        let sessions = vec![quota_session("old", &["2026-10-12T06:00:00Z"], 1.0), sonnet];
+        let mut allowances = std::collections::BTreeMap::new();
+        allowances.insert("claude-sonnet-4".to_string(), 2.0);
+        let plan = QuotaPlanProfile {
+            five_hour_usd: Some(5.0),
+            weekly_usd: Some(40.0),
+            weekly_model_allowances: allowances,
+            effective_utc: Some(parse_ts("2026-10-12T08:00:00Z").expect("ts")),
+            basis: "test profile".to_string(),
+        };
+        let text =
+            render_quota_view("text", &sessions, &plan).expect("text lane renders");
+        assert!(text.contains("5h blocks"), "block line: {text}");
+        assert!(text.contains("first-use anchor 2026-10-12T06:00:00Z"));
+        assert!(
+            text.contains("limits          five-hour $5.0000 / weekly $40.0000"),
+            "limits line: {text}"
+        );
+        assert!(text.contains("vs plan"), "reconciliation line: {text}");
+        assert!(text.contains("(within"));
+        assert!(
+            text.contains("model allowances claude-sonnet-4"),
+            "model line: {text}"
+        );
+        assert!(
+            text.contains("pre-plan        effective 2026-10-12T08:00:00Z"),
+            "pre-plan line: {text}"
+        );
+        // Undeclared keeps the honest unknown line.
+        let text = render_quota_view("text", &sessions, &QuotaPlanProfile::default())
+            .expect("text lane renders");
+        assert!(
+            text.contains("limits          unknown — no plan profile declared"),
+            "undeclared limits line: {text}"
+        );
+        assert!(!text.contains("vs plan"));
     }
 }
