@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 type TokenUsage = BTreeMap<String, i64>;
@@ -21,16 +22,128 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     }
     if is_cline_task_file(path) {
         if let Some(dir) = path.parent() {
-            if let Ok(session) = parse_cline_task_dir(dir) {
-                return Ok(session);
+            // rm-451 review fix (independent review 1f153416, F1): a cline-dir
+            // member refused by the cap must stay loud — falling
+            // through to the generic named-file read would either
+            // duplicate the refusal or, worse, parse the small
+            // named file and silently drop its over-cap siblings.
+            match parse_cline_task_dir(dir) {
+                Ok(session) => return Ok(session),
+                Err(err) if err.downcast_ref::<ReadCapRefused>().is_some() => return Err(err),
+                Err(_) => {}
             }
         }
     }
-    let raw =
-        std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
+    let raw = read_session_file_bounded(path, file_read_cap_bytes())?;
     let name = session_name(path);
     let path_text = path.to_string_lossy().to_string();
     parse_session_bytes(raw, &path_text, &name)
+}
+
+/// rm-451: named-file read cap — the last unbounded member of the
+/// admission family IN THIS BASE (stdin 256 MiB rm-503, zstd rollout
+/// decode 64 MiB rm-992 above, statusline journal 10 MiB rm-898).
+/// Review fix (independent review 1f153416, F1) extends it to the cline
+/// task-file arm: `read_json_value` now refuses over-cap
+/// api_conversation_history.json / ui_messages.json /
+/// task_metadata.json members with the same marker instead of the
+/// old bare `read_to_string` bypass. Disclosed residual NOT covered
+/// by this cap on the merged tree (integration 1afb6709 update): the
+/// sibling rm-1437 lane landed in this lineage at HEAD, so the
+/// opencode reads (`read_opencode_records` and the opencode
+/// project-doc read) are stat-capped at
+/// `OPENCODE_TRANSCRIPT_READ_CAP_BYTES` (10 MiB) and compose with
+/// this cap — the remaining uncapped member is the opencode
+/// fork-parent pointer probe in discovery
+/// (`opencode_session_fork_parent`), tracked on rm-548's open row. `parse_file` serves the claude/codex/pi/cline named-file +
+/// positional CLI lane; a huge file used to load fully into
+/// memory before format rejection (300 MiB of NULs peaked at 613
+/// MiB RSS via the positional lane, assess 635ecf6a F2). The read
+/// now refuses past this bound with the named [`ReadCapRefused`]
+/// error — skip, never crash — which the loader and `--doctor`
+/// classify into their disclosure counters.
+/// `AGENTTRACE_FILE_CAP_BYTES` overrides it (best-effort like every
+/// other `AGENTTRACE_*` knob — unparseable or non-positive values
+/// fall back to the default rather than failing the run over a
+/// typo'd cap; the same contract as `AGENTTRACE_STDIN_CAP_BYTES`).
+pub const FILE_READ_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Effective named-file read cap for this run (see
+/// [`FILE_READ_CAP_BYTES`]). Kept as a pure resolver beside the env
+/// wrapper so the override contract is unit-testable without a
+/// process-wide env race.
+pub(crate) fn file_read_cap_bytes() -> u64 {
+    resolve_file_read_cap(std::env::var("AGENTTRACE_FILE_CAP_BYTES").ok().as_deref())
+}
+
+/// Pure half of [`file_read_cap_bytes`]: `None`/unparseable/
+/// non-positive overrides fall back to the default cap.
+fn resolve_file_read_cap(env_value: Option<&str>) -> u64 {
+    env_value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(FILE_READ_CAP_BYTES)
+}
+
+/// Marker error for a session file refused by [`FILE_READ_CAP_BYTES`].
+/// A distinct type (not a message match) so discovery and `--doctor`
+/// can classify the refusal into their loud skip counters without
+/// string sniffing.
+#[derive(Debug)]
+pub struct ReadCapRefused {
+    pub path: String,
+    pub size: u64,
+    pub cap: u64,
+}
+
+impl ReadCapRefused {
+    fn new(path: &Path, size: u64, cap: u64) -> Self {
+        Self {
+            path: path.display().to_string(),
+            size,
+            cap,
+        }
+    }
+}
+
+impl std::fmt::Display for ReadCapRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session file {} is {} bytes and exceeds the {}-byte read cap; \
+             refusing the unbounded read (set AGENTTRACE_FILE_CAP_BYTES to raise or lower \
+             the cap, or split the file and pipe it through stdin)",
+            self.path, self.size, self.cap
+        )
+    }
+}
+
+impl std::error::Error for ReadCapRefused {}
+
+/// Read one named session file, bounded by `cap` bytes (rm-451). A
+/// metadata fast path refuses an over-cap file before any read; the
+/// read itself is capped with `take(cap + 1)` so a file that GREWS
+/// between the two (the metadata lie / TOCTOU case) still cannot
+/// allocate more than one byte over the cap. Every other failure
+/// keeps the exact `read session file {}` context wording the bare
+/// `std::fs::read` produced, so non-cap behavior is unchanged.
+fn read_session_file_bounded(path: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
+    let metadata_len = std::fs::metadata(path)
+        .with_context(|| format!("read session file {}", path.display()))?
+        .len();
+    if metadata_len > cap {
+        return Err(ReadCapRefused::new(path, metadata_len, cap).into());
+    }
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("read session file {}", path.display()))?;
+    let mut raw = Vec::with_capacity(metadata_len.min(1024 * 1024) as usize);
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut raw)
+        .with_context(|| format!("read session file {}", path.display()))?;
+    if raw.len() as u64 > cap {
+        return Err(ReadCapRefused::new(path, raw.len() as u64, cap).into());
+    }
+    Ok(raw)
 }
 
 /// Decode + parse one session stream (rm-503): the shared tail of
@@ -228,7 +341,13 @@ pub fn parse_stdin_bytes(raw: Vec<u8>) -> anyhow::Result<Session> {
 }
 
 fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
-    let metadata = read_json_value(&dir.join("task_metadata.json")).unwrap_or(Value::Null);
+    // rm-451 review fix (independent review 1f153416, F1): read_json_value now refuses
+    // over-cap members with the same named-file cap error, so `?`
+    // propagates a loud ReadCapRefused instead of the old silent
+    // None-skip that let a huge api_conversation_history.json sail
+    // past the cap (review F1, live-proven bypass of the same
+    // named-file lanes this row governs).
+    let metadata = read_json_value(&dir.join("task_metadata.json"))?.unwrap_or(Value::Null);
     let model = metadata
         .as_object()
         .map(cline_model)
@@ -236,14 +355,14 @@ fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
     let mut events = Vec::new();
     let mut seen = BTreeSet::new();
 
-    if let Some(raw) = read_json_value(&dir.join("api_conversation_history.json")) {
+    if let Some(raw) = read_json_value(&dir.join("api_conversation_history.json"))? {
         if let Some(api_events) = parse_cline_value(&raw, &model) {
             for event in api_events {
                 append_cline_event(&mut events, &mut seen, event);
             }
         }
     }
-    if let Some(raw) = read_json_value(&dir.join("ui_messages.json")) {
+    if let Some(raw) = read_json_value(&dir.join("ui_messages.json"))? {
         for event in parse_cline_ui_messages(&raw, &model) {
             append_cline_event(&mut events, &mut seen, event);
         }
@@ -9145,9 +9264,24 @@ fn is_cline_task_file(path: &Path) -> bool {
     )
 }
 
-fn read_json_value(path: &Path) -> Option<Value> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+// rm-451 review fix (independent review 1f153416, F1): the cline task-file arm
+// used to bypass the named-file cap entirely — bare read_to_string
+// on api_conversation_history.json / ui_messages.json /
+// task_metadata.json, reachable from the SAME positional and --dir
+// lanes parse_file governs. Now shares the bounded read: a read or
+// parse failure stays Ok(None) (pre-existing skip semantics), but
+// an over-cap member refuses loudly with the ReadCapRefused marker
+// so parse_cline_task_dir propagates it and parse_file surfaces
+// the named error instead of silently parsing around a huge
+// sibling file.
+fn read_json_value(path: &Path) -> anyhow::Result<Option<Value>> {
+    match read_session_file_bounded(path, file_read_cap_bytes()) {
+        // Only the cap refusal is loud; a vanished/unreadable or
+        // malformed member keeps the old skip shape.
+        Err(err) if err.downcast_ref::<ReadCapRefused>().is_some() => Err(err),
+        Err(_) => Ok(None),
+        Ok(raw) => Ok(serde_json::from_slice(&raw).ok()),
+    }
 }
 
 fn cline_model(metadata: &Map<String, Value>) -> String {
@@ -10406,6 +10540,101 @@ mod tests {
             "error must name the remedy, got: {message}"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// rm-451 acceptance: a named file past the admission cap is
+    /// refused BEFORE the read with a named error that carries the
+    /// cap and the knob — and the marker type classifies it for the
+    /// loader/doctor counters without string sniffing.
+    #[test]
+    fn over_cap_named_file_is_refused_with_the_marker_error() {
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm451-cap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("huge.jsonl");
+        fs::write(&file, vec![b'x'; 200]).expect("write 200-byte file");
+        let err = read_session_file_bounded(&file, 100)
+            .expect_err("a 200-byte file past a 100-byte cap must be refused");
+        let refused = err
+            .downcast_ref::<ReadCapRefused>()
+            .expect("the refusal must downcast to the marker type");
+        assert_eq!(refused.size, 200);
+        assert_eq!(refused.cap, 100);
+        let message = err.to_string();
+        assert!(
+            message.contains("exceeds the") && message.contains("read cap"),
+            "error must name the cap class, got: {message}"
+        );
+        assert!(
+            message.contains("AGENTTRACE_FILE_CAP_BYTES"),
+            "error must name the knob, got: {message}"
+        );
+        // Exactly-at-cap is admitted: the bound is inclusive.
+        let raw = read_session_file_bounded(&file, 200).expect("at-cap file must parse");
+        assert_eq!(raw.len(), 200);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// rm-451 review fix (independent review 1f153416, F1): the cline task-file
+    /// arm used to bypass the cap — a huge
+    /// api_conversation_history.json was read whole by
+    /// read_json_value regardless of the knob. Now the arm refuses
+    /// loudly: both the named-file path (the huge member itself)
+    /// and the directory path (a small named file whose SIBLING is
+    /// over cap) must surface the marker, never a silent
+    /// partial-parse around the over-cap member. Sparse fixture
+    /// under the DEFAULT cap — no AGENTTRACE_FILE_CAP_BYTES mutation,
+    /// because parallel parser tests parse real fixtures through
+    /// file_read_cap_bytes() and a process-wide set_var would race them.
+    #[test]
+    fn cline_arm_over_cap_refuses_loudly_both_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm451-cline-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(root.join("task_metadata.json"), b"{}").expect("write small cline member");
+        let api = root.join("api_conversation_history.json");
+        let file = fs::File::create(&api).expect("create sparse member");
+        file.set_len(FILE_READ_CAP_BYTES + 1)
+            .expect("len-only 256 MiB + 1 sparse member");
+        for probe in [api, root.clone()] {
+            let err =
+                parse_file(&probe).expect_err("an over-cap cline member must refuse the parse");
+            let refused = err
+                .downcast_ref::<ReadCapRefused>()
+                .expect("the cline refusal must be the marker type");
+            assert_eq!(refused.size, FILE_READ_CAP_BYTES + 1);
+            assert_eq!(refused.cap, FILE_READ_CAP_BYTES);
+            let msg = format!("{err:#}");
+            assert!(msg.contains("read cap"), "cap class named: {msg}");
+            assert!(
+                msg.contains("AGENTTRACE_FILE_CAP_BYTES"),
+                "knob named: {msg}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// rm-451 knob contract (mirrors the rm-503 stdin resolver):
+    /// absent/unparseable/non-positive overrides fall back to the
+    /// default instead of failing the run over a typo'd cap.
+    #[test]
+    fn file_cap_resolver_contract() {
+        assert_eq!(resolve_file_read_cap(None), FILE_READ_CAP_BYTES);
+        assert_eq!(
+            resolve_file_read_cap(Some("not-a-number")),
+            FILE_READ_CAP_BYTES
+        );
+        assert_eq!(resolve_file_read_cap(Some("0")), FILE_READ_CAP_BYTES);
+        assert_eq!(resolve_file_read_cap(Some("  ")), FILE_READ_CAP_BYTES);
+        assert_eq!(resolve_file_read_cap(Some("1024")), 1024);
+        assert_eq!(resolve_file_read_cap(Some(" 2048 ")), 2048);
+        assert_eq!(FILE_READ_CAP_BYTES, 256 * 1024 * 1024);
     }
 
     #[test]

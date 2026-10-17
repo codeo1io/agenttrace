@@ -40,7 +40,10 @@ struct Args {
     /// never touch the session cache; the read is capped at 256 MiB
     /// by default — an over-cap stream fails with a named error
     /// instead of reading without bound, and AGENTTRACE_STDIN_CAP_BYTES
-    /// overrides the cap)
+    /// overrides the cap; a NAMED file is bounded by the same-order
+    /// cap — AGENTTRACE_FILE_CAP_BYTES, default 256 MiB (rm-451) —
+    /// and an over-cap file is refused with a named error and counted
+    /// in --doctor's read-cap-refused disclosure)
     path: Option<String>,
     /// Output format for the requested view: text (default), json, csv,
     /// markdown/md, html, svg (the shareable usage card; requires
@@ -2285,10 +2288,20 @@ fn parse_failure_advisory(report: &LoadReport) -> Option<String> {
         return None;
     }
     report.first_parse_failure.as_deref().map(|first| {
-        format!(
+        let mut advisory = format!(
             "{} of {} discovered session files failed to parse; first: {first}",
             report.parse_failures, report.discovered
-        )
+        );
+        // rm-451: name the read-cap share of the failures so the
+        // admission class (and its knob) is disclosed even when the
+        // first failure in discovery order is some other error class.
+        if report.read_cap_refused > 0 {
+            advisory.push_str(&format!(
+                "; {} refused by the file-read cap (AGENTTRACE_FILE_CAP_BYTES)",
+                report.read_cap_refused
+            ));
+        }
+        advisory
     })
 }
 
