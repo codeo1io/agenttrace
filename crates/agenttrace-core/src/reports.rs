@@ -972,7 +972,15 @@ fn card_daily_series(sessions: &[Session], days: usize) -> Vec<(chrono::NaiveDat
             Some(current) if current >= day => current,
             _ => day,
         });
-        *buckets.entry(day).or_insert(0.0) += session.metrics.cost_estimated;
+        // rm-1500 (cycle 5, run e4209f0c): the daily series folded cost_estimated
+        // without the finiteness gate the lib.rs overview arms carry — the one
+        // fold the "every aggregate fold" acceptance missed. Poisoned sessions
+        // contribute 0.0 here and stay counted by overview.non_finite_costs.
+        *buckets.entry(day).or_insert(0.0) += if session.metrics.cost_estimated.is_finite() {
+            session.metrics.cost_estimated
+        } else {
+            0.0
+        };
     }
     let mut series = Vec::with_capacity(days);
     match latest {
@@ -4018,6 +4026,41 @@ mod tests {
         let sessions = vec![session.clone(), session];
         let summary = overview_summary(&crate::Overview::default(), &sessions);
         assert_eq!(summary["total_tokens"].as_i64(), Some(i64::MAX));
+    }
+
+    #[test]
+    fn card_daily_series_skips_non_finite_cost() {
+        // rm-1500 (cycle 5, run e4209f0c assess F2): the daily cost series
+        // folded cost_estimated without the finiteness gate the overview
+        // arms carry — one NaN journal poisoned the whole card series.
+        let session = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "poisoned".to_string(),
+            path: "/tmp/poisoned.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                cost_estimated: f64::NAN,
+                session_end: chrono::Utc::now().to_rfc3339(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let series = card_daily_series(&[session], 14);
+        assert!(
+            !series.is_empty(),
+            "the poisoned session's day must still appear (it is counted)"
+        );
+        for (_, cost) in series {
+            assert!(
+                cost.is_finite(),
+                "non-finite cost leaked into the daily series"
+            );
+        }
     }
 
     #[test]

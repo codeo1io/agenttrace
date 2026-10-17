@@ -497,7 +497,15 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .cache_read
             .saturating_add(session.metrics.tokens_cache_r);
         row.tokens.total = row.tokens.total.saturating_add(total_tokens(session));
-        row.cost += session.metrics.cost_estimated;
+        // rm-1500 (cycle 5, run e4209f0c): governance rows fold cost_estimated;
+        // gate it like the lib.rs overview arms (the "every aggregate fold"
+        // acceptance named this row and it was missed). Poisoned sessions
+        // contribute 0.0 to the row and stay counted by overview.non_finite_costs.
+        row.cost += if session.metrics.cost_estimated.is_finite() {
+            session.metrics.cost_estimated
+        } else {
+            0.0
+        };
         // rm-520: carry each session's rm-436 recorded-cost basis into
         // the row so the drift comparison prices recorded classes
         // exactly once instead of re-estimating them at catalog rates.
@@ -1697,6 +1705,27 @@ mod tests {
             health: 80,
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn cost_by_model_folds_skip_non_finite_cost() {
+        // rm-1500 (cycle 5, run e4209f0c assess F2): cost_by_model folded
+        // cost_estimated without the finiteness gate the overview arms
+        // carry — one NaN journal poisoned the CSV models lane.
+        let mut poisoned = session("nan-cost");
+        poisoned.metrics.cost_estimated = f64::NAN;
+        poisoned.metrics.model_used = "poison-model".to_string();
+        let audit = cost_audit(&[poisoned]);
+        assert!(
+            !audit.by_provider_model.is_empty(),
+            "the poisoned session's model row must still exist (sessions counted)"
+        );
+        for m in &audit.by_provider_model {
+            assert!(
+                m.stored_estimated_cost_usd.is_finite(),
+                "non-finite cost leaked into the provider/model cost fold"
+            );
         }
     }
 

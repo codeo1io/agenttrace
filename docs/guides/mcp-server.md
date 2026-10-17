@@ -102,6 +102,24 @@ count) when files exist but fall outside the window or filters
 the twin of the CLI's rc2 usage errors; `isError` results are the
 twin of its rc1 report failures.
 
+### Result members the 2026-07-28 revision requires (rm-455)
+
+Every result carries `resultType: "complete"` — the revision's
+`Result` base interface makes the member REQUIRED on all results a
+server implementing it returns (clients built against older
+revisions must treat absence as `"complete"`, so the member is
+additive there and this server emits it unconditionally rather than
+keeping per-connection negotiation state). `tools/list` additionally
+carries the revision's required `CacheableResult` pair:
+`ttlMs: 3600000` (an honest freshness hint — the tool list is
+compiled into the binary and changes only with a binary upgrade, and
+`initialize` declares `listChanged: false`, so TTL-based freshness is
+the only invalidation channel a host has) and `cacheScope:
+"public"` (the caching guide's own recommendation for tool lists
+identical for all users). `tools/call` deliberately emits **no**
+caching hints: it is not one of the revision's cacheable operations,
+and a per-corpus report must not look cacheable across users.
+
 ## Tools
 
 ### `usage_overview`

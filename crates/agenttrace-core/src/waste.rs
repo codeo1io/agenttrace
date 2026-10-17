@@ -96,12 +96,28 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
                 },
             }),
     );
-    let loop_cost = session.diagnostics.loop_cost.total_loop_cost;
+    let raw_loop_cost = session.diagnostics.loop_cost.total_loop_cost;
     let loop_basis = session.diagnostics.loop_cost.cost_basis;
-    let loop_percent = loop_waste_percent(loop_cost, session.metrics.cost_estimated);
+    // rm-1500 (cycle 5, run e4209f0c): fold gates for the waste lane — the
+    // loop-percent ratio, the bloat fold, and the loop-cost summand used
+    // cost_estimated/total_loop_cost without the finiteness gate the lib.rs
+    // overview arms carry (the "every aggregate fold" acceptance named
+    // total_wasted and it was missed). A poisoned session contributes 0.0
+    // here and stays counted by overview.non_finite_costs.
+    let cost_estimated = if session.metrics.cost_estimated.is_finite() {
+        session.metrics.cost_estimated
+    } else {
+        0.0
+    };
+    let loop_cost = if raw_loop_cost.is_finite() {
+        raw_loop_cost
+    } else {
+        0.0
+    };
+    let loop_percent = loop_waste_percent(raw_loop_cost, cost_estimated);
     let mut total_wasted = cache.wasted_cost + loop_cost;
     if bloat.bloat_score > 50 {
-        total_wasted += session.metrics.cost_estimated * 0.05;
+        total_wasted += cost_estimated * 0.05;
     }
 
     let mut score = match cache.rating {
@@ -754,6 +770,45 @@ fn level_emoji(level: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Diagnostics;
+
+    #[test]
+    fn poisoned_session_yields_zero_loop_percent_and_finite_waste() {
+        // rm-1500 (cycle 5, run e4209f0c assess F2): the waste lane folded
+        // cost_estimated (bloat arm) and divided by it (loop percent) without
+        // the finiteness gate the lib.rs overview arms carry. Before the
+        // gates, NaN.cost_estimated made total_wasted NaN and NaN loop_cost
+        // survived NaN.clamp() into the score.
+        let session = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "poisoned".to_string(),
+            path: "/tmp/poisoned.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                cost_estimated: f64::NAN,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: {
+                let mut d = Diagnostics::default();
+                d.loop_cost.total_loop_cost = f64::NAN;
+                d
+            },
+        };
+        let report = compute_waste_report(&session);
+        assert!(
+            report.total_wasted.is_finite(),
+            "NaN cost_estimated/loop_cost poisoned total_wasted"
+        );
+        assert_eq!(
+            report.loop_percent, 0.0,
+            "NaN loop_cost must clamp to 0% loop waste"
+        );
+    }
 
     #[test]
     fn cache_hit_rate_above_100_is_disclosed_not_excellent() {

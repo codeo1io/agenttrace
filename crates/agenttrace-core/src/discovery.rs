@@ -1228,7 +1228,20 @@ pub fn is_session_file_name(name: &str) -> bool {
     if name.ends_with(".lock") {
         return false;
     }
-    name.ends_with(".jsonl") || name.ends_with(".json")
+    // rm-992 (cycle 5, run e4209f0c assess F1 + research 30082665): codex
+    // 0.163.0 STABLE (2026-10-15) compresses rollouts to `<name>.jsonl.zst`
+    // (opt-in `LocalThreadStoreCompression` + the `migrate_rollouts` CLI;
+    // upstream `rollout/src/compression.rs` COMPRESSED_SUFFIX = ".zst"). The
+    // parser already decodes zstd frames transparently via its magic sniff
+    // (parser.rs, rm-1516, concatenated frames included) — but this NAME
+    // filter rejected the file before the sniff could run, so a migrated
+    // home silently undercounted (assess PoC: a zst-only home reported "No
+    // session files found" while identical bytes under a plain `.jsonl`
+    // name parsed fine). Admitting the name lets the existing sniff+decode
+    // path own the file end to end; anything that is NOT a valid frame still
+    // lands in skipped_files with the honest `zstd-compressed` error (see
+    // discovery_contract's raw-magic test).
+    name.ends_with(".jsonl") || name.ends_with(".jsonl.zst") || name.ends_with(".json")
 }
 
 fn max_session_dir_depth(dir: &Path) -> usize {
