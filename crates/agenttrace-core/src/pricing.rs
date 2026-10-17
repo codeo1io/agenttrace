@@ -360,7 +360,7 @@ enum ServingCatalog {
 }
 
 fn serving_catalog(model: &str, catalog: &PricingCatalog) -> Option<ServingCatalog> {
-    if let Some(key) = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries) {
+    if let Some(key) = matching_catalog_key_for(model, catalog) {
         if pricing_override_models().contains(&key)
             || catalog
                 .providers
@@ -431,7 +431,7 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
             .get(&key)
             .cloned()
             .unwrap_or_default(),
-        _ => lookup_price_in(model, &catalog.aliases, &catalog.entries),
+        _ => lookup_price_in(model, catalog),
     };
     let (input_tier, output_tier, cw_tier, cr_tier) = match service_tier {
         Some("flex") => (
@@ -669,7 +669,7 @@ fn lookup_context_window_in(model: &str, catalog: &PricingCatalog) -> Option<u64
     // the raw qualified id: "azure/eu/GPT-5.5" and alias-mapped ids like
     // "aihubmix/glm-5.3-flash" got the BASE row's window (or None)
     // while their rates came from their own rows.
-    let key = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries)?;
+    let key = matching_catalog_key_for(model, catalog)?;
     catalog
         .entries
         .get(&key)
@@ -1413,17 +1413,15 @@ fn write_pricing_cache_at(path: &Path, raw: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn lookup_price_in(
-    model: &str,
-    aliases: &BTreeMap<String, String>,
-    entries: &BTreeMap<String, Price>,
-) -> Price {
+fn lookup_price_in(model: &str, catalog: &PricingCatalog) -> Price {
+    let aliases = &catalog.aliases;
+    let entries = &catalog.entries;
     // rm-1053 (run f2fccaa9 cycle 3): catalog first, on the raw-first
     // ladder — the id exactly as the session recorded it wins before
     // any normalization collapses it onto a base-model row. Only a
     // model the catalog does not know at all falls to the built-in
     // table, which keeps the alias-resolved ladder it always had.
-    if let Some(key) = matching_catalog_key_for(model, aliases, entries) {
+    if let Some(key) = matching_catalog_key_for(model, catalog) {
         return entries.get(&key).cloned().unwrap_or_default();
     }
     // rm-1511 review fix (1a615b64, review ed20477f F1/F4): the catalog-first
@@ -1440,7 +1438,7 @@ fn lookup_price_in(
     // second_order_variant_expansion_resolves_via_the_catalog_loop.
     for variant in match_variants(model) {
         if variant != model {
-            if let Some(key) = matching_catalog_key_for(&variant, aliases, entries) {
+            if let Some(key) = matching_catalog_key_for(&variant, catalog) {
                 return entries.get(&key).cloned().unwrap_or_default();
             }
         }
@@ -1485,11 +1483,9 @@ fn resolution_ladder(model: &str, aliases: &BTreeMap<String, String>) -> Vec<Str
     ladder
 }
 
-fn matching_catalog_key_for(
-    model: &str,
-    aliases: &BTreeMap<String, String>,
-    entries: &BTreeMap<String, Price>,
-) -> Option<String> {
+fn matching_catalog_key_for(model: &str, catalog: &PricingCatalog) -> Option<String> {
+    let aliases = &catalog.aliases;
+    let entries = &catalog.entries;
     // rm-1053 raw-first: the id exactly as the session recorded it wins
     // before normalization collapses it onto a base-model row. rm-196
     // composed onto that ladder at integration (conflict case
@@ -1529,7 +1525,60 @@ fn matching_catalog_key_for(
         // the unqualified first hit (rm-196), while later non-override
         // variants never displace it (rm-1053 ladder order).
     }
+    if first_hit.is_none() {
+        // rm-1994: the ladder missed entirely — a bare display name
+        // the catalog only knows as provider-QUALIFIED rows (e.g.
+        // `gemini-4-argon`, which exists only as `gemini/`,
+        // `vertex_ai/` and `github_copilot/` rows) used to fall all
+        // the way through to fallback pricing. Probe the qualified
+        // arms instead. The probe can never override a top-level hit:
+        // it only runs when the ladder found nothing at all, so the
+        // precedence contracts (rm-1053/rm-196/rm-1532) are untouched.
+        return qualified_base_probe(model, catalog);
+    }
     first_hit
+}
+
+/// rm-1994: provider-qualified probe arm for bare display names. When
+/// the raw-first ladder finds nothing, look for catalog rows whose
+/// `normalize_model` base identity equals the query's — i.e. the
+/// qualified twins (`gemini/…`, `vertex_ai/…`, reseller paths) of the
+/// same model — and serve the best one. Selection is deterministic and
+/// snapshot-derived (no vendored rows, so a refresh can only change it
+/// by genuinely changing the catalog): first-party provider rows win,
+/// ties break lexicographically. The probe invents no names and never
+/// mutates the query — it answers with an existing catalog key or
+/// stays silent, and a first-party top-level row (if one appears in a
+/// later snapshot) automatically outranks the probe because the
+/// ladder itself wins first.
+fn qualified_base_probe(model: &str, catalog: &PricingCatalog) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let target = normalize_model(trimmed);
+    if target.is_empty() || target == "default" || target == "unknown" {
+        return None;
+    }
+    let mut best: Option<(bool, String)> = None; // (is_reseller, key)
+    for key in catalog.entries.keys() {
+        if !key.contains('/') {
+            // Top-level rows are the ladder's jurisdiction; indexing
+            // them here could only ever shadow real hits.
+            continue;
+        }
+        if normalize_model(key) != target {
+            continue;
+        }
+        let is_reseller = !is_first_party_provider(
+            catalog.providers.get(key).map(String::as_str).unwrap_or(""),
+        );
+        let candidate = (is_reseller, key.clone());
+        if best.as_ref().is_none_or(|current| candidate < *current) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, key)| key)
 }
 
 /// rm-1053: the catalog id a region/vendor-qualified LiteLLM key must
@@ -3695,7 +3744,7 @@ mod tests {
         let twin = "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0";
         // Pre-override: the twin already bills its own retained row
         // (the landed rm-1053 mechanics this lane composes onto).
-        let before = lookup_price_in(twin, &catalog.aliases, &catalog.entries);
+        let before = lookup_price_in(twin, catalog);
         assert!((before.input - 3.6).abs() < 1e-9);
 
         let root = std::env::temp_dir().join(format!(
@@ -3727,7 +3776,7 @@ mod tests {
 
         // The twin's own row carries the user's rates, provider, and
         // source — all three surfaces cite one row.
-        let price = lookup_price_in(twin, &catalog.aliases, &catalog.entries);
+        let price = lookup_price_in(twin, catalog);
         assert_eq!((price.input, price.output), (4.0, 20.0));
         assert_eq!(provider_for_in(twin, &catalog), Some("bedrock".to_string()));
         assert_eq!(
@@ -3741,7 +3790,7 @@ mod tests {
         let slot = "anthropic.claude-sonnet-4-5";
         let slot_price = catalog.entries.get(slot).expect("shared slot row");
         assert!((slot_price.input - 3.0).abs() < 1e-9);
-        let base = lookup_price_in(slot, &catalog.aliases, &catalog.entries);
+        let base = lookup_price_in(slot, catalog);
         assert!((base.input - 3.0).abs() < 1e-9);
     }
 
@@ -3807,7 +3856,7 @@ mod tests {
             // Resolve exactly like the production rate path — one
             // raw-first ladder call — so the pin cannot pass through a
             // different resolution chain than a real session does.
-            let price = lookup_price_in(model, &catalog.aliases, &catalog.entries);
+            let price = lookup_price_in(model, catalog);
             assert!(
                 (price.input - input).abs() < 1e-9 && (price.output - output).abs() < 1e-9,
                 "{model} priced from the wrong row: got ({}, {}), expected ({input}, {output})",
@@ -3822,7 +3871,7 @@ mod tests {
             // The single-row invariant: the rate path and the provider
             // path resolve the SAME catalog key — the model's own raw
             // id for qualified rows, its normalized winner otherwise.
-            let key = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries)
+            let key = matching_catalog_key_for(model, catalog)
                 .expect("row key resolves");
             assert_eq!(
                 catalog.providers.get(&key).map(String::as_str),
