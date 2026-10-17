@@ -4522,3 +4522,61 @@ fn codex_walk_admits_migrated_zst_rollouts_with_stable_names() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+#[test]
+fn codex_zst_admission_extends_down_from_ancestor_root() {
+    // rm-1941 (run 122b213a98a1): the admission must extend DOWN the
+    // tree, not just fire at a root that already sits inside `.codex` —
+    // an explicit walk of an ancestor directory (`-d $HOME`, a backup
+    // tree, a relocated corpus) must admit migrated rollouts nested
+    // under `.codex/` exactly like the default per-root scan does. The
+    // rollout sits directly under `.codex/sessions/` so the case stays
+    // inside the walk's depth budget (the real codex date nesting
+    // `sessions/YYYY/MM/DD/` is reached by the DEFAULT scan, whose root
+    // IS the sessions dir — the depth cap itself is unchanged by
+    // design). The walk is exercised twice: cold (no stored listing)
+    // and warm (the second call replays the stored directory listing),
+    // pinning the descent fold in BOTH the cold and the warm-replay
+    // arms.
+    let root = temp_root("agenttrace-codex-zst-ancestor");
+    let home = root.join("home");
+    let cache = root.join("cache");
+    let rollout_dir = home.join(".codex").join("sessions");
+    fs::create_dir_all(&rollout_dir).expect("create codex sessions dir");
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-zstd/migrated-pair");
+    fs::copy(
+        fixture_dir.join("rollout-2026-10-16-101530-a1b2c3.jsonl.zst"),
+        rollout_dir.join("rollout-2026-10-16-101530-a1b2c3.jsonl.zst"),
+    )
+    .expect("copy compressed rollout");
+    // The plain twin is deliberately absent: the ancestor walk must find
+    // the migrated rollout on its own, not inherit it from a plain-name
+    // sibling admission.
+    with_home_and_cache(&home, &cache, || {
+        for pass in ["cold", "warm"] {
+            let sessions = load_sessions_from_dir(Some(&home));
+            let zst = sessions.iter().find(|session| {
+                session
+                    .path
+                    .ends_with("rollout-2026-10-16-101530-a1b2c3.jsonl.zst")
+            });
+            assert!(
+                zst.is_some(),
+                "{pass} ancestor-root walk (root = home, rollout nested under .codex) \
+                 must admit the migrated .jsonl.zst rollout: {:?}",
+                sessions
+                    .iter()
+                    .map(|session| session.path.clone())
+                    .collect::<Vec<_>>()
+            );
+            if let Some(session) = zst {
+                assert_eq!(
+                    session.name, "rollout-2026-10-16-101530-a1b2c3",
+                    "pre-migration name stays stable from an ancestor root too"
+                );
+            }
+        }
+    });
+    let _ = fs::remove_dir_all(&home);
+}

@@ -845,6 +845,7 @@ fn entry_is_dir_entry(file_type: &fs::FileType, path: &Path) -> bool {
     false
 }
 
+#[allow(clippy::too_many_arguments)] // rm-1941: codex_tree threads the zst admission down the walk
 fn walk_session_files_cached(
     dir: &Path,
     depth: usize,
@@ -889,11 +890,19 @@ fn walk_session_files_cached(
         );
         for child in listing.dirs {
             if visited.admit(&child) {
+                // rm-1941: the codex family extends down the tree — a walk
+                // rooted above `.codex` (e.g. `-d $HOME`) must still admit
+                // the migrated rollouts nested inside it (mirrors the
+                // sibling lineage's rm-1527 descent fold).
+                let child_codex_tree = codex_tree
+                    || child
+                        .components()
+                        .any(|component| component.as_os_str() == ".codex");
                 walk_session_files_cached(
                     &child,
                     depth + 1,
                     max_depth,
-                    codex_tree,
+                    child_codex_tree,
                     cache,
                     items,
                     visited,
@@ -962,11 +971,19 @@ fn walk_session_files_cached(
 
     items.extend(files.into_iter().filter(|path| file_targets.admit(path)));
     for child in dirs {
+        // rm-1941: mirrored warm-listing fold — the cold arm above and the
+        // uncached walker below keep the same descent semantics, so a
+        // cached replay rooted above `.codex` stays identical to a cold
+        // walk of the same tree.
+        let child_codex_tree = codex_tree
+            || child
+                .components()
+                .any(|component| component.as_os_str() == ".codex");
         walk_session_files_cached(
             &child,
             depth + 1,
             max_depth,
-            codex_tree,
+            child_codex_tree,
             cache,
             items,
             visited,
@@ -975,7 +992,7 @@ fn walk_session_files_cached(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // rm-1941: codex_tree threads the root-scoped zst admission
+#[allow(clippy::too_many_arguments)] // rm-1941: codex_tree threads the zst admission down the walk
 fn walk_session_files(
     dir: &Path,
     depth: usize,
@@ -1016,11 +1033,18 @@ fn walk_session_files(
             if !visited.admit(&path) {
                 continue;
             }
+            // rm-1941: the codex family extends down the tree — a walk
+            // rooted above `.codex` (e.g. `-d $HOME`) must still admit
+            // the migrated rollouts nested inside it.
+            let child_codex_tree = codex_tree
+                || path
+                    .components()
+                    .any(|component| component.as_os_str() == ".codex");
             walk_session_files(
                 &path,
                 depth + 1,
                 max_depth,
-                codex_tree,
+                child_codex_tree,
                 items,
                 visited,
                 file_targets,

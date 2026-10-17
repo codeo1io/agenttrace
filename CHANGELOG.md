@@ -4,7 +4,7 @@
 
 ### Added
 
-- codex: migrated `.jsonl.zst` rollouts (codex ≥ 0.162 renames cold rollouts) are now discovered during walk — name-gated (`rollout-*.jsonl.zst`) and scoped to codex trees only, with session names held stable across the migration (`.jsonl.zst` → `.jsonl` keeps its pre-migration identity) and a directory-listing walk-version bump so stale warm listings refresh once (rm-1941, run 122b213a98a1 cycle 1; sibling lineage rm-1527@d2355d7 owns the same subject — reconcile by title).
+- codex: migrated `.jsonl.zst` rollouts (codex ≥ 0.162 renames cold rollouts) are now discovered during walk — name-gated (`rollout-*.jsonl.zst`) and scoped to codex trees only, with the scope extending down the walk (an explicit `-d` root above `.codex` admits the same rollouts — cold and warm-replay arms alike, mirroring the sibling lineage's descent fold), session names held stable across the migration (`.jsonl.zst` → `.jsonl` keeps its pre-migration identity) and a directory-listing walk-version bump so stale warm listings refresh once (rm-1941, run 122b213a98a1 cycle 1; sibling lineage rm-1527@d2355d7 owns the same subject — reconcile by title).
 - pricing: the Daybreak family is priced — `daybreak-red-latest`/`gpt-daybreak-red-latest` at $12.5/$75 per Mtok and `daybreak-blue-latest`/`gpt-daybreak-blue-latest` at $4/$20 (codex 0.163.0 enables Daybreak by default; LiteLLM carries the rates, no cache prices published yet so cache rates stay 0.0) (rm-176 arm, run 122b213a98a1 cycle 1).
 - terminal-spoofing sanitization covers the invisible zero-width Cf family, and the
   machine lanes stay lossless (rm-933 slice 3, run ff7615be cycle 3; review fix 6f85e2c9): the shared
