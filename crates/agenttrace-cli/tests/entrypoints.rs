@@ -1801,6 +1801,209 @@ fn stdin_dash_within_the_knob_cap_still_parses() {
     );
 }
 
+/// rm-451 acceptance, positional/named lane: a file past the admission
+/// cap is refused with the NAMED error before the read, carrying the
+/// cap class and the knob. The knob is child-scoped, so this test
+/// never touches host env.
+#[test]
+fn named_file_over_cap_fails_with_the_named_cap_error() {
+    let fixture = generated_fixture("detailed-tool-steps.jsonl");
+    let base = std::fs::read(&fixture).expect("fixture must be readable");
+    // ~10 KiB named file against a 1 KiB cap (the fixture itself is
+    // well under 1 KiB — the stdin over-cap probe's repeat trick):
+    // refused on byte count alone, pre-parse.
+    let payload = base.repeat(16);
+    let root = std::env::temp_dir().join(format!(
+        "agenttrace-rm451-named-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    let file = root.join("huge.jsonl");
+    std::fs::write(&file, &payload).expect("write over-cap named file");
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg(&file)
+        .env("AGENTTRACE_FILE_CAP_BYTES", "1024")
+        .output()
+        .expect("run over-cap named-file probe");
+    assert_eq!(
+        Some(1),
+        out.status.code(),
+        "an over-cap named file must fail rc1, got {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exceeds the") && stderr.contains("read cap"),
+        "the over-cap failure must be the named cap error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("AGENTTRACE_FILE_CAP_BYTES"),
+        "the cap error must name the override knob, got: {stderr}"
+    );
+    // The knob bounds the file, never breaks it: the same file with a
+    // raised cap parses to the same overview a capless run produces.
+    let mut raised_env = std::collections::HashMap::new();
+    raised_env.insert(
+        "AGENTTRACE_FILE_CAP_BYTES",
+        (payload.len() + 4096).to_string(),
+    );
+    let raised = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--overview", file.to_str().expect("utf-8 path")])
+        .envs(raised_env)
+        .output()
+        .expect("run within-cap named-file probe");
+    assert!(
+        raised.status.success(),
+        "a within-cap named file must parse: {}",
+        String::from_utf8_lossy(&raised.stderr)
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// rm-451 acceptance, discovery lane: an over-cap file inside a scanned
+/// directory is a LOUD skip — the run still renders the good sessions,
+/// and the stderr advisory names both the failure count and the
+/// read-cap share with its knob.
+#[test]
+fn dir_scan_with_over_cap_file_discloses_the_refusal() {
+    let fixture = generated_fixture("detailed-tool-steps.jsonl");
+    let root = std::env::temp_dir().join(format!(
+        "agenttrace-rm451-dir-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    std::fs::copy(&fixture, root.join("good.jsonl")).expect("seed good session");
+    std::fs::write(root.join("huge.jsonl"), vec![b'x'; 4096]).expect("seed over-cap session");
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--sessions", "-d"])
+        .arg(&root)
+        .env("AGENTTRACE_FILE_CAP_BYTES", "1024")
+        .output()
+        .expect("run dir-scan refusal probe");
+    assert!(
+        out.status.success(),
+        "the refusal must be a skip, never a crash: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.lines().count() >= 2,
+        "the good session must still render beside the refusal, got: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1 of 2 discovered session files failed to parse"),
+        "the advisory must count the failure, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("refused by the file-read cap (AGENTTRACE_FILE_CAP_BYTES)"),
+        "the advisory must name the read-cap share and knob, got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// rm-451 acceptance, doctor lane: --doctor names the admission class
+/// per directory in both render arms (text line + JSON field).
+#[test]
+fn doctor_reports_read_cap_refused_per_dir() {
+    let root = std::env::temp_dir().join(format!(
+        "agenttrace-rm451-doc-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    std::fs::write(root.join("huge.jsonl"), vec![b'x'; 4096]).expect("seed over-cap session");
+    for (extra_args, needle) in [
+        (vec!["--doctor"], "read-cap refused: 1 file(s)"),
+        (vec!["--doctor", "-f", "json"], "\"read_cap_refused\": 1"),
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+        cmd.args(&extra_args)
+            .arg("-d")
+            .arg(&root)
+            .env("AGENTTRACE_FILE_CAP_BYTES", "1024");
+        let out = cmd.output().expect("run doctor read-cap probe");
+        assert!(
+            out.status.success(),
+            "--doctor must stay healthy under a refusal: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(needle),
+            "doctor {extra_args:?} must carry '{needle}', got: {stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// rm-451 review fix (independent review 1f153416, F1), cline lane:
+/// a task-dir member over the cap refuses loudly through BOTH CLI
+/// lanes — the positional member path (which routes through the
+/// parent task dir) and the `--dir` scan (skip-never-crash with the
+/// read-cap share disclosed beside a healthy session).
+#[test]
+fn cline_task_member_over_cap_fails_loudly_on_both_cli_lanes() {
+    let fixture = generated_fixture("detailed-tool-steps.jsonl");
+    let root = std::env::temp_dir().join(format!(
+        "agenttrace-rm451-cline-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let task = root.join("task-9f2c");
+    std::fs::create_dir_all(&task).expect("create task dir");
+    std::fs::copy(&fixture, root.join("good.jsonl")).expect("seed good session");
+    std::fs::write(task.join("task_metadata.json"), b"{}").expect("seed small cline member");
+    std::fs::write(task.join("api_conversation_history.json"), vec![b'x'; 4096])
+        .expect("seed over-cap cline member");
+
+    // Positional on the member itself: the cline arm routes through the
+    // parent dir and must refuse rc1 with the named cap error, not parse
+    // around the huge member (the old bare read_to_string bypass).
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg(task.join("api_conversation_history.json"))
+        .env("AGENTTRACE_FILE_CAP_BYTES", "1024")
+        .output()
+        .expect("run cline positional refusal probe");
+    assert!(
+        !out.status.success(),
+        "an over-cap cline member must refuse, not render"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("read cap") && stderr.contains("AGENTTRACE_FILE_CAP_BYTES"),
+        "the positional lane must carry the named cap error, got: {stderr}"
+    );
+
+    // --dir scan over the same root: the refusal is a disclosed skip
+    // beside the healthy session (skip-never-crash contract).
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--sessions", "-d"])
+        .arg(&root)
+        .env("AGENTTRACE_FILE_CAP_BYTES", "1024")
+        .output()
+        .expect("run cline dir-scan refusal probe");
+    assert!(
+        out.status.success(),
+        "the refusal must be a skip, never a crash: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.lines().count() >= 2,
+        "the good session must still render beside the refusal, got: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1 of 2 discovered session files failed to parse")
+            && stderr.contains("refused by the file-read cap (AGENTTRACE_FILE_CAP_BYTES)"),
+        "the advisory must count the refusal and name the knob, got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn keyword_host_commands_have_real_help_routes() {
     // rm-505: `statusline` and `upstream` are documented host keywords,

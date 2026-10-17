@@ -9,11 +9,12 @@ use agenttrace_core::{
     render_test_match, render_waste_report_with_language, report_compare_json,
     report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
-    report_overview_svg_with_context, report_overview_text_with_context, report_search_json,
-    report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
-    session_capability, session_start_cmp, tool_fail_rate, total_tokens, update_pricing,
-    waste_report_json, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session,
-    SvgCardTheme, TimeRange, VERSION,
+    report_overview_svg_with_context, report_overview_text_with_context,
+    report_search_json_detailed, report_search_text_detailed, report_text_with_language,
+    sanitize_line_segment, search_sessions_detailed, session_capability, session_start_cmp,
+    tool_fail_rate, total_tokens, update_pricing, waste_report_json, BaselineThresholds,
+    LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
+    TRANSCRIPT_SCAN_FILE_BYTE_CAP, TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -39,7 +40,10 @@ struct Args {
     /// never touch the session cache; the read is capped at 256 MiB
     /// by default — an over-cap stream fails with a named error
     /// instead of reading without bound, and AGENTTRACE_STDIN_CAP_BYTES
-    /// overrides the cap)
+    /// overrides the cap; a NAMED file is bounded by the same-order
+    /// cap — AGENTTRACE_FILE_CAP_BYTES, default 256 MiB (rm-451) —
+    /// and an over-cap file is refused with a named error and counted
+    /// in --doctor's read-cap-refused disclosure)
     path: Option<String>,
     /// Output format for the requested view: text (default), json, csv,
     /// markdown/md, html, svg (the shareable usage card; requires
@@ -1046,11 +1050,20 @@ fn run() -> anyhow::Result<()> {
         // rm-988: blank queries never reach here — validate_gate_thresholds
         // rejects them up front (see below); the library arm keeps its own
         // defensive empty-result contract for other callers.
-        let results = search_sessions(&sessions, query, args.search_limit);
+        // rm-1415: the detailed lane scans bounded transcript content (per-file
+        // byte cap + corpus read budget, every skip disclosed in the summary);
+        // the metadata lanes and the rm-988 blank-query guard are unchanged.
+        let report = search_sessions_detailed(
+            &sessions,
+            query,
+            args.search_limit,
+            TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+            TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+        );
         let out = if args.format == "json" {
-            report_search_json(&results)
+            report_search_json_detailed(&report)
         } else {
-            report_search_text(&results, query)
+            report_search_text_detailed(&report, query)
         };
         let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &(out.clone() + "\n"))?;
@@ -2275,10 +2288,20 @@ fn parse_failure_advisory(report: &LoadReport) -> Option<String> {
         return None;
     }
     report.first_parse_failure.as_deref().map(|first| {
-        format!(
+        let mut advisory = format!(
             "{} of {} discovered session files failed to parse; first: {first}",
             report.parse_failures, report.discovered
-        )
+        );
+        // rm-451: name the read-cap share of the failures so the
+        // admission class (and its knob) is disclosed even when the
+        // first failure in discovery order is some other error class.
+        if report.read_cap_refused > 0 {
+            advisory.push_str(&format!(
+                "; {} refused by the file-read cap (AGENTTRACE_FILE_CAP_BYTES)",
+                report.read_cap_refused
+            ));
+        }
+        advisory
     })
 }
 

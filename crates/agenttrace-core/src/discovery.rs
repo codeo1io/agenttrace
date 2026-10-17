@@ -66,6 +66,13 @@ pub struct LoadReport {
     /// `--overview -d dir -o dir/bad.jsonl` silently overwrites the
     /// unparseable input (a `.orig` twin is not a recovery path).
     pub parse_failure_paths: Vec<PathBuf>,
+    /// rm-451: the read-cap-refused share of `parse_failures` — files
+    /// past [`crate::FILE_READ_CAP_BYTES`] (knob:
+    /// `AGENTTRACE_FILE_CAP_BYTES`). Refused before the read, so the
+    /// disclosure names the admission class instead of a generic
+    /// parse failure; a subclass of `parse_failures`, never an extra
+    /// count.
+    pub read_cap_refused: usize,
     /// rm-799: subagent transcripts whose parent session is NOT part
     /// of the loaded corpus (orphaned children — moved transcripts,
     /// partial copies). They still render as standalone rows, but the
@@ -468,12 +475,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // parse fine by construction, so theirs is None).
     /// Parsed session (None on failure), rm-835 parse-failure message,
     /// cache-hit flag.
-    type Slot = Option<(Option<Session>, Option<String>, bool)>;
+    type Slot = Option<(Option<Session>, Option<String>, bool, bool)>;
     let mut slots: Vec<Slot> = Vec::with_capacity(files.len());
     let mut misses = Vec::new();
     for (index, path) in files.iter().enumerate() {
         match cached_session(path, cache) {
-            Some(session) => slots.push(Some((Some(session), None, true))),
+            Some(session) => slots.push(Some((Some(session), None, true, false))),
             None => {
                 slots.push(None);
                 misses.push(index);
@@ -501,7 +508,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // rm-912: attempted-but-failed paths in discovery order, for the
     // CLI's -o membership check (see LoadReport::parse_failure_paths).
     let mut parse_failure_paths: Vec<PathBuf> = Vec::new();
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<Session>, Option<String>)>();
+    // rm-451: the read-cap-refused share of the parse failures — the
+    // loud skip counter the roadmap row demands, kept beside
+    // parse_failures so the advisory can name the cap class without
+    // string-matching the parser's message.
+    let mut read_cap_refused = 0usize;
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<Session>, Option<String>, bool)>();
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let tx = tx.clone();
@@ -530,8 +542,20 @@ pub fn load_sessions_with_progress_from_cache_mode(
                             }
                         }
                     }
+                    // rm-451: classify read-cap refusals beside the
+                    // failure string so the LoadReport can name the
+                    // admission class without re-parsing the message.
+                    let read_cap = parsed
+                        .as_ref()
+                        .err()
+                        .map(|error| {
+                            error
+                                .downcast_ref::<crate::parser::ReadCapRefused>()
+                                .is_some()
+                        })
+                        .unwrap_or(false);
                     let failure = parsed.as_ref().err().map(|error| format!("{error:#}"));
-                    if tx.send((index, parsed.ok(), failure)).is_err() {
+                    if tx.send((index, parsed.ok(), failure, read_cap)).is_err() {
                         break;
                     }
                 }
@@ -541,7 +565,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
 
         let mut next = 0;
         let mut drain = |slots: &mut Vec<Slot>, cache: &mut SessionCache| {
-            while let Some((result, failure, from_cache)) =
+            while let Some((result, failure, from_cache, read_cap)) =
                 slots.get_mut(next).and_then(Option::take)
             {
                 match (&result, from_cache) {
@@ -561,6 +585,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
                         // session was produced from it.
                         parse_failure_paths.push(files[next].clone());
                         parse_failures += 1;
+                        // rm-451: classify the read-cap share so the
+                        // advisory can name the cap class (a subclass
+                        // of parse_failures, never an extra count).
+                        if read_cap {
+                            read_cap_refused += 1;
+                        }
                     }
                 }
                 report_load_progress(
@@ -577,8 +607,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
             }
         };
         drain(&mut slots, cache);
-        for (index, result, failure) in rx {
-            slots[index] = Some((result, failure, false));
+        for (index, result, failure, read_cap) in rx {
+            slots[index] = Some((result, failure, false, read_cap));
             drain(&mut slots, cache);
         }
     });
@@ -681,6 +711,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
+        read_cap_refused,
         unlinked_subagents,
         future_excluded_sessions,
     }

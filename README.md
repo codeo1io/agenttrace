@@ -335,6 +335,21 @@ the process until the allocator dies, and `AGENTTRACE_STDIN_CAP_BYTES`
 raises or lowers the cap (an unparseable or non-positive value falls back
 to the default rather than failing the run over a typo'd knob).
 
+### Named session files are bounded too
+
+The named-file lane (a positional path or an explicit `--dir` scan) reads
+through the same parser with the same admission posture (rm-451): each
+file is capped at 256 MiB by default, `AGENTTRACE_FILE_CAP_BYTES` raises
+or lowers the bound (same best-effort contract as the stdin knob), and an
+over-cap file is refused with a named `session file … exceeds the …-byte
+read cap` error before the read happens — the process never grows to the
+file's size just to learn it is unparseable. Refused files are skipped,
+never fatal: `--doctor` reports them as `read-cap refused` per directory
+(and as a `read_cap_refused` field in its JSON), and a directory scan's
+stderr advisory names the count. The bound is an admission knob, not a
+format contract: split the file or pipe it through stdin to analyze
+oversized transcripts.
+
 ### Compressed (zstd) Codex rollouts
 
 Codex stores rollout transcripts as zstd frames: the file keeps its

@@ -64,12 +64,14 @@ pub use insights::{
     SessionComparison, SourceScope, TimeRange, FUTURE_ADMISSION_GRACE_SECS,
 };
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
-pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
+pub use parser::{
+    parse_file, parse_raw_session, parse_stdin_bytes, ReadCapRefused, FILE_READ_CAP_BYTES,
+};
 pub use pricing::{
-    cache_rate_census, catalog_identity, has_specific_price, list_pricing, lookup_context_window,
-    lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source, pricing_source_for,
-    provider_for, render_model_pricing_list, render_test_match, update_pricing, CacheRateCensus,
-    Price,
+    cache_rate_census, catalog_identity, effort_tier_of, has_specific_price, list_pricing,
+    lookup_context_window, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
+    pricing_source_for, provider_for, render_model_pricing_list, render_test_match,
+    specific_base_for_unpriced, update_pricing, CacheRateCensus, Price,
 };
 pub use reports::{
     add_baseline_comparison, guard_formula_json_leaves, report_compare, report_compare_json,
@@ -84,7 +86,11 @@ pub use reports::{
 pub use runtime_config::{
     get as runtime_config_overrides, set as set_runtime_config, RuntimeConfigOverrides,
 };
-pub use search::{report_search_json, report_search_text, search_sessions};
+pub use search::{
+    report_search_json, report_search_json_detailed, report_search_text,
+    report_search_text_detailed, search_sessions, search_sessions_detailed, SearchReport,
+    TranscriptScanSummary, TRANSCRIPT_SCAN_FILE_BYTE_CAP, TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+};
 pub use session_cache::{
     cached_session, clear_session_cache, effective_session_cache_entries, load_cached_sessions,
     load_cached_sessions_from_cache, load_session_cache, save_session_cache,
@@ -968,6 +974,10 @@ pub struct SearchResult {
     pub cost: f64,
     pub tokens: i64,
     pub matches: Vec<String>,
+    /// rm-1415: disclosure for this row's bounded transcript re-read lane
+    /// ("scanned (N bytes)" or "skipped: <reason>"); the hand-rolled JSON
+    /// writers carry it per row.
+    pub transcript_scan: String,
 }
 
 /// rm-449 F4 (review fix bd6e4a50 F1): the hermes/generic lane consumes
