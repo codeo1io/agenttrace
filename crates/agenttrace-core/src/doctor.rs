@@ -27,6 +27,11 @@ pub struct DoctorScanPartial {
     pub files_parsed: usize,
     pub files_skipped_budget: usize,
     pub files_skipped_size: usize,
+    /// rm-451 (run 737103b1d0ce cycle 4): files skipped because they
+    /// exceeded the per-file admission bound — disclosed with the
+    /// other partial-scan counts, never counted as failures.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub files_skipped_admission: usize,
     pub sqlite_dbs_partial: usize,
     pub elapsed_ms: u64,
     pub note: String,
@@ -217,6 +222,12 @@ pub struct DoctorDirReport {
     /// parsed bytes crossed the size cap (count-sampled pass).
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub skipped_size: usize,
+    /// rm-451 (run 737103b1d0ce cycle 4): files this root skipped
+    /// because they exceeded the per-file admission bound
+    /// (AGENTTRACE_FILE_ADMISSION_MAX_BYTES) — refused before the
+    /// read, counted, never labeled as failures.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub skipped_admission: usize,
     /// Present when the provider directory is itself a symlink, so the
     /// doctor names the link it follows instead of implying a plain
     /// directory (cycle 7, Codex `#42135`).
@@ -441,12 +452,16 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             let files_skipped_budget: usize =
                 directories.iter().map(|row| row.skipped_budget).sum();
             let files_skipped_size: usize = directories.iter().map(|row| row.skipped_size).sum();
+            let files_skipped_admission: usize =
+                directories.iter().map(|row| row.skipped_admission).sum();
             let roots_truncated = directories
                 .iter()
-                .filter(|row| row.skipped_budget + row.skipped_size > 0)
+                .filter(|row| row.skipped_budget + row.skipped_size + row.skipped_admission > 0)
                 .count();
             let sqlite_dbs_partial = sqlite_ingest.partial_dbs.len();
-            if files_skipped_budget + files_skipped_size + sqlite_dbs_partial == 0 {
+            if files_skipped_budget + files_skipped_size + files_skipped_admission + sqlite_dbs_partial
+                == 0
+            {
                 None
             } else {
                 let bound = DoctorRootBound::from_env();
@@ -457,6 +472,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
                     files_parsed: directories.iter().map(|row| row.parsed).sum(),
                     files_skipped_budget,
                     files_skipped_size,
+                    files_skipped_admission,
                     sqlite_dbs_partial,
                     elapsed_ms: started.elapsed().as_millis() as u64,
                     note: format!(
@@ -1079,6 +1095,7 @@ fn doctor_dir_report(
     let mut parsed_bytes: u64 = 0;
     let mut skipped_budget = 0;
     let mut skipped_size = 0;
+    let mut skipped_admission = 0;
     for file in files {
         // Keep the parsed session where the decode disclosure (rm-381) can
         // see it; the parse accounting below is unchanged.
@@ -1095,6 +1112,18 @@ fn doctor_dir_report(
             // rm-367(d): count-sampled pass for oversized roots — the
             // root is counted past the cap, not parsed.
             skipped_size += 1;
+            None
+        } else if fs::metadata(file)
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+            > crate::parser::file_admission_max_bytes()
+        {
+            // rm-451 (run 737103b1d0ce cycle 4): files past the
+            // per-file admission bound are refused by parse_file
+            // itself — doctor counts them up front as admission-skipped
+            // (never failed, never parsed) so the row stays honest
+            // without paying the refused read.
+            skipped_admission += 1;
             None
         } else if let Ok(session) = parse_file(file) {
             parsed += 1;
@@ -1136,9 +1165,10 @@ fn doctor_dir_report(
         parsed,
         failed: files
             .len()
-            .saturating_sub(parsed + skipped_budget + skipped_size),
+            .saturating_sub(parsed + skipped_budget + skipped_size + skipped_admission),
         skipped_budget,
         skipped_size,
+        skipped_admission,
         cache_hits,
         symlink_target: symlink_target_of(path),
         failure_samples,

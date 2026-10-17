@@ -15,6 +15,68 @@ type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 /// values have already been summed.
 type ParseCounters = Vec<(String, i64)>;
 
+/// rm-451 (run 737103b1d0ce cycle 4): per-file admission bound for the
+/// plain-file lane. Every sibling intake lane is bounded — stdin
+/// 256 MiB (AGENTTRACE_STDIN_CAP_BYTES, CLI), zstd decode 64 MiB
+/// (ZSTD_ROLLOUT_DECODE_MAX_BYTES, above), MCP transport 1 MiB
+/// (MCP_INPUT_MAX_BYTES) — but this lane used `std::fs::read` with no
+/// gate, so one hostile journal sized the whole process (measured at
+/// 4d9f9a4: a 60 MiB single-line .jsonl parsed in 22.6 s wall at
+/// 322 MiB peak RSS in a single lane, fanned out per worker).
+pub const FILE_ADMISSION_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Environment override for the per-file admission bound. A value that
+/// is not a positive integer is IGNORED (never a hard error): a typo'd
+/// override must not brick every invocation.
+pub const FILE_ADMISSION_MAX_BYTES_ENV: &str = "AGENTTRACE_FILE_ADMISSION_MAX_BYTES";
+
+fn parse_file_admission_override(raw: Option<&str>) -> Option<u64> {
+    raw?.trim().parse::<u64>().ok().filter(|value| *value > 0)
+}
+
+pub(crate) fn file_admission_max_bytes() -> u64 {
+    parse_file_admission_override(
+        std::env::var(FILE_ADMISSION_MAX_BYTES_ENV).ok().as_deref(),
+    )
+    .unwrap_or(FILE_ADMISSION_MAX_BYTES)
+}
+
+/// Derived from the effective cap, never hand-written (ZSTD label
+/// discipline): a retuned constant or override must not ship a stale
+/// numeral.
+fn format_admission_cap(cap: u64) -> String {
+    let mib = 1024 * 1024;
+    if cap >= mib && cap % mib == 0 {
+        format!("{} MiB", cap / mib)
+    } else {
+        format!("{cap} bytes")
+    }
+}
+
+/// Bounded whole-file read for one session file. `take(cap + 1)` keeps
+/// the refusal TOCTOU-safe: a file that grows between stat and read is
+/// still refused, and the reader never buffers past the bound.
+fn read_session_file_bounded(path: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let cap = cap.max(1) as usize;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("read session file {}", path.display()))?;
+    let mut raw = Vec::new();
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut raw)
+        .with_context(|| format!("read session file {}", path.display()))?;
+    if raw.len() > cap {
+        bail!(
+            "session file {} is at least {} bytes, past the {} file admission bound (override via {}); refusing to read it whole — split the journal or stream it via stdin",
+            path.display(),
+            raw.len(),
+            format_admission_cap(cap as u64),
+            FILE_ADMISSION_MAX_BYTES_ENV
+        );
+    }
+    Ok(raw)
+}
+
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     if path.is_dir() {
         return parse_cline_task_dir(path);
@@ -26,8 +88,7 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
             }
         }
     }
-    let raw =
-        std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
+    let raw = read_session_file_bounded(path, file_admission_max_bytes())?;
     let name = session_name(path);
     let path_text = path.to_string_lossy().to_string();
     parse_session_bytes(raw, &path_text, &name)
@@ -697,6 +758,18 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     }
     if let Ok(session) = parse_jsonl_session(name, path, raw) {
         return Ok(session);
+    }
+    // rm-1968 (run 737103b1d0ce cycle 4): a record nested deeper than
+    // serde's recursion limit fails every probe above with the same
+    // silence as a format miss — name the depth, not the format, so
+    // the census classifies it honestly.
+    if let Err(probe) = serde_json::from_str::<serde_json::Value>(raw) {
+        if format!("{probe}").contains("recursion limit exceeded") {
+            bail!(
+                "session file {} exceeds the parser nesting depth limit (recursion limit exceeded); the record is valid JSON but nested too deeply — flatten or split it",
+                path
+            );
+        }
     }
     bail!("unsupported session format: {}", path)
 }
@@ -13310,9 +13383,117 @@ mod zstd_cap_label_tests {
         assert_eq!(zstd_decode_cap_label(), "64 MiB");
         let derived = ZSTD_ROLLOUT_DECODE_MAX_BYTES / (1024 * 1024);
         assert!(zstd_decode_cap_label().contains(&derived.to_string()));
-        // The label is a whole number of MiB at every value the constant
-        // can take (the derivation must not silently produce "0 MiB" or
-        // a fraction if the cap is ever retuned).
+    }
+
+    // rm-1968 (run 737103b1d0ce, red-first): a single-line JSONL record
+    // nested deeper than serde's recursion limit used to land in the
+    // generic "unsupported session format" bucket, misdirecting the
+    // operator toward a format problem instead of a depth problem.
+    #[test]
+    fn rm1968_deep_nesting_failure_names_depth_not_format() {
+        let dir = std::env::temp_dir().join("agenttrace-rm1968-depth");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("deep.jsonl");
+        let mut deep = String::from("{\"type\":\"user\",\"message\":{\"content\":");
+        for _ in 0..200 {
+            deep.push('{');
+            deep.push_str("\"x\":");
+        }
+        deep.push('1');
+        for _ in 0..200 {
+            deep.push('}');
+        }
+        deep.push_str("}}\n");
+        std::fs::write(&path, deep).unwrap();
+        let err = parse_file(&path).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("nesting depth"),
+            "depth failure must name depth: {text}"
+        );
+        assert!(
+            !text.contains("unsupported session format"),
+            "depth failure must not be mislabeled as a format miss: {text}"
+        );
+    }
+
+    // The label is a whole number of MiB at every value the constant
+    // can take (the derivation must not silently produce "0 MiB" or
+    // a fraction if the cap is ever retuned).
+    #[test]
+    fn zstd_decode_cap_label_is_whole_mib() {
         assert_eq!(ZSTD_ROLLOUT_DECODE_MAX_BYTES % (1024 * 1024), 0);
+    }
+
+    // rm-451 (run 737103b1d0ce cycle 4): the explicit-cap seam keeps
+    // the refusal pins off the shared process environment.
+    use super::{parse_file_admission_override, parse_file_with_admission_cap};
+
+    fn write_session(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn file_admission_bound_allows_at_bound_refuses_past() {
+        let dir = std::env::temp_dir().join("agenttrace-rm451-parser");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = concat!(
+            r#"{"type":"user","timestamp":"2026-10-17T10:00:00Z","message":{"content":"hi"}}"#,
+            "\n"
+        );
+        let at_bound = write_session(&dir, "at-bound.jsonl", body);
+        assert!(parse_file_with_admission_cap(&at_bound, body.len() as u64).is_ok());
+
+        let over = write_session(&dir, "over.jsonl", body);
+        let err = parse_file_with_admission_cap(&over, body.len() as u64 - 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("file admission bound"), "{err}");
+        assert!(err.contains("AGENTTRACE_FILE_ADMISSION_MAX_BYTES"), "{err}");
+    }
+
+    #[test]
+    fn file_admission_read_stops_at_cap_plus_one() {
+        // The bounded read never buffers past the bound: a file LARGER
+        // than the cap reports `at least cap + 1` bytes — proving the
+        // reader stopped there (a file that grows between stat and
+        // read cannot re-open an unbounded allocation).
+        let dir = std::env::temp_dir().join("agenttrace-rm451-cap");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let huge = write_session(&dir, "huge.jsonl", &"a".repeat(4096));
+        let err = parse_file_with_admission_cap(&huge, 1024).unwrap_err().to_string();
+        assert!(err.contains("at least 1025 bytes"), "{err}");
+        assert!(err.contains("1024 bytes"), "{err}");
+    }
+
+    #[test]
+    fn file_admission_label_derives_from_cap() {
+        let dir = std::env::temp_dir().join("agenttrace-rm451-label");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let huge = write_session(&dir, "huge.jsonl", &"a".repeat(3 * 1024 * 1024));
+        let err =
+            parse_file_with_admission_cap(&huge, 2 * 1024 * 1024).unwrap_err().to_string();
+        assert!(err.contains("2 MiB"), "derived label must match the cap: {err}");
+        assert!(
+            !err.contains("256 MiB"),
+            "stale default numeral must not leak: {err}"
+        );
+    }
+
+    #[test]
+    fn file_admission_override_ignores_garbage() {
+        assert_eq!(parse_file_admission_override(Some("2048")), Some(2048));
+        assert_eq!(parse_file_admission_override(Some(" 2048 ")), Some(2048));
+        assert_eq!(parse_file_admission_override(Some("0")), None);
+        assert_eq!(parse_file_admission_override(Some("-1")), None);
+        assert_eq!(parse_file_admission_override(Some("banana")), None);
+        assert_eq!(parse_file_admission_override(Some("")), None);
+        assert_eq!(parse_file_admission_override(None), None);
     }
 }

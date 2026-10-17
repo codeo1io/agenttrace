@@ -2275,10 +2275,30 @@ fn parse_failure_advisory(report: &LoadReport) -> Option<String> {
         return None;
     }
     report.first_parse_failure.as_deref().map(|first| {
-        format!(
-            "{} of {} discovered session files failed to parse; first: {first}",
-            report.parse_failures, report.discovered
-        )
+        // rm-1968 (run 737103b1d0ce cycle 4): disclose every failure
+        // CLASS with its own count and first error — the old single
+        // bucket + single first-string sent operators chasing the
+        // wrong cause (a 200-deep record read as a format miss).
+        let census = report
+            .parse_failure_classes
+            .iter()
+            .map(|(class, count)| match report.parse_failure_first_by_class.get(class) {
+                Some(first) => format!("{class}: {count} (first: {first})"),
+                None => format!("{class}: {count}"),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        if census.is_empty() {
+            format!(
+                "{} of {} discovered session files failed to parse; first: {first}",
+                report.parse_failures, report.discovered
+            )
+        } else {
+            format!(
+                "{} of {} discovered session files failed to parse; {census}",
+                report.parse_failures, report.discovered
+            )
+        }
     })
 }
 
@@ -5098,6 +5118,45 @@ mod tests {
         assert!(
             parse_failure_advisory(&report).is_none(),
             "no message means nothing to print"
+        );
+    }
+
+    #[test]
+    fn parse_failure_advisory_discloses_the_class_census() {
+        // rm-1968 (run 737103b1d0ce cycle 4): every failure class gets
+        // its own count and first error; classes render in census map
+        // order (deterministic across runs); a hand-built report with
+        // no census maps keeps the legacy single-first wording.
+        let mut report = agenttrace_core::LoadReport {
+            discovered: 4,
+            parse_failures: 3,
+            first_parse_failure: Some("first is superseded by the census".to_string()),
+            ..Default::default()
+        };
+        report.parse_failure_classes.insert("non-utf8".into(), 1);
+        report
+            .parse_failure_first_by_class
+            .insert("non-utf8".into(), "read session file /x/bad.jsonl: not valid UTF-8".into());
+        report.parse_failure_classes.insert("nesting-depth".into(), 2);
+        report
+            .parse_failure_first_by_class
+            .insert("nesting-depth".into(), "depth first".into());
+        let advisory = parse_failure_advisory(&report).expect("advisory for census");
+        assert!(
+            advisory.starts_with("3 of 4 discovered session files failed to parse; "),
+            "{advisory}"
+        );
+        assert!(
+            advisory.contains("nesting-depth: 2 (first: depth first)"),
+            "{advisory}"
+        );
+        assert!(
+            advisory.contains("non-utf8: 1 (first: read session file /x/bad.jsonl: not valid UTF-8)"),
+            "{advisory}"
+        );
+        assert!(
+            advisory.contains("nesting-depth: 2 (first: depth first); non-utf8: 1"),
+            "{advisory}"
         );
     }
 

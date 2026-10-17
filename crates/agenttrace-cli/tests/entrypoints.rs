@@ -3173,3 +3173,102 @@ fn cli_quota_view_reports_plan_windows_and_guards_its_lane() {
         String::from_utf8_lossy(&range.stderr)
     );
 }
+
+#[test]
+fn overview_parse_failure_census_discloses_classes() {
+    // rm-1968 (run 737103b1d0ce cycle 4, red-first): the parse-failure
+    // aggregate used to render ONE bucket + ONE first-string for every
+    // cause. The census must disclose per-class counts and per-class
+    // first errors, and a depth failure must not hide inside the
+    // "unsupported session format" bucket.
+    let root = std::env::temp_dir().join("agenttrace-rm1968-census");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(root.join("fake-dir.jsonl")).unwrap();
+    std::fs::write(
+        root.join("good.jsonl"),
+        concat!(
+            r#"{"type":"user","timestamp":"2026-10-17T10:00:00Z","message":{"content":"hi"}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("bad-utf8.jsonl"), b"\xff\xfe{}\n").unwrap();
+    let mut deep = String::from("{\"type\":\"user\",\"message\":{\"content\":");
+    for _ in 0..200 {
+        deep.push('{');
+        deep.push_str("\"x\":");
+    }
+    deep.push('1');
+    for _ in 0..200 {
+        deep.push('}');
+    }
+    deep.push_str("}}\n");
+    std::fs::write(root.join("deep.jsonl"), deep).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["-d", root.to_str().expect("tempdir path"), "--overview"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "one good file parsed; advisory must not be fatal: {:?}",
+        output
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("non-utf8: 1"),
+        "census must count the non-UTF-8 file: {stderr}"
+    );
+    assert!(
+        stderr.contains("nesting-depth: 1"),
+        "census must count the depth failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("directory: 1"),
+        "census must count the *.jsonl directory: {stderr}"
+    );
+    assert!(
+        stderr.contains("first:"),
+        "census must keep per-class first errors: {stderr}"
+    );
+}
+
+#[test]
+fn over_admission_bound_file_refused_loud() {
+    // rm-451 (run 737103b1d0ce cycle 4, red-first): the plain-file lane
+    // used to read session files whole with no size gate while every
+    // sibling intake lane was capped. An over-bound file must be
+    // refused with the derived numeral and the override named, and the
+    // refusal must stay loud (single-file invocation -> no sessions ->
+    // exit 1), never a silent skip.
+    let root = std::env::temp_dir().join("agenttrace-rm451-loud");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("huge.jsonl");
+    std::fs::write(&path, vec![b'a'; 4096]).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("AGENTTRACE_FILE_ADMISSION_MAX_BYTES", "1024")
+        .args(["--overview", path.to_str().expect("tempdir path")])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        !output.status.success(),
+        "single refused file -> no sessions -> exit 1: {:?}",
+        output
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("file admission bound"),
+        "refusal must name the bound: {stderr}"
+    );
+    assert!(
+        stderr.contains("1024"),
+        "refusal numeral must derive from the effective cap: {stderr}"
+    );
+    assert!(
+        stderr.contains("AGENTTRACE_FILE_ADMISSION_MAX_BYTES"),
+        "refusal must name the override: {stderr}"
+    );
+}
