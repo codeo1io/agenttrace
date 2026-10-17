@@ -3067,6 +3067,8 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn stale_cache_is_served_as_is_without_download_or_rewrite() {
         with_isolated_cache_env(|| {

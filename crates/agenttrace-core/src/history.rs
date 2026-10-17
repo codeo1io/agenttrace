@@ -821,6 +821,7 @@ mod tests {
     }
 }
 
+#[cfg(target_os = "linux")] // driveless "/xdg" absolute fixtures; never executed on Windows before the 2026-10-17 E0433 fix
 #[test]
 fn history_path_ignores_relative_xdg_data_home() {
     // rm-248: same XDG rule for the history root — a relative

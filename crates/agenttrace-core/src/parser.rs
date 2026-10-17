@@ -12594,6 +12594,8 @@ mod tests {
         assert_eq!(lane(Some(&Value::Bool(true))), None);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn aider_time_resolves_dst_ambiguity_deterministically() {
         // rm-899: aider chat histories carry LOCAL wall-clock starts

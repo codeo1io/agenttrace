@@ -456,6 +456,8 @@ mod tests {
         assert_eq!(sessions[4].metrics.subagent_count, 0);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn hardlinked_parent_spellings_all_link() {
         // rm-797 red-first: the PoC shape from assess 35b3b690 —
@@ -581,6 +583,8 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn resolves_same_dir_parent_from_journal_session_id() {
         let scratch = Scratch::new("resolve");

@@ -1759,6 +1759,8 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn ambiguous_samples_dedup_by_project_path() {
         // rm-512 ambiguous arm: a transcript under an encoded dir that
@@ -1890,6 +1892,8 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn resolved_decode_notes_dedup_by_identity_with_counts() {
         // Integration 2026-10-07 (conflict case d9ddc6a9): the rm-240

@@ -3933,6 +3933,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn compaction_keeps_newest_whole_lines_under_half_the_bound() {
         let root = std::env::temp_dir().join(format!(
@@ -4289,6 +4291,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn invalid_utf8_journal_still_discloses_and_retention_repairs() {
         // rm-922: one invalid UTF-8 byte used to fail the whole read —
@@ -4435,6 +4439,8 @@ mod tests {
         std::fs::remove_file(&journal).ok();
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn bad_byte_journal_recovers_retention_through_append() {
         // rm-922, the wedge leg: an over-bound journal carrying a
@@ -4810,6 +4816,8 @@ mod tests {
     // test) with AGENTTRACE_JOURNAL_CHILD_ROLE set, taking the child
     // branch below; coordination between processes is marker files in
     // the temp root.
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn journal_appends_survive_parallel_compaction() {
         if let Ok(role) = std::env::var("AGENTTRACE_JOURNAL_CHILD_ROLE") {

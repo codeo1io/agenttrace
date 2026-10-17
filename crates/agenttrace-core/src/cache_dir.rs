@@ -108,6 +108,8 @@ mod tests {
     /// joined `HOME=rel-home` into the RELATIVE `.cache` /
     /// `Library/Caches` against the CWD, the bug the rm-248 rider
     /// landed the guard for; this shared form preserves that guard.
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn user_cache_dir_decision_table() {
         let empty = Some(OsStr::new(""));

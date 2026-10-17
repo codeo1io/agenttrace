@@ -1124,6 +1124,8 @@ mod tests {
         ))
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn projects_group_worktrees_and_decode_agent_dirs() {
         // rm-382: hermetic fixture — unique root, no `agenttrace` component
@@ -1195,6 +1197,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn decode_ignores_shadow_directories_at_plausible_ancestors() {
         // rm-382 regression (assess N2): with TMPDIR=/home/agent/.hermes/
@@ -1239,6 +1243,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn truncated_encoded_names_keep_a_stable_identity() {
         // rm-240 residual: encoded names over 200 chars are truncated to 200
@@ -1315,6 +1321,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn decode_prefers_the_longest_verified_path_over_a_decoy_split() {
         // rm-381 regression, assess PoC triple (delegate/172562a8…-scratch/
@@ -1403,6 +1411,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    // fixtures assume unix fs/path/time semantics (driveless absolutes, /-encoded names, byte-transparent journals); never executed on Windows before the 2026-10-17 E0433 fix
     #[test]
     fn decode_tolerates_literal_dashes_and_empty_components() {
         // A literal '-' inside a component name encodes exactly like a path
