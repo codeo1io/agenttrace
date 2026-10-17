@@ -2940,7 +2940,15 @@ fn oh_my_pi_recorded_cost_usd(usage: Option<&Value>) -> Option<f64> {
         .as_object()?
         .get("total")?
         .as_f64()?;
-    (total.is_finite() && total >= 0.0).then_some(total)
+    recorded_cost_sample_is_valid(total).then_some(total)
+}
+
+/// rm-1388: one validity contract for every journal-authored cost
+/// sample entering the pipeline — transcript `cost.total` (oh-my-pi)
+/// and statusline-journal `total_cost_usd` alike: finite and
+/// non-negative. An invalid sample is treated as absent.
+pub(crate) fn recorded_cost_sample_is_valid(total: f64) -> bool {
+    total.is_finite() && total >= 0.0
 }
 
 /// rm-436 counter-family keys embed journal-authored strings (usage
@@ -12540,4 +12548,20 @@ fn oh_my_pi_usage_cache_write_1h_is_own_class() {
     let usage = oh_my_pi_usage(Some(&snake)).expect("snake alias yields usage");
     assert_eq!(usage.get("cache_write_1h_tokens"), Some(&7));
     assert!(!usage.contains_key("cache_creation_input_tokens"));
+}
+
+// rm-1388: the shared journal-cost validity predicate must accept every
+// legitimate sample and reject every hostile one (negative, NaN,
+// infinities).
+#[test]
+fn recorded_cost_sample_is_valid_rejects_hostile_samples() {
+    assert!(recorded_cost_sample_is_valid(0.0));
+    assert!(recorded_cost_sample_is_valid(0.01));
+    assert!(recorded_cost_sample_is_valid(1e308));
+    assert!(!recorded_cost_sample_is_valid(-0.01));
+    assert!(!recorded_cost_sample_is_valid(-50.0));
+    assert!(!recorded_cost_sample_is_valid(-1e308));
+    assert!(!recorded_cost_sample_is_valid(f64::NAN));
+    assert!(!recorded_cost_sample_is_valid(f64::INFINITY));
+    assert!(!recorded_cost_sample_is_valid(f64::NEG_INFINITY));
 }

@@ -1370,6 +1370,7 @@ pub fn render_statusline_report(
                     series.first_day_baseline_unknown_sessions,
                 "first_day_baseline_unknown_usd":
                     series.first_day_baseline_unknown_usd,
+            "invalid_cost_samples": series.invalid_cost_samples,
             });
         }
         return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
@@ -1526,6 +1527,13 @@ fn render_statusline_report_text(
                 series.first_day_baseline_unknown_sessions, series.first_day_baseline_unknown_usd
             ));
         }
+        if series.invalid_cost_samples > 0 {
+            out.push_str(&format!(
+                "Budget samples: {} invalid cost sample(s) excluded from the 7d total \
+             (negative or non-finite journal cost)\n",
+                series.invalid_cost_samples
+            ));
+        }
     }
     // rm-037: context pressure per session — the payload's
     // pre-calculated utilization plus the last-API token counts
@@ -1629,8 +1637,19 @@ fn render_statusline_report_text(
 /// The `cost.total_cost_usd` sample a capture carries, if any. The
 /// payload gates this field at v2.1.251+, so older captures simply
 /// contribute nothing rather than failing the aggregation.
-fn capture_cost_usd(capture: &CapturedStatusline) -> Option<f64> {
+/// Journal cost with no validity judgement — Some only when the field
+/// is present as a number.
+fn raw_journal_cost_usd(capture: &CapturedStatusline) -> Option<f64> {
     capture.payload.get("cost")?.get("total_cost_usd")?.as_f64()
+}
+
+fn capture_cost_usd(capture: &CapturedStatusline) -> Option<f64> {
+    // rm-1388: journal cost samples share the parser's recorded-cost
+    // validity contract (finite && >= 0.0 —
+    // parser::recorded_cost_sample_is_valid). An invalid sample is
+    // treated as absent so it can never book spend.
+    raw_journal_cost_usd(capture)
+        .filter(|total| crate::parser::recorded_cost_sample_is_valid(*total))
 }
 
 fn utc_day(epoch: i64) -> String {
@@ -1693,6 +1712,10 @@ pub struct StatuslineBudgetSeries {
     /// from `daily`/`total` and disclosed by the budget views so a
     /// misdated journal stays visible, not silently dropped.
     pub excluded_future_days: usize,
+    /// rm-1388: journal cost samples that were present but failed the
+    /// shared validity predicate (negative / non-finite) — excluded
+    /// from `daily`/`total`, disclosed per render lane.
+    pub invalid_cost_samples: usize,
 }
 
 pub fn statusline_budget_series(
@@ -1709,8 +1732,16 @@ pub fn statusline_budget_series(
     // retained journal — the session began mid-window, or the 10 MiB
     // retention cap (rm-385) dropped its true first days (rm-771).
     let mut per_session: BTreeMap<&str, BTreeMap<String, (f64, f64)>> = BTreeMap::new();
+    // rm-1388: journal cost samples that are present but fail the
+    // shared validity predicate are excluded and disclosed, never
+    // booked.
+    let mut invalid_cost_samples = 0;
     for capture in captures {
-        if let Some(cost) = capture_cost_usd(capture) {
+        let journal_cost = capture_cost_usd(capture);
+        if raw_journal_cost_usd(capture).is_some() && journal_cost.is_none() {
+            invalid_cost_samples += 1;
+        }
+        if let Some(cost) = journal_cost {
             let day = utc_day(capture.captured_at);
             if day.is_empty() {
                 continue;
@@ -1812,6 +1843,9 @@ pub fn statusline_budget_series(
             // bias — F3 scopes the counters to the (empty) window.
             first_day_baseline_unknown_sessions: 0,
             first_day_baseline_unknown_usd: 0.0,
+            // rm-1388: an empty window books no samples, so none can
+            // be invalid.
+            invalid_cost_samples: 0,
         };
     }
     let window_start = today - Duration::days(days as i64 - 1);
@@ -1875,6 +1909,7 @@ pub fn statusline_budget_series(
         excluded_future_days,
         first_day_baseline_unknown_sessions: baseline_unknown_sessions,
         first_day_baseline_unknown_usd: (baseline_unknown_usd * 100.0).round() / 100.0,
+        invalid_cost_samples,
     }
 }
 
@@ -1921,6 +1956,7 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "first_day_baseline_unknown_sessions":
                 series.first_day_baseline_unknown_sessions,
             "first_day_baseline_unknown_usd": series.first_day_baseline_unknown_usd,
+            "invalid_cost_samples": series.invalid_cost_samples,
         });
         if let Some(budget) = weekly_budget {
             value["weekly_budget_usd"] = serde_json::json!(budget);
@@ -1974,6 +2010,13 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "  first-day baseline unknown for {} session(s) — \
              ${:.2} of pre-journal spend excluded from the 7d total\n",
             series.first_day_baseline_unknown_sessions, series.first_day_baseline_unknown_usd
+        ));
+    }
+    if series.invalid_cost_samples > 0 {
+        out.push_str(&format!(
+            "  {} invalid cost sample(s) excluded from the 7d total \
+             (negative or non-finite journal cost)\n",
+            series.invalid_cost_samples
         ));
     }
     match weekly_budget {
@@ -2162,6 +2205,70 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .expect("noon exists");
         chrono::Utc.from_utc_datetime(&noon).timestamp() + secs_into_day
+    }
+
+    #[test]
+    fn budget_series_excludes_hostile_negative_cost_samples() {
+        // rm-1388 red-first: a journal-authored negative
+        // total_cost_usd must not book negative spend or flip a budget
+        // verdict (live PoC at assess ecf1d292: {+5,+8} plus {-50,-50}
+        // on a $10 weekly budget printed "7d total $-47.00" /
+        // "$57.00 remaining (100%)" — the first-seen baseline gate only
+        // fires on positives, so the negative first delta books as
+        // spend). All samples sit on one in-window day (noon-anchored,
+        // never future-dated).
+        let captures = vec![
+            budget_capture("sess-real", epoch_on_day_offset(1, 0), 5.0),
+            budget_capture("sess-real", epoch_on_day_offset(1, 3600), 8.0),
+            budget_capture("sess-neg", epoch_on_day_offset(1, 600), -50.0),
+            budget_capture("sess-neg", epoch_on_day_offset(1, 4200), -50.0),
+            budget_capture("sess-alt", epoch_on_day_offset(1, 5400), 10.0),
+            budget_capture("sess-alt", epoch_on_day_offset(1, 6000), -10.0),
+        ];
+        let series = statusline_budget_series(&captures, 7, Utc::now());
+        assert!(
+            series.total.is_finite(),
+            "total must stay finite: {}",
+            series.total
+        );
+        assert_eq!(
+            series.total, 3.0,
+            "only valid samples book: sess-real span 8-5=3; sess-neg has no \
+             valid sample and sess-alt's -10 is excluded"
+        );
+        assert!(
+            series.daily.iter().all(|(_, v)| *v >= 0.0),
+            "no day may book negative spend: {:?}",
+            series.daily
+        );
+        assert_eq!(
+            series.invalid_cost_samples, 3,
+            "the two -50 samples and the -10 sample must be disclosed as \
+             excluded invalid samples"
+        );
+    }
+
+    // rm-1388: the validated accessor is the single gate every journal
+    // cost sample passes before booking (NaN and infinities cannot
+    // round-trip serde_json, so negatives are the reachable hostile
+    // arm; the predicate itself is unit-tested in parser.rs).
+    #[test]
+    fn capture_cost_usd_rejects_negative_journal_cost() {
+        let valid = budget_capture("s", 1_700_000_000, 3.5);
+        assert_eq!(capture_cost_usd(&valid), Some(3.5));
+        let zero = budget_capture("s", 1_700_000_000, 0.0);
+        assert_eq!(capture_cost_usd(&zero), Some(0.0));
+        for hostile in [-0.01, -50.0, -1e308] {
+            let capture = budget_capture("s", 1_700_000_000, hostile);
+            assert_eq!(
+                capture_cost_usd(&capture),
+                None,
+                "negative journal cost must be treated as absent"
+            );
+            assert_eq!(raw_journal_cost_usd(&capture), Some(hostile));
+        }
+        let absent = budget_capture("s", 1_700_000_000, f64::NAN);
+        assert_eq!(raw_journal_cost_usd(&absent), None);
     }
 
     #[test]

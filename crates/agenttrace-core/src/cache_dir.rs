@@ -262,4 +262,48 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn shared_user_cache_resolver_census_pins_one_definition() {
+        // rm-1389 census pin (run 1a4cce3a cycle 3, batch "one truth
+        // on the money-and-cache path"; relocated here at integration
+        // case 4d82812f): exactly one definition of the shared
+        // resolver may exist across crates/ — the four hand-synced
+        // private copies the consolidations removed (rm-1389 first,
+        // then the superseding rm-1536 move into this module) had
+        // already drifted twice in three days (the empty-HOME fix
+        // landed on three copies while statusline's lagged; the
+        // relative-HOME fix then landed on statusline alone), so a
+        // re-born private copy is a regression of exactly that
+        // family. The needle is assembled at runtime so this test's
+        // own source cannot count itself.
+        let needle = ["fn ", "resolve_user_cache_dir"].concat();
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("crates");
+        let mut definitions = 0usize;
+        let mut stack = vec![crates_dir];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|err| panic!("census cannot read {}: {err}", dir.display()));
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("census cannot read {}: {err}", path.display()));
+                definitions += source.matches(&needle).count();
+            }
+        }
+        assert_eq!(
+            definitions, 1,
+            "exactly one shared resolver definition may exist (this module); \
+             the census found {definitions} across crates/"
+        );
+    }
 }
