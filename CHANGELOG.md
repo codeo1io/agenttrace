@@ -573,6 +573,50 @@
 
 ### Fixed
 
+- Cline `tokensIn` is cache-EXCLUSIVE — cline input is now recorded by
+  identity, ending the false-zero class on every cache-hit Cline/Roo
+  session (rm-1884, run 8a57b895 cycle 4): the rm-1430 carrier fold
+  recorded input "net of the cache legs" on the rm-600 basis, but upstream
+  Cline meters `tokensIn` as uncached input only and reconstructs the
+  total additively (legacy-task-handling.ts:160
+  `tokensIn+cacheReads+cacheWrites`; Anthropic bills cache reads/writes
+  separately from `input_tokens`), so the subtraction drove `input_tokens`
+  to ~0 on exactly the cache-heavy sessions the lane was minted to price
+  — `cacheReads>>tokensIn` is the normal case with caching on — and the
+  saturating fold clamped through `magnitude_clamped:negative_to_zero` on
+  all-positive carriers (the assess F2 PoC).
+  `input_tokens` is now `tokensIn` as-recorded — the identity mapping of
+  the otel.rs delta-basis convention, cache legs staying separate disjoint
+  counters — superseding the rm-1430 entry's basis sentence above; the
+  Gemini/Qwen cache-INCLUSIVE netting (`promptTokenCount` class) is
+  lane-scoped-untouched and still pinned
+  (`qwen_mirrored_input_aliases_count_once_and_cache_nets_out`). Pinned
+  red-first by `cline_input_basis_is_identity_not_netted` (all-positive
+  `{tokensIn:500, cacheReads:700}` asserted at input 500 with NO
+  `negative_to_zero` disclosure), with the doc gate's basis clause
+  corrected alongside (docs/quality-gates/untrusted-usage-metrics-intake.md
+  now adjudicates the basis per provider instead of asserting Cline
+  inclusive).
+
+- a Cline message carrying both a text-JSON metrics carrier and a sibling
+  `metrics` object is ONE measurement, and the text-carrier scan is gated
+  on the upstream usage vocabulary (rm-1885, run 8a57b895 cycle 4): the
+  rm-1430 scan absorbed BOTH shapes of a dual-shape message
+  (`cline_metrics_carriers_parsed:2`, cost and tokens exactly 2× from one
+  request — the assess F1 PoC: one $0.01 message reported $0.02), and
+  folded token-shaped JSON text in ANY say-type as usage. The sibling
+  `metrics` object now wins per message; the text-JSON carrier folds only
+  on `api_req_started` / `api_req_finished` / `deleted_api_reqs` /
+  `subagent_usage` rows (the getApiMetrics.ts allowlist, plus finished
+  rows — the persisted metrics live there because combineApiRequests.ts
+  merging is render-only) — token-shaped JSON anywhere else is content,
+  not usage evidence. Pinned red-first by
+  `cline_dual_shape_message_absorbs_once` and
+  `cline_text_carrier_outside_usage_say_types_is_not_a_carrier`, with
+  finished-row folding, token-free started rows (structurally
+  non-carriers), and the deleted/subagent distinct census pinned beside
+  them.
+
 - An `AGENTTRACE_PRICING_FILE` rate naming a regional twin's exact catalog
   id corrects that row alone (rm-1053 override lane, run bbf61fbd cycle 3,
   folded at integration onto the landed raw-id retention chassis of runs
