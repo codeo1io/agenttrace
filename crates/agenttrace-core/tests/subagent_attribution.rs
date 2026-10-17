@@ -360,3 +360,30 @@ fn preserved_history_rows_keep_their_subagent_rollups() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn hostile_overflow_corpus_saturates_parent_rollups() {
+    // rm-487 end-to-end: the assess-PoC corpus class (run e775cac5
+    // cycle 1) — two children each carrying i64::MAX/2 + 1 input
+    // tokens — panicked debug builds at the plain `+=` rollup
+    // (subagents.rs) and would wrap release totals negative. Through
+    // the real discovery pipeline the parent must saturate instead:
+    // no panic, both children linked, tokens pinned at i64::MAX, and a
+    // finite (never poisoned) cost rollup.
+    let sessions = load_dir(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/subagent-overflow"),
+    );
+    let parent = by_suffix(&sessions, "p2-4242.jsonl");
+    assert_eq!(parent.metrics.subagent_count, 2);
+    assert_eq!(
+        parent.metrics.subagent_tokens,
+        i64::MAX,
+        "hostile rollup must saturate, not wrap"
+    );
+    assert!(parent.metrics.subagent_cost.is_finite());
+    assert!(parent.metrics.subagent_cost > 0.0);
+    let h1 = by_suffix(&sessions, "agent-h1.jsonl");
+    let h2 = by_suffix(&sessions, "agent-h2.jsonl");
+    assert!(h1.metrics.parent_session.ends_with("p2-4242.jsonl"));
+    assert!(h2.metrics.parent_session.ends_with("p2-4242.jsonl"));
+}

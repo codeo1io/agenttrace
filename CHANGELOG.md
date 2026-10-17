@@ -560,6 +560,33 @@
 
 ### Fixed
 
+- subagent rollups saturate instead of panicking or wrapping (rm-487, run
+  e775cac5 cycle 1, batch "cost-lane truth under hostile corpora"):
+  `attribute_subagents` accumulated `subagent_count` (usize),
+  `subagent_cost` (f64) and `subagent_tokens` (i64) with six plain `+=`
+  lines — the only rollup in the attribution lane still escaping the
+  clamp-plus-saturate contract (`lib.rs` `analyze`: "a new sum of
+  untrusted counts must use saturating_add, never `+=`"). A hostile
+  corpus of two children each carrying `i64::MAX/2 + 1` input tokens
+  panicked debug builds (`attempt to add with overflow`, rc 101, proven
+  live by the assess PoC) and silently wrapped the parent's token total
+  negative in release builds. Counts and tokens now saturate (the parent
+  pins at `i64::MAX`) and a poisoned — non-finite — child cost is
+  skipped rather than propagated, matching the rm-1500 rule the
+  insights rollups already follow. Pinned by an in-crate debug-profile
+  test, a poisoned-cost test, and the end-to-end fixture corpus
+  `tests/fixtures/subagent-overflow/` driven through the real discovery
+  pipeline by `subagent_attribution.rs`.
+- zstd over-cap refusal names the real cap, derived (rm-1025, run
+  e775cac5 cycle 1, batch "cost-lane truth under hostile corpora"): the
+  Codex-rollout decode refusal in `parser.rs` hand-wrote the numeral
+  "64 MiB" while the bound lives in `ZSTD_ROLLOUT_DECODE_MAX_BYTES` —
+  retuning the constant would have shipped a message stating a stale
+  size with no test failing. The numeral is now derived from the
+  constant (`zstd_decode_cap_label()`, the same discipline as
+  `MCP_INPUT_MAX_BYTES` in the CLI transport lane) and locked by a
+  const-tracking unit test.
+
 - An `AGENTTRACE_PRICING_FILE` override is no longer shadowed by bundled rows
   derived under a session's bare dated id (rm-196 composed onto the rm-1053
   raw-first ladder, integration of run 92ea794984ae cycle 4): the cycle-5
