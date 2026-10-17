@@ -552,13 +552,15 @@ directory; missing directories are simply skipped.
 | OpenClaw (legacy Clawdbot) | `~/.clawdbot/sessions` |
 | OpenCode | `~/.local/share/opencode/storage` |
 | OpenCode (macOS) | `~/Library/Application Support/opencode/storage` |
+| Cline CLI | `~/.cline/data/sessions` |
 | Cline (VS Code) | `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks` |
 
 Relocations honored at scan time: `CODEX_HOME` (Codex sessions and
 archived sessions), `CLAUDE_CONFIG_DIR` (Claude Code transcripts and
 projects), `XDG_CONFIG_HOME` (Antigravity config and Cline),
 `XDG_DATA_HOME` / `OPENCODE_DATA_DIR` (OpenCode), `OPENCLAW_STATE_DIR`
-(OpenClaw sessions; the legacy `~/.clawdbot` root is not relocatable).
+(OpenClaw sessions; the legacy `~/.clawdbot` root is not relocatable),
+`CLINE_SESSION_DATA_DIR` (Cline CLI `~/.cline/data/sessions` store).
 Pi-family homes are
 enumerated structurally (every `~/.pi`, `~/.omp`, `~/.senpi`, `~/.omo`,
 `~/.config/pi` root child carrying a `sessions/` directory registers —

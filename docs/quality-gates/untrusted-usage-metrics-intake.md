@@ -1,6 +1,6 @@
 # Untrusted usage-metrics intake — clamp, disclose, never invent
 
-**Class:** quality gate (parser intake) · **Origin:** rm-1430, cycle 3 of run a3f96656 (2026-10-15); observed live via tokscale #1369 · **Applies to:** every lane parser that consumes externally-recorded usage metrics (Cline/Roo landed; the same rule binds codex, gemini, pi, and future lanes)
+**Class:** quality gate (parser intake) · **Origin:** rm-1430, cycle 3 of run a3f96656 (2026-10-15); observed live via tokscale #1369; extended by rm-1881/rm-1882, run e30a8801 cycle 1 (2026-10-16) · **Applies to:** every lane parser that consumes externally-recorded usage metrics (Cline/Roo landed; the same rule binds codex, gemini, pi, and future lanes)
 
 ## The defect class
 
@@ -16,13 +16,15 @@ Every intake of externally-recorded usage MUST:
 - **Clamp at intake, and disclose the clamp.** Negative values are recorded as 0 with a counter (e.g. `cline_metrics_negative_clamped`) disclosed in the report's data-health disclosures — never silently propagated, never a hard failure.
 - **Count what you cannot parse.** Present-but-unparseable fields increment a disclosed `unparsed_fields` counter; they are not defaulted, not dropped.
 - **Refuse cost-only "carriers".** An object with a cost and no token fields is **not** a usage carrier; treating it as one invents token truth from a price. Require ≥1 token field before the object qualifies.
-- **Preserve the delta basis.** If the provider's `input` figure includes cache legs (Cline `tokensIn` does), record net input with the cache legs separate (rm-600 basis), saturating — and pin the arithmetic in tests.
+- **Fold at most one carrier per entry (single-carrier rule).** A journal entry can encode the same usage evidence twice — a structural `metrics` sibling AND a metrics-shaped text carrier on one message (rm-1882, observed live: one $0.01 turn rendered $0.02). The structural sibling supersedes the text; one entry folds one carrier, and `carriers` counts entries-with-carriers, never absorptions, so the counter cannot diverge from the double-count rule.
+- **Absorb on every production path, or the carrier is unreachable.** A carrier shape absorbed in one parse lane only is still zero on every route that dispatches elsewhere (rm-1881: the CLI envelope has no `type`/`say` entries, so the ui walk never saw it — absorption had to land in the role/content walk too). A new carrier shape ships with a test that reaches it through EACH production path: positional file, `-d` walk, and discovery root.
+- **Preserve the delta basis.** If the provider's `input` figure includes cache legs (Cline `tokensIn` does), record net input with the cache legs separate (rm-600 basis), saturating and floored at zero per carrier (a cache-only carrier cannot net negative) — and pin the arithmetic in tests.
 - **Flip provenance, suppress estimation.** When a real carrier is absorbed, token provenance becomes `reported_by_agent` and text-stream estimation is suppressed — but the event stream stays additive-untouched otherwise.
 - **Pin the metrics-free case byte-identically.** A store without carriers must render exactly as before the feature landed (including preserved text-estimated fallbacks), or the change is a regression, not an addition.
 
 ## Test shape (red-first)
 
-Write the failing tests against a banked payload fixture **before** the parser exists (fixture-first — no host corpus needed, per the tokscale-reference payload). Cover: string-typed numerics, negative metrics (clamp + disclosure), cost-only rejection, net-of-cache arithmetic, and the metrics-free zero-delta pin.
+Write the failing tests against a banked payload fixture **before** the parser exists (fixture-first — no host corpus needed, per the tokscale-reference payload). Cover: string-typed numerics, negative metrics (clamp + disclosure), cost-only rejection, net-of-cache arithmetic, single-carrier-per-entry folding (sibling-and-text double encodings), the metrics-free zero-delta pin, and one end-to-end path per production route (positional, `-d`, discovery) — a lane that only unit-tests its happy walk ships false zeros on the other two.
 
 ## Why this is a doc and not just a row
 

@@ -335,6 +335,9 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
             }
         }
     }
+    // rm-1881: the same session id in both the canonical CLI store and
+    // the legacy VS Code tasks root renders one session (canonical wins).
+    retain_single_cline_session_per_id(&mut all);
     sort_paths_by_mod_time(all)
 }
 
@@ -649,6 +652,9 @@ pub(crate) fn find_session_files_cached(
             true
         }
     });
+    // rm-1881: the same session id in both the canonical CLI store and
+    // the legacy VS Code tasks root renders one session (canonical wins).
+    retain_single_cline_session_per_id(&mut all);
     (sort_paths_by_cache(all, cache), opencode_fork_excluded)
 }
 
@@ -947,6 +953,14 @@ fn walk_session_files_cached(
         if is_open_code_storage_path(&path) && !is_open_code_storage_session_file(&path) {
             continue;
         }
+        // rm-1881: under the Cline CLI canonical root only the
+        // `<id>.messages.json` transcript is admitted — the
+        // `session.json` manifest and `hooks.jsonl` siblings stay out,
+        // and the name alone never qualifies (content-shaped gates in
+        // `is_cline_cli_session_file`).
+        if is_cline_cli_session_path(&path) && !is_cline_cli_session_file(&path) {
+            continue;
+        }
         files.push(path);
     }
     files.sort();
@@ -1030,6 +1044,14 @@ fn walk_session_files(
             continue;
         }
         if is_open_code_storage_path(&path) && !is_open_code_storage_session_file(&path) {
+            continue;
+        }
+        // rm-1881: under the Cline CLI canonical root only the
+        // `<id>.messages.json` transcript is admitted — the
+        // `session.json` manifest and `hooks.jsonl` siblings stay out,
+        // and the name alone never qualifies (content-shaped gates in
+        // `is_cline_cli_session_file`).
+        if is_cline_cli_session_path(&path) && !is_cline_cli_session_file(&path) {
             continue;
         }
         // rm-597: same-file admission — a symlink or hardlink alias of an
@@ -1265,15 +1287,161 @@ fn open_code_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
 }
 
 fn cline_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
-    vec![KnownSessionDir {
-        name: "Cline".to_string(),
+    let canonical = KnownSessionDir {
+        name: "Cline CLI".to_string(),
+        path: cline_cli_session_root(home),
+    };
+    let legacy = KnownSessionDir {
+        name: "Cline (VS Code)".to_string(),
         path: user_config_dir(home)
             .join("Code")
             .join("User")
             .join("globalStorage")
             .join("saoudrizwan.claude-dev")
             .join("tasks"),
-    }]
+    };
+    // An operator pointing the relocation env at the legacy tasks root
+    // must not register the same tree twice.
+    if canonical.path == legacy.path {
+        vec![legacy]
+    } else {
+        vec![canonical, legacy]
+    }
+}
+
+/// The Cline CLI canonical session store (rm-1881 arm b / rm-1435
+/// discovery fold): messages contract v1 locates sessions at
+/// `~/.cline/data/sessions/<sessionId>/` with
+/// `<sessionId>.messages.json` as the transcript and a `session.json`
+/// manifest alongside. `CLINE_SESSION_DATA_DIR` relocates the store
+/// root; a trimmed-empty override falls back to the default (the
+/// OpenClaw `OPENCLAW_STATE_DIR` discipline).
+fn cline_cli_session_root(home: &Path) -> PathBuf {
+    let default = home.join(".cline").join("data").join("sessions");
+    match std::env::var_os("CLINE_SESSION_DATA_DIR") {
+        Some(dir) => {
+            if dir.to_string_lossy().trim().is_empty() {
+                default
+            } else {
+                PathBuf::from(dir)
+            }
+        }
+        None => default,
+    }
+}
+
+/// A file is a Cline CLI session transcript only when every
+/// content-shaped gate holds (rm-1435 discipline — the name alone is
+/// far too generic to key on): it lives under the canonical root, its
+/// name is `<dirName>.messages.json` (the transcript stem matches its
+/// session dir), and that dir carries the `session.json` manifest
+/// contract v1 writes beside every transcript. The manifest,
+/// `hooks.jsonl`, and any non-canonical name stay out of discovery.
+fn is_cline_cli_session_file(path: &Path) -> bool {
+    if !is_cline_cli_session_path(path) {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(dir_name) = parent.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if path.file_name().and_then(|name| name.to_str())
+        != Some(format!("{dir_name}.messages.json").as_str())
+    {
+        return false;
+    }
+    parent.join("session.json").is_file()
+}
+
+/// Whether a candidate path lives under the Cline CLI canonical store
+/// root (env-relocated or default) — the scope inside which the
+/// `<id>.messages.json`-only admission rule applies. The custom-dir
+/// walk hands us paths as the operator typed them (a `-d` argument can
+/// be relative), so the comparison runs on a lexically-normalized
+/// absolute form — cwd-prepended, `.`/`..` collapsed — without
+/// touching the filesystem.
+fn is_cline_cli_session_path(path: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    path_starts_with_root(path, &cline_cli_session_root(Path::new(&home)))
+}
+
+/// Lexical `starts_with`: absolute paths compare directly, relative
+/// ones are made absolute against the current directory first — the
+/// ROOT too. A relative `CLINE_SESSION_DATA_DIR` override passes
+/// through verbatim, and comparing the absolutized candidate against
+/// a still-relative root never matches, leaving the canonical gates
+/// inert (review F2: `session.json`/`hooks.jsonl` slip back in as
+/// name-admitted parse noise while the transcript still parses).
+fn path_starts_with_root(path: &Path, root: &Path) -> bool {
+    lexical_absolute(path).starts_with(lexical_absolute(root))
+}
+
+/// cwd-prepended, lexically normalized path — no filesystem access,
+/// no symlink resolution (traversal policy is the walk's concern, not
+/// the gate's).
+fn lexical_absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        let mut out = PathBuf::new();
+        out.extend_normalized(path);
+        return out;
+    }
+    let joined = match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => return PathBuf::from(path),
+    };
+    let mut out = PathBuf::new();
+    out.extend_normalized(&joined);
+    out
+}
+
+trait NormalizeComponents {
+    fn extend_normalized(&mut self, path: &Path);
+}
+
+impl NormalizeComponents for PathBuf {
+    fn extend_normalized(&mut self, path: &Path) {
+        use std::path::Component;
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    self.pop();
+                }
+                other => self.push(other.as_os_str()),
+            }
+        }
+    }
+}
+
+/// rm-1881 dedup pin: one session id must render one session even when
+/// it exists in BOTH the canonical CLI store and the legacy VS Code
+/// tasks root — the canonical store wins (canonical identity
+/// discipline; the rm-338 alias dedup only collapses path aliases, not
+/// the same id materialized under two different roots).
+fn retain_single_cline_session_per_id(all: &mut Vec<PathBuf>) {
+    let canonical_ids: HashSet<String> = all
+        .iter()
+        .filter(|path| is_cline_cli_session_file(path))
+        .filter_map(|path| {
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    if canonical_ids.is_empty() {
+        return;
+    }
+    all.retain(|path| {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return true;
+        };
+        !(path.is_dir() && is_cline_task_dir(path) && canonical_ids.contains(name))
+    });
 }
 
 fn user_config_dir(home: &Path) -> PathBuf {

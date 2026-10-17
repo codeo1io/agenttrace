@@ -4,6 +4,42 @@
 
 ### Added
 
+- Cline CLI envelope intake works on every production path, and its
+  canonical store is auto-discovered (rm-1881 + rm-1882, run e30a8801
+  cycle 1): the Cline CLI `.messages.json` envelope carries usage as
+  per-message `metrics` siblings, but absorption lived only in the
+  ui-message walk (`ui_messages.json`) while the envelope has no
+  `type`/`say` entries — so positionally, via `-d` walks, and via
+  discovery, every envelope rendered text-estimated tokens and $0.00
+  with zero disclosures (the assess PoC: a $0.045 turn printed $0.00).
+  The role/content walk now absorbs `metrics` siblings through the
+  same carrier rules as the ui lane — clamp-at-intake, net-of-cache
+  (rm-600 basis: upstream `inputTokens` is the full prompt including
+  the cache legs, so input is recorded net and all three legs are
+  recoverable), cost-only refusal, disclosed counters — so one object
+  folds to identical totals through either lane; retry semantics
+  accumulate (saturating adds; nothing overwritten or dropped) and
+  unknown additive fields are tolerated. The canonical store
+  `~/.cline/data/sessions/<id>/<id>.messages.json` (messages contract
+  v1) is a discovery root — `CLINE_SESSION_DATA_DIR` relocates it,
+  trimmed-empty falls back to the default — and a transcript is
+  admitted only under content-shaped gates: `<dirName>.messages.json`
+  name plus the sibling `session.json` manifest, under the canonical
+  root. `session.json`/`hooks.jsonl` never become sessions, a generic
+  `.messages.json` outside the store never qualifies, and the same id
+  in both the canonical store and the legacy VS Code tasks root
+  renders one session (canonical wins). A ui entry carrying both a
+  structural `metrics` sibling and a metrics-shaped text carrier folds
+  once — the sibling supersedes the text (the same evidence encoded
+  twice must not double-count) — and
+  `cline_metrics_carriers_parsed` counts entries-with-carriers, not
+  absorptions. A prefilter skips the JSON parse for texts that cannot
+  possibly be carriers (substring probe over the eight token keys
+  themselves, since `cacheReads`/`cacheWrites` carry no "okens"
+  substring; any text containing a `\u` escape bypasses it), keeping
+  the admission set identical. Warm session caches regenerate once
+  under schema rung 65, so pre-fix silent-zero and double-counted
+  totals do not survive the upgrade.
 - Cline/Roo usage metrics carriers are consumed, not zeroed (rm-1430, run
   a3f96656 cycle 3): Cline journals record per-response usage — as a say
   entry whose text is a JSON object (`cost`/`tokensIn`/`tokensOut`/

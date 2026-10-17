@@ -6907,6 +6907,18 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
         _ => return None,
     };
     let mut events = Vec::new();
+    // rm-1881: the Cline CLI `.messages.json` envelope (messages
+    // contract v1) carries usage as a `metrics` sibling on terminal
+    // assistant messages — and this role/content walk is the ONLY lane
+    // that can reach it (the envelope has no `type`/`say` entries, so
+    // `parse_cline_ui_messages` never sees it). Absorb siblings through
+    // the same carrier rules the ui lane uses — clamp-at-intake,
+    // net-of-cache (rm-600 basis), cost-only refusal, disclosed
+    // counters — so one object folds to the same totals through either
+    // lane. Contract v1 retry semantics are accumulate-never-overwrite:
+    // every absorbed carrier adds (saturating); nothing is overwritten
+    // or dropped, and unknown additive fields are tolerated.
+    let mut usage_state = ClineUsageState::default();
     for message in messages {
         let Some(message) = message.as_object() else {
             continue;
@@ -6921,6 +6933,13 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
             first_value(message, &["timestamp", "ts", "createdAt", "created_at"])
                 .unwrap_or(&Value::Null),
         );
+        if let Some(carrier) = message.get("metrics").and_then(cline_carrier_from_object) {
+            cline_absorb_carrier(&mut usage_state, carrier, &ts);
+            // rm-1882: `carriers` counts entries-with-carriers, not
+            // absorptions (one increment per message that yielded a
+            // carrier).
+            usage_state.carriers += 1;
+        }
         let before = events.len();
         if let Some(content) = message.get("content") {
             cline_content_events(&role, &ts, model, content, &mut events);
@@ -6940,6 +6959,15 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
                 });
             }
         }
+    }
+    // Appended after the text stream (pi `recorded_cost_usd`
+    // precedent): reported usage rides a synthetic session_meta usage
+    // event, so text events stay additive-untouched and token
+    // provenance flips to reported_by_agent downstream. A metrics-free
+    // envelope takes none of this path (carriers == 0 gates the event)
+    // and renders byte-identically to the pre-rm-1881 walk.
+    if let Some(event) = cline_usage_event(&usage_state, model) {
+        events.push(event);
     }
     non_empty(events)
 }
@@ -7207,22 +7235,28 @@ fn cline_metric_f64(value: Option<&Value>) -> Option<f64> {
     }
 }
 
+/// The eight usage keys a metrics carrier can carry — the carrier
+/// admission set. Shared by the object walk and the text-carrier
+/// prefilter, which must probe exactly this set: two of the keys
+/// ("cacheReads"/"cacheWrites") contain no "okens" substring, so a
+/// narrower probe silently drops legal carriers (review F1).
+const CLINE_TOKEN_KEYS: [&str; 8] = [
+    "tokensIn",
+    "tokensOut",
+    "cacheReads",
+    "cacheWrites",
+    "inputTokens",
+    "outputTokens",
+    "cacheReadTokens",
+    "cacheWriteTokens",
+];
+
 /// Never invent (rm-1430 acceptance 4): a token count is the evidence
 /// of usage. A bare "cost" (an invoice pasted as text, say) is not a
 /// carrier; at least one token field is required.
 fn cline_carrier_from_object(object: &Value) -> Option<ClineCarrier> {
-    const TOKEN_KEYS: [&str; 8] = [
-        "tokensIn",
-        "tokensOut",
-        "cacheReads",
-        "cacheWrites",
-        "inputTokens",
-        "outputTokens",
-        "cacheReadTokens",
-        "cacheWriteTokens",
-    ];
     let fields = object.as_object()?;
-    if !TOKEN_KEYS.iter().any(|key| fields.contains_key(*key)) {
+    if !CLINE_TOKEN_KEYS.iter().any(|key| fields.contains_key(*key)) {
         return None;
     }
     let token = |key: &str| -> Option<i64> { cline_metric_i64(fields.get(key)) };
@@ -7231,7 +7265,7 @@ fn cline_carrier_from_object(object: &Value) -> Option<ClineCarrier> {
     let cache_read = token("cacheReads").or_else(|| token("cacheReadTokens"));
     let cache_write = token("cacheWrites").or_else(|| token("cacheWriteTokens"));
     let mut unparsed_fields = 0;
-    for key in TOKEN_KEYS {
+    for key in CLINE_TOKEN_KEYS {
         if fields.contains_key(key) && cline_metric_i64(fields.get(key)).is_none() {
             unparsed_fields += 1;
         }
@@ -7257,6 +7291,21 @@ fn cline_text_metrics_carrier(text: &str) -> Option<ClineCarrier> {
     if !trimmed.starts_with('{') {
         return None;
     }
+    // rm-1882 prefilter: a carrier object must carry at least one of
+    // the eight token keys, so on tool-result-dense journals (most
+    // texts are not JSON) the full serde parse runs only for texts
+    // that can possibly qualify. The probe is the key set itself —
+    // two of the eight ("cacheReads"/"cacheWrites") contain no
+    // "okens" substring, and the earlier "okens"-only probe
+    // silently dropped those legal carriers (review F1: regression
+    // vs the pre-batch base, which full-parsed and folded them). A
+    // unicode-escaped key ("\u0074okensIn") defeats any substring
+    // probe, so any text containing a "\u" escape still parses —
+    // the admission set, and therefore every output, is
+    // byte-identical.
+    if !CLINE_TOKEN_KEYS.iter().any(|key| trimmed.contains(key)) && !trimmed.contains("\\u") {
+        return None;
+    }
     let value: Value = serde_json::from_str(trimmed).ok()?;
     cline_carrier_from_object(&value)
 }
@@ -7271,14 +7320,25 @@ fn cline_clamped(state: &mut ClineUsageState, value: i64) -> i64 {
 }
 
 fn cline_absorb_carrier(state: &mut ClineUsageState, carrier: ClineCarrier, ts: &str) {
-    state.carriers += 1;
+    // rm-1882: `carriers` counts entries-with-carriers at the entry
+    // level in each walk (one increment per message that yielded a
+    // carrier), not absorptions — moved out of this helper so the
+    // single-carrier rule and the counter cannot drift apart.
     state.last_ts = ts.to_string();
     state.unparsed_fields += carrier.unparsed_fields;
     let input = cline_clamped(state, carrier.input.unwrap_or(0));
     let output = cline_clamped(state, carrier.output.unwrap_or(0));
     let cache_read = cline_clamped(state, carrier.cache_read.unwrap_or(0));
     let cache_write = cline_clamped(state, carrier.cache_write.unwrap_or(0));
-    let net_input = input.saturating_sub(cache_read).saturating_sub(cache_write);
+    // Net (uncached) input: the Roo/CLI `tokensIn` is cache-INCLUSIVE,
+    // so cached reads/writes come off it. A cache-only carrier (no
+    // tokensIn — the review-F1 admission shape) would net NEGATIVE and
+    // eat its siblings' input, so the per-carrier net floors at zero:
+    // a carrier cannot carry negative uncached input.
+    let net_input = input
+        .saturating_sub(cache_read)
+        .saturating_sub(cache_write)
+        .max(0);
     let mut add = |key: &str, value: i64| {
         if let Some(total) = state.usage.get_mut(key) {
             *total = total.saturating_add(value);
@@ -8394,12 +8454,21 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
         // JSON metrics object, and/or a sibling `metrics` object (Cline
         // CLI envelope). Text events are unaffected: metrics presence
         // never alters the text stream.
+        //
+        // rm-1882 single-carrier rule: at most one folded carrier per
+        // ui entry — the structural `metrics` sibling supersedes a
+        // metrics-shaped say text (the same evidence twice encoded on
+        // one entry must not double-count; the rule is stated in the
+        // intake contract, docs/quality-gates/untrusted-usage-metrics-
+        // intake.md). `carriers` counts entries-with-carriers, not
+        // absorptions.
         if let Some(carrier) = message.get("metrics").and_then(cline_carrier_from_object) {
             cline_absorb_carrier(&mut usage_state, carrier, &ts);
-        }
-        if !text.is_empty() {
+            usage_state.carriers += 1;
+        } else if !text.is_empty() {
             if let Some(carrier) = cline_text_metrics_carrier(text) {
                 cline_absorb_carrier(&mut usage_state, carrier, &ts);
+                usage_state.carriers += 1;
             }
         }
         if text.is_empty() {
@@ -10788,6 +10857,240 @@ mod tests {
         assert_eq!(session.metrics.tokens_input, 3);
         assert_eq!(session.metrics.cost_estimated, 0.0001);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cline_cli_envelope_metrics_fold_in_the_role_walk() {
+        // rm-1881 red-first: a positional `.messages.json` envelope —
+        // and the same file reached by any `-d` custom-dir walk or by
+        // canonical-store discovery — parses through the ROLE walk
+        // (`parse_cline_value`), which pre-fix absorbed nothing: every
+        // production envelope rendered text-estimated tokens and
+        // $0.00 with zero disclosures. The envelope has no
+        // `type`/`say` entries, so the ui lane rm-1430 wired cannot
+        // reach it.
+        let dir = std::env::temp_dir().join("agenttrace-rm1881-role-walk");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1784094124598_rruoq.messages.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 1,
+                "agent": "cli",
+                "sessionId": "1784094124598_rruoq",
+                "messages": [
+                    {"id":"m1","role":"user","ts":1700000100,"content":[{"type":"text","text":"hi"}]},
+                    {"id":"m2","role":"assistant","ts":1700000101,
+                     "content":[{"type":"text","text":"hello"}],
+                     "modelInfo":{"id":"claude-sonnet-4-20260514","provider":"anthropic"},
+                     "metrics":{"inputTokens":1500,"outputTokens":900,"cacheReadTokens":600,"cacheWriteTokens":200,"cost":0.045}}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let session = parse_file(&path).expect("positional envelope file parses");
+        // Same basis as the ui-lane pin (cline_cli_envelope_metrics_
+        // objects_fold_usage): upstream usage.ts normalizes inputTokens
+        // to the FULL prompt — "inputTokens is already the full prompt
+        // size, including any cache-read/cache-write portions. Do not
+        // add cache fields back on top" — so the rm-600 delta basis
+        // records the non-cached input net of the legs: 1500-600-200=700,
+        // legs separate, 700+600+200=1500 recoverable. The acceptance
+        // numeral "input 1500" was re-anchored to this net basis: one
+        // object must fold to the same totals through either lane.
+        assert_eq!(session.metrics.tokens_input, 700);
+        assert_eq!(session.metrics.tokens_output, 900);
+        assert_eq!(session.metrics.tokens_cache_r, 600);
+        assert_eq!(session.metrics.tokens_cache_w, 200);
+        assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+        assert_eq!(session.metrics.cost_estimated, 0.045);
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("cline_metrics_carriers_parsed"),
+            Some(&1)
+        );
+        // The text stream is additive-untouched: both envelope turns
+        // still render as counted conversation legs.
+        assert!(session.metrics.user_messages >= 1);
+        assert!(session.metrics.assistant_turns >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cline_envelope_retry_metrics_accumulate_and_tolerate_unknown_fields() {
+        // rm-1881 clause d: messages contract v1 retry semantics — a
+        // retried turn appends another terminal-assistant message with
+        // its own metrics. Carriers accumulate (saturating adds; prior
+        // metrics are never overwritten or dropped), and unknown
+        // additive fields (a newer contract field) are tolerated
+        // without counting as parse loss.
+        let dir = std::env::temp_dir().join("agenttrace-rm1881-retries");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("retry-s1.messages.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 1,
+                "agent": "cli",
+                "sessionId": "retry-s1",
+                "messages": [
+                    {"id":"m1","role":"user","ts":1700000300,"content":[{"type":"text","text":"go"}]},
+                    {"id":"m2","role":"assistant","ts":1700000301,
+                     "content":[{"type":"text","text":"first try"}],
+                     "metrics":{"inputTokens":500,"outputTokens":100,"cacheReadTokens":0,"cacheWriteTokens":0,"cost":0.01,"futureAdditiveField":true}},
+                    {"id":"m3","role":"assistant","ts":1700000302,
+                     "content":[{"type":"text","text":"retried"}],
+                     "metrics":{"inputTokens":1000,"outputTokens":300,"cacheReadTokens":50,"cacheWriteTokens":0,"cost":0.02}}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let session = parse_file(&path).expect("retry envelope parses");
+        assert_eq!(session.metrics.tokens_input, 1450);
+        assert_eq!(session.metrics.tokens_output, 400);
+        assert_eq!(session.metrics.tokens_cache_r, 50);
+        assert_eq!(session.metrics.tokens_cache_w, 0);
+        assert_eq!(session.metrics.cost_estimated, 0.03);
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("cline_metrics_carriers_parsed"),
+            Some(&2),
+            "one counted entry per metrics-bearing message"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("cline_metrics_unparsed_fields"),
+            None,
+            "unknown additive fields are tolerated, not parse loss"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cline_metrics_free_envelope_is_unchanged_in_the_role_walk() {
+        // rm-1881 zero-delta pin: without metrics siblings the role
+        // walk renders exactly as pre-fix — estimated tokens (the
+        // estimation path is untouched), no session_meta usage event,
+        // no cline counters.
+        let dir = std::env::temp_dir().join("agenttrace-rm1881-zero-delta");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plain-s2.messages.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 1,
+                "agent": "cli",
+                "sessionId": "plain-s2",
+                "messages": [
+                    {"id":"m1","role":"user","ts":1700000400,"content":[{"type":"text","text":"hi"}]},
+                    {"id":"m2","role":"assistant","ts":1700000401,"content":[{"type":"text","text":"hello"}]}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let session = parse_file(&path).expect("metrics-free envelope parses");
+        assert_eq!(session.metrics.provenance.tokens, "estimated_from_text");
+        assert!(session.metrics.tokens_input > 0);
+        assert!(
+            session
+                .metrics
+                .disclosure_counters
+                .keys()
+                .all(|key| !key.starts_with("cline_")),
+            "no cline counters without carriers"
+        );
+        // No synthetic usage event without carriers: the estimation
+        // path is untouched (text-estimated tokens, exactly as pre-fix)
+        // and no cline counter exists.
+        assert!(session.metrics.tokens_input > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cline_both_carrier_shapes_on_one_entry_fold_once() {
+        // rm-1882 red-first: a ui entry carrying BOTH a structural
+        // `metrics` sibling and a metrics-shaped say text encodes the
+        // same evidence twice; pre-fix both folded, double-counting the
+        // turn (assess PoC: one message, $0.01 carrier, rendered
+        // $0.02). The single-carrier rule: the sibling supersedes the
+        // text — one fold per entry — and `carriers` counts
+        // entries-with-carriers, not absorptions.
+        let carrier_text = "{\"cost\":0.01,\"tokensIn\":1000,\"tokensOut\":200}";
+        let doc = serde_json::json!([
+            {"ts":1700000500,"type":"say","say":"text",
+             "text": carrier_text,
+             "metrics":{"tokensIn":1000,"tokensOut":200,"cost":0.01}},
+            {"ts":1700000501,"type":"say","say":"text",
+             "text":"{\"cost\":0.005,\"tokensIn\":500,\"tokensOut\":100}"},
+            {"ts":1700000502,"type":"say","say":"text","text":"and a plain turn",
+             "metrics":{"tokensIn":250,"tokensOut":50,"cost":0.0025}}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("carriers fold");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&1750));
+        assert_eq!(meta.usage.get("output_tokens"), Some(&350));
+        let cost = meta.recorded_cost_usd.expect("cost folded");
+        assert!(
+            (cost - 0.0175).abs() < 1e-9,
+            "single-fold total cost: {cost}"
+        );
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_carriers_parsed"),
+            Some(&3),
+            "three entries-with-carriers — not four absorptions"
+        );
+    }
+
+    #[test]
+    fn cline_text_carrier_prefilter_probes_the_full_token_key_set() {
+        // rm-1882 + review F1: the "okens" substring prefilter skips
+        // the full serde parse for texts that cannot possibly be
+        // carriers (tool-result journals are mostly non-JSON) while
+        // keeping the admission set byte-identical — but the probe
+        // must be the eight-key set itself, because a
+        // cacheReads/cacheWrites-only carrier (no "okens" substring
+        // anywhere) is a legal carrier the narrower probe silently
+        // dropped. A unicode-escaped key still parses (any text
+        // containing a "\u" escape bypasses the probe), and non-JSON
+        // texts stay text events.
+        let doc = serde_json::json!([
+            {"ts":1700000600,"type":"say","say":"text","text":"{\"cost\":0.02,\"tokensIn\":800,\"tokensOut\":100}"},
+            {"ts":1700000601,"type":"say","say":"text","text":"{\"\\u0074okensIn\": 5, \"tokensOut\": 1}"},
+            {"ts":1700000602,"type":"say","say":"text","text":"{\"cost\":0.01,\"cacheReads\":100,\"cacheWrites\":50}"},
+            {"ts":1700000603,"type":"say","say":"tool","text":"Executed `npm install` in /work (12s) — 0 errors."}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("carriers fold through the prefilter");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&805));
+        assert_eq!(meta.usage.get("output_tokens"), Some(&101));
+        assert_eq!(meta.usage.get("cache_read_input_tokens"), Some(&100));
+        assert_eq!(meta.usage.get("cache_creation_input_tokens"), Some(&50));
+        let cost = meta.recorded_cost_usd.expect("cost folded");
+        assert!((cost - 0.03).abs() < 1e-9, "three-carrier total: {cost}");
+        let text_events: Vec<&Event> = events.iter().filter(|e| e.role != "session_meta").collect();
+        assert_eq!(text_events.len(), 4, "every say entry keeps its text event");
+        assert!(
+            text_events
+                .iter()
+                .any(|e| e.content.contains("npm install")),
+            "non-JSON tool text stays a text event"
+        );
     }
 
     #[test]

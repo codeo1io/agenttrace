@@ -52,6 +52,7 @@ fn scratch_enumeration() -> Vec<(String, String)> {
         "XDG_DATA_HOME",
         "OPENCODE_DATA_DIR",
         "OPENCLAW_STATE_DIR",
+        "CLINE_SESSION_DATA_DIR",
     ] {
         std::env::remove_var(var);
     }

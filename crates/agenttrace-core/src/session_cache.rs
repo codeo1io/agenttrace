@@ -5,7 +5,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 64;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 65;
+// Bumped 64 -> 65 (review fix of run e30a880139e54a60ba60b458cc2077a5
+// cycle 1 'Cline envelope intake: role-walk absorption + canonical-
+// store discovery + single-carrier rule', rm-1881 LEAD + rm-1882 +
+// rm-1435 discovery arm, attempt cab6a467 @ base 8c9e882, review
+// findings NEW-1/F1): the batch changed parser SEMANTICS for
+// UNCHANGED source files — the Cline CLI envelope's `metrics`
+// sibling now folds into usage (rm-1881) and the legacy ui-lane
+// double absorption of a say text beside its structural sibling is
+// cured (rm-1882) — but shipped only the DIR_LISTING_WALK_VERSION
+// 5 -> 6 rung, which re-walks listings WITHOUT re-parsing, so a
+// warm v64 sessions entry kept serving the pre-fix silent zero
+// ($0.0000 estimated_from_text) and the double-counted ui-lane
+// totals on unchanged files. The same rung also covers the
+// review-fix widening of the rm-1882 text prefilter from the
+// "okens" substring to the full eight-key probe: a
+// cacheReads/cacheWrites-only text carrier folds at the v64 base
+// (no prefilter there) and the shipped probe silently dropped it;
+// the same fix floors a carrier's net (uncached) input at zero — a
+// cache-only carrier used to net negative and eat its siblings'
+// input tokens.
+// rm-230 convention: parser-semantics changes that alter reported
+// totals for unchanged files bump the schema so cached sessions
+// regenerate under corrected accounting. Entries regenerate once on
+// next scan.
 // Bumped 63 -> 64 (integration of run 90514a3833d04721a6a3ca40ea695423
 // cycle 4 'pi cost truth: recorded-zero disclosure + 1h-tier cache
 // accounting', rm-1052 LEAD + rm-499, conflict case
@@ -1002,7 +1026,14 @@ const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 /// load instead of being filtered. The batch's own 3 -> 4 bump re-bases
 /// onto the already-landed v4 lane (rm-732) per the same convention one
 /// lane up.
-const DIR_LISTING_WALK_VERSION: i64 = 5;
+///
+/// v6 (rm-1881): Cline CLI canonical-store admission changed — under
+/// `~/.cline/data/sessions/` (or `CLINE_SESSION_DATA_DIR`) only the
+/// `<id>.messages.json` transcript is admitted; the `session.json`
+/// manifest and `hooks.jsonl` siblings no longer are. A listing stored
+/// by a pre-rm-1881 walk of that root replays the old admission set,
+/// so the lane bumps once to retire every stored listing.
+const DIR_LISTING_WALK_VERSION: i64 = 6;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")

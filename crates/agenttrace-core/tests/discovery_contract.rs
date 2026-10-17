@@ -2846,17 +2846,24 @@ fn with_home_and_cache(home: &std::path::Path, cache: &std::path::Path, f: impl 
         let previous_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
         let previous_xdg_data = std::env::var_os("XDG_DATA_HOME");
         let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        // rm-1881: CLINE_SESSION_DATA_DIR relocates the Cline CLI
+        // canonical store root — clear any operator value so every test
+        // starts from the default root, and tests that exercise the
+        // relocation set it themselves under the same lock.
+        let previous_cline_store = std::env::var_os("CLINE_SESSION_DATA_DIR");
         std::env::set_var("HOME", home);
         std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
         std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
+        std::env::remove_var("CLINE_SESSION_DATA_DIR");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         restore_env("HOME", previous_home);
         restore_env("XDG_CONFIG_HOME", previous_xdg_config);
         restore_env("XDG_CACHE_HOME", previous_xdg_cache);
         restore_env("XDG_DATA_HOME", previous_xdg_data);
         restore_env("AGENTTRACE_SESSION_CACHE_DIR", previous_session_cache);
+        restore_env("CLINE_SESSION_DATA_DIR", previous_cline_store);
         result
     };
     if let Err(payload) = result {
@@ -4444,4 +4451,494 @@ fn antigravity_sibling_roots_are_discovered_and_disclosed() {
         }
     });
     let _ = fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------
+// rm-1881 / rm-1435 — Cline CLI canonical store discovery
+// ---------------------------------------------------------------------------
+
+/// Writes a Cline CLI canonical-store session dir: the `<id>.messages.json`
+/// envelope plus the `session.json` manifest and optional `hooks.jsonl`
+/// siblings (messages contract v1 layout).
+fn seed_cline_cli_session(
+    root: &std::path::Path,
+    id: &str,
+    envelope: &serde_json::Value,
+) -> std::path::PathBuf {
+    let dir = root.join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{id}.messages.json")),
+        envelope.to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("session.json"),
+        serde_json::json!({
+            "version": 1,
+            "session_id": id,
+            "source": "cli",
+            "created": 1700000100000_u64
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("hooks.jsonl"),
+        "{\"event\":\"hook\",\"ts\":1700000100000}\n",
+    )
+    .unwrap();
+    dir
+}
+
+fn cline_cli_envelope(
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cost: f64,
+) -> serde_json::Value {
+    // The envelope shape from the assess PoC store (research f40a153a,
+    // messages contract v1): role/content walk with per-message `metrics`
+    // siblings on terminal assistant messages.
+    serde_json::json!({
+        "version": 1,
+        "agent": "cli",
+        "sessionId": "1784094124598_rruoq",
+        "messages": [
+            {"id":"m1","role":"user","ts":1700000100,"content":[{"type":"text","text":"hi"}]},
+            {"id":"m2","role":"assistant","ts":1700000101,
+             "content":[{"type":"text","text":"hello"}],
+             "modelInfo":{"id":"claude-sonnet-4-20260514","provider":"anthropic"},
+             "metrics":{"inputTokens":input,"outputTokens":output,"cacheReadTokens":cache_read,"cacheWriteTokens":cache_write,"cost":cost}}
+        ]
+    })
+}
+
+#[test]
+fn cline_cli_canonical_store_discovers_envelope_sessions_end_to_end() {
+    // rm-1881 red-first (arm b, the rm-1435 discovery fold): the Cline
+    // CLI canonical store `~/.cline/data/sessions/<id>/<id>.messages.json`
+    // must be a discovery root. Pre-fix the root was not registered at
+    // all, so the CLI store was invisible — while a `-d` walk of the
+    // same tree would have name-admitted `session.json` and
+    // `hooks.jsonl` as noise. Only the transcript is admitted now, and
+    // its metrics fold through the role walk (rm-600 net basis).
+    let home = std::env::temp_dir().join("agenttrace-rm1881-canonical-home");
+    let cache = std::env::temp_dir().join("agenttrace-rm1881-canonical-cache");
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+    let root = home.join(".cline").join("data").join("sessions");
+    seed_cline_cli_session(
+        &root,
+        "1784094124598_rruoq",
+        &cline_cli_envelope(1500, 900, 600, 200, 0.045),
+    );
+    with_home_and_cache(&home, &cache, || {
+        let files = find_session_files(None);
+        let under_cline: Vec<_> = files
+            .iter()
+            .filter(|path| path.starts_with(&root))
+            .collect();
+        assert_eq!(under_cline.len(), 1, "exactly the transcript: {files:?}");
+        assert!(
+            under_cline[0]
+                .file_name()
+                .is_some_and(|name| name == "1784094124598_rruoq.messages.json"),
+            "the transcript is the admitted path"
+        );
+        assert!(
+            !files.iter().any(|path| {
+                matches!(
+                    path.file_name().and_then(|n| n.to_str()),
+                    Some("session.json") | Some("hooks.jsonl")
+                )
+            }),
+            "the manifest and hooks siblings are never admitted"
+        );
+
+        let sessions = load_sessions_from_dir(None);
+        let cline: Vec<_> = sessions
+            .iter()
+            .filter(|session| session.metrics.source_tool == "cline")
+            .collect();
+        assert_eq!(cline.len(), 1, "one cline session: {:?}", sessions);
+        let session = &cline[0];
+        // rm-600 net basis: upstream inputTokens includes the cache legs
+        // (usage.ts: "already the full prompt size"), so the recorded
+        // input is net of them: 1500-600-200=700.
+        assert_eq!(session.metrics.tokens_input, 700);
+        assert_eq!(session.metrics.tokens_output, 900);
+        assert_eq!(session.metrics.tokens_cache_r, 600);
+        assert_eq!(session.metrics.tokens_cache_w, 200);
+        assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+        assert_eq!(session.metrics.cost_estimated, 0.045);
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("cline_metrics_carriers_parsed"),
+            Some(&1)
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn cline_cli_store_root_relocates_via_env_and_empty_falls_back() {
+    // rm-1881 arm b: `CLINE_SESSION_DATA_DIR` relocates the store root
+    // (OpenClaw `OPENCLAW_STATE_DIR` discipline); a trimmed-empty value
+    // falls back to the default root rather than a relative "" walk.
+    let home = std::env::temp_dir().join("agenttrace-rm1881-relocate-home");
+    let _ = fs::remove_dir_all(&home);
+    let relocated = home.join("elsewhere").join("sessions");
+    seed_cline_cli_session(
+        &relocated,
+        "reloc-01",
+        &cline_cli_envelope(400, 100, 0, 0, 0.02),
+    );
+
+    let cache_a = std::env::temp_dir().join("agenttrace-rm1881-relocate-cache-a");
+    let cache_b = std::env::temp_dir().join("agenttrace-rm1881-relocate-cache-b");
+    let cache_c = std::env::temp_dir().join("agenttrace-rm1881-relocate-cache-c");
+    for cache in [&cache_a, &cache_b, &cache_c] {
+        let _ = fs::remove_dir_all(cache);
+    }
+
+    with_home_and_cache(&home, &cache_a, || {
+        std::env::set_var("CLINE_SESSION_DATA_DIR", &relocated);
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|session| session.metrics.source_tool == "cline")
+                .count(),
+            1,
+            "relocated root is the scan root"
+        );
+    });
+    with_home_and_cache(&home, &cache_b, || {
+        // Unset: the default root (~/.cline/data/sessions) is empty, so
+        // the relocated store is out of scope.
+        let sessions = load_sessions_from_dir(None);
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.metrics.source_tool != "cline"),
+            "no cline sessions without the relocation env"
+        );
+    });
+    with_home_and_cache(&home, &cache_c, || {
+        std::env::set_var("CLINE_SESSION_DATA_DIR", "   ");
+        let sessions = load_sessions_from_dir(None);
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.metrics.source_tool != "cline"),
+            "trimmed-empty override falls back to the default root"
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+    for cache in [&cache_a, &cache_b, &cache_c] {
+        let _ = fs::remove_dir_all(cache);
+    }
+}
+
+#[test]
+fn cline_cli_gates_reject_generic_messages_json_false_positives() {
+    // rm-1435 discipline: a `.messages.json` candidate qualifies ONLY
+    // under the canonical root with the `<dirName>.messages.json` name
+    // AND the `session.json` manifest present — never by bare filename.
+    // Hostile corpus: same extension and near-shape names, no session.
+    let home = std::env::temp_dir().join("agenttrace-rm1881-hostile-home");
+    let cache = std::env::temp_dir().join("agenttrace-rm1881-hostile-cache");
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+
+    let root = home.join(".cline").join("data").join("sessions");
+    // ghost: canonical name, NO manifest → not admitted.
+    let ghost = root.join("ghost");
+    fs::create_dir_all(&ghost).unwrap();
+    fs::write(
+        ghost.join("ghost.messages.json"),
+        cline_cli_envelope(10, 10, 0, 0, 0.001).to_string(),
+    )
+    .unwrap();
+    // wrong-stem: manifest present, but the file name is not
+    // `<dirName>.messages.json` → not admitted.
+    let wrong_stem = root.join("s2");
+    fs::create_dir_all(&wrong_stem).unwrap();
+    fs::write(
+        wrong_stem.join("other.messages.json"),
+        cline_cli_envelope(20, 20, 0, 0, 0.002).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        wrong_stem.join("session.json"),
+        r#"{"version":1,"session_id":"s2"}"#,
+    )
+    .unwrap();
+    // keep: the true positive control — proves the gates select rather
+    // than reject everything.
+    seed_cline_cli_session(&root, "keep-01", &cline_cli_envelope(30, 30, 0, 0, 0.003));
+
+    // generic: an envelope-shaped file OUTSIDE every root, plus a plain
+    // generic JSON of the same extension — reachable only through the
+    // `-d` escape, and neither may become a session (the generic one is
+    // name-admitted then parse-skipped with disclosure; the envelope
+    // one DOES parse — it is a real transcript found by explicit path —
+    // but only through the explicit dir, never from `None`).
+    let corpus = home.join("hostile-corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    fs::write(
+        corpus.join("generic.messages.json"),
+        serde_json::json!({"hello":"world","nope":{"not":"a session"}}).to_string(),
+    )
+    .unwrap();
+
+    with_home_and_cache(&home, &cache, || {
+        let files = find_session_files(None);
+        assert_eq!(
+            files.iter().filter(|path| path.starts_with(&root)).count(),
+            1,
+            "only the keep-01 transcript is admitted: {files:?}"
+        );
+        assert!(
+            files
+                .iter()
+                .any(|path| path.ends_with("keep-01.messages.json")),
+            "the true positive control is the admitted one"
+        );
+
+        let generic = load_sessions_from_dir(Some(&corpus));
+        assert!(
+            generic.is_empty(),
+            "a generic .messages.json never becomes a session: {generic:?}"
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn cline_canonical_session_supersedes_legacy_task_dir_duplicate() {
+    // rm-1881 dedup pin: one session id in BOTH the canonical CLI store
+    // and the legacy VS Code tasks root renders ONE session — the
+    // canonical store wins (the rm-338 alias dedup only collapses path
+    // aliases, not the same id materialized under two roots).
+    let home = std::env::temp_dir().join("agenttrace-rm1881-dedup-home");
+    let cache = std::env::temp_dir().join("agenttrace-rm1881-dedup-cache");
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+
+    let canonical = home.join(".cline").join("data").join("sessions");
+    seed_cline_cli_session(
+        &canonical,
+        "shared-01",
+        &cline_cli_envelope(1000, 500, 0, 0, 0.05),
+    );
+
+    let legacy = home
+        .join(".config")
+        .join("Code")
+        .join("User")
+        .join("globalStorage")
+        .join("saoudrizwan.claude-dev")
+        .join("tasks")
+        .join("shared-01");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(
+        legacy.join("task_metadata.json"),
+        r#"{"task":"Legacy twin","workDir":"/tmp","created":1700000000000,"status":"completed"}"#,
+    )
+    .unwrap();
+    fs::write(
+        legacy.join("api_conversation_history.json"),
+        r#"[{"role":"user","content":"legacy twin"}]"#,
+    )
+    .unwrap();
+    // Distinct carrier values (tokensIn 3000 / cost $0.10) so a
+    // double-render is detectable in the totals.
+    fs::write(
+        legacy.join("ui_messages.json"),
+        r#"[{"ts":1700000001,"type":"say","say":"text","text":"{\"cost\":0.10,\"tokensIn\":3000,\"tokensOut\":1000}"}]"#,
+    )
+    .unwrap();
+
+    with_home_and_cache(&home, &cache, || {
+        let files = find_session_files(None);
+        assert!(
+            files
+                .iter()
+                .any(|path| path.ends_with("shared-01.messages.json")),
+            "the canonical transcript is enumerated: {files:?}"
+        );
+        assert!(
+            !files.contains(&legacy),
+            "the same-id legacy task dir is superseded, not double-rendered"
+        );
+
+        let sessions = load_sessions_from_dir(None);
+        let cline: Vec<_> = sessions
+            .iter()
+            .filter(|session| session.metrics.source_tool == "cline")
+            .collect();
+        assert_eq!(cline.len(), 1, "exactly one cline session: {sessions:?}");
+        // Canonical values only: a double-count would read 1000+3000
+        // input and $0.05+$0.10.
+        assert_eq!(cline[0].metrics.tokens_input, 1000);
+        assert_eq!(cline[0].metrics.cost_estimated, 0.05);
+    });
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn cline_cli_gates_hold_for_relative_custom_dir_paths() {
+    // rm-1881 arm b regression pin: the canonical-root gates must hold
+    // when the `-d` argument is typed RELATIVE (the walk hands paths
+    // through as given) — a plain component `starts_with` on a
+    // relative (or `..`-bearing) path never matches the absolute
+    // canonical root, so `session.json`/`hooks.jsonl` came back in as
+    // name-admitted parse noise. The gate compares on a lexically
+    // normalized absolute form.
+    fn relative_to(cwd: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
+        let mut cwd_iter = cwd.components();
+        let mut target_iter = target.components();
+        let mut common = 0;
+        loop {
+            match (cwd_iter.clone().next(), target_iter.clone().next()) {
+                (Some(left), Some(right)) if left == right => {
+                    cwd_iter.next();
+                    target_iter.next();
+                    common += 1;
+                }
+                _ => break,
+            }
+        }
+        let mut rel = std::path::PathBuf::new();
+        for _ in common..cwd.components().count() {
+            rel.push("..");
+        }
+        for component in target_iter {
+            rel.push(component.as_os_str());
+        }
+        rel
+    }
+
+    let home = std::env::temp_dir().join("agenttrace-rm1881-relative-home");
+    let cache = std::env::temp_dir().join("agenttrace-rm1881-relative-cache");
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+    let root = home.join(".cline").join("data").join("sessions");
+    seed_cline_cli_session(&root, "rel-01", &cline_cli_envelope(200, 40, 0, 0, 0.004));
+
+    with_home_and_cache(&home, &cache, || {
+        let cwd = std::env::current_dir().expect("cwd");
+        // A `..`-bearing relative path to the store — the exact form a
+        // plain starts_with gate misses.
+        let rel_store = relative_to(&cwd, &root);
+        assert!(
+            !rel_store.is_absolute(),
+            "the test needs a genuinely relative path: {rel_store:?}"
+        );
+        let files = find_session_files(Some(&rel_store));
+        assert_eq!(
+            files.len(),
+            1,
+            "only the transcript is admitted through a relative -d path: {files:?}"
+        );
+        assert!(
+            files[0].ends_with("rel-01.messages.json"),
+            "the admitted file is the transcript"
+        );
+
+        let sessions = load_sessions_from_dir(Some(&rel_store));
+        let cline: Vec<_> = sessions
+            .iter()
+            .filter(|session| session.metrics.source_tool == "cline")
+            .collect();
+        assert_eq!(cline.len(), 1, "exactly one cline session: {sessions:?}");
+        assert_eq!(cline[0].metrics.tokens_input, 200);
+        assert_eq!(cline[0].metrics.cost_estimated, 0.004);
+    });
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn cline_cli_gates_hold_for_a_relative_env_store_root() {
+    // Review F2 regression pin: `CLINE_SESSION_DATA_DIR` can be typed
+    // RELATIVE and the root passes through verbatim, so the
+    // canonical-root gates must absolutize the ROOT too — a plain
+    // comparison of the absolutized candidate against a still-relative
+    // root never matches, and `session.json`/`hooks.jsonl` slip back
+    // in as name-admitted parse noise while the transcript still
+    // parses (numbers right, parse confidence dishonest).
+    fn relative_to(cwd: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
+        let mut cwd_iter = cwd.components();
+        let mut target_iter = target.components();
+        let mut common = 0;
+        loop {
+            match (cwd_iter.clone().next(), target_iter.clone().next()) {
+                (Some(left), Some(right)) if left == right => {
+                    cwd_iter.next();
+                    target_iter.next();
+                    common += 1;
+                }
+                _ => break,
+            }
+        }
+        let mut rel = std::path::PathBuf::new();
+        for _ in common..cwd.components().count() {
+            rel.push("..");
+        }
+        for component in target_iter {
+            rel.push(component.as_os_str());
+        }
+        rel
+    }
+
+    let home = std::env::temp_dir().join("agenttrace-rm1881-relenv-home");
+    let cache = std::env::temp_dir().join("agenttrace-rm1881-relenv-cache");
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+    let root = home.join(".cline").join("data").join("sessions");
+    seed_cline_cli_session(
+        &root,
+        "relenv-01",
+        &cline_cli_envelope(210, 30, 0, 0, 0.005),
+    );
+
+    with_home_and_cache(&home, &cache, || {
+        let cwd = std::env::current_dir().expect("cwd");
+        let rel_store = relative_to(&cwd, &root);
+        assert!(
+            !rel_store.is_absolute(),
+            "the test needs a genuinely relative root: {rel_store:?}"
+        );
+        std::env::set_var("CLINE_SESSION_DATA_DIR", &rel_store);
+        let files = find_session_files(None);
+        assert_eq!(
+            files.len(),
+            1,
+            "only the transcript is admitted through a relative env root: {files:?}"
+        );
+        assert!(
+            files[0].ends_with("relenv-01.messages.json"),
+            "the admitted file is the transcript"
+        );
+
+        let sessions = load_sessions_from_dir(None);
+        let cline: Vec<_> = sessions
+            .iter()
+            .filter(|session| session.metrics.source_tool == "cline")
+            .collect();
+        assert_eq!(cline.len(), 1, "exactly one cline session: {sessions:?}");
+        assert_eq!(cline[0].metrics.tokens_input, 210);
+        assert_eq!(cline[0].metrics.cost_estimated, 0.005);
+    });
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
 }
