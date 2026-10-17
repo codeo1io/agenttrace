@@ -1220,6 +1220,14 @@ fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
     let mut override_models = BTreeSet::new();
     if let Some((prices, aliases)) = load_pricing_overrides() {
         for (name, mut override_price) in prices {
+            // rm-1053 (run bbf61fbd cycle 3, composed at integration
+            // onto the landed retention mechanics): a raw name that IS
+            // a catalog row corrects THAT row alone — the run's PoC
+            // had a rate naming the exact twin id
+            // `bedrock/us-gov-west-1/anthropic.…:0` silently land on
+            // the shared slot's winner. Any other name lands on the
+            // normalized slot it has always landed on, so base-id
+            // override files keep their landed (rm-196) behavior.
             // rm-231/rm-419: override files usually carry only the four
             // rate fields (`max_input_tokens`/`deprecation_date` serde
             // default to None), and the previous wholesale
@@ -1230,10 +1238,17 @@ fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
             // descriptive fields the override leaves unset; an override
             // that sets `max_input_tokens: 0` still clears the window
             // on purpose (0 is filtered out at lookup time).
+            let normalized = normalize_model(&name);
+            let exact_row = name != normalized && catalog.entries.contains_key(&name);
+            let target = if exact_row {
+                name.clone()
+            } else {
+                normalized.clone()
+            };
             if override_price.max_input_tokens.is_none()
                 || override_price.deprecation_date.is_none()
             {
-                if let Some(catalog_price) = catalog.entries.get(&name) {
+                if let Some(catalog_price) = catalog.entries.get(&target) {
                     if override_price.max_input_tokens.is_none() {
                         override_price.max_input_tokens = catalog_price.max_input_tokens;
                     }
@@ -1242,8 +1257,15 @@ fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
                     }
                 }
             }
+            // Register both spellings so the ladder's override arm
+            // (rm-196) and the source line find the entry whichever
+            // variant a session reports; the entry itself lives at
+            // `target` (the row the user named).
             override_models.insert(name.clone());
-            catalog.entries.insert(name, override_price);
+            if !exact_row {
+                override_models.insert(normalized);
+            }
+            catalog.entries.insert(target, override_price);
         }
         catalog.aliases.extend(aliases);
     }
@@ -1584,7 +1606,17 @@ fn parse_pricing_overrides(raw: &[u8]) -> Result<PricingOverrideMaps, String> {
     let mut prices = BTreeMap::new();
     for (model, price) in overrides.prices {
         validate_override_price(&model, &price)?;
-        prices.insert(normalize_model(&model), price);
+        // rm-1053 (run bbf61fbd cycle 3, composed at integration onto
+        // the landed raw-id retention): keep the RAW price name.
+        // Normalizing here silently redirected a rate written against
+        // a catalog row's own id — a region/vendor-qualified twin such
+        // as `bedrock/us-gov-west-1/anthropic.…`, or a bare dated id
+        // the snapshot itself ships — onto the shared slot it
+        // normalizes onto: the winner row the user did NOT name.
+        // `apply_pricing_overrides` normalizes only when the raw name
+        // is not itself a catalog row, so every override file that
+        // names a non-row id behaves exactly as before (rm-196).
+        prices.insert(model, price);
     }
     let aliases: BTreeMap<String, String> = overrides
         .aliases
@@ -2893,12 +2925,22 @@ mod tests {
     }
 
     #[test]
-    fn user_pricing_overrides_normalize_models_and_aliases() {
+    fn user_pricing_overrides_keep_raw_names_and_normalize_aliases() {
+        // rm-1053 (run bbf61fbd cycle 3, composed at integration):
+        // parse keeps the raw price name — normalizing here used to
+        // redirect a rate written against a retained raw catalog id
+        // (a region/vendor-qualified twin) onto the shared slot it
+        // normalizes onto. `apply_pricing_overrides` decides where a
+        // raw name lands; aliases stay normalized (they are lookup
+        // keys, not catalog rows).
         let (prices, aliases) = parse_pricing_overrides(
             br#"{"prices":{"Provider/My-Model":{"input":1,"output":2,"cw":3,"cr":4}},"aliases":{"MY-ALIAS":"Provider/My-Model"}}"#,
         )
         .expect("pricing overrides");
-        assert!(prices.contains_key("my-model"));
+        assert!(
+            prices.contains_key("Provider/My-Model"),
+            "rm-1053: parse keeps the raw price name — normalizing here used to redirect a twin-keyed override onto the shared slot"
+        );
         assert_eq!(
             aliases.get("my-alias").map(String::as_str),
             Some("my-model")
@@ -3519,6 +3561,94 @@ mod tests {
                 .map(String::as_str),
             Some("bedrock_converse")
         );
+    }
+
+    #[test]
+    fn exact_key_overrides_correct_the_twin_row() {
+        // rm-1053 override lane (run bbf61fbd cycle 3, composed at
+        // integration onto the landed raw-id retention): a user rate
+        // naming a retained raw catalog id — a regional twin kept
+        // under its own row by the conversion — corrects THAT row
+        // alone; the shared slot the id normalizes onto keeps its
+        // winner. Rate, provider, and provenance still cite one row
+        // (the user's).
+        let fixture = serde_json::json!({
+            "anthropic.claude-sonnet-4-5-20250929-v1:0": {
+                "input_cost_per_token": 0.000003,
+                "output_cost_per_token": 0.000015,
+                "mode": "chat",
+                "litellm_provider": "anthropic"
+            },
+            "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0": {
+                "input_cost_per_token": 0.0000036,
+                "output_cost_per_token": 0.000018,
+                "mode": "chat",
+                "litellm_provider": "bedrock"
+            }
+        });
+        let converted = convert_litellm(
+            serde_json::to_vec(&fixture)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        let mut catalog = PricingCatalog {
+            entries: converted.entries,
+            aliases: BTreeMap::new(),
+            source: "cache".to_string(),
+            providers: converted.providers,
+            reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
+        };
+        let twin = "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0";
+        // Pre-override: the twin already bills its own retained row
+        // (the landed rm-1053 mechanics this lane composes onto).
+        let before = lookup_price_in(twin, &catalog.aliases, &catalog.entries);
+        assert!((before.input - 3.6).abs() < 1e-9);
+
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-pricing-twin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let override_file = root.join("pricing.json");
+        std::fs::write(
+            &override_file,
+            serde_json::json!({
+                "prices": {twin: {"input": 4.0, "output": 20.0, "cw": 0, "cr": 0}}
+            })
+            .to_string(),
+        )
+        .expect("write override file");
+
+        let _env = crate::test_env::lock_env();
+        let prior_file = std::env::var_os("AGENTTRACE_PRICING_FILE");
+        std::env::set_var("AGENTTRACE_PRICING_FILE", &override_file);
+        let override_models = apply_pricing_overrides(&mut catalog);
+        match prior_file {
+            Some(value) => std::env::set_var("AGENTTRACE_PRICING_FILE", value),
+            None => std::env::remove_var("AGENTTRACE_PRICING_FILE"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+
+        // The twin's own row carries the user's rates, provider, and
+        // source — all three surfaces cite one row.
+        let price = lookup_price_in(twin, &catalog.aliases, &catalog.entries);
+        assert_eq!((price.input, price.output), (4.0, 20.0));
+        assert_eq!(provider_for_in(twin, &catalog), Some("bedrock".to_string()));
+        assert_eq!(
+            pricing_source_for_catalog(twin, &catalog, &override_models),
+            "user override"
+        );
+        assert!(override_models.contains(twin));
+        // ... while the shared slot the twin normalizes onto keeps its
+        // winner: a twin-scoped override corrects one row, not the
+        // family.
+        let slot = "anthropic.claude-sonnet-4-5";
+        let slot_price = catalog.entries.get(slot).expect("shared slot row");
+        assert!((slot_price.input - 3.0).abs() < 1e-9);
+        let base = lookup_price_in(slot, &catalog.aliases, &catalog.entries);
+        assert!((base.input - 3.0).abs() < 1e-9);
     }
 
     #[test]

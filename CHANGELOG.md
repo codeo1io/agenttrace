@@ -4,6 +4,19 @@
 
 ### Added
 
+- Implausible token magnitudes are pinned to bill-as-parsed-with-disclosure
+  (rm-600 verify-arm, run bbf61fbd cycle 3): the cycle's hostile-corpus PoC
+  ($1.69e14 overview total rendered from repeated i64::MAX usage rows) proved
+  the 1e12 plausibility bound discloses but never gates cost. That compound
+  is now pinned end to end by
+  `implausible_magnitudes_bill_as_parsed_with_disclosure`: a value above the
+  plausibility bound but inside i64 prices exactly as parsed (finite,
+  provenance `calculated_from_tokens`, no saturation) while the magnitude
+  census discloses it on BOTH channels — the session's
+  `magnitude_clamped:above_plausibility_bound` counter and the overview's
+  `clamped_values`. Clamping would fabricate a cost the transcript does not
+  contain; the pin makes any future clamp a deliberate, reviewed change.
+
 - `--doctor` completes honestly on real homes (rm-367 stages (b)(c)(d), run
   ff5c1cd8 cycle 4): the doctor walk now runs under a per-root wall-clock
   budget (default 60s, `AGENTTRACE_DOCTOR_ROOT_BUDGET_MS`) with a per-root
@@ -559,6 +572,42 @@
   test and healthy corpora render zero-count clean.
 
 ### Fixed
+
+- An `AGENTTRACE_PRICING_FILE` rate naming a regional twin's exact catalog
+  id corrects that row alone (rm-1053 override lane, run bbf61fbd cycle 3,
+  folded at integration onto the landed raw-id retention chassis of runs
+  f2fccaa9/d130035f — the third sibling implementation of the rm-1053 row:
+  the landed `resolution_ladder`/`qualified_catalog_id` mechanics stay the
+  mechanism, this landing keeps the run's override lane and its widened
+  PoC): the cycle's live PoC priced the exact twin id
+  `bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0` (its own
+  snapshot row says $3.6/M in) at the shared slot's $3.0/M (−16.7%) — and a
+  user rate written against that exact id was equally redirected, because
+  the override parser normalized the name before anything could see which
+  row the user had named, landing the correction on the winner row instead.
+  Parse now keeps the raw price name, and `apply_pricing_overrides` writes
+  it to THAT row when the name is itself a catalog row (a retained
+  region/vendor-qualified twin, or a bare dated id the snapshot ships);
+  every other name lands on the normalized slot it has always landed on, so
+  base-id override files keep their landed rm-196 behavior byte-for-byte
+  (the warm-cache override contract re-run green on the merged tree). Rate,
+  provider, and pricing source all cite the one row the user named. Pinned
+  by `exact_key_overrides_correct_the_twin_row` (rate + provider + source +
+  the untouched family winner) and
+  `user_pricing_overrides_keep_raw_names_and_normalize_aliases`; the landed
+  family pins (`regional_twin_families_bill_at_their_own_rows`,
+  `regional_provider_attribution_rides_the_rate_row`, the window and
+  bundled-catalog sweep pins) stay green unchanged on the merged tree.
+
+- The changelog structure gate can no longer pass vacuously (rm-1390, run
+  bbf61fbd cycle 3): the keep-a-changelog lens matched only the bare
+  `## Unreleased` spelling, so a DATED header (`## Unreleased (2026-10-14)`)
+  turned the entry-count check into "0 visible of 0 total" — rc0 over a
+  section a first-per-kind consumer cannot see (the cycle's assess PoC). The
+  lens now matches the header by prefix, dated or not, and a present-but-empty
+  Unreleased section fails outright: a header over zero entry bullets claims a
+  landing lane that does not exist. Only enforced when the section exists —
+  rm-1036 deliberately does not require an Unreleased header at all.
 
 - subagent rollups saturate instead of panicking or wrapping (rm-487, run
   e775cac5 cycle 1, batch "cost-lane truth under hostile corpora"):
