@@ -2802,3 +2802,28 @@ fn tui_reconciles_replay_families_and_discloses_them() {
         load_summary_line(&app)
     );
 }
+
+// rm-1543 red-first: the boot path reconciled codex multiagent replay
+// families but discarded the adjustment count, so the load summary
+// disclosed it only after the first reload completed — the same corpus
+// told a different truth depending on the entry path.
+#[test]
+fn boot_load_summary_discloses_replay_adjustment() {
+    use super::presentation::load_summary_line;
+    use agenttrace_core::parse_raw_session;
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../agenttrace-core/tests/fixtures/codex-multiagent-v2");
+    let mut sessions = Vec::new();
+    for name in ["parent.jsonl", "child.jsonl"] {
+        let path = dir.join(name);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        sessions.push(parse_raw_session("codex", path.to_str().unwrap(), &raw).unwrap());
+    }
+    let app = App::new(sessions, "test", None);
+    let line = load_summary_line(&app);
+    assert!(
+        line.contains("1 replay-adjusted sessions"),
+        "boot summary must disclose the replay adjustment on first launch: {line}"
+    );
+}
