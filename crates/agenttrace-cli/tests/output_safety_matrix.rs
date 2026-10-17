@@ -275,6 +275,7 @@ fn tempdir(tag: &str) -> PathBuf {
 /// through the same `guard_formula`; this is the lane-parity pin:
 /// whichever of the two lanes a machine consumer imports, the cell
 /// is inert.
+#[cfg(unix)] // stems like "=SUM(9+9)" are reserved/invalid Windows filenames (os error 123)
 #[test]
 fn default_text_lane_guards_spreadsheet_formulas_like_csv() {
     let tmp = tempdir("output-safety-formula");
