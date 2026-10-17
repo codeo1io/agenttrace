@@ -1,0 +1,3 @@
+{"timestamp":"2026-10-13T03:00:00Z","type":"user","message":{"role":"user","content":"innocuous opener line"}}
+{"timestamp":"2026-10-13T03:05:00Z","type":"user","message":{"role":"user","content":"later turn mentioning zygomorphic flora"}}
+{"timestamp":"2026-10-13T03:06:00Z","type":"assistant","message":{"role":"assistant","model":"g-5","content":"answer about zygomorphic petals"},"usage":{"input_tokens":10,"output_tokens":5}}

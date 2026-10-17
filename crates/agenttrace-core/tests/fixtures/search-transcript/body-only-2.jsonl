@@ -1,0 +1,3 @@
+{"timestamp":"2026-10-13T04:00:00Z","type":"user","message":{"role":"user","content":"plain second fixture opener"}}
+{"timestamp":"2026-10-13T04:05:00Z","type":"user","message":{"role":"user","content":"another turn mentioning zygomorphic vines"}}
+{"timestamp":"2026-10-13T04:06:00Z","type":"assistant","message":{"role":"assistant","model":"g-5","content":"answer about zygomorphic vines"},"usage":{"input_tokens":7,"output_tokens":3}}

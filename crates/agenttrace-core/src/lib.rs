@@ -84,7 +84,11 @@ pub use reports::{
 pub use runtime_config::{
     get as runtime_config_overrides, set as set_runtime_config, RuntimeConfigOverrides,
 };
-pub use search::{report_search_json, report_search_text, search_sessions};
+pub use search::{
+    report_search_json, report_search_json_detailed, report_search_text,
+    report_search_text_detailed, search_sessions, search_sessions_detailed, SearchReport,
+    TranscriptScanSummary, TRANSCRIPT_SCAN_FILE_BYTE_CAP, TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+};
 pub use session_cache::{
     cached_session, clear_session_cache, effective_session_cache_entries, load_cached_sessions,
     load_cached_sessions_from_cache, load_session_cache, save_session_cache,
@@ -968,6 +972,10 @@ pub struct SearchResult {
     pub cost: f64,
     pub tokens: i64,
     pub matches: Vec<String>,
+    /// rm-1415: disclosure for this row's bounded transcript re-read lane
+    /// ("scanned (N bytes)" or "skipped: <reason>"); the hand-rolled JSON
+    /// writers carry it per row.
+    pub transcript_scan: String,
 }
 
 /// rm-449 F4 (review fix bd6e4a50 F1): the hermes/generic lane consumes
