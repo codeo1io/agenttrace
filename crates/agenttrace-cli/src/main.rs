@@ -3284,8 +3284,31 @@ fn admit_session_path(path: &std::path::Path) -> anyhow::Result<()> {
             path.display(),
             special_file_kind(&meta)
         ),
-        Err(_) => bail!("session path does not exist: {}", path.display()),
+        Err(_) => match mode_word_hint(&path.to_string_lossy()) {
+            Some(word) => bail!(
+                "session path does not exist: {} (looks like a mode word — did you mean: agenttrace --{} <session-path>?)",
+                path.display(),
+                word
+            ),
+            None => bail!("session path does not exist: {}", path.display()),
+        },
     }
+}
+
+/// Positional mode-word hint (rm-1506, run a1f6c1f8 cycle 2, batch
+/// "assess-truth closeout"): `agenttrace doctor` parses the bare word as
+/// the session path, and the not-exist bail used to answer a flag-order
+/// mistake with a path-shaped error. When the missing path's text names
+/// one of the CLI's action flags (dash and case tolerant), the bail
+/// carries the flag-form remediation instead. Word list = the action
+/// flags a user plausibly types positionally; keep it aligned with the
+/// `#[arg(long)]` action cluster at the top of `Args`.
+fn mode_word_hint(raw: &str) -> Option<&'static str> {
+    const MODE_WORDS: &[&str] = &[
+        "doctor", "overview", "search", "sessions", "cost", "health", "budget", "demo", "version",
+    ];
+    let trimmed = raw.trim_start_matches('-').to_ascii_lowercase();
+    MODE_WORDS.iter().find(|word| **word == trimmed).copied()
 }
 
 // Review fix (2026-10-07, round 2 MF1): this variant imports
@@ -5376,6 +5399,40 @@ mod tests {
         admit_session_path(&good).expect("symlink to a regular file is admitted");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admission_mode_word_bail_names_the_flag_form() {
+        // rm-1506 (run a1f6c1f8 cycle 2, batch "assess-truth closeout"):
+        // bare `agenttrace doctor` parses "doctor" as the session path and
+        // the not-exist bail answers a flag-order mistake with a
+        // path-shaped error (this run's assess PoC: rc1 "session path does
+        // not exist: doctor"). The bail must recognize mode words (dash
+        // and case tolerant) and carry the flag-form remediation; a missing
+        // path that is NOT a mode word keeps the plain bail.
+        let err = admit_session_path(std::path::Path::new("doctor"))
+            .expect_err("bare mode word is not an existing path");
+        let msg = err.to_string();
+        assert!(msg.contains("--doctor"), "flag form missing: {msg}");
+        assert!(msg.contains("did you mean"), "remediation missing: {msg}");
+
+        for form in ["--doctor", "-doctor", "Doctor", "DOCTOR"] {
+            let err = admit_session_path(std::path::Path::new(form))
+                .expect_err("mode-word form is not an existing path");
+            assert!(
+                err.to_string().contains("--doctor"),
+                "form {form:?} lost the hint"
+            );
+        }
+
+        let plain = admit_session_path(std::path::Path::new("definitely-not-a-mode-word"))
+            .expect_err("missing non-mode path must still fail");
+        let plain = plain.to_string();
+        assert!(
+            plain.contains("session path does not exist"),
+            "got: {plain}"
+        );
+        assert!(!plain.contains("did you mean"), "hint leaked: {plain}");
     }
 
     #[test]

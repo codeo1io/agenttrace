@@ -4,6 +4,19 @@
 
 ### Added
 
+- Standing battery reds get a typed environmental/flaky/defect verdict
+  (rm-1507, run a1f6c1f8 cycle 2): `scripts/ci/check-battery-adjudicate.sh`
+  re-runs a single failing test N times isolated (fresh mktemp TMPDIR per
+  attempt, `-p` `[--test]` scoping, `--exact` AFTER the `--` separator where
+  cargo requires it) and emits a typed verdict — environmental (all green
+  isolated, exit 0) / flaky (mixed, exit 0, disclosed) / defect (all red,
+  exit 1) — with a `--json` typed record and a reproducible rerun command,
+  plus a fully-synthetic `--selftest` (4 verdict classes, fresh-TMPDIR
+  isolation proof, exit contract; `AT_ADJUDICATE_RUNNER` test-only override,
+  never set in CI). Flagship: the cycle's own assess battery red
+  (`pi_cache_write_1h_blocks_disclosed`) was machine-adjudicated
+  `environmental` (attempts 0,0) instead of hand-waved.
+
 - Implausible token magnitudes are pinned to bill-as-parsed-with-disclosure
   (rm-600 verify-arm, run bbf61fbd cycle 3): the cycle's hostile-corpus PoC
   ($1.69e14 overview total rendered from repeated i64::MAX usage rows) proved
@@ -572,6 +585,17 @@
   test and healthy corpora render zero-count clean.
 
 ### Fixed
+
+- Bare `agenttrace doctor` names the flag-order mistake instead of answering
+  it with a path-shaped error (rm-1886, run a1f6c1f8 cycle 2): the mode word
+  parsed as the session path fed the not-exist bail. `mode_word_hint`
+  (dash/case-tolerant match on the 9 action flags a user plausibly types
+  positionally) rewrites the bail to `session path does not exist: doctor
+  (looks like a mode word — did you mean: agenttrace --doctor
+  <session-path>?)`; plain missing paths keep the unmodified bail. Pinned
+  red-first in the admission unit matrix
+  (`admission_mode_word_bail_names_the_flag_form` — the pre-fix failure
+  message matched the assess PoC exactly) and proven on the release binary.
 
 - Cline `tokensIn` is cache-EXCLUSIVE — cline input is now recorded by
   identity, ending the false-zero class on every cache-hit Cline/Roo
