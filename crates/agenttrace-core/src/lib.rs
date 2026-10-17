@@ -1838,6 +1838,26 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 // classes) — a PRESENT cost must not be silently
                 // zeroed for lacking tokens. The token exclusions
                 // below add zero for an empty map.
+                // rm-1888 (run 77ca5de0 cycle 5, "count-honesty
+                // ledger"): a finite NEGATIVE recorded cost is
+                // rejected here (and at every parser-side mint — the
+                // pi gate mints the same key) — but no longer
+                // silently: the cline clamp-disclosure discipline
+                // applies, so each rejection counts under
+                // `recorded_costs_negative_rejected` and the fallback
+                // to the catalog estimate reads as disclosed, not
+                // silent. Well-formed 0.0 stays honored (rm-436
+                // discipline: a present cost is never zeroed for
+                // lacking tokens).
+                if let Some(_negative) = event
+                    .recorded_cost_usd
+                    .filter(|cost| cost.is_finite() && *cost < 0.0)
+                {
+                    *metrics
+                        .disclosure_counters
+                        .entry("recorded_costs_negative_rejected".to_string())
+                        .or_insert(0) += 1;
+                }
                 if let Some(cost) = event
                     .recorded_cost_usd
                     .filter(|cost| cost.is_finite() && *cost >= 0.0)

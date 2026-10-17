@@ -265,6 +265,9 @@ jobs:
       - name: Documented command smoke tests
         run: scripts/ci/check-docs-commands.sh
 
+      - name: Relative link resolution (rm-1892)
+        run: scripts/ci/check-docs-links.sh
+
       - name: Rust CLI fixture smoke
         env:
           AGENTTRACE_REAL_CLI_DIR: testdata

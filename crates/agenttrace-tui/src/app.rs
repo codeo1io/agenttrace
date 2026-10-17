@@ -38,10 +38,13 @@ const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const LOAD_BATCH_SIZE: usize = 8;
 enum LoadMessage {
     Progress(Vec<LoadProgress>),
-    // rm-367 rider: LoadReport grew the sqlite budget-truncation
-    // disclosure (`SqliteIngestReport.partial_dbs`), which pushed the
-    // largest variant over clippy's large_enum_variant threshold —
-    // box the one-shot completion payload (the hot path is Progress).
+    // rm-367 rider + rm-1886 (run 77ca5de0 cycle 5, "count-honesty
+    // ledger"): LoadReport kept growing landed disclosure payloads
+    // (the sqlite budget-truncation `SqliteIngestReport.partial_dbs`,
+    // then the admission-ledger counters), each push crossing clippy's
+    // large_enum_variant threshold for this channel message — the
+    // one-shot completion payload is boxed (the hot path is Progress;
+    // the allocation fires once per load, never per progress tick).
     Complete(Box<anyhow::Result<(bool, LoadReport)>>),
 }
 

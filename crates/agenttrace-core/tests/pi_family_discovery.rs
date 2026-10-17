@@ -29,7 +29,13 @@ fn pi_transcript(root: &Path, proj: &str, name: &str) -> PathBuf {
     let dir = root.join("sessions").join(proj);
     fs::create_dir_all(&dir).expect("create fixture session dir");
     let path = dir.join(name);
-    fs::write(&path, PI_SESSION).expect("write fixture transcript");
+    // rm-1886 fixture note (run 77ca5de0 cycle 5): admission collapses
+    // byte-identical copies into one session (content-signature
+    // ledger). This test pins ROOT ENUMERATION — every fork/agent-dir
+    // variant path is discovered — so each planted transcript carries
+    // a distinct session id derived from its file name.
+    let body = PI_SESSION.replace("pi-family-fixture", &format!("pi-family-fixture-{name}"));
+    fs::write(&path, body).expect("write fixture transcript");
     path
 }
 
