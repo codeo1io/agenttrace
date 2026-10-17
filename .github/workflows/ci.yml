@@ -67,6 +67,12 @@ jobs:
           bash -n scripts/record-demo.sh scripts/ci/*.sh scripts/release/*.sh
           sh -n install.sh
 
+      - name: Stewardship retention gate
+        # rm-1984: docs/stewardship/ keeps only the 12 most-recent
+        # maintenance cycles inline; older records live under
+        # docs/archive/stewardship/ and INDEX.md maps the moved paths.
+        run: scripts/ci/check-stewardship-retention.sh
+
       - name: Lockfile enforcement (cargo --locked)
         # rm-170 lineage: every CI cargo step runs --locked; this gate
         # makes a drifted lockfile a named failure, not a surprise.
