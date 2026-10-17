@@ -8,9 +8,9 @@ use agenttrace_core::{
     delivery_evidence_with_git, format_cost, format_tokens, inspect_first, inspect_reason,
     load_cached_sessions_from_cache, load_session_cache, load_sessions_with_progress,
     load_sessions_with_progress_from_cache_mode, mcp_governance, needs_attention, project_name,
-    recommendations, reconcile_codex_multiagent_replays, resolve_project, session_capability,
-    session_cost_audit, session_matches_time_range, total_tokens, ContextTrend, CostAudit,
-    DataHealth, DeliveryEvidence, LoadOptions, LoadProgress, LoadReport, McpGovernance, Overview,
+    recommendations, resolve_project, session_capability, session_cost_audit,
+    session_matches_time_range, total_tokens, ContextTrend, CostAudit, DataHealth,
+    DeliveryEvidence, LoadOptions, LoadProgress, LoadReport, McpGovernance, Overview,
     ProjectIdentity, Recommendation, ReportLanguage, Session, SessionCache, TimeRange,
 };
 #[cfg(test)]
@@ -408,12 +408,21 @@ enum LoadPhase {
 impl App {
     fn new(sessions: Vec<Session>, source_label: &str, reload_dir: Option<String>) -> Self {
         let mut sessions = canonical_sessions(&sessions);
+        // rm-1979: boot with the on-disk scan memo — a warm cache-loaded
+        // corpus would otherwise re-read every codex rollout from disk
+        // before the first frame renders.
         // rm-402 (review af521003 F5): the boot path (cache-loaded
         // sessions via `new_loading`) assembles the same corpus the
         // CLI reconciles before any view — replay families must
         // reconcile here too, or the TUI rendered double-counted
         // family totals until the first reload landed.
-        let replay = reconcile_codex_multiagent_replays(&mut sessions);
+        let scan_store_path = agenttrace_core::rollout_scan_store_path();
+        let mut scan_store = agenttrace_core::RolloutScanStore::load(&scan_store_path);
+        let replay = agenttrace_core::reconcile_codex_multiagent_replays_with_store(
+            &mut sessions,
+            Some(&mut scan_store),
+        );
+        let _ = scan_store.save_if_dirty(&scan_store_path);
         let overview = compute_overview(&sessions);
         let project_identities = sessions
             .iter()
@@ -1150,7 +1159,13 @@ impl App {
         // state is rebuilt, the same pass the CLI runs after loading.
         // Reconciliation never touches non-family sessions, so every
         // replay-free corpus is byte-identical before/after.
-        let replay = reconcile_codex_multiagent_replays(&mut self.sessions);
+        let scan_store_path = agenttrace_core::rollout_scan_store_path();
+        let mut scan_store = agenttrace_core::RolloutScanStore::load(&scan_store_path);
+        let replay = agenttrace_core::reconcile_codex_multiagent_replays_with_store(
+            &mut self.sessions,
+            Some(&mut scan_store),
+        );
+        let _ = scan_store.save_if_dirty(&scan_store_path);
         // Reset per load with the report that landed (rm-904 pattern).
         self.load_state.replay_children_adjusted = replay.children_adjusted;
         self.sessions

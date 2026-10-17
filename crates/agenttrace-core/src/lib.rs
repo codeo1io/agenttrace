@@ -38,7 +38,10 @@ pub use filters::{
     NumericFilterOp,
 };
 
-pub use codex_replay::{reconcile_codex_multiagent_replays, CodexReplayAdjustment};
+pub use codex_replay::{
+    reconcile_codex_multiagent_replays, reconcile_codex_multiagent_replays_with_store,
+    rollout_scan_store_path, CodexReplayAdjustment, RolloutScanStore,
+};
 pub use discovery::{
     collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
     load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,

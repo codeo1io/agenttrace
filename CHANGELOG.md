@@ -4,6 +4,30 @@
 
 ### Added
 
+- Codex replay reconcile is warm-cache cheap and no longer destroys
+  reruns (rm-1979 + rm-1980, run 958b0f698423 cycle 1): every run —
+  including warm session-cache runs — re-read and re-parsed the entire
+  codex corpus for the replay pass (measured: the whole warm residual
+  on a 49 MiB corpus, ~50 ms/MiB, paid again on every TUI boot and
+  reload), and the family heuristic rebased any two rollouts sharing a
+  384-byte opening — so an independent rerun of a deterministic task
+  had its real usage erased onto the earlier run. Scans now memoize in
+  `codex-rollout-scans.json` beside the session cache (size+mtime
+  re-validation; a stale store costs a re-read, never a wrong
+  decision), the plain-rollout read is capped
+  (`ROLLOUT_PLAIN_SCAN_MAX_BYTES`, 64 MiB) with a disclosed skip, and
+  family members carry a `session_meta` id trace key (the rollout
+  uuid minus its final node group) used as a rebase VETO — members
+  with two or more distinct stems stay fully counted behind a
+  `codex_multiagent_replay_skipped_divergent_trace` disclosure,
+  keyless families keep the fingerprint fallback behind
+  `codex_multiagent_replay_family_unkeyed`, and rollouts unreadable
+  at reconcile time disclose `codex_replay_scan_unreadable` instead
+  of silently rendering the corpus unreconciled. Verified live on a
+  19 MiB corpus: cold 4.7 s → warm 0.21–0.34 s, outputs identical
+  modulo the cache-hit self-report. `AGENTTRACE_DOCTOR_*` scan-budget
+  knobs are documented in the README (rm-1981).
+
 - Cline CLI envelope intake works on every production path, and its
   canonical store is auto-discovered (rm-1881 + rm-1882, run e30a8801
   cycle 1): the Cline CLI `.messages.json` envelope carries usage as

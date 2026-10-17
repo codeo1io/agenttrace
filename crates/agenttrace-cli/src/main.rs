@@ -2227,7 +2227,15 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // rm-402: reconcile codex multi-agent replay families on the assembled
     // corpus — discovery lanes see parent and child rollouts together, and a
     // replayed prefix billed inside both would double the family's usage.
-    agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
+    // rm-1979: the scan memo makes warm runs skip re-reading the codex
+    // corpus; a lost memo only costs the reads, never a decision.
+    let scan_store_path = agenttrace_core::rollout_scan_store_path();
+    let mut scan_store = agenttrace_core::RolloutScanStore::load(&scan_store_path);
+    agenttrace_core::reconcile_codex_multiagent_replays_with_store(
+        &mut sessions,
+        Some(&mut scan_store),
+    );
+    let _ = scan_store.save_if_dirty(&scan_store_path);
     ensure_output_is_not_an_input(args, &sessions, &report.parse_failure_paths)?;
     Ok((sessions, Some(report)))
 }
@@ -2387,7 +2395,14 @@ fn prepare_explicit_sessions(
     // rm-402: codex MultiAgent V2 replay families must be reconciled
     // wherever a full corpus assembles — the explicit lane can load a
     // parent/child pair via repeated positional files.
-    agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
+    // rm-1979: same scan memo as the discovery lane.
+    let scan_store_path = agenttrace_core::rollout_scan_store_path();
+    let mut scan_store = agenttrace_core::RolloutScanStore::load(&scan_store_path);
+    agenttrace_core::reconcile_codex_multiagent_replays_with_store(
+        &mut sessions,
+        Some(&mut scan_store),
+    );
+    let _ = scan_store.save_if_dirty(&scan_store_path);
     filter_cli_sessions(sessions, args)
 }
 

@@ -156,6 +156,32 @@ with the file, line number, and key — a typo never silently does
 nothing. The same flags exist on the command line (`--history-dir`,
 `--pricing-file`, `--weekly-budget`) and win over every file.
 
+### Environment variables
+
+The layered `AGENTTRACE_*` set is small; `--doctor` diagnoses unknown
+`AGENTTRACE_` names (a typo'd knob is reported, not ignored). Four
+environment knobs bound the `--doctor` scan itself, for hosts with
+huge session trees or slow disks:
+
+```bash
+# Per-root discovery budget (wall-clock) and per-root size cap.
+# Defaults: 60000 ms and 536870912 bytes (512 MiB).
+AGENTTRACE_DOCTOR_ROOT_BUDGET_MS=120000
+AGENTTRACE_DOCTOR_ROOT_MAX_BYTES=1073741824
+
+# SQLite lane budgets: per-database wall-clock and total lane wall-clock.
+# Defaults: 25000 ms per db, 90000 ms total.
+AGENTTRACE_DOCTOR_DB_BUDGET_MS=50000
+AGENTTRACE_DOCTOR_SQLITE_TOTAL_BUDGET_MS=180000
+
+agenttrace --doctor   # budget-exceeded roots/dbs are disclosed as partial, never dropped silently
+```
+
+Values are unsigned integers; a smaller-than-default budget truncates
+the pass earlier (disclosed per row), a larger one trades scan time for
+coverage. These knobs only bound `--doctor` — they do not affect
+`--overview`, the TUI, or statusline runs.
+
 ### CSV statement export (rm-409)
 
 `-f csv` emits RFC 4180 (CRLF rows, `""`-doubled quotes) with one table per

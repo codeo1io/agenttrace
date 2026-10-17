@@ -13,7 +13,10 @@
 //! and attributed to the parent. Single-file codex corpora must stay
 //! byte-identical before/after (no family, no adjustment).
 
-use agenttrace_core::{parse_raw_session, reconcile_codex_multiagent_replays};
+use agenttrace_core::{
+    parse_raw_session, reconcile_codex_multiagent_replays,
+    reconcile_codex_multiagent_replays_with_store, RolloutScanStore,
+};
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> PathBuf {
@@ -361,4 +364,176 @@ fn unrelated_short_opening_is_not_a_family() {
             "non-family session must carry no replay disclosures"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// rm-1980 — rerun discrimination, keyless fallback, unreadable disclosure.
+// ---------------------------------------------------------------------------
+
+fn fixture_in(dir: &str, name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(dir)
+        .join(name)
+}
+
+fn load_in(dir: &str, name: &str) -> agenttrace_core::Session {
+    let path = fixture_in(dir, name);
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let path_str = path.to_str().expect("utf-8 fixture path");
+    parse_raw_session("codex", path_str, &raw).unwrap_or_else(|e| panic!("parse {name}: {e}"))
+}
+
+#[test]
+fn independent_rerun_with_shared_opening_is_not_rebased() {
+    // Two INDEPENDENT runs of the same deterministic task: identical
+    // >384-byte openings, but fresh rollout uuids (77c2e4ff vs 33ab90cc)
+    // and disjoint time windows. The old heuristic rebased the second run
+    // onto the first and erased its real usage; the trace-stem veto keeps
+    // both fully counted and discloses instead.
+    let first = load_in("codex-multiagent-v2-rerun", "first.jsonl");
+    let second = load_in("codex-multiagent-v2-rerun", "second.jsonl");
+    let second_input = second.metrics.tokens_input;
+
+    let mut sessions = vec![first, second];
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 1, "the opening still forms a family");
+    assert_eq!(stats.divergent_trace_families, 1);
+    assert_eq!(stats.children_adjusted, 0, "no rebase happened");
+    assert_eq!(
+        sessions[1].metrics.tokens_input, second_input,
+        "the rerun keeps every token it really burned"
+    );
+    assert_eq!(
+        sessions[0].metrics.tokens_input, 1_400,
+        "the earlier run is untouched"
+    );
+    for idx in [0usize, 1] {
+        assert_eq!(
+            sessions[idx]
+                .metrics
+                .disclosure_counters
+                .get("codex_multiagent_replay_skipped_divergent_trace"),
+            Some(&1),
+            "member {idx} discloses the veto"
+        );
+    }
+}
+
+#[test]
+fn keyless_family_falls_back_to_fingerprint_with_disclosure() {
+    // Truncated rollouts carry no session_meta id. The fingerprint-only
+    // fallback keeps the shipped reconciliation, but the family is no
+    // longer silent about lacking id evidence.
+    let a = load_in("codex-multiagent-v2-unkeyed", "a.jsonl");
+    let b = load_in("codex-multiagent-v2-unkeyed", "b.jsonl");
+
+    let mut sessions = vec![a, b];
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 1);
+    assert_eq!(stats.unkeyed_families, 1);
+    assert_eq!(stats.divergent_trace_families, 0);
+    assert_eq!(
+        stats.children_adjusted, 1,
+        "fingerprint fallback still rebases"
+    );
+    assert_eq!(sessions[1].metrics.tokens_input, 300);
+    for idx in [0usize, 1] {
+        assert_eq!(
+            sessions[idx]
+                .metrics
+                .disclosure_counters
+                .get("codex_multiagent_replay_family_unkeyed"),
+            Some(&1)
+        );
+    }
+}
+
+#[test]
+fn unreadable_rollout_at_reconcile_time_is_disclosed() {
+    // A rollout that parses fine but disappears (or loses permissions)
+    // before reconcile used to render the corpus silently unreconciled.
+    // rm-1980 F3: the scan failure is now a disclosed counter.
+    let dir = std::env::temp_dir().join(format!("codex-replay-unreadable-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let parent_path = dir.join("parent.jsonl");
+    let child_path = dir.join("child.jsonl");
+    std::fs::copy(fixture("parent.jsonl"), &parent_path).unwrap();
+    std::fs::copy(fixture("child.jsonl"), &child_path).unwrap();
+
+    // Sessions parsed from the TMP copies, so the fixture originals stay
+    // readable and only the vanished file drops out at reconcile time.
+    let raw_p = std::fs::read_to_string(&parent_path).unwrap();
+    let raw_c = std::fs::read_to_string(&child_path).unwrap();
+    let parent = parse_raw_session("codex", parent_path.to_str().unwrap(), &raw_p).unwrap();
+    let child = parse_raw_session("codex", child_path.to_str().unwrap(), &raw_c).unwrap();
+    let mut sessions = vec![parent, child];
+
+    // The child's file vanishes between parse and reconcile.
+    std::fs::remove_file(&child_path).unwrap();
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.scans_unreadable, 1);
+    assert_eq!(stats.families, 0, "no evidence, no family, no rebase");
+    assert_eq!(sessions[1].metrics.tokens_input, 1_700, "usage intact");
+    assert_eq!(
+        sessions[1]
+            .metrics
+            .disclosure_counters
+            .get("codex_replay_scan_unreadable"),
+        Some(&1)
+    );
+    // Only the surviving parent reaches the scan path; the vanished
+    // child is disclosed before any read is attempted.
+    assert_eq!(stats.scan_cache_misses, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_store_warm_run_hits_the_memo_and_changes_nothing() {
+    // rm-1979: the second pass over an unchanged corpus must serve every
+    // scan from the on-disk memo (zero re-reads) while producing the
+    // exact same adjustment and session totals as the cold pass.
+    let dir = std::env::temp_dir().join(format!("codex-replay-store-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["parent.jsonl", "child.jsonl"] {
+        std::fs::copy(fixture(name), dir.join(name)).unwrap();
+    }
+    let store_path = dir.join("codex-rollout-scans.json");
+    let _ = std::fs::remove_file(&store_path);
+
+    let build = || -> Vec<agenttrace_core::Session> {
+        let raw_p = std::fs::read_to_string(dir.join("parent.jsonl")).unwrap();
+        let raw_c = std::fs::read_to_string(dir.join("child.jsonl")).unwrap();
+        let p = dir.join("parent.jsonl");
+        let c = dir.join("child.jsonl");
+        vec![
+            parse_raw_session("codex", p.to_str().unwrap(), &raw_p).unwrap(),
+            parse_raw_session("codex", c.to_str().unwrap(), &raw_c).unwrap(),
+        ]
+    };
+
+    // Cold pass: every scan is a miss, results recorded and persisted.
+    let mut sessions = build();
+    let mut store = RolloutScanStore::load(&store_path);
+    let cold = reconcile_codex_multiagent_replays_with_store(&mut sessions, Some(&mut store));
+    assert_eq!(cold.scan_cache_misses, 2);
+    assert_eq!(cold.scan_cache_hits, 0);
+    assert_eq!(cold.families, 1);
+    assert_eq!(sessions[1].metrics.tokens_input, 300);
+    store.save_if_dirty(&store_path).unwrap();
+
+    // Warm pass: unchanged files hydrate from the memo; the family
+    // decision, drops, and totals come out identical.
+    let mut sessions = build();
+    let mut store = RolloutScanStore::load(&store_path);
+    let warm = reconcile_codex_multiagent_replays_with_store(&mut sessions, Some(&mut store));
+    assert_eq!(warm.scan_cache_hits, 2, "no rollout file was re-read");
+    assert_eq!(warm.scan_cache_misses, 0);
+    assert_eq!(warm.families, cold.families);
+    assert_eq!(warm.children_adjusted, cold.children_adjusted);
+    assert_eq!(warm.tokens_input_dropped, cold.tokens_input_dropped);
+    assert_eq!(sessions[1].metrics.tokens_input, 300);
+    assert!(!store.is_dirty(), "warm pass records nothing new");
+    let _ = std::fs::remove_dir_all(&dir);
 }
