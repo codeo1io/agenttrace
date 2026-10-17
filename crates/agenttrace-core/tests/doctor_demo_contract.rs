@@ -92,8 +92,12 @@ fn doctor_demo_dir_arg_gates_the_directory_lane() {
         assert!(control.session_files >= 1);
         assert!(control.directories.iter().any(|d| d.files >= 1));
         let control_json = render_doctor_report(Some(&root), false, "json").expect("render json");
+        // JSON string literals escape backslashes; on Windows the marker
+        // path carries them, so compare the JSON-encoded form (no-op on
+        // unix — same fix as the CLI twin of this pin).
+        let marker_path_json = marker_path.replace('\\', "\\\\");
         assert!(
-            control_json.contains(&marker_path),
+            control_json.contains(&marker_path_json),
             "control must disclose the probed directory: {control_json}"
         );
         fs::remove_dir_all(&root).ok();
