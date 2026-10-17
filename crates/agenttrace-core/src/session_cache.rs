@@ -8,7 +8,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 71;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+// Bumped 71 -> 72 (integration of run 4eeea89188b245068a569ba76f8caa71
+// cycle 2 "truth of the default surfaces", rm-1553: the claude identity
+// capture (orgIdentifier/loginEmail) is now capped at capture
+// (SESSION_IDENTITY_BYTE_CAP, parser.rs) with an org_truncated:*
+// disclosure counter riding the session_meta carrier. Cached rows
+// written before this rung may hold UNCAPPED org strings — the bump
+// regenerates them so a warm row can never serve an unbounded key a
+// re-parse would cap. SEAM: the run minted its bump 68 -> 69 straight
+// at its base 4405d13 on the then-landed ceiling 68 (its own comment
+// carried the re-mint rider), but this tree had since landed 69 (run
+// 7fd83ab2's claude unmatched-type rung, below), 70 (run e30a8801's
+// Cline envelope rung, below) and 71 (run 0915f736's effort-suffixed
+// pricing rung, below) — so per the landed-rung-keeps-numeral
+// convention (c7c07e48/58fbbd6c) the landed rungs keep their numerals
+// and this integration (conflict case f28c7946365b4f7382e5c59a73f8cfd4)
+// lands the identity-cap rung as 72, the lowest rung unique above the
+// ceiling, one invalidation either way. No SQLite snapshot rung rode
+// the batch; the landed 13 (run b01c2b6a, below) remains the snapshot
+// ceiling. Entries regenerate once on next scan.
 // Bumped 70 -> 71 (integration of run 0915f736aa1c488ebd3b085b73a6d7df
 // cycle 4 'reasoning-effort-suffixed model ids price at their
 // in-catalog base', rm-1511, review fix 1a615b64 / independent review

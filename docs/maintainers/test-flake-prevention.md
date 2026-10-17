@@ -156,9 +156,10 @@ the cross-campaign collision convention both rules record.
 this rule documented is FIXED for the doctor lane — rm-367 stages (b)(c)(d)
 landed the per-root wall-clock budget (`AGENTTRACE_DOCTOR_ROOT_BUDGET_MS`,
 default 60 s), per-root parsed-byte cap (`AGENTTRACE_DOCTOR_ROOT_MAX_BYTES`,
-default 512 MiB), and bounded SQLite ingest, with truncation always
-disclosed (`scan_partial`, `skipped_budget`/`skipped_size`,
-`sqlite_partial_dbs`); the operator home that red rc=124 at BOTH timeout
+default 512 MiB), and bounded SQLite ingest, with truncation disclosed
+on every surface — `scan_partial`, `skipped_budget`/`skipped_size`, and
+`sqlite_partial_dbs` in JSON, and the same facts on the plain-text lane
+(the CLI default) since rm-1550; the operator home that red rc=124 at BOTH timeout
 240 and timeout 900 now completes rc 0 in 4m1.4 s real / 3m0 s user
 (implement 1f2cb8e6, salvaged dc7bcac; contract
 `doctor_scan_budget_contract`). The isolation guidance stands — the

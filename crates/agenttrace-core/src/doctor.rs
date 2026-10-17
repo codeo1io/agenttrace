@@ -9,6 +9,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -36,11 +37,51 @@ fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 
+thread_local! {
+    /// rm-1554: unparsable doctor budget-knob values observed by
+    /// `doctor_env_u64` during the current pass, drained into the
+    /// report's disclosures before it leaves `build_doctor_report`.
+    /// A typo'd knob previously ran the default SILENTLY — the
+    /// operator asking for a tighter or looser bound got neither the
+    /// value nor a warning, which the doctor's own
+    /// AGENTTRACE_CACHE_DIR typo warning (:1319 neighborhood) already
+    /// treats as a bug class.
+    static DOCTOR_ENV_FALLBACKS: RefCell<Vec<(String, String)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
 fn doctor_env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(default)
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                DOCTOR_ENV_FALLBACKS.with(|fallbacks| {
+                    fallbacks.borrow_mut().push((name.to_string(), raw.clone()));
+                });
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+/// rm-1554: fold the fallbacks recorded so far into the report's
+/// disclosures. Keys carry the variable name and the raw value (run
+/// through the control-byte sanitizer — the value is operator input,
+/// the disclosure lane treats every key as hostile). Counts are
+/// per-key: a knob read twice in one pass (the scan-partial note
+/// re-reads the sqlite total) reports count 2, which is the truth.
+fn drain_doctor_env_fallbacks(disclosures: &mut BTreeMap<String, usize>) {
+    DOCTOR_ENV_FALLBACKS.with(|fallbacks| {
+        for (name, raw) in std::mem::take(&mut *fallbacks.borrow_mut()) {
+            let key = format!(
+                "doctor_env_fallback:{}={}",
+                name,
+                crate::parser::capped_disclosure_value(&raw)
+            );
+            *disclosures.entry(key).or_insert(0) += 1;
+        }
+    });
 }
 
 /// rm-367(b)/(d): the per-root scan bound — a wall-clock budget for
@@ -365,6 +406,9 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     // rm-367(b): the scan disclosure's clock covers the whole pass,
     // discovery included (the sqlite lane runs inside discovery).
     let started = Instant::now();
+    // rm-1554: clear any fallback left behind by an aborted prior
+    // build so one pass never discloses another pass's knobs.
+    DOCTOR_ENV_FALLBACKS.with(|fallbacks| fallbacks.borrow_mut().clear());
     let DoctorDiscovery {
         cache,
         cache_size_bytes,
@@ -490,6 +534,10 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
+    // rm-1554: drained last so every knob read inside this build is
+    // covered (root bound, sqlite budget, and the scan-partial
+    // note's re-read of the sqlite total).
+    drain_doctor_env_fallbacks(&mut report.disclosures);
     report
 }
 
@@ -1541,6 +1589,43 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
             "Disclosed facts (informational): {}\n",
             parts.join(", ")
         ));
+    }
+    // rm-1550: budget truncation must be disclosed on the TEXT lane too —
+    // scan_partial and sqlite_partial_dbs previously rendered JSON-only,
+    // so a truncated scan presented partial counts as complete on the
+    // CLI's default format. Zero-noise: nothing renders when the scan
+    // completed unbounded (the rm-367 contract "partial counts are never
+    // presented as complete ones" now holds on every surface).
+    if let Some(partial) = &report.scan_partial {
+        out.push_str(&format!(
+            "Scan budget: TRUNCATED — {} of {} session file(s) parsed, {} skipped on root budget, {} skipped on size cap, {} sqlite database pass(es) cut short ({} of {} root(s) completed); counts below are partial, not complete\n",
+            partial.files_parsed,
+            partial.session_files,
+            partial.files_skipped_budget,
+            partial.files_skipped_size,
+            partial.sqlite_dbs_partial,
+            partial.roots - partial.roots_truncated,
+            partial.roots
+        ));
+        if !partial.note.is_empty() {
+            out.push_str(&format!(
+                "  {}\n",
+                crate::parser::capped_disclosure_value(&partial.note)
+            ));
+        }
+    }
+    if !report.sqlite_partial_dbs.is_empty() {
+        out.push_str(&format!(
+            "Sqlite session stores truncated by the scan budget ({} partial — rows below are partial, not complete):\n",
+            report.sqlite_partial_dbs.len()
+        ));
+        for db in &report.sqlite_partial_dbs {
+            out.push_str(&format!(
+                "  {} — {} session(s) kept before the budget cut the pass short\n",
+                crate::parser::capped_disclosure_value(&db.path),
+                db.sessions_kept
+            ));
+        }
     }
     out.push_str("\nProviders:\n");
     for dir in &report.directories {

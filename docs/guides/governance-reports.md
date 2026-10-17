@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 71 and the SQLite snapshot is schema 13; the
+The session cache is schema 72 and the SQLite snapshot is schema 13; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -492,7 +492,20 @@ unchanged digest and a warm entry would keep replaying the over-billed
 integration, conflict case ab19f050f02e4aa882c9c659a9a089b8, lands the
 rung as 70 → 71 — the lowest rung unique above the ceiling at the
 fleet census, one invalidation either way; the SQLite snapshot stays
-13 — no snapshot semantics moved)
+13 — no snapshot semantics moved),
+and to 72 when the claude identity capture gained its byte cap
+(orgIdentifier/loginEmail capped at capture with an
+`org_truncated:*` disclosure counter riding the session_meta
+carrier; cached rows written before the rung may hold uncapped org
+strings, so the bump regenerates them and a warm row can never serve
+an unbounded key a re-parse would cap — run 4eeea891 cycle 2 "truth
+of the default surfaces", rm-1553; the run minted 68 → 69 straight
+at its base 4405d13 on the then-landed ceiling 68, below this tree's
+advanced ceiling 71 — so this integration, conflict case
+f28c7946365b4f7382e5c59a73f8cfd4, re-bases it onto the advanced
+ceiling as 71 → 72 per the landed-rung-keeps-numeral convention,
+one invalidation either way; the SQLite snapshot stays 13 — no
+snapshot semantics moved)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

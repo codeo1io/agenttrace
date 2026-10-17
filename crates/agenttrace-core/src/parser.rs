@@ -408,6 +408,28 @@ pub(crate) fn cap_session_cwd(raw: &str) -> (String, bool) {
     (raw[..cut].to_string(), true)
 }
 
+/// rm-1553: cap journal-derived org identity strings at the same
+/// bound as the session cwd (rm-778 discipline). orgIdentifier /
+/// loginEmail are journal-controlled strings that flow into
+/// `Session`, the session cache, and `by_org` map keys — a hostile
+/// journal must not pin unbounded keys there.
+pub(crate) const SESSION_IDENTITY_BYTE_CAP: usize = 4096;
+
+/// rm-1553: cap a journal-derived org identity string at
+/// [`SESSION_IDENTITY_BYTE_CAP`] bytes (UTF-8 boundary safe).
+/// Returns the capped string and whether truncation happened, so
+/// call sites can mint the disclosure — mirror of [`cap_session_cwd`].
+fn cap_session_identity(raw: &str) -> (String, bool) {
+    if raw.len() <= SESSION_IDENTITY_BYTE_CAP {
+        return (raw.to_string(), false);
+    }
+    let mut cut = SESSION_IDENTITY_BYTE_CAP;
+    while cut > 0 && !raw.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (raw[..cut].to_string(), true)
+}
+
 /// The `cwd_truncated:<lane>` disclosure map for a truncation result —
 /// empty (and therefore absent from every serialized shape) when the
 /// journal's cwd was within the cap.
@@ -5462,6 +5484,13 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // only — the record content (repeated per request, potentially
     // large) is never retained, keeping parsing bounded.
     let mut unmatched_kinds: BTreeMap<String, i64> = BTreeMap::new();
+    // rm-1553: the identity strings are capped at capture; remember
+    // WHICH carrier field was truncated so the disclosure counter
+    // rides the same session_meta event as the identity itself
+    // (first-wins: a later, saner identity block must NOT retro-
+    // actively un-truncate an already-truncated capture).
+    let mut org_truncated_seen = false;
+    let mut org_email_truncated_seen = false;
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
         if cwd.is_empty() {
@@ -5500,8 +5529,15 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         // the cwd gate above.
         if org.is_empty() {
             if let Some((captured_org, captured_email)) = claude_org_identity(obj) {
-                org = captured_org;
-                org_email = captured_email;
+                // rm-1553: cap the journal-derived identity at capture
+                // (assess d95bd222 F6) — Session.org, the session cache,
+                // and by_org keys stay bounded under hostile journals.
+                let (capped_org, org_truncated) = cap_session_identity(&captured_org);
+                let (capped_email, email_truncated) = cap_session_identity(&captured_email);
+                org_truncated_seen |= org_truncated;
+                org_email_truncated_seen |= email_truncated;
+                org = capped_org;
+                org_email = capped_email;
             }
         }
         match typ {
@@ -5737,6 +5773,21 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // entirely rather than bucketing an invented "unknown".
     if !org.is_empty() {
         let carrier = events.iter_mut().find(|event| event.role == "session_meta");
+        // rm-1553: the cap disclosure rides the same carrier — an
+        // org_truncated:<field>:claude counter per truncated field,
+        // zero-noise for sane identities (no counter, no line).
+        let seed_truncation_counters = |counters: &mut BTreeMap<String, i64>| {
+            if org_truncated_seen {
+                *counters
+                    .entry("org_truncated:org:claude".to_string())
+                    .or_insert(0) += 1;
+            }
+            if org_email_truncated_seen {
+                *counters
+                    .entry("org_truncated:email:claude".to_string())
+                    .or_insert(0) += 1;
+            }
+        };
         match carrier {
             Some(meta) => {
                 meta.org = org;
@@ -5745,10 +5796,12 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     .disclosure_counters
                     .entry("claude_org_identity:transcript".to_string())
                     .or_insert(0) += 1;
+                seed_truncation_counters(&mut meta.disclosure_counters);
             }
             None => {
                 let mut counters = BTreeMap::new();
                 counters.insert("claude_org_identity:transcript".to_string(), 1);
+                seed_truncation_counters(&mut counters);
                 events.insert(
                     0,
                     Event {
