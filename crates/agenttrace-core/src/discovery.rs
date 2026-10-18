@@ -72,6 +72,27 @@ pub struct LoadReport {
     /// capped at five, naming the paths so an operator can tell a
     /// copy from a coincidence.
     pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-2126 (run 82a64f5a cycle 2, "nothing read-side is silent"):
+    /// directories the walk's depth bound refused to descend whose
+    /// peek still found eligible session files or further
+    /// directories — their content is invisible to every lane, and
+    /// before this counter it was invisible silently (assess PoC:
+    /// a codex rollout nested one level past the bound vanished with
+    /// zero output on both the auto lane and explicit `-d`).
+    pub depth_clipped_dirs: usize,
+    /// rm-2127: directories whose read_dir or stat failed for a
+    /// reason other than NotFound — EACCES and friends (assess PoC:
+    /// mode-000 subdir under uid 1000, rc 0, report rendered, zero
+    /// stderr). NotFound is the normal missing-root race and stays
+    /// silent, the opencode lane's precedent.
+    pub unreadable_dirs: usize,
+    /// rm-1888 arm: files the same-inode admission suppressed
+    /// (hardlink/symlink aliases of already-admitted transcripts) —
+    /// one inode at two names, distinct from
+    /// `duplicate_session_files` (content-identical DISTINCT
+    /// inodes); previously admitted-silently-one with no counter
+    /// anywhere.
+    pub same_inode_files_suppressed: usize,
     /// rm-451 walk-lane arm: opencode session info docs skipped because
     /// they exceed `OPENCODE_INFO_DOC_READ_CAP_BYTES` (rm-212 admits them
     /// by file-kind). The skip is disclosed here, never silent, and the
@@ -355,18 +376,30 @@ fn canonical_identity(path: &Path) -> PathBuf {
 }
 
 pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
+    find_session_files_reported(dir).0
+}
+
+/// rm-2126/rm-2127/rm-1888 arm (run 82a64f5a cycle 2, "nothing
+/// read-side is silent"): the uncached lane's walk disclosure — the
+/// same three silent classes [`WalkDisclosure`] names on the cached
+/// lane, exposed for surfaces that have no `LoadReport` carrier
+/// (the doctor's explicit `-d` arm).
+pub fn find_session_files_reported(dir: Option<&Path>) -> (Vec<PathBuf>, WalkDisclosure) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return vec![dir.to_path_buf()];
+            return (vec![dir.to_path_buf()], WalkDisclosure::default());
         }
-        return collect_session_files(dir);
+        return collect_session_files_reported(dir);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
     let mut identities: HashSet<PathBuf> = HashSet::new();
     let mut all = Vec::new();
+    let mut walk = WalkDisclosure::default();
     for dir in dirs {
-        for path in collect_session_files(&dir) {
+        let (dir_files, dir_walk) = collect_session_files_reported(&dir);
+        walk.absorb(dir_walk);
+        for path in dir_files {
             // rm-338: dedup across roots by canonical identity so roots
             // aliasing or nesting one canonical directory cannot
             // double-count a session file; listed paths are kept as-is.
@@ -399,7 +432,8 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
             .map(|signature| signatures.insert(signature))
             .unwrap_or(true)
     });
-    sort_paths_by_mod_time(all)
+    let files = sort_paths_by_mod_time(all);
+    (files, walk)
 }
 
 pub fn load_sessions_from_dir(dir: Option<&Path>) -> Vec<Session> {
@@ -574,7 +608,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // for org-less claude_code journals served from an override root.
     let override_root = std::env::var_os("CLAUDE_CONFIG_DIR").is_some();
     let mut sessions = Vec::new();
-    let (files, suppressed, opencode_info_docs_skipped_over_cap) =
+    let (files, suppressed, opencode_info_docs_skipped_over_cap, walk) =
         find_session_files_cached(dir, cache, true);
     let discovered = files.len();
     let mut cache_hits = 0;
@@ -723,7 +757,14 @@ pub fn load_sessions_with_progress_from_cache_mode(
     });
     let live_parsed = sessions.len();
     if cache.is_dirty() {
-        let _ = save_session_cache(cache);
+        // rm-367 arm (run 82a64f5a cycle 2): the cache persist tail
+        // was `let _ = save_session_cache(cache)` — a read-only or
+        // unwritable cache dir failed silently on EVERY run (assess
+        // p7 PoC: rc 0, report rendered, zero stderr), so the cache
+        // never converges and the operator never learns why cold
+        // starts stay slow. One stderr note naming the path; never an
+        // error — the load already succeeded.
+        crate::session_cache::persist_session_cache_disclosed(cache);
     }
     let mut sqlite_ingest = crate::sqlite_sessions::SqliteIngestReport::default();
     // rm-548: the JSON storage lane's fork exclusions (counted during
@@ -823,6 +864,9 @@ pub fn load_sessions_with_progress_from_cache_mode(
         subagent_artifact_files,
         duplicate_session_files,
         duplicate_session_file_pairs,
+        depth_clipped_dirs: walk.depth_clipped_dirs,
+        unreadable_dirs: walk.unreadable_dirs,
+        same_inode_files_suppressed: walk.same_inode_files_suppressed,
         opencode_info_docs_skipped_over_cap,
         parse_failures,
         first_parse_failure,
@@ -851,13 +895,18 @@ fn matches_filter(value: &str, filter: &str) -> bool {
 }
 
 pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
+    collect_session_files_reported(dir).0
+}
+
+fn collect_session_files_reported(dir: &Path) -> (Vec<PathBuf>, WalkDisclosure) {
     if is_cline_task_dir(dir) {
-        return vec![dir.to_path_buf()];
+        return (vec![dir.to_path_buf()], WalkDisclosure::default());
     }
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
     let mut visited = SymlinkTargets::new(dir);
     let mut file_targets = SessionFileTargets::new();
+    let mut walk = WalkDisclosure::default();
     walk_session_files(
         dir,
         0,
@@ -865,9 +914,12 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
         &mut items,
         &mut visited,
         &mut file_targets,
+        &mut walk,
     );
     items.sort_by_key(|item| Reverse(item.1));
-    items.into_iter().map(|item| item.0).collect()
+    let files = items.into_iter().map(|item| item.0).collect();
+    walk.same_inode_files_suppressed += file_targets.suppressed_aliases();
+    (files, walk)
 }
 
 /// rm-1887/rm-1886 (run 77ca5de0 cycle 5, "count-honesty ledger"):
@@ -1231,9 +1283,9 @@ pub(crate) fn opencode_session_fork_parent_cached(
     probed
 }
 
-fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<PathBuf> {
+fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> (Vec<PathBuf>, WalkDisclosure) {
     if is_cline_task_dir(dir) {
-        return vec![dir.to_path_buf()];
+        return (vec![dir.to_path_buf()], WalkDisclosure::default());
     }
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
@@ -1307,11 +1359,22 @@ pub(crate) enum SameFileIdentity {
     Canonical(PathBuf),
 }
 
-struct SessionFileTargets(HashSet<SameFileIdentity>);
+struct SessionFileTargets {
+    seen: HashSet<SameFileIdentity>,
+    /// rm-1888 arm (run 82a64f5a cycle 2): same-inode admissions the
+    /// set refused — one inode at two names. Was silent before this
+    /// counter: the assess hardlink PoC admitted one row with zero
+    /// disclosure anywhere (the content-dedup counter never sees
+    /// these — the alias is suppressed before the merge).
+    suppressed: usize,
+}
 
 impl SessionFileTargets {
     fn new() -> Self {
-        SessionFileTargets(HashSet::new())
+        SessionFileTargets {
+            seen: HashSet::new(),
+            suppressed: 0,
+        }
     }
 
     /// Returns true when the file's identity has not been collected
@@ -1320,10 +1383,85 @@ impl SessionFileTargets {
     /// fingerprint) still gate them.
     fn admit(&mut self, path: &Path) -> bool {
         match same_file_identity(path) {
-            Some(identity) => self.0.insert(identity),
+            Some(identity) => {
+                let admitted = self.seen.insert(identity);
+                if !admitted {
+                    self.suppressed += 1;
+                }
+                admitted
+            }
             None => true,
         }
     }
+
+    fn suppressed_aliases(&self) -> usize {
+        self.suppressed
+    }
+}
+
+/// rm-2126/rm-2127/rm-1888 arm (run 82a64f5a cycle 2, "nothing
+/// read-side is silent"): what the file WALK itself lost before
+/// admission ever ran. [`SuppressedSessions`] carries what AGGREGATION
+/// admission suppressed; this carries what the walk never delivered.
+/// Warm == cold by construction — every counter is derived at the
+/// recursion/read boundary, never from a stored listing, so a
+/// replayed cache converges on the same numbers without a
+/// walk-version bump (rm-597's raw-listing discipline; the cached
+/// walker's replay arm re-derives depth counters from the recursion
+/// it still performs and unreadable counters from the read it still
+/// attempts).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalkDisclosure {
+    /// Directories the depth bound refused to descend whose peek
+    /// still found eligible session files or further directories
+    /// (rm-2126).
+    pub depth_clipped_dirs: usize,
+    /// Directories whose read_dir or stat failed for a reason other
+    /// than NotFound (rm-2127).
+    pub unreadable_dirs: usize,
+    /// Same-inode alias files suppressed at admission — one inode at
+    /// two names (rm-1888 arm); distinct from content duplicates.
+    pub same_inode_files_suppressed: usize,
+}
+
+impl WalkDisclosure {
+    fn absorb(&mut self, other: WalkDisclosure) {
+        self.depth_clipped_dirs += other.depth_clipped_dirs;
+        self.unreadable_dirs += other.unreadable_dirs;
+        self.same_inode_files_suppressed += other.same_inode_files_suppressed;
+    }
+}
+
+/// rm-2126: when the depth bound refuses a descent, answer "did the
+/// clip lose anything?" — one peek readdir of the refused directory.
+/// Eligibility mirrors the walker's own gates at the cheap tier:
+/// name-admissible session files (no content-shaped gates — those
+/// need opens), and directories the walker would itself descend
+/// (skipped names excluded, so a `.git` inside does not cry loss;
+/// cline task dirs count — they are admitted as session roots). An
+/// unreadable peek counts as a loss (the walk cannot prove the clip
+/// was harmless).
+fn depth_clip_loses_children(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if entry_is_dir_entry(&file_type, &path) {
+            if is_open_code_storage_skipped_dir(&path) || is_skipped_session_dir(&path) {
+                continue;
+            }
+            return true;
+        }
+        let name = entry.file_name();
+        if is_session_file_name(&name.to_string_lossy()) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn same_file_identity(path: &Path) -> Option<SameFileIdentity> {
@@ -1369,16 +1507,33 @@ fn walk_session_files_cached(
     items: &mut Vec<PathBuf>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
+    disclosure: &mut WalkDisclosure,
 ) {
     if depth > max_depth {
+        // rm-2126 (run 82a64f5a cycle 2, "nothing read-side is
+        // silent"): the clip is disclosed, not silent — a refused
+        // descent that still had eligible children is a loss the
+        // operator must be able to see.
+        if depth_clip_loses_children(dir) {
+            disclosure.depth_clipped_dirs += 1;
+        }
         return;
     }
     if is_cline_task_dir(dir) {
         items.push(dir.to_path_buf());
         return;
     }
-    let Ok(metadata) = fs::metadata(dir) else {
-        return;
+    let metadata = match fs::metadata(dir) {
+        Ok(metadata) => metadata,
+        // rm-2127: NotFound is the normal missing-root race and stays
+        // silent; any other failure (EACCES, EIO) hides a subtree from
+        // every lane and is disclosed here.
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                disclosure.unreadable_dirs += 1;
+            }
+            return;
+        }
     };
     if !metadata.is_dir() {
         return;
@@ -1412,14 +1567,26 @@ fn walk_session_files_cached(
                     items,
                     visited,
                     file_targets,
+                    disclosure,
                 );
             }
         }
         return;
     }
 
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // rm-2127: same classification as the metadata gate above —
+        // NotFound silent, everything else (EACCES subtree, EIO)
+        // disclosed. This is the arm the live mode-000 PoC hit: a
+        // root walking fine, one subdir refusing readdir, zero
+        // evidence anywhere.
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                disclosure.unreadable_dirs += 1;
+            }
+            return;
+        }
     };
     let mut files = Vec::new();
     let mut dirs = Vec::new();
@@ -1492,6 +1659,7 @@ fn walk_session_files_cached(
             items,
             visited,
             file_targets,
+            disclosure,
         );
     }
 }
@@ -1503,12 +1671,27 @@ fn walk_session_files(
     items: &mut Vec<(PathBuf, SystemTime)>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
+    disclosure: &mut WalkDisclosure,
 ) {
     if depth > max_depth {
+        // rm-2126: same disclosure contract as the cached walker —
+        // this is the arm the explicit `-d` PoC hit (a five-deep
+        // nested file missed with zero stderr).
+        if depth_clip_loses_children(dir) {
+            disclosure.depth_clipped_dirs += 1;
+        }
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // rm-2127: NotFound silent, everything else disclosed — the
+        // uncached lane must not be the lane that hides a subtree.
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                disclosure.unreadable_dirs += 1;
+            }
+            return;
+        }
     };
     // rm-597 review fix: collect candidates first and admit them in
     // sorted order, mirroring the cached walk (files.sort() before the
@@ -1535,7 +1718,15 @@ fn walk_session_files(
             if !visited.admit(&path) {
                 continue;
             }
-            walk_session_files(&path, depth + 1, max_depth, items, visited, file_targets);
+            walk_session_files(
+                &path,
+                depth + 1,
+                max_depth,
+                items,
+                visited,
+                file_targets,
+                disclosure,
+            );
             continue;
         }
         let name = entry.file_name();
