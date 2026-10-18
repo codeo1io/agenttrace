@@ -128,7 +128,7 @@ jobs:
           # regenerated and ride the SAME commit (the rm-588 refresh path
           # kept regen inside the PR branch; this extends it to every
           # byte that the snapshot date leaks into).
-          UPDATE_CARD_GOLDEN=1 cargo test -p agenttrace-core --test svg_card_contract
+          UPDATE_CARD_GOLDEN=1 cargo test --locked -p agenttrace-core --test svg_card_contract
           if ! git diff --quiet crates/agenttrace-core/tests/fixtures/svg-card/; then
             echo "svg-card fixtures regenerated (snapshot-date footer moved with the refresh)"
           fi
@@ -137,7 +137,7 @@ jobs:
           # move them silently. Run them; on a pin move the PR body
           # carries the reconcile note instead of a hidden red.
           pins_note="census pins unchanged"
-          if ! cargo test -p agenttrace-core --test pricing_snapshot_hygiene --test cache_rate_truth_contract; then
+          if ! cargo test --locked -p agenttrace-core --test pricing_snapshot_hygiene --test cache_rate_truth_contract; then
             pins_note="CENSUS PINS MOVED by this refresh — a maintainer must update the pinned counts in pricing_snapshot_hygiene.rs and cache_rate_truth_contract.rs in this PR before merge (the pins force conscious movement, rm-1508/rm-176)"
           fi
 

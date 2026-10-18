@@ -76,15 +76,22 @@ fn snapshot_derived_cost(model: &str, tokens: &Value) -> f64 {
         m => m,
     });
     let term = |key: &str| tokens[key].as_f64().unwrap_or(0.0) / 1_000_000.0;
-    // rm-1508: standard cache slots are Option — the conformance
-    // oracle prices only models whose bundle rows publish rates
-    // (explicit 0 included), so unwrap() fails loudly rather than
-    // silently repricing an absent-rate row at $0.
+    // rm-1508: the oracle mirrors the production catalog formula in
+    // lib.rs exactly — absent cache rates bill at the disclosed
+    // fallback (cr = input rate, cw = input x 1.25), never a silent
+    // $0 — so a serving row without a published cache-write rate
+    // (case 005's baseten/zai-org/GLM-5.2 winner after the 2026-10-17
+    // refresh retired the openrouter row) prices identically here
+    // and in the renderer, keeping the drift guard a true
+    // re-derivation of the billed total instead of an unwrap() that
+    // rejects rows production legitimately bills via the fallback.
+    let (cw, _) = price.cache_write_billed();
+    let (cr, _) = price.cache_read_billed();
     round4(
         term("input") * price.input
             + term("output") * price.output
-            + term("cache_w") * price.cw.unwrap()
-            + term("cache_r") * price.cr.unwrap(),
+            + term("cache_w") * cw
+            + term("cache_r") * cr,
     )
 }
 

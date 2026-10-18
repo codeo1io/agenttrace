@@ -2,50 +2,6 @@
 
 ## Unreleased
 
-### Fixed
-
-- Pricing snapshot cured with dated drops, a live refresh, and
-  workflow-side stage widening (rm-176, run 190481d0d cycle 1): the
-  466 bundle-priced keys no longer priced upstream (459-key openrouter
-  family sweep + github_copilot/palm/openai.gpt-6.1-sol/xai.grok-4.7
-  stragglers) now carry dated, reasoned drop notes in
-  `scripts/pricing/snapshot-drops.txt` instead of riding the union
-  forever; the sanctioned 2026-10-17 offline refresh (LiteLLM census,
-  +109 chat+costed adds, 2,249 rate mutations, 0 retained-by-union)
-  lands as `PRICING_SNAPSHOT_DATE`/`_snapshot.date` in lockstep
-  (3,130 → 2,773 models) so the Monday pricing-drift cron's
-  removal_guard/desync guards go green instead of failing into a
-  guaranteed red. The drift gate's PR regeneration now widens its
-  staged fileset — the svg-card golden fixtures (which embed the
-  snapshot date in their disclosure footers) are regenerated via
-  `UPDATE_CARD_GOLDEN=1` and the census-consciousness pins are
-  run-with-note instead of silently moved — so a sanctioned refresh
-  can no longer land half its bytes.
-
-- `agenttrace.waste.v1` discloses the unbounded cache-exclusive ratio
-  instead of rendering JSON `null` (rm-339 arm, run 190481d0d cycle
-  1): the fresh-input==0-with-cache-reads corner makes
-  `hit_rate_exclusive_percent` INFINITY, and RFC 8259 has no
-  Infinity — the number slot serialized as `null` while the text lane
-  printed `n/a`. The json lane now carries the disclosure as a
-  sibling boolean `hit_rate_exclusive_infinite` (additive, versioned
-  contract), pinned red-first by a fresh==0 fixture, with
-  docs/guides/governance-reports.md documenting the null as a
-  pinned, contract-documented state rather than a silent
-  number→null type change.
-
-- Journal-race fixture Phase-1 gets Phase-2's deadline discipline
-  (rm-1967, run 190481d0d cycle 1): the statusline journal-race
-  hammer loop's Phase-1 (tight compaction loop with NO deadline —
-  the pattern that produced the fleet's live 1h40m battery wedge)
-  now shares the named `journal_race_deadline` helper with Phase-2's
-  30s bound, with phase-tagged failure messages carrying writer
-  accounting; the fixture additionally counts exhausted writers
-  (lock-budget spin-out) as signaled so a killed child can never
-  hang the race silently, and a red-first mechanism test pins that
-  the Phase-1 deadline actually fires when a writer never signals
-  (pre-fix behavior: infinite spin).
-
 ### Added
 
 - Standing battery reds get a typed environmental/flaky/defect verdict
@@ -629,6 +585,48 @@
   test and healthy corpora render zero-count clean.
 
 ### Fixed
+
+- Pricing snapshot cured with dated drops, a live refresh, and
+  workflow-side stage widening (rm-176, run 190481d0d cycle 1): the
+  466 bundle-priced keys no longer priced upstream (459-key openrouter
+  family sweep + github_copilot/palm/openai.gpt-6.1-sol/xai.grok-4.7
+  stragglers) now carry dated, reasoned drop notes in
+  `scripts/pricing/snapshot-drops.txt` instead of riding the union
+  forever; the sanctioned 2026-10-17 offline refresh (LiteLLM census,
+  +109 chat+costed adds, 2,249 rate mutations, 0 retained-by-union)
+  lands as `PRICING_SNAPSHOT_DATE`/`_snapshot.date` in lockstep
+  (3,130 → 2,773 models) so the Monday pricing-drift cron's
+  removal_guard/desync guards go green instead of failing into a
+  guaranteed red. The drift gate's PR regeneration now widens its
+  staged fileset — the svg-card golden fixtures (which embed the
+  snapshot date in their disclosure footers) are regenerated via
+  `UPDATE_CARD_GOLDEN=1` and the census-consciousness pins are
+  run-with-note instead of silently moved — so a sanctioned refresh
+  can no longer land half its bytes.
+
+- `agenttrace.waste.v1` discloses the unbounded cache-exclusive ratio
+  instead of rendering JSON `null` (rm-339 arm, run 190481d0d cycle
+  1): the fresh-input==0-with-cache-reads corner makes
+  `hit_rate_exclusive_percent` INFINITY, and RFC 8259 has no
+  Infinity — the number slot serialized as `null` while the text lane
+  printed `n/a`. The json lane now carries the disclosure as a
+  sibling boolean `hit_rate_exclusive_infinite` (additive, versioned
+  contract), pinned red-first by a fresh==0 fixture, with
+  docs/guides/governance-reports.md documenting the null as a
+  pinned, contract-documented state rather than a silent
+  number→null type change.
+
+- Journal-race fixture Phase-1 gets Phase-2's deadline discipline
+  (rm-1967, run 190481d0d cycle 1): the statusline journal-race
+  hammer loop's Phase-1 (tight compaction loop with NO deadline —
+  the pattern that produced the fleet's live 1h40m battery wedge)
+  now shares the named `journal_race_deadline` helper with Phase-2's
+  30s bound, with phase-tagged failure messages carrying writer
+  accounting; the fixture additionally counts exhausted writers
+  (lock-budget spin-out) as signaled so a killed child can never
+  hang the race silently, and a red-first mechanism test pins that
+  the Phase-1 deadline actually fires when a writer never signals
+  (pre-fix behavior: infinite spin).
 
 - The statusline budget truth lane clamps and discloses hostile capture costs instead of folding them into every budget surface (rm-1887 at this landing — campaign-local numeral rm-1503, run 80336dfb cycle 2, batch "Statusline budget truth: clamp-and-disclose hostile capture costs and unparsable journal lines"; title-keyed per the stewardship request, the numeral twin reconciles by title at the commit gate and takes the next free wall numeral here; composed at integration over the landed rm-1388 shared-predicate gate): at the run's base `capture_cost_usd` returned `cost.total_cost_usd` raw, so a negative capture rendered `7d total $-50.00` on a $10 budget with `$60.00 remaining` — a hostile editor hook literally bought budget headroom — while a non-representable sample (a `1e400` literal, which serde rejects at line-parse time, or a `null`/string/bool cost node) vanished from every budget surface with zero disclosure (`"lines": 1, "daily": []`, `captures_unknown_payload: 0`). Cost samples are now classified before the day fold — riding the same `parser::recorded_cost_sample_is_valid` predicate rm-1388 landed, so the classification can never drift from the fold's gate: finite non-negative spend enters unchanged (the rm-771 first-seen/baseline-unknown discipline is untouched), a finite negative is discarded and counted, and a present-but-not-finite node is discarded and counted separately — `negative_capture_cost_samples` / `invalid_capture_cost_samples` on the series, surfaced in `--budget -f json` and in `--statusline-report -f json`'s budget block, plus a text disclosure line in both views (`N hostile cost sample(s) discarded (X negative, Y not a finite number) — excluded from the 7d total/spend`) alongside rm-1388's own `invalid_cost_samples` line and counter (the two disclosure families share one classification pass at this integration; `capture_cost_usd` remains pinned as the Spend-only view). `remaining_usd` is floored into `[0, budget]` in both JSON arms (the text arms keep their OVER verdict; a hostile negative `--weekly-budget` cannot panic the floor), and the journal-stats census gained `unparsable_lines` — a torn or `1e400` line still counts in `lines` but is disclosed (`N unparsable journal line(s) — counted in the totals above, excluded from every capture stat`) so a lines-vs-captures gap has a visible cause. Pinned red-first by `crates/agenttrace-core/tests/statusline_budget_truth.rs` (11 tests: 3 hostile-negative behavioral pins, 4 disclosure/counting pins, 2 completion-turn pins for the `remaining_usd` floor and the `--statusline-report` arms, and 2 adoption-turn pins for non-numeric cost nodes — the reachable NaN/±inf shapes — and the zero-noise healthy corpus; the first seven were red or un-compilable on the pre-fix tree).
 - **rm-540 residual — `--search` evidence rows guard the VALUE, not the joined line (run 7fd83ab2 cycle 2, batch "evidence-lane paste-safety + claude-lane format-compat", assess cbf457f4 F1 live-proven)**. Every search evidence row joins `label: value` in `add_match` and the render loop applied `guarded_segment` to the JOINED item — but `guard_formula_cell` only neutralizes an introducer at the FIRST non-whitespace byte, so behind the label (`- tool: `, `- name: `, `- tool argument: `, …) the guard could never fire: a transcript carrying the hostile tool name `+cmd|' /C calc'!A0` or the session name `=HYPERLINK("http://evil.example","click-me") please review` rendered its payload raw in the text search lane (live PoCs on the formula-lane fixtures; the summary row was the only one guarded — it never carries a label). Text-to-columns and `": "`-aware paste targets make the value a cell of its own, so the fix splits the fixed label off and routes the VALUE through the same rm-985 stack (`sanitize_line_segment` then the formula guard): evidence rows now render `- tool: '+cmd|' /C calc'!A0`, `- name: '=HYPERLINK(…`, and the lane contract is upgraded to the strict every-occurrence-marker-preceded form. The JSON search lane stays byte-lossless by design (the guard is a text-render concern; the stored match item keeps its raw value — pinned). Label-less items and the summary row take the unchanged whole-item path.
