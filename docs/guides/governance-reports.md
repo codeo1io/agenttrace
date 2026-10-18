@@ -579,6 +579,13 @@ construction — and it is the graded rate behind `rating`.
 reads / fresh input, disclosed for diagnosis: the parser's
 `tokens_input` is a fresh-only (delta) basis, so this ratio exceeds
 100% on every healthy cache-heavy session and is not an anomaly.
+When fresh input is zero with cache reads present the ratio is
+unbounded — RFC 8259 has no Infinity, so the JSON number slot
+renders `null` there, and the sibling field
+`hit_rate_exclusive_infinite: true` carries the disclosure the text
+lane prints as `n/a` (rm-339, run 190481d0d cycle 1): the null is a
+pinned, contract-documented state, never a silent number→null type
+change.
 
 Per-tool `allocated_cost` figures share the text report's caveat: they
 are a share of the session-level estimate, not measured per-tool spend.

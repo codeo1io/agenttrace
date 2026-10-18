@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### Fixed
+
+- Pricing snapshot cured with dated drops, a live refresh, and
+  workflow-side stage widening (rm-176, run 190481d0d cycle 1): the
+  466 bundle-priced keys no longer priced upstream (459-key openrouter
+  family sweep + github_copilot/palm/openai.gpt-6.1-sol/xai.grok-4.7
+  stragglers) now carry dated, reasoned drop notes in
+  `scripts/pricing/snapshot-drops.txt` instead of riding the union
+  forever; the sanctioned 2026-10-17 offline refresh (LiteLLM census,
+  +109 chat+costed adds, 2,249 rate mutations, 0 retained-by-union)
+  lands as `PRICING_SNAPSHOT_DATE`/`_snapshot.date` in lockstep
+  (3,130 → 2,773 models) so the Monday pricing-drift cron's
+  removal_guard/desync guards go green instead of failing into a
+  guaranteed red. The drift gate's PR regeneration now widens its
+  staged fileset — the svg-card golden fixtures (which embed the
+  snapshot date in their disclosure footers) are regenerated via
+  `UPDATE_CARD_GOLDEN=1` and the census-consciousness pins are
+  run-with-note instead of silently moved — so a sanctioned refresh
+  can no longer land half its bytes.
+
+- `agenttrace.waste.v1` discloses the unbounded cache-exclusive ratio
+  instead of rendering JSON `null` (rm-339 arm, run 190481d0d cycle
+  1): the fresh-input==0-with-cache-reads corner makes
+  `hit_rate_exclusive_percent` INFINITY, and RFC 8259 has no
+  Infinity — the number slot serialized as `null` while the text lane
+  printed `n/a`. The json lane now carries the disclosure as a
+  sibling boolean `hit_rate_exclusive_infinite` (additive, versioned
+  contract), pinned red-first by a fresh==0 fixture, with
+  docs/guides/governance-reports.md documenting the null as a
+  pinned, contract-documented state rather than a silent
+  number→null type change.
+
+- Journal-race fixture Phase-1 gets Phase-2's deadline discipline
+  (rm-1967, run 190481d0d cycle 1): the statusline journal-race
+  hammer loop's Phase-1 (tight compaction loop with NO deadline —
+  the pattern that produced the fleet's live 1h40m battery wedge)
+  now shares the named `journal_race_deadline` helper with Phase-2's
+  30s bound, with phase-tagged failure messages carrying writer
+  accounting; the fixture additionally counts exhausted writers
+  (lock-budget spin-out) as signaled so a killed child can never
+  hang the race silently, and a red-first mechanism test pins that
+  the Phase-1 deadline actually fires when a writer never signals
+  (pre-fix behavior: infinite spin).
+
 ### Added
 
 - Standing battery reds get a typed environmental/flaky/defect verdict

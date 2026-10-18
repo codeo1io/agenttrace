@@ -75,6 +75,13 @@ jobs:
             echo "mode=bump" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install Rust toolchain (rm-176 stage widening)
+        if: steps.gate.outputs.mode == 'bump'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # same pin as ci.yml (rm-405 discipline)
+        with:
+          # rm-173: aligned with rust-toolchain.toml
+          toolchain: "1.98.1"
+
       - name: Regenerate bundle, bump const, open PR
         if: steps.gate.outputs.mode == 'bump'
         env:
@@ -114,7 +121,27 @@ jobs:
             exit 1
           fi
 
-          git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs
+          # rm-176 stage widening (run 190481d0d cycle 1, implement 136d7f8f):
+          # a sanctioned refresh moves MORE than the bundle and the const —
+          # the svg-card golden fixtures embed the snapshot date and the
+          # census counts in their disclosure footers, so they must be
+          # regenerated and ride the SAME commit (the rm-588 refresh path
+          # kept regen inside the PR branch; this extends it to every
+          # byte that the snapshot date leaks into).
+          UPDATE_CARD_GOLDEN=1 cargo test -p agenttrace-core --test svg_card_contract
+          if ! git diff --quiet crates/agenttrace-core/tests/fixtures/svg-card/; then
+            echo "svg-card fixtures regenerated (snapshot-date footer moved with the refresh)"
+          fi
+          # The census pins (pricing_snapshot_hygiene / cache_rate_truth)
+          # are CONSCIOUSNESS pins by design — the automation must not
+          # move them silently. Run them; on a pin move the PR body
+          # carries the reconcile note instead of a hidden red.
+          pins_note="census pins unchanged"
+          if ! cargo test -p agenttrace-core --test pricing_snapshot_hygiene --test cache_rate_truth_contract; then
+            pins_note="CENSUS PINS MOVED by this refresh — a maintainer must update the pinned counts in pricing_snapshot_hygiene.rs and cache_rate_truth_contract.rs in this PR before merge (the pins force conscious movement, rm-1508/rm-176)"
+          fi
+
+          git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs crates/agenttrace-core/tests/fixtures/svg-card/ scripts/pricing/snapshot-drops.txt
           git commit -m "chore(pricing): refresh bundled snapshot to $new_date (pricing-drift gate)"
 
           counts="$(grep -E 'costed-chat models' refresh-check.txt | tr -s ' ' | tr '\n' ';')"
@@ -130,6 +157,7 @@ jobs:
             cat refresh-check.txt
             echo '```'
             echo "Snapshot date: **$new_date**. $counts"
+            echo "$pins_note"
             echo
             echo "Note: PRs authored by the default GITHUB_TOKEN do not trigger CI workflows (GitHub limitation); the post-regeneration gate run above is the validation artifact. Removal guard and desync paths never reach this step — they fail the workflow instead."
           } > pr-body.md

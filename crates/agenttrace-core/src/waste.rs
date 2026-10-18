@@ -264,6 +264,16 @@ pub fn waste_report_json(report: &WasteReport) -> String {
             // parser's fresh-only basis, so this exceeds 100% on every
             // healthy cache-heavy session and is not an anomaly.
             "hit_rate_exclusive_percent": (report.cache.hit_rate_exclusive * 10.0).round() / 10.0,
+            // rm-339 json non-finite disclosure (run 190481d0d cycle 1,
+            // implement 136d7f8f): the fresh==0 ∧ cache_read>0 corner makes
+            // the exclusive ratio INFINITY, and RFC 8259 has no Infinity —
+            // serde_json renders the number slot as null. The text lane
+            // prints 'n/a' for that corner; the json lane now carries the
+            // same disclosure as a sibling boolean so the null is an
+            // explicit, contract-pinned state on the versioned
+            // agenttrace.waste.v1 surface instead of a silent
+            // number→null type change.
+            "hit_rate_exclusive_infinite": !report.cache.hit_rate_exclusive.is_finite(),
             "cache_read_tokens": report.cache.cache_read_tokens,
             "total_input_tokens": report.cache.total_input_tokens,
             "wasted_cost": round4(report.cache.wasted_cost),
@@ -815,6 +825,61 @@ mod tests {
         assert!(
             text.contains("reads exceed fresh input"),
             "the text lane names the exclusive-over-100% shape: {text}"
+        );
+    }
+
+    #[test]
+    fn waste_json_discloses_unbounded_exclusive_hit_rate_instead_of_silent_null() {
+        // rm-339 json non-finite arm (run 190481d0d cycle 1): fresh input
+        // 0 ∧ cache reads > 0 makes hit_rate_exclusive INFINITY
+        // (waste.rs analyze arm), and serde_json renders the number slot
+        // as null — a silent type change on the versioned
+        // agenttrace.waste.v1 CI contract. The json lane must CARRY the
+        // disclosure the text lane already prints ('n/a'), so consumers
+        // can distinguish "unbounded ratio" from "field absent". Written
+        // red-first: on the pre-fix emitter the sibling field does not
+        // exist and the assertion below fails (null != true).
+        let session = Session {
+            name: "noll".to_string(),
+            path: "/tmp/noll.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics {
+                tokens_input: 0,
+                tokens_cache_r: 5_000,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let report = compute_waste_report(&session);
+        assert!(
+            report.cache.hit_rate_exclusive.is_infinite(),
+            "fixture premise: no fresh input with cache reads is the unbounded corner"
+        );
+        assert_eq!(
+            report.cache.hit_rate, 100.0,
+            "the graded inclusive rate stays bounded: 5000/(5000+0)"
+        );
+        let json = waste_report_json(&report);
+        let parsed: serde_json::Value =
+            serde_json::from_str(json.trim()).expect("waste json parses");
+        assert!(
+            parsed["cache"]["hit_rate_exclusive_percent"].is_null(),
+            "RFC 8259 forbids Infinity — the number slot is null by design, the sibling field is the disclosure"
+        );
+        assert_eq!(
+            parsed["cache"]["hit_rate_exclusive_infinite"], true,
+            "the json lane must disclose the unbounded corner (rm-339): a silent number→null type change on agenttrace.waste.v1 is not a disclosure"
+        );
+        let text = render_waste_report(&session);
+        assert!(
+            text.contains("n/a"),
+            "the text lane keeps its 'n/a' disclosure for the same corner"
         );
     }
 

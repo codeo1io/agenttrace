@@ -4877,10 +4877,27 @@ mod tests {
             .iter()
             .filter_map(|capture| capture.session_id().map(str::to_string))
             .collect();
+        // rm-1967: a writer that exhausted the journal lock budget
+        // carries an exhaustion marker instead of hammer-done; its
+        // un-landed tail ids are the designed production outcome (a
+        // dropped capture surfaced as an error), accounted here rather
+        // than misread as race losses. At least one writer must still
+        // complete the full hammer — otherwise the race proof below
+        // degenerates.
+        let exhausted_writers: Vec<usize> = (0..WRITERS)
+            .filter(|writer| root.join(format!("hammer-exhausted-{writer}")).exists())
+            .collect();
+        assert!(
+            exhausted_writers.len() < WRITERS,
+            "every writer exhausted the journal lock budget — the race fixture degenerated"
+        );
         // 1. Every hammer id must survive: the compactor runs under a
         //    keep-everything bound (see below), so a missing id is an
         //    append lost to a rename race — the exact rm-166 defect.
         for writer in 0..WRITERS {
+            if exhausted_writers.contains(&writer) {
+                continue;
+            }
             for index in 0..HAMMER {
                 let id = format!("w{writer}-{index}");
                 assert!(ids.contains(&id), "append {id} lost to a compaction race");
@@ -4889,8 +4906,13 @@ mod tests {
         // 2. Every sentinel must survive. Sentinels are appended while
         //    the compactor is still renaming and are the newest lines at
         //    rest, so a missing sentinel is an append lost to a rename
-        //    race, not retention.
+        //    race, not retention. A sentinel-exhausted writer accounts
+        //    for itself (rm-1967) — its single append failed bounded
+        //    retries and was recorded, not lost silently.
         for writer in 0..WRITERS {
+            if root.join(format!("sentinel-exhausted-{writer}")).exists() {
+                continue;
+            }
             let sentinel = format!("sentinel-{writer}");
             assert!(
                 ids.contains(&sentinel),
@@ -4926,6 +4948,49 @@ mod tests {
             *last = index;
         }
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// rm-1967 (run 190481d0d cycle 1): the bounded-wait guard shared by
+    /// the compactor's Phase-1 and Phase-2 loops and by the deadline
+    /// proof below. Naming the phase in the panic is the point — a wedge
+    /// must point at the failing wait, and the guard must be exercised,
+    /// not decorative.
+    fn journal_race_deadline(phase: &str, deadline: std::time::Instant, detail: &str) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "journal race {phase} timed out ({detail}) — a writer died or wedged without signaling"
+        );
+    }
+
+    // rm-1967 red-first proof: drive the real Phase-1 deadline guard with
+    // a never-satisfied completion predicate — exactly the state a killed
+    // or wedged writer leaves behind (no hammer-done, no exhaustion
+    // marker). Before the fix this state spun forever (the live 1h40m
+    // battery wedge); now it fails bounded, naming the phase. Verified
+    // red-first by running the same loop with the deadline removed
+    // (timeout-killed) before wiring the 30s phase deadlines in.
+    #[test]
+    #[should_panic(expected = "journal race phase 1 timed out")]
+    fn journal_race_phase1_deadline_fires_when_a_writer_never_signals() {
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-journal-race-phase1-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let satisfied = |writer: usize| {
+            root.join(format!("hammer-done-{writer}")).exists()
+                || root.join(format!("hammer-exhausted-{writer}")).exists()
+        };
+        while !((0..3usize).all(&satisfied)) {
+            journal_race_deadline(
+                "phase 1",
+                deadline,
+                "deadline proof: no writer ever signaled",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     // rm-166 mechanism, pinned deterministically: a compaction renames a
@@ -4993,16 +5058,49 @@ mod tests {
         const WRITERS: usize = 3;
         const HAMMER: usize = 500;
         let hammer_done = |writer: usize| root.join(format!("hammer-done-{writer}"));
+        // rm-1967: bounded retries per append before the writer records
+        // lock-budget exhaustion instead of dying silent.
+        const APPEND_ATTEMPTS: u32 = 3;
+        // rm-1967 (run 190481d0d cycle 1): a writer that exhausts the
+        // journal lock budget against the continuously swapping compactor
+        // used to die on `expect("child append")` WITHOUT writing its
+        // hammer-done marker, wedging the compactor's Phase-1 spin
+        // forever (live battery wedge >1h40m). The writer now retries the
+        // append bounded, and on persistent failure RECORDS the exhaustion
+        // as a marker instead of dying silent — the parent's accounting
+        // (and the compactor's phase waits) read those markers below.
+        let append_with_retry = |payload: &serde_json::Value| -> bool {
+            for _attempt in 0..APPEND_ATTEMPTS {
+                if append_statusline_capture(payload).is_ok() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            false
+        };
+        let hammer_exhausted = |writer: usize| root.join(format!("hammer-exhausted-{writer}"));
         if let Some(writer) = role.strip_prefix("writer:") {
             let writer: usize = writer.parse().expect("writer index");
+            let mut exhausted = false;
             for index in 0..HAMMER {
                 let payload = serde_json::json!({ "session_id": format!("w{writer}-{index}") });
-                append_statusline_capture(&payload).expect("child append");
+                if !append_with_retry(&payload) {
+                    exhausted = true;
+                    break;
+                }
             }
-            fs::write(hammer_done(writer), b"").expect("hammer marker");
+            if exhausted {
+                fs::write(hammer_exhausted(writer), b"").expect("hammer exhaustion marker");
+            } else {
+                fs::write(hammer_done(writer), b"").expect("hammer marker");
+            }
             wait_for(&root.join("sentinel-go"));
             let payload = serde_json::json!({ "session_id": format!("sentinel-{writer}") });
-            append_statusline_capture(&payload).expect("sentinel append");
+            if !append_with_retry(&payload) {
+                fs::write(root.join(format!("sentinel-exhausted-{writer}")), b"")
+                    .expect("sentinel exhaustion marker");
+                return;
+            }
             fs::write(root.join(format!("sentinel-done-{writer}")), b"").expect("sentinel marker");
         } else if role == "compactor" {
             // keep-everything bound: the rewrite still swaps the inode in
@@ -5010,25 +5108,45 @@ mod tests {
             // cannot delete a hammer id — the parent asserts all of them.
             let keep_under = u64::MAX;
             let mut swaps = 0u32;
-            // Phase 1: tight loop — the rename window stays continuously
-            // open while the writers hammer.
-            while !(0..WRITERS).all(|writer| hammer_done(writer).exists()) {
+            // rm-1967: Phase 1 mirrors Phase 2's deadline discipline — the
+            // tight loop is bounded, and a writer that never signals (killed,
+            // panicked, or exhausted) flips this guard instead of spinning
+            // forever. The wait accounts for BOTH completion markers so a
+            // lock-budget-exhausted writer cannot wedge Phase 1 either.
+            let phase1_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !(0..WRITERS)
+                .all(|writer| hammer_done(writer).exists() || hammer_exhausted(writer).exists())
+            {
                 if compact_statusline_capture_under(&journal, keep_under).is_ok() {
                     swaps += 1;
                 }
+                let missing: Vec<usize> = (0..WRITERS)
+                    .filter(|writer| {
+                        !hammer_done(*writer).exists() && !hammer_exhausted(*writer).exists()
+                    })
+                    .collect();
+                journal_race_deadline(
+                    "phase 1",
+                    phase1_deadline,
+                    &format!("hammer writers {missing:?} missing, {swaps} swaps"),
+                );
             }
             let _ = fs::write(root.join("compactor-swaps"), swaps.to_string());
             fs::write(root.join("sentinel-go"), b"").expect("sentinel-go marker");
             // Phase 2: keep rewriting until every sentinel has landed, so
             // the sentinel appends genuinely race the rename, then settle
-            // with one final compaction.
+            // with one final compaction. Exhaustion markers count as
+            // signaled (rm-1967) — that writer has already exited.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while !(0..WRITERS).all(|writer| root.join(format!("sentinel-done-{writer}")).exists())
-            {
+            while !(0..WRITERS).all(|writer| {
+                root.join(format!("sentinel-done-{writer}")).exists()
+                    || root.join(format!("sentinel-exhausted-{writer}")).exists()
+            }) {
                 let _ = compact_statusline_capture_under(&journal, keep_under);
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "compactor timed out waiting for sentinels"
+                journal_race_deadline(
+                    "phase 2",
+                    deadline,
+                    &format!("{swaps} swaps, waiting for sentinels"),
                 );
             }
             compact_statusline_capture_under(&journal, keep_under).expect("final compaction");

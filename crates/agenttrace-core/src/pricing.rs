@@ -18,7 +18,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-17";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -3791,9 +3791,19 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // rm-176 cure (run 190481d0d cycle 1): the 2026-10-17 sanctioned
+        // refresh moved this pin consciously — upstream's census revised
+        // the first-party claude-sonnet-4-5 rows from the 1M window down
+        // to the 200k value every bedrock/vertex/gov twin already
+        // published, and the bundle carries upstream's truth.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
+            Some(200_000)
+        );
+        // The 1M-window default class (rm-231's motivating case) stays
+        // pinned on a model whose whole twin family is unanimous at 1M.
+        assert_eq!(
+            catalog.entries["claude-opus-4-6"].max_input_tokens,
             Some(1_000_000)
         );
     }

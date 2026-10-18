@@ -54,16 +54,23 @@ fn vendored_pricing_bundle_cache_rate_census_is_pinned() {
         "the bundle must still be the full LiteLLM chat catalog (got {})",
         census.models
     );
+    // rm-176 dated-drop cure (run 190481d0d cycle 1, implement 136d7f8f):
+    // the sanctioned 2026-10-17 refresh moved these pins consciously.
+    // update-snapshot.sh now preserves upstream cache-rate ABSENCE
+    // (rm-1508), so the census carries real absent counts for the first
+    // time; absence is disclosed billing (fallback + disclosure flag),
+    // never a silent $0. Any further change here must be a sanctioned
+    // refresh that moves these pins again, with a dated drop note.
     assert_eq!(
-        census.cache_read_absent, 0,
-        "the 2026-10-08 bundle zero-fills: absent cache-read rows can only appear via a \
-         sanctioned refresh (rm-176 lane), which must move this pin consciously"
+        census.cache_read_absent, 2226,
+        "post-2026-10-17 refresh pin (rm-176 cure): absent cache-read rows \
+         only move via a sanctioned refresh"
     );
     assert_eq!(
-        census.cache_write_absent, 0,
-        "the 2026-10-08 bundle zero-fills (upstream even publishes an explicit $0 on the \
-         gpt-5.3-codex rows, so the vend row is Some(0.0)): absent rows can only appear \
-         via a sanctioned refresh (rm-176 lane), which must move this pin consciously"
+        census.cache_write_absent, 3346,
+        "post-2026-10-17 refresh pin (rm-176 cure): absent cache-write rows \
+         only move via a sanctioned refresh (upstream still publishes an \
+         explicit $0 on some rows, so zero stays a distinct, pinned class)"
     );
     assert_eq!(
         census.cache_read_absent + census.cache_read_zero + census.cache_read_published,
