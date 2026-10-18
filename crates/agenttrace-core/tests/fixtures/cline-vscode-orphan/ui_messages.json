@@ -1,0 +1,9 @@
+{
+  "messages": [
+    {
+      "ts": 1760712297000,
+      "say": "api_req_finished",
+      "text": "{\"tokensIn\":10,\"tokensOut\":20,\"cost\":0.11}"
+    }
+  ]
+}

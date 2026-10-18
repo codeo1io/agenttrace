@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "agent": "lead",
+  "messages": [
+    {
+      "id": "msg-0001",
+      "ts": "2026-10-17T14:04:33.201Z",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Run the deployment smoke check."
+        }
+      ]
+    },
+    {
+      "id": "msg-0002",
+      "ts": "2026-10-17T14:04:41.872Z",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Smoke check green: 3/3 probes."
+        }
+      ],
+      "metrics": {
+        "inputTokens": 34334,
+        "outputTokens": 741,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0,
+        "cost": 0.48953
+      },
+      "modelInfo": {
+        "id": "anthropic/claude-opus-4.8-fast",
+        "provider": "cline",
+        "family": "claude-opus"
+      }
+    }
+  ]
+}

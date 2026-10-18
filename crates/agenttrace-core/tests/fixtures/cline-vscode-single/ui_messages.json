@@ -1,0 +1,14 @@
+{
+  "messages": [
+    {
+      "ts": 1760712285000,
+      "say": "api_req_started",
+      "text": "Cline wants to use a tool"
+    },
+    {
+      "ts": 1760712291000,
+      "say": "api_req_finished",
+      "text": "{\"tokensIn\":50,\"tokensOut\":60,\"cost\":0.42}"
+    }
+  ]
+}

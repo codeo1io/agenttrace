@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "session_id": "1736805123-a1b2c3d4",
+  "source": "cli",
+  "provider": "anthropic",
+  "model": "claude-opus-4.8",
+  "started_at": "2026-10-17T14:04:32.118Z",
+  "ended_at": "2026-10-17T14:05:10.402Z",
+  "exit_code": 0,
+  "status": "completed",
+  "interactive": true,
+  "cwd": "/home/user/project",
+  "workspace_root": "/home/user/project"
+}
