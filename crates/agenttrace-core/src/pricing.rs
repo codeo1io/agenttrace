@@ -1,5 +1,5 @@
 use crate::round4;
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +18,7 @@ const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
 
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, Deserialize)]
 pub struct Price {
     pub input: f64,
     pub output: f64,
@@ -95,6 +95,38 @@ pub fn pricing_source() -> String {
     }
 }
 
+/// rm-079 provenance disclosure for `--doctor`: which catalog the
+/// process serves and why, plus — whenever the cached and bundled
+/// catalogs disagree on snapshot date — BOTH dates. Re-derives the
+/// load-time precedence decision instead of reading the process
+/// singleton so the line always reflects the current environment
+/// (doctor is a diagnostic, not a hot path; this re-reads the cache
+/// file once). `demo` consults no host state and stays bundled-only.
+pub fn pricing_provenance_line(demo: bool) -> String {
+    let bundled_date = bundled_snapshot_date();
+    let bundled_phrase = format!(
+        "bundled snapshot {bundled_date} ({} models, {} days old)",
+        bundled_snapshot_model_count(),
+        bundled_snapshot_age_days().unwrap_or(-1)
+    );
+    if demo {
+        return format!("serving {bundled_phrase} (demo; host cache not consulted)");
+    }
+    let mut line = format!(
+        "serving {}; {bundled_phrase}",
+        catalog_source(&load_catalog_for_current_env())
+    );
+    if let Some(cache_date) = cached_catalog_snapshot_date() {
+        if cache_date.to_string() != bundled_date {
+            line.push_str(&format!(
+                "; cached catalog snapshot {cache_date} vs bundled {bundled_date} — \
+                 the fresher one is served"
+            ));
+        }
+    }
+    line
+}
+
 /// Model count in the bundled offline snapshot, parsed once, for
 /// provenance disclosure (cycle 7 R1: users should be able to see how
 /// old the offline catalog they are paying from actually is).
@@ -134,6 +166,15 @@ fn catalog_source(catalog: &PricingCatalog) -> String {
         }
         "remote" => "LiteLLM (just refreshed)".to_string(),
         "snapshot" => format!("LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled)"),
+        // rm-079: emitted when the bundled snapshot beat an older cache.
+        // Still clock-free — it quotes the cache's own snapshot date (an
+        // input), never the wall clock (see check-deterministic-output).
+        source if source.starts_with("bundled-newer:") => format!(
+            "LiteLLM snapshot {PRICING_SNAPSHOT_DATE} \
+             (bundled; newer than the cached catalog from {} \
+             — run --update-pricing to refresh)",
+            source.trim_start_matches("bundled-newer:")
+        ),
         _ => "built-in fallback (run --update-pricing for the latest catalog)".to_string(),
     }
 }
@@ -168,7 +209,9 @@ pub fn pricing_cache_path() -> PathBuf {
 
 pub fn update_pricing() -> anyhow::Result<usize> {
     let (raw, entries) = download_pricing(Duration::from_secs(30))?;
-    write_pricing_cache(&raw)?;
+    // Stamp the fetch date in the bundled snapshot's own meta shape so
+    // cache-vs-bundled freshness never has to trust mtimes (rm-079).
+    write_pricing_cache(&stamp_snapshot_date(&raw))?;
     let count = entries.len();
     // Publish the fresh catalog to later pricing_catalog() consumers in
     // this process (a no-op when the singleton was already initialized).
@@ -278,15 +321,35 @@ fn pricing_catalog() -> &'static PricingCatalog {
     PRICING_CATALOG.get_or_init(load_catalog_for_current_env)
 }
 
-/// Resolve the pricing catalog without touching the network: a cached
-/// catalog is served as-is regardless of age, and when no cache exists the
-/// bundled snapshot is used. The only network path is the explicit
-/// `--update-pricing` action.
+/// Resolve the pricing catalog without touching the network: serve the
+/// FRESHER of the cached and bundled catalogs (rm-079), and when no cache
+/// exists the bundled snapshot is used. The only network path is the
+/// explicit `--update-pricing` action.
 fn load_catalog_for_current_env() -> PricingCatalog {
-    let mut catalog = load_pricing_cache().unwrap_or_else(fallback_catalog);
+    let mut catalog = freshest_catalog();
     let override_models = apply_pricing_overrides(&mut catalog);
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
     catalog
+}
+
+/// rm-079: the cache used to win unconditionally — a cache fetched before
+/// a snapshot refresh kept shadowing the newer bundled prices forever.
+/// A cache whose snapshot date (stamped `_snapshot.date` meta, else the
+/// file's mtime date) predates the bundled snapshot loses to the bundle,
+/// and the catalog's source label says which catalog won and why.
+fn freshest_catalog() -> PricingCatalog {
+    let Some((cached, cache_date)) = load_pricing_cache() else {
+        return fallback_catalog();
+    };
+    let bundled_date = chrono::NaiveDate::parse_from_str(PRICING_SNAPSHOT_DATE, "%Y-%m-%d").ok();
+    if let (Some(cache_date), Some(bundled_date)) = (cache_date, bundled_date) {
+        if cache_date < bundled_date {
+            let mut catalog = fallback_catalog();
+            catalog.source = format!("bundled-newer:{cache_date}");
+            return catalog;
+        }
+    }
+    cached
 }
 
 fn fallback_catalog() -> PricingCatalog {
@@ -315,12 +378,11 @@ fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
     override_models
 }
 
-fn load_pricing_cache() -> Option<PricingCatalog> {
+fn load_pricing_cache() -> Option<(PricingCatalog, Option<chrono::NaiveDate>)> {
     let path = pricing_cache_path();
     let metadata = path.metadata().ok()?;
-    let stale = metadata
-        .modified()
-        .ok()
+    let modified = metadata.modified().ok();
+    let stale = modified
         .and_then(|time| SystemTime::now().duration_since(time).ok())
         .map(|age| age > CACHE_MAX_AGE)
         .unwrap_or(false);
@@ -329,24 +391,83 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
     if entries.is_empty() {
         return None;
     }
-    Some(PricingCatalog {
+    let catalog = PricingCatalog {
         entries,
         aliases: BTreeMap::new(),
         source: if stale { "cache(stale)" } else { "cache" }.to_string(),
-    })
+    };
+    Some((catalog, cached_snapshot_date(&raw, modified)))
+}
+
+/// Snapshot date recorded in a raw LiteLLM payload: the `_snapshot.date`
+/// meta (stamped on every write since rm-079), falling back to the file's
+/// mtime date for caches written before stamping landed. The live registry
+/// embeds no comparable meta, which is why agenttrace stamps its own.
+pub fn cached_catalog_snapshot_date() -> Option<chrono::NaiveDate> {
+    let path = pricing_cache_path();
+    let modified = std::fs::metadata(&path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    let raw = std::fs::read(&path).ok()?;
+    cached_snapshot_date(&raw, modified)
+}
+
+fn cached_snapshot_date(raw: &[u8], modified: Option<SystemTime>) -> Option<chrono::NaiveDate> {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(raw) {
+        let stamped = map
+            .get("_snapshot")
+            .and_then(|meta| meta.get("date"))
+            .and_then(|date| date.as_str())
+            .and_then(|text| chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok());
+        if stamped.is_some() {
+            return stamped;
+        }
+    }
+    modified.map(|time| chrono::DateTime::<chrono::Utc>::from(time).date_naive())
+}
+
+/// Stamp `_snapshot.date` (today, UTC) into a downloaded payload before
+/// it is cached, using the same meta shape as the bundled snapshot. The
+/// stamp is additive: `convert_litellm` ignores the `_snapshot` meta key,
+/// and payloads that somehow fail to round-trip are cached verbatim.
+fn stamp_snapshot_date(raw: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_string();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return raw.to_string();
+    };
+    let date = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let meta = object
+        .entry("_snapshot")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(map) = meta.as_object_mut() {
+        map.insert("date".to_string(), Value::String(date));
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| raw.to_string())
 }
 
 fn pricing_override_models() -> &'static BTreeSet<String> {
     PRICING_OVERRIDE_MODELS.get_or_init(BTreeSet::new)
 }
 
-fn download_pricing(timeout: Duration) -> anyhow::Result<(String, BTreeMap<String, Price>)> {
-    let raw = ureq::get(PRICING_URL)
+/// GET `url` as text through the same in-process HTTP client the
+/// pricing fetch uses (bounded timeout, no shell-out). Shared so every
+/// network probe in the binary has one client policy (rm-081).
+pub fn http_get_text(url: &str, timeout: Duration) -> anyhow::Result<String> {
+    ureq::get(url)
         .timeout(timeout)
         .call()
         .map_err(|err| anyhow!("download failed: {err}"))?
         .into_string()
-        .context("read pricing response")?;
+        .map_err(|err| anyhow!("read response body: {err}"))
+}
+
+fn download_pricing(timeout: Duration) -> anyhow::Result<(String, BTreeMap<String, Price>)> {
+    let raw = http_get_text(PRICING_URL, timeout)?;
     let entries = convert_litellm(raw.as_bytes());
     if entries.is_empty() {
         return Err(anyhow!("no chat models found in downloaded data"));
@@ -1296,6 +1417,171 @@ mod tests {
             assert_eq!(
                 before, after,
                 "the read path must never rewrite the pricing cache"
+            );
+        });
+    }
+
+    #[test]
+    fn bundled_snapshot_beats_older_cached_catalog() {
+        // rm-079 golden: the cache used to win unconditionally, so a
+        // cache fetched before a snapshot refresh kept shadowing the
+        // newer bundled prices forever. Here the cache's snapshot date
+        // (mtime fallback) predates the bundled snapshot, so the bundle
+        // wins and the source label says which side won and why.
+        with_isolated_cache_env(|| {
+            let bundled_date = chrono::NaiveDate::parse_from_str(PRICING_SNAPSHOT_DATE, "%Y-%m-%d")
+                .expect("bundled snapshot date parses");
+            let older = bundled_date - chrono::Duration::days(10);
+            let raw = br#"{"test/older-cache-model":{"input_cost_per_token":9.9e-6,"output_cost_per_token":9.9e-5,"mode":"chat","litellm_provider":"test"}}"#;
+            let path = pricing_cache_path();
+            std::fs::create_dir_all(path.parent().expect("cache parent")).expect("cache dir");
+            std::fs::write(&path, raw).expect("cache seed");
+            std::fs::File::open(&path)
+                .expect("cache open")
+                .set_modified(SystemTime::from(
+                    older.and_hms_opt(12, 0, 0).expect("noon").and_utc(),
+                ))
+                .expect("backdate cache before the bundled snapshot");
+            let catalog = load_catalog_for_current_env();
+            assert_eq!(
+                catalog.source,
+                format!("bundled-newer:{older}"),
+                "the newer bundled catalog must win over an older cache"
+            );
+            assert!(
+                catalog.entries.contains_key("claude-sonnet-4-5"),
+                "bundled entries are served, not the older cache's"
+            );
+            assert!(
+                !catalog.entries.contains_key("older-cache-model"),
+                "the losing cache's models must not shadow the bundle"
+            );
+            let label = catalog_source(&catalog);
+            assert!(
+                label.contains("newer than the cached catalog from"),
+                "label must say which catalog won: {label}"
+            );
+            assert!(
+                label.contains(&older.to_string()),
+                "label must quote the losing cache's date: {label}"
+            );
+            // The losing cache file is left untouched for inspection.
+            assert!(pricing_cache_path().exists());
+        });
+    }
+
+    #[test]
+    fn stamped_snapshot_date_beats_mtime_in_precedence() {
+        // rm-079: a cache stamped `_snapshot.date` NEWER than the bundle
+        // keeps winning even when its mtime predates the bundle — the
+        // stamp written at fetch time is the comparable freshness fact,
+        // the mtime is only the fallback for pre-stamping caches.
+        with_isolated_cache_env(|| {
+            let bundled_date = chrono::NaiveDate::parse_from_str(PRICING_SNAPSHOT_DATE, "%Y-%m-%d")
+                .expect("bundled snapshot date parses");
+            let stamped_newer = bundled_date + chrono::Duration::days(1);
+            let raw = format!(
+                r#"{{"_snapshot":{{"date":"{stamped_newer}","models":1}},"test/stamped-cache-model":{{"input_cost_per_token":2e-6,"output_cost_per_token":1e-5,"mode":"chat","litellm_provider":"test"}}}}"#
+            );
+            let path = pricing_cache_path();
+            std::fs::create_dir_all(path.parent().expect("cache parent")).expect("cache dir");
+            std::fs::write(&path, raw).expect("cache seed");
+            std::fs::File::open(&path)
+                .expect("cache open")
+                .set_modified(SystemTime::from(
+                    (bundled_date - chrono::Duration::days(10))
+                        .and_hms_opt(12, 0, 0)
+                        .expect("noon")
+                        .and_utc(),
+                ))
+                .expect("backdate mtime before the bundled snapshot");
+            let catalog = load_catalog_for_current_env();
+            assert_eq!(
+                catalog.source, "cache(stale)",
+                "the stamped-newer cache must win despite the old mtime"
+            );
+            assert!(
+                catalog.entries.contains_key("stamped-cache-model"),
+                "the winning cache's models are served"
+            );
+        });
+    }
+
+    #[test]
+    fn stamp_snapshot_date_adds_meta_without_disturbing_models() {
+        // rm-079: the write-time stamp is additive meta in the bundled
+        // snapshot's own shape — it never changes the parsed catalog,
+        // always records today (UTC), and leaves payloads it cannot
+        // rewrite (non-objects, invalid JSON) cached verbatim.
+        let raw =
+            br#"{"test/stamp-model":{"input_cost_per_token":1e-6,"output_cost_per_token":5e-6,"mode":"chat","litellm_provider":"test"}}"#;
+        let stamped = stamp_snapshot_date(std::str::from_utf8(raw).expect("raw utf-8"));
+        let value = serde_json::from_str::<Value>(&stamped).expect("stamped payload parses");
+        assert_eq!(
+            value["_snapshot"]["date"].as_str(),
+            Some(
+                chrono::Utc::now()
+                    .date_naive()
+                    .format("%Y-%m-%d")
+                    .to_string()
+                    .as_str()
+            ),
+            "the stamp records the fetch date, not the wall clock of a later read"
+        );
+        assert_eq!(
+            convert_litellm(stamped.as_bytes()),
+            convert_litellm(raw),
+            "the meta key must not disturb parsed model entries"
+        );
+        // Re-stamping overwrites a prior date instead of accumulating.
+        let restamped = stamp_snapshot_date(&stamped);
+        let revalue = serde_json::from_str::<Value>(&restamped).expect("restamped parses");
+        assert!(revalue["_snapshot"].is_object());
+        assert!(revalue["_snapshot"]["date"].is_string());
+        // Payloads that cannot be rewritten round-trip verbatim.
+        assert_eq!(stamp_snapshot_date("not json"), "not json");
+        assert_eq!(stamp_snapshot_date("[1,2,3]"), "[1,2,3]");
+    }
+
+    #[test]
+    fn provenance_line_prints_both_dates_when_catalogs_disagree() {
+        // rm-079 doctor disclosure: whatever the precedence verdict, the
+        // line names both snapshot dates whenever they disagree, and the
+        // demo arm consults no host state at all.
+        with_isolated_cache_env(|| {
+            let bundled_date = chrono::NaiveDate::parse_from_str(PRICING_SNAPSHOT_DATE, "%Y-%m-%d")
+                .expect("bundled snapshot date parses");
+            let older = bundled_date - chrono::Duration::days(10);
+            let raw = br#"{"test/older-cache-model":{"input_cost_per_token":9.9e-6,"output_cost_per_token":9.9e-5,"mode":"chat","litellm_provider":"test"}}"#;
+            let path = pricing_cache_path();
+            std::fs::create_dir_all(path.parent().expect("cache parent")).expect("cache dir");
+            std::fs::write(&path, raw).expect("cache seed");
+            // Backdate the cache so the bundled snapshot wins the
+            // precedence verdict — the one case where the line must
+            // spell out BOTH dates.
+            std::fs::File::open(&path)
+                .expect("cache open")
+                .set_modified(SystemTime::from(
+                    older.and_hms_opt(12, 0, 0).expect("noon").and_utc(),
+                ))
+                .expect("backdate cache");
+            let line = pricing_provenance_line(false);
+            assert!(
+                line.contains("newer than the cached catalog from"),
+                "the line says which catalog is served and why: {line}"
+            );
+            assert!(
+                line.contains(&format!("cached catalog snapshot {older} vs bundled")),
+                "both dates must appear when they disagree: {line}"
+            );
+            assert!(
+                line.contains(&format!("bundled snapshot {bundled_date}")),
+                "the bundled side is dated too: {line}"
+            );
+            let demo = pricing_provenance_line(true);
+            assert!(
+                demo.contains("demo") && !demo.contains("vs bundled"),
+                "the demo arm must stay host-independent: {demo}"
             );
         });
     }

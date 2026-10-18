@@ -18,7 +18,12 @@ By default every governance report audits **every** session in scope, and the
 report discloses its coverage: `audited_sessions` / `total_sessions` /
 `excluded_reason` in JSON, and a leading `(auditing N of M sessions)` line in
 text, Markdown, and HTML. `--limit` caps list views only — it never filters
-aggregates. To bound an expensive audit explicitly, use `--sample N`, which
+aggregates, and the capped list views disclose the cap the same way:
+`--sessions` carries `total_matches` + `truncated` in JSON and appends a
+`# showing N of M matching sessions` trailer in text, and `--latest`
+discloses the match-set size (`total_matches` in JSON, a leading
+`(latest of N matching sessions)` line in text). To bound an expensive audit
+explicitly, use `--sample N`, which
 audits the first N sessions of the active `--sort`/`--order` view
 (newest-first by default) and names that view in the exclusion reason, in
 every format.

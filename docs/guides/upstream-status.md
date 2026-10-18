@@ -41,8 +41,9 @@ $ agenttrace --fetch upstream
 It runs `git fetch upstream --quiet` first (refreshing the
 remote-tracking refs — the upstream remote is fetch-only by design) and
 additionally probes the npm registry for `@zack78/agenttrace`, reporting
-the published version against the running build. If the registry probe
-fails (no `curl`, offline, bad response) the report degrades to
+the published version against the running build. The probe runs
+in-process (no external `curl` dependency); if it fails (offline, bad
+response) the report degrades to
 `unavailable (...)` instead of failing.
 
 Like the rest of the CLI, flags follow Go-style placement: they must

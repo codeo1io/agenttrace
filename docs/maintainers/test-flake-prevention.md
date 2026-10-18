@@ -66,3 +66,35 @@ schema-faithful to the producer's documented payload while being disclosed as
 fixtures, not recordings — see `docs/guides/statusline-capture.md` for the
 worked example. A test that passes by under-claiming is preferable to one
 that passes by inventing evidence.
+
+## Rule 6 — Assert absence by construction, never by host luck
+
+Any test that asserts a view renders WITHOUT host-state-derived content (the
+statusline capture journal, the real pricing cache, language preference)
+must manufacture that absence itself. Views lazy-load host state on the first
+render — `ensure_governance` runs inside `terminal.draw`, and the statusline
+snapshot loader resolves the journal from the ambient cache dir — so on a
+host that actually runs the statusline hook, the "no journal" arm reads the
+real `~/.cache/agenttrace/statusline.jsonl` and the assertion fails
+deterministically on that host while CI (and clean-HOME laptops) stay green.
+
+The pattern (see `efficiency_panel_renders_statusline_limits_and_cache_causes`
+in `crates/agenttrace-tui/src/tests.rs`): draw once to let the lazy loader
+finish against whatever the host has, clear the loaded field
+(`app.governance.as_mut().statusline = None`), then draw again and assert on
+the re-render. The loader only runs while its inputs are still missing, so
+the second render cannot resurrect the state — deterministic on every host,
+and it never mutates the process-global cache-dir env that Rule 1's lock
+exists to protect.
+
+Case study (cycle 8 / 2026-10-01, run `e602bb692466`): the test asserted
+"no journal means no statusline block" and passed on an isolated
+`AGENTTRACE_SESSION_CACHE_DIR`, but failed 3/3 under the validation gate's
+real-HOME environment (TUI suite 44/45) because the maintainer workstation
+keeps a 2.4 MB capture journal. Earlier "green" full-suite logs had been
+produced with an isolated cache env, which masked the host dependency
+entirely. The warm-clear-rerender fix made the suite host-independent
+(45/45 × 5 consecutive runs, then 276/276 through the full gate). Lesson on
+top of the rule: before declaring a suite green, run it once under the
+environment the gate actually uses (real `HOME`), not only under the
+isolated env the tests were written in.

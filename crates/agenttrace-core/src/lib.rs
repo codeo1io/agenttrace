@@ -50,8 +50,9 @@ pub use insights::{
 };
 pub use parser::{parse_file, parse_raw_session};
 pub use pricing::{
-    lookup_price, pricing_cache_path, pricing_source, pricing_source_for,
-    render_model_pricing_list, render_test_match, update_pricing,
+    cached_catalog_snapshot_date, http_get_text, lookup_price, pricing_cache_path,
+    pricing_provenance_line, pricing_source, pricing_source_for, render_model_pricing_list,
+    render_test_match, update_pricing,
 };
 pub use reports::{
     add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,

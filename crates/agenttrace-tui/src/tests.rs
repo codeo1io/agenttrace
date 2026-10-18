@@ -1965,6 +1965,23 @@ fn efficiency_panel_renders_statusline_limits_and_cache_causes() {
         .expect("open efficiency panel");
     let backend = TestBackend::new(140, 44);
     let mut terminal = Terminal::new(backend).expect("test terminal");
+    // Hermetic no-journal arm: the panel's lazy snapshot loader
+    // (ensure_governance, reached from presentation) fills mcp/context and
+    // the statusline capture journal during the FIRST render. On a host
+    // that runs the statusline hook that first render loads the real
+    // ~/.cache/agenttrace/statusline.jsonl, so warm the snapshot once,
+    // then clear the loaded insights (the same field the injection arm
+    // below writes) and re-render for the assertion. The lazy loader only
+    // runs while mcp/context are still missing, so the re-render cannot
+    // resurrect a journal: deterministic on every host, and no mutation of
+    // the process-global cache-dir env the parallel cache tests rely on.
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("warm efficiency panel snapshot");
+    app.governance
+        .as_mut()
+        .expect("governance initialized")
+        .statusline = None;
     terminal
         .draw(|frame| render(frame, &mut app))
         .expect("render efficiency panel");

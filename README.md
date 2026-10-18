@@ -156,7 +156,10 @@ agenttrace -f json sessions.jsonl    # -f json works
 ```
 
 `--limit` caps list views only (for example the overview's `recent_sessions`);
-it never filters aggregates, audit totals, or recommendations. Governance
+it never filters aggregates, audit totals, or recommendations. Bounded views
+disclose their bound: `--sessions` appends a `# showing N of M matching
+sessions` line in text and carries `total_matches` + `truncated` fields in
+JSON, and `--latest` says how many sessions the filters matched. Governance
 reports are unbounded by default — use `--sample N` for an explicitly
 disclosed bound.
 

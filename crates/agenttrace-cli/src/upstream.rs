@@ -17,8 +17,10 @@
 //! from the network. `--fetch` (`agenttrace --fetch upstream`) refreshes
 //! the remote-tracking refs first via `git fetch` and additionally probes
 //! the npm registry; both network touches happen only behind that
-//! explicit flag. No new crate dependencies: `git` (and optionally
-//! `curl`) run as subprocesses, so the CLI crate stays network-free.
+//! explicit flag. No new crate dependencies: `git` runs as a subprocess,
+//! and the registry probe goes through agenttrace-core's in-process
+//! HTTP client (rm-081) — no external `curl` — so the CLI crate adds no
+//! network machinery of its own.
 
 use anyhow::{anyhow, bail};
 use serde_json::json;
@@ -26,7 +28,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 const DEFAULT_REMOTE: &str = "upstream";
 const DEFAULT_REF: &str = "master";
@@ -88,10 +90,12 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
     let remote = remote_name();
     let ref_name = ref_name();
 
-    // Fail fast with the same hints scripts/upstream-delta gives.
-    if git(&["rev-parse", "--show-toplevel"]).is_err() {
-        bail!("not inside a git repository");
-    }
+    // Fail fast with the same hints scripts/upstream-delta gives. The
+    // preflight separates "git could not even be spawned" from
+    // "spawned fine, cwd is not a work tree" (rm-081): a valid
+    // checkout with git absent from PATH used to be misreported as
+    // "not inside a git repository".
+    repository_preflight()?;
     let remote_url = match git(&["remote", "get-url", &remote]) {
         Ok(url) => url,
         Err(_) => bail!("no '{remote}' remote configured (git remote add {remote} <url>)"),
@@ -154,7 +158,10 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
     let npm_state = if fetch {
         match npm_registry_version() {
             Some(version) => format!("{NPM_PACKAGE}@{version} (registry)"),
-            None => "unavailable (registry probe failed or curl absent)".to_string(),
+            // rm-081: the probe is in-process now, so "curl absent" is
+            // no longer a failure mode. Distinguishing WHY an in-process
+            // probe failed stays rm-052's lane (npm state split).
+            None => "unavailable (registry probe failed)".to_string(),
         }
     } else {
         "unknown (offline; agenttrace --fetch upstream)".to_string()
@@ -193,6 +200,47 @@ fn fetch_remote(remote: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Outcome of the repository preflight probe.
+#[derive(Debug, PartialEq)]
+enum RepoProbe {
+    /// The git binary could not be spawned at all (absent from PATH,
+    /// not executable). Distinct from a genuine non-repository cwd —
+    /// conflating the two misdiagnosed valid checkouts (rm-081).
+    GitUnavailable(String),
+    /// git ran and reported this cwd is not inside a work tree.
+    NotARepository,
+    /// Inside a work tree; the payload is `rev-parse --show-toplevel`.
+    WorkTree(String),
+}
+
+fn repo_probe(spawn: Result<std::process::Output, std::io::Error>) -> RepoProbe {
+    match spawn {
+        Err(err) => RepoProbe::GitUnavailable(err.to_string()),
+        Ok(output) if !output.status.success() => RepoProbe::NotARepository,
+        Ok(output) => {
+            RepoProbe::WorkTree(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+    }
+}
+
+/// rm-081: the repository preflight behind `agenttrace upstream`.
+/// "git absent from PATH" gets its own actionable diagnosis instead of
+/// the old blanket "not inside a git repository".
+fn repository_preflight() -> anyhow::Result<()> {
+    let probe = repo_probe(
+        Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .output(),
+    );
+    match probe {
+        RepoProbe::WorkTree(_) => Ok(()),
+        RepoProbe::GitUnavailable(err) => bail!(
+            "git is not available ({err}); 'agenttrace upstream' drives the git CLI — install git or extend PATH"
+        ),
+        RepoProbe::NotARepository => bail!("not inside a git repository"),
+    }
 }
 
 /// Runs git and returns trimmed stdout; errors carry the command and a
@@ -310,19 +358,21 @@ fn mtime_age(path: &std::path::Path) -> Option<u64> {
         .map(|age| age.as_secs())
 }
 
-/// npm registry probe behind `--fetch` only. Degrades to `None` (never
-/// fails the report) when curl is absent or the registry answers badly.
+/// npm registry probe behind `--fetch` only. In-process through the
+/// same ureq client the pricing fetch uses (rm-081) — no external curl
+/// dependency, same bounded timeout — so a PATH without curl can no
+/// longer report the registry as unavailable. Degrades to `None`
+/// (never fails the report) when the registry answers badly.
 fn npm_registry_version() -> Option<String> {
-    let output = Command::new("curl")
-        .args(["-fsSL", "--max-time", "15", NPM_REGISTRY_URL])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let body =
-        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&output.stdout)).ok()?;
-    body.get("version")?.as_str().map(str::to_string)
+    let body = agenttrace_core::http_get_text(NPM_REGISTRY_URL, Duration::from_secs(15)).ok()?;
+    npm_version_from_body(&body)
+}
+
+/// Pure parsing half of the registry probe, split out for hermetic
+/// tests: pull the `version` field out of a registry document.
+fn npm_version_from_body(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    value.get("version")?.as_str().map(str::to_string)
 }
 
 fn age_phrase(seconds: Option<u64>) -> String {
@@ -582,5 +632,93 @@ mod tests {
         assert_eq!(age_phrase(Some(120)), "2min old");
         assert_eq!(age_phrase(Some(7_200)), "2h old");
         assert_eq!(age_phrase(Some(172_800)), "2d old");
+    }
+
+    #[test]
+    fn npm_version_from_body_parses_registry_documents() {
+        // rm-081: the parsing half of the in-process registry probe,
+        // hermetic — no network, no curl.
+        assert_eq!(
+            npm_version_from_body(r#"{"name":"@zack78/agenttrace","version":"0.42.0"}"#),
+            Some("0.42.0".to_string())
+        );
+        assert_eq!(npm_version_from_body("not json"), None);
+        assert_eq!(
+            npm_version_from_body(r#"{"name":"@zack78/agenttrace"}"#),
+            None
+        );
+        assert_eq!(npm_version_from_body(r#"{"version":42}"#), None);
+    }
+
+    #[test]
+    fn repo_probe_classifies_spawn_failure_as_git_unavailable() {
+        // rm-081 arm 1, fully hermetic: a real spawn failure (the exact
+        // io::Error a PATH without git produces) must classify as
+        // GitUnavailable, never as NotARepository.
+        let missing_binary = Command::new("agenttrace-git-probe-nonexistent")
+            .args(["rev-parse", "--show-toplevel"])
+            .output();
+        match repo_probe(missing_binary) {
+            RepoProbe::GitUnavailable(_) => {}
+            other => panic!("spawn failure misclassified as {other:?}"),
+        }
+        // Same classification for a synthetic spawn error (portable).
+        assert!(matches!(
+            repo_probe(Err(std::io::Error::from_raw_os_error(2))),
+            RepoProbe::GitUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn repo_probe_classifies_git_exit_failure_as_not_a_repository() {
+        // rm-081 arm 2: git ran fine and said "not a work tree" — the
+        // only outcome that may report "not inside a git repository".
+        // Run real git from a pristine temp directory so the exit path
+        // is exercised exactly as production sees it.
+        let temp =
+            std::env::temp_dir().join(format!("agenttrace-repo-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).expect("temp dir");
+        let probe = repo_probe(
+            Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .current_dir(&temp)
+                .output(),
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+        match probe {
+            RepoProbe::NotARepository => {}
+            // Hosts without a git binary skip the live arm — the spawn
+            // arm above already covers that classification.
+            RepoProbe::GitUnavailable(_) => {}
+            RepoProbe::WorkTree(toplevel) => {
+                panic!("pristine temp dir {temp:?} classified as work tree {toplevel}")
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn git_absent_from_path_is_not_reported_as_not_a_repository() {
+        // Assess F2 live repro, hermetic: a VALID checkout (this test
+        // runs inside one) with git scrubbed from the child's PATH must
+        // diagnose "git unavailable" — the old code called this exact
+        // state "not inside a git repository". The PATH override is
+        // scoped to the spawned probe; this process's env is untouched.
+        let probe = Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .env("PATH", "/nonexistent-agenttrace-probe")
+            .current_dir(std::env::current_dir().expect("cwd"))
+            .output();
+        match repo_probe(probe) {
+            RepoProbe::GitUnavailable(_) => {}
+            RepoProbe::WorkTree(toplevel) => panic!(
+                "PATH scrub ignored by the platform — probe found git via {toplevel}; \
+                 drop this test or use an absolute missing binary"
+            ),
+            RepoProbe::NotARepository => {
+                panic!("valid checkout + absent git misreported as not a repository")
+            }
+        }
     }
 }

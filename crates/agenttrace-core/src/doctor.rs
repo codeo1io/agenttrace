@@ -29,9 +29,9 @@ pub struct DoctorReport {
     /// command; the journal is the only local source of subscription
     /// limit pressure and upstream prompt-cache analytics.
     pub statusline: DoctorStatuslineReport,
-    /// Offline pricing catalog provenance (cycle 7 R1): the bundled
-    /// snapshot's date, model count, and age, so reports can disclose
-    /// how current the prices behind `cost_estimated` are.
+    /// Pricing catalog provenance (cycle 7 R1 + rm-079): which catalog
+    /// the process serves, its snapshot date, and BOTH dates whenever
+    /// the cached and bundled catalogs disagree on freshness.
     pub pricing: String,
     pub recommendations: Vec<String>,
 }
@@ -128,12 +128,9 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         session_files: files.len(),
         directories: doctor_directories(dir, &files, &sqlite_sessions),
         statusline: doctor_statusline_report(demo),
-        pricing: format!(
-            "LiteLLM snapshot {} (bundled, {} models, {} days old)",
-            crate::pricing::bundled_snapshot_date(),
-            crate::pricing::bundled_snapshot_model_count(),
-            crate::pricing::bundled_snapshot_age_days().unwrap_or(-1)
-        ),
+        // rm-079: which catalog the process serves, plus BOTH dates
+        // whenever the cached and bundled catalogs disagree.
+        pricing: crate::pricing::pricing_provenance_line(demo),
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
