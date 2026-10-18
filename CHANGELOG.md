@@ -4,6 +4,29 @@
 
 ### Added
 
+- priority-tier pricing now bills the published priority rate, and codex `fast` bills the
+  community-published multiplier table (rm-1556 fused with rm-1538, run 1fb75154 cycle 4):
+  the bundled LiteLLM snapshot refreshed to 2026-10-17 (3,237 keys, up from 3,130; the
+  2026-10-08 bundle predates 25 material in/out price changes and 162 new text models),
+  and with it the new `input_cost_per_token_priority`/`output_cost_per_token_priority`
+  (plus cache-variant) tier family - live on 275 bundled keys, a consistent 2x of
+  standard on the OpenAI families (gpt-5.5/5.6/6 classes, o-series, grok-5).
+  `service_tier: "priority"` turns now bill that published row instead of silently
+  falling back to standard (azure/gpt-5.6-luna priority turns priced 2x, matching the
+  vendor catalog). Codex `service_tier: "fast"` bills a mirrored multiplier table -
+  transcribed verbatim from the ccusage #1855 override set (v20.0.29, 2026-10-10:
+  gpt-5.5 2.5x; gpt-5.6/-sol/-terra/-luna and the gpt-6 sol/astra families 2x;
+  claude-opus-4-8/4-7/4-6 dated variants 2x/6x/6x by family prefix) - and every model
+  outside the table keeps the standard rate, disclosed rather than guessed. Absent or
+  zero-published priority slots still bill standard (the flex/ultrafast discipline,
+  test-pinned for zero-vs-absent parity), and the 2026-10-17 catalog's 0-to-absent churn
+  on cache-cost fields is pinned to bill identically (no separate cache rate either way).
+  The retained-from-previous union keeps all 466 keys the new catalog dropped, so no
+  previously-priced session goes unpriced across the refresh (the drops stay flagged by
+  drift-check's fail-closed removal guard until per-key adjudication). SVG card goldens
+  regenerated for the new snapshot label (UPDATE_CARD_GOLDEN), and the corpus-anchor
+  test now scans data axes only - the pricing-footer label legitimately carries the
+  bundle date, which equals today's wall date on the very day a snapshot ships.
 - terminal-spoofing sanitization covers the invisible zero-width Cf family, and the
   machine lanes stay lossless (rm-933 slice 3, run ff7615be cycle 3; review fix 6f85e2c9): the shared
   predicate split into directional (`is_bidi_format_control`, unchanged set) and
@@ -423,6 +446,27 @@
 
 ### Fixed
 
+- the `--latest` docs no longer promise combinations the gate rejects (rm-1560, run
+  1fb75154 cycle 4, assess F1): the clap help and README row claimed `--latest`
+  "works with `--waste` and report actions" while the runtime gate has only ever
+  accepted `--diagnostics` and `--inspect` (measured: `--waste --latest` RC=1). Both
+  surfaces now state the gated truth, the gate is pinned by an RC-table unit test,
+  and check-docs-commands.sh gained a flag-combination arm so this class of drift
+  goes red in CI. Same pass, the `--lang` clap doc now carries the same
+  partial-coverage caveat the README documents (rm-085 fold, assess F2): zh is
+  honored by the single-session report, `--diagnostics`, `--inspect`, `--latest`,
+  `--waste`, `--compare`, and the TUI - the corpus rollups and quota/search/governance
+  text lanes render English-only.
+- the invisible math operators no longer ride raw through rendered cells (rm-933
+  follow-up, run 1fb75154 cycle 4, assess F3): U+2061 function application, U+2062
+  invisible times, U+2063 invisible separator, and U+2064 invisible plus - zero-width
+  Cf with no orthographic role - were od-verified passing byte-for-byte through the
+  `--sessions` TSV/CSV name cells at b894d2c, the same cell-gluing spoofing class the
+  rm-933 widening arm closed for ZWJ/ZWNJ. They now substitute U+FFFD at both render
+  boundaries (line-segment and document passes); U+00AD soft hyphen stays deliberately
+  raw (legitimate typography, test-pinned residue), and the JSON lane's escape
+  carve-out is unchanged - binary-verified post-fix: 0 raw E2 81 A2 in output, 4
+  U+FFFD substitutions, soft hyphen preserved.
 - The install-runtime gate no longer hardcodes the installer's pinned default ref (assess F1, run 79fe78c0 cycle 3, batch "canonical CI truth"; adoption of salvage 9b2a7a1 U4 — the identical derive-from-install.sh shape was executed in parallel by sibling run `a64735b75a46` cycle 3 and folds here by title, one entry): `scripts/ci/check-install-runtime.sh` grepped the literal `^ref=v0.9.0$` (test D) plus `^clone --branch v0.9.0$` and `pinned ref v0.9.0` (test E) while install.sh's `AGENTTRACE_SOURCE_REF` default has been `v0.10.1` since 2026-10-05 — so the wired `Install runtime verification` CI lane was permanently red, masking every future regression it exists to catch. The gate now DERIVES the expected default from install.sh's own `REF="${AGENTTRACE_SOURCE_REF:-…}"` line and fails loudly if that line moves or changes shape: tests D and E track the pin by construction, and every future bump stays green-or-loud instead of silently re-staling. The default lanes also pin `AGENTTRACE_SOURCE_REF` empty (rm-1394 acceptance 4, review 6cbb259b F2): an operator's ambient export otherwise leaked through `env` into install.sh, the receipt recorded the override, and the derived-default assertion false-reds — the override lanes stay covered deliberately by tests F/H/I. The installer itself is untouched — the pin was always the correct side (it matches the newest release, which `check-install-ref-drift.sh` already ties to the newest CHANGELOG heading).
 - `--fetch` before the `statusline`/`mcp` keywords now fails loudly instead of
   being silently swallowed (rm-558, run aa36ecb0 cycle 3): the offline

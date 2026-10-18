@@ -126,8 +126,9 @@ struct Args {
     /// the directory and the requested target (rm-784).
     #[arg(short = 'o')]
     output: Option<PathBuf>,
-    /// Restrict the view to the single most recent session (works with
-    /// `--waste` and report actions).
+    /// Restrict the view to the single most recent session (combines
+    /// only with `--diagnostics` and `--inspect`; it is rejected
+    /// alongside any other report action, including `--waste`).
     #[arg(long)]
     latest: bool,
     /// Render the token-waste report: redundant context, loop cost,
@@ -242,6 +243,11 @@ struct Args {
     #[arg(long = "no-baseline-gate")]
     no_baseline_gate: bool,
     /// Report language for text and TUI surfaces: en (default) or zh.
+    /// Partial coverage (rm-085): honored by the single-session report
+    /// (bare `agenttrace FILE`), `--diagnostics`, `--inspect`,
+    /// `--latest`, `--waste`, `--compare`, and the TUI; the corpus
+    /// rollups (`--overview`, `--sessions`) and the quota, `--search`,
+    /// insights, and governance text lanes render English-only for now.
     #[arg(long = "lang", default_value = "en", value_name = "en|zh")]
     lang: String,
     /// Time range filter for every report: today, 7d, 30d, or all
@@ -4491,6 +4497,30 @@ mod tests {
                 OsString::from("--no-baseline-gate"),
             ]
         );
+    }
+
+    #[test]
+    fn latest_combination_gate_matches_its_documented_rc_table() {
+        // rm-1560 (cycle-4, assess F1): the clap doc and README now claim
+        // "(combines only with `--diagnostics` and `--inspect`)". This
+        // table is the gate truth that claim is written against — if
+        // either drifts, this goes red instead of shipping a stale
+        // claim. `--waste` and every other report action are rejected.
+        let cases: &[(&[&str], bool)] = &[
+            (&["agenttrace", "--demo", "--diagnostics", "--latest"], true),
+            (
+                &["agenttrace", "--demo", "--latest", "--inspect", "1"],
+                true,
+            ),
+            (&["agenttrace", "--demo", "--waste", "--latest"], false),
+            (&["agenttrace", "--demo", "--overview", "--latest"], false),
+            (&["agenttrace", "--demo", "--sessions", "--latest"], false),
+            (&["agenttrace", "--demo", "--latest", "--compare"], false),
+        ];
+        for (argv, ok) in cases {
+            let args = Args::try_parse_from(argv.to_vec()).expect("argv parses");
+            assert_eq!(validate_primary_action(&args).is_ok(), *ok, "argv {argv:?}");
+        }
     }
 
     #[test]
