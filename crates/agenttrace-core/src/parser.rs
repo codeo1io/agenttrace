@@ -1461,13 +1461,63 @@ struct AntigravityModelId {
 }
 
 /// rm-1864: numeric model ids observed in the wild and their proven
-/// model names. 1417 → gemini-4-argon is ccusage v20.0.34's first-party
-/// mapping (PR #1894, 2026-10-15); further ids arrive weekly (ccusage
-/// #1897 reports 1277/1050 unmapped). The map fixes IDENTITY only —
-/// pricing still rides the catalog's normal lookup, so a mapped id whose
-/// model is absent from the catalog degrades through the disclosed
-/// unknown-model path rather than this table inventing a price.
-const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[(1417, "gemini-4-argon")];
+/// model names. The table is ccusage's map of record (PR #1894,
+/// 2026-10-15; `model_name_from_id` in their rust antigravity adapter)
+/// extended 2026-10-18 with the answer PRs #1905 (1417|1418|1419 →
+/// gemini-4-argon; effort variants collapse to the same base model)
+/// and #1902 (1050 → gemini-3.1-flash-lite, the model subagent STEP
+/// rows bill on while the main thread bills the flagship). 1277 stays
+/// unmapped upstream (ccusage #1897) and is deliberately absent. The
+/// map fixes IDENTITY only — pricing still rides the catalog's normal
+/// lookup, so a mapped id whose model is absent from the catalog
+/// degrades through the disclosed unknown-model path rather than this
+/// table inventing a price.
+const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
+    (1050, "gemini-3.1-flash-lite"),
+    (246, "gemini-2.5-pro"),
+    (312, "gemini-2.5-flash"),
+    (313, "gemini-2.5-flash-thinking"),
+    (329, "gemini-2.5-flash-thinking"),
+    (330, "gemini-2.5-flash-lite"),
+    (281, "claude-4-sonnet"),
+    (282, "claude-4-sonnet"),
+    (290, "claude-4-opus"),
+    (291, "claude-4-opus"),
+    (333, "claude-4.5-sonnet"),
+    (334, "claude-4.5-sonnet"),
+    (340, "claude-4.5-haiku"),
+    (341, "claude-4.5-haiku"),
+    (342, "model_openai_gpt_oss_120b_medium"),
+    (1071, "gemini-3.6-flash-high"),
+    (1072, "gemini-3.6-flash-medium"),
+    (1073, "gemini-3.6-flash-low"),
+    (1298, "gemini-3.7-flash-high"),
+    (1299, "gemini-3.7-flash-medium"),
+    (1300, "gemini-3.7-flash-low"),
+    (1318, "gemini-3.8-flash-high"),
+    (1319, "gemini-3.8-flash-medium"),
+    (1320, "gemini-3.8-flash-low"),
+    (1417, "gemini-4-argon"),
+    (1418, "gemini-4-argon"),
+    (1419, "gemini-4-argon"),
+];
+
+/// rm-1533 extension (2026-10-18, ccusage #1905): antigravity also
+/// emits placeholder SPELLINGS for the effort arms of gemini-4-argon
+/// (`model_placeholder_m41x`). Identity-only, same precedence as the
+/// numeric map — an explicit display name on the row always wins.
+const ANTIGRAVITY_MODEL_STRING_ALIASES: &[(&str, &str)] = &[
+    ("model_placeholder_m417", "gemini-4-argon"),
+    ("model_placeholder_m418", "gemini-4-argon"),
+    ("model_placeholder_m419", "gemini-4-argon"),
+];
+
+fn antigravity_model_string_alias(text: &str) -> Option<&'static str> {
+    ANTIGRAVITY_MODEL_STRING_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == text)
+        .map(|(_, model)| *model)
+}
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
 /// number, but the float spelling stringifies as `"1417.0"` — the
@@ -1518,7 +1568,11 @@ fn antigravity_model_id(obj: &Map<String, Value>) -> Option<AntigravityModelId> 
                 })
                 .unwrap_or(raw)
         } else {
-            raw
+            // rm-1533: placeholder effort spellings resolve to their
+            // base model (identity only); anything else stays raw.
+            antigravity_model_string_alias(raw.as_str())
+                .map(|model| model.to_string())
+                .unwrap_or(raw)
         };
         Some(AntigravityModelId { display, numeric })
     })
@@ -10699,6 +10753,75 @@ mod tests {
         let line = r#"{"a":"\\ud800","b":"\ud800"}"#;
         let repaired = repair_lone_surrogates(line).expect("real lone surrogate still repairs");
         assert_eq!(repaired, r#"{"a":"\\ud800","b":"\ufffd"}"#);
+    }
+
+    #[test]
+    fn antigravity_numeric_map_resolves_the_extended_id_table() {
+        // rm-1993 / rm-1533 (2026-10-18): the ccusage map of record plus
+        // the 2026-10-15 answer PRs — #1905 (1417|1418|1419 →
+        // gemini-4-argon; effort variants collapse to the same base) and
+        // #1902 (1050 → gemini-3.1-flash-lite, what subagent STEP rows
+        // bill on while the main thread bills the flagship).
+        let cases: &[(i64, &str)] = &[
+            (1417, "gemini-4-argon"),
+            (1418, "gemini-4-argon"),
+            (1419, "gemini-4-argon"),
+            (1050, "gemini-3.1-flash-lite"),
+            (246, "gemini-2.5-pro"),
+            (312, "gemini-2.5-flash"),
+            (330, "gemini-2.5-flash-lite"),
+            (281, "claude-4-sonnet"),
+            (290, "claude-4-opus"),
+            (333, "claude-4.5-sonnet"),
+            (340, "claude-4.5-haiku"),
+            (342, "model_openai_gpt_oss_120b_medium"),
+            (1071, "gemini-3.6-flash-high"),
+            (1298, "gemini-3.7-flash-high"),
+            (1319, "gemini-3.8-flash-medium"),
+        ];
+        for (id, model) in cases {
+            let mut obj = Map::new();
+            obj.insert("modelConfigId".into(), serde_json::json!(id));
+            let resolved =
+                antigravity_model_id(&obj).unwrap_or_else(|| panic!("id {id} must resolve"));
+            assert_eq!(resolved.display, *model, "id {id}");
+            assert!(resolved.numeric, "id {id} stays flagged numeric");
+        }
+
+        // Unmapped ids stay RAW + numeric (never a guess): ccusage #1897
+        // reports 1277 unmapped upstream, and the map deliberately
+        // omits it.
+        let mut obj = Map::new();
+        obj.insert("modelConfigId".into(), serde_json::json!(1277));
+        let unresolved = antigravity_model_id(&obj).expect("raw numeric id still resolves");
+        assert_eq!(unresolved.display, "1277");
+        assert!(unresolved.numeric);
+    }
+
+    #[test]
+    fn antigravity_placeholder_effort_spellings_resolve_to_the_base_model() {
+        // rm-1533 extension (ccusage #1905): antigravity also emits
+        // placeholder SPELLINGS for the effort arms of gemini-4-argon.
+        // Identity-only — the resolved name must be the base model, and
+        // any OTHER string stays exactly as recorded.
+        for spelling in [
+            "model_placeholder_m417",
+            "model_placeholder_m418",
+            "model_placeholder_m419",
+        ] {
+            let mut obj = Map::new();
+            obj.insert("model".into(), serde_json::json!(spelling));
+            let resolved = antigravity_model_id(&obj)
+                .unwrap_or_else(|| panic!("{spelling} must resolve"));
+            assert_eq!(resolved.display, "gemini-4-argon", "{spelling}");
+            assert!(!resolved.numeric);
+        }
+
+        let mut obj = Map::new();
+        obj.insert("model".into(), serde_json::json!("claude-opus-4-5"));
+        let raw = antigravity_model_id(&obj).expect("ordinary string id resolves");
+        assert_eq!(raw.display, "claude-opus-4-5");
+        assert!(!raw.numeric);
     }
 
     #[test]

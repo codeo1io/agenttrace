@@ -39,6 +39,15 @@ pub struct CostAudit {
     /// reasons about.
     #[serde(skip_serializing_if = "usize_is_zero")]
     pub aborted_sessions: usize,
+    /// rm-1996: sessions whose stored cost estimate was non-finite
+    /// (NaN/±inf) — excluded from the cost totals above and censused
+    /// here instead of folding into them: the old plain `.sum()` let a
+    /// single poisoned session null the whole `total_estimated_cost` /
+    /// `stored_estimated_cost_usd` pair through serde with no
+    /// disclosure. Mirrors the compute_overview lane's
+    /// non_finite_costs posture (rm-600 / cost_non_finite_contract).
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub non_finite_cost_sessions: usize,
     pub stored_estimated_cost_usd: f64,
     pub current_estimated_cost_usd: Option<f64>,
     pub pricing_coverage: PricingCoverage,
@@ -741,12 +750,20 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             }
         })
         .collect::<Vec<_>>();
-    let stored_estimated_cost_usd = round4(
-        sessions
-            .iter()
-            .map(|session| session.metrics.cost_estimated)
-            .sum(),
-    );
+    // rm-1996: exclude non-finite stored estimates from the fold with a
+    // named census — never fold them (a NaN sum nulls every total it
+    // touches) and never invent a replacement value for them.
+    let mut non_finite_cost_sessions = 0usize;
+    let mut stored_estimated_cost = 0.0f64;
+    for session in sessions {
+        let cost = session.metrics.cost_estimated;
+        if cost.is_finite() {
+            stored_estimated_cost += cost;
+        } else {
+            non_finite_cost_sessions += 1;
+        }
+    }
+    let stored_estimated_cost_usd = round4(stored_estimated_cost);
     let current_estimated_cost_usd = by_provider_model
         .iter()
         .try_fold(0.0, |total, row| {
@@ -770,6 +787,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         total_estimated_cost: stored_estimated_cost_usd,
         clamped_values,
         aborted_sessions,
+        non_finite_cost_sessions,
         stored_estimated_cost_usd,
         current_estimated_cost_usd,
         pricing_coverage: coverage,

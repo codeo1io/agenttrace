@@ -536,6 +536,23 @@ fn transcript_evidence(
         return (Vec::new(), "skipped: unreadable".to_string());
     }
     let read = bytes.len() as u64;
+    // rm-1993: the stat length gates admission, but the READ length
+    // settles the ledger. A file whose read returns more than stat
+    // reported — a procfs-style entry claiming st_size 0 with real
+    // content, or a live journal appended between the metadata call and
+    // the read — must skip with disclosure through the same budget-skip
+    // family, never underflow the budget: debug builds would panic on
+    // the subtract and release builds would wrap, silently unbounding
+    // the remaining scan (the exact bounded-I/O contract rm-1415
+    // landed to uphold against hostile corpora).
+    if read > *budget_left {
+        scan.skipped_budget += 1;
+        *budget_left = 0;
+        return (
+            Vec::new(),
+            format!("skipped: read overran the remaining budget (stat {len}, read {read}; budget saturated)"),
+        );
+    }
     *budget_left -= read;
     scan.scanned_files += 1;
     scan.scanned_bytes += read;

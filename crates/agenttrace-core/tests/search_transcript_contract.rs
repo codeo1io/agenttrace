@@ -189,3 +189,81 @@ fn blank_queries_still_match_nothing_in_the_detailed_lane() {
     }
     assert_eq!(search_sessions(&[session], "   ", 20).len(), 0);
 }
+#[test]
+fn stat_lie_read_overrun_saturates_the_budget_and_skips_with_disclosure() {
+    // rm-1993: the stat length gates admission but the READ length
+    // settles the ledger. /proc/self/cmdline reports st_size 0 with real
+    // content — the exact divergence that used to hit
+    // `*budget_left -= read` on an exhausted budget (debug panic
+    // "attempt to subtract with overflow"; release wrap silently
+    // unbounding the scan). The overrun must skip with disclosure and
+    // saturate the budget at zero, and the ordinary file AFTER it must
+    // be budget-skipped, never admitted past the cap.
+    let dir = std::env::temp_dir().join(format!("at-search-stat-lie-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let ordinary = dir.join("s1.jsonl");
+    std::fs::write(&ordinary, "needle-stat-lie\n").expect("write ordinary file");
+
+    let overran = session_with_path("/proc/self/cmdline");
+    let after_it = session_with_path(&ordinary.to_string_lossy());
+    let report = search_sessions_detailed(
+        &[overran, after_it],
+        "needle-stat-lie",
+        10,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        0, // exhausted budget: stat 0 > 0 is false, so the read overruns
+    );
+
+    assert!(
+        report.results.is_empty(),
+        "no content may be admitted from an overran budget"
+    );
+    assert_eq!(
+        report.scan.skipped_budget, 2,
+        "the overran file AND the after-it ordinary file must both land in the budget-skip family"
+    );
+    assert_eq!(report.scan.scanned_files, 0, "nothing was actually scanned");
+    let summary = report.scan.describe().expect("summary renders");
+    assert!(
+        summary.contains("2 skipped: read budget exhausted"),
+        "the overrun skip must surface in the disclosure summary: {summary}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stat_lie_overran_file_never_panics_and_never_unbounds_a_partial_budget() {
+    // rm-1993 release-mode shape: with a PARTIAL budget larger than the
+    // procfs stat (0) but smaller than the read, the budget must clamp
+    // to zero — never wrap past the cap — and the scan still discloses.
+    let report = search_sessions_detailed(
+        &[session_with_path("/proc/self/cmdline")],
+        "anything",
+        10,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        1, // stat 0 <= 1 admits; the read (~tens of bytes) overruns 1
+    );
+    assert!(report.results.is_empty());
+    assert_eq!(report.scan.skipped_budget, 1);
+    assert_eq!(report.scan.scanned_files, 0);
+}
+
+/// rm-1993 test helper: a session shell pointing at an arbitrary path —
+/// the transcript lane only reads `path`, so the shell stays minimal.
+fn session_with_path(path: &str) -> agenttrace_core::Session {
+    use agenttrace_core::{Diagnostics, Metrics, Session};
+    Session {
+        org: String::new(),
+        org_email: String::new(),
+        name: "stat-lie-shell".to_string(),
+        path: path.to_string(),
+        cwd: String::new(),
+        branch: String::new(),
+        metrics: Metrics::default(),
+        anomalies: Vec::new(),
+        health: 100,
+        tool_warnings: Vec::new(),
+        diagnostics: Diagnostics::default(),
+    }
+}

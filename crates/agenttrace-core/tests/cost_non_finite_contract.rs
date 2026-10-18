@@ -177,3 +177,61 @@ fn overview_render_lanes_disclose_the_excluded_cost_sessions() {
             ..(json.find("\"summary\"").map(|i| i + 400).unwrap_or(400)).min(json.len())]
     );
 }
+
+/// rm-1996 contract — the --audit lane must uphold the same
+/// exclude-and-disclose posture as compute_overview. The old plain
+/// `.sum()` folded a non-finite cost into `stored_estimated_cost_usd`
+/// (and its mirrored `total_estimated_cost`), nulling the totals
+/// through serde with zero disclosure.
+#[test]
+fn cost_audit_excludes_non_finite_costs_with_a_named_census() {
+    use agenttrace_core::cost_audit;
+
+    let clean = demo_sessions().expect("demo sessions parse");
+    let clean_total: f64 = clean.iter().map(|s| s.metrics.cost_estimated).sum();
+
+    let sessions = sessions_with_one_poisoned_cost();
+    let audit = cost_audit(&sessions);
+
+    assert!(
+        audit.stored_estimated_cost_usd.is_finite(),
+        "the poisoned session must not fold into the audit total (got {})",
+        audit.stored_estimated_cost_usd
+    );
+    assert!(
+        (audit.stored_estimated_cost_usd
+            - (clean_total - clean[clean.len() - 1].metrics.cost_estimated))
+            .abs()
+            < 1e-6,
+        "the audit total must be the finite remainder"
+    );
+    assert_eq!(
+        audit.non_finite_cost_sessions, 1,
+        "the poisoned session must be censused, not silently dropped"
+    );
+
+    // The document must carry no null totals and must carry the census.
+    let json = serde_json::to_value(&audit).expect("audit serializes");
+    assert!(
+        json.get("stored_estimated_cost_usd").unwrap().is_f64(),
+        "serde must render a finite total, not null"
+    );
+    assert!(
+        json.get("non_finite_cost_sessions").is_some(),
+        "the census key must be present when non-zero"
+    );
+}
+
+#[test]
+fn cost_audit_zero_census_stays_silent_on_clean_corpora() {
+    use agenttrace_core::cost_audit;
+
+    let clean = demo_sessions().expect("demo sessions parse");
+    let audit = cost_audit(&clean);
+    assert_eq!(audit.non_finite_cost_sessions, 0);
+    let json = serde_json::to_value(&audit).expect("audit serializes");
+    assert!(
+        json.get("non_finite_cost_sessions").is_none(),
+        "a clean corpus keeps the audit document unchanged in shape"
+    );
+}
