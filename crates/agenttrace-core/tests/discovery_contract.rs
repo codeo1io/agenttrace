@@ -4453,3 +4453,56 @@ fn antigravity_sibling_roots_are_discovered_and_disclosed() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+// rm-1562: `-d DIR` used to walk json/jsonl only, so a RELOCATED
+// opencode store (the db copied out of ~/.local/share/opencode)
+// read as "No session files found" — live research host: 310
+// sessions invisible to `-d`. A v2-schema db planted directly under
+// the requested dir must load find→parse→usage-fold end-to-end.
+#[test]
+fn explicit_dir_ingests_relocated_opencode_db() {
+    let root = temp_root("agenttrace-explicit-dir-sqlite");
+    let home = root.join("home");
+    let store_dir = root.join("relocated-store");
+    fs::create_dir_all(&store_dir).expect("create relocated store dir");
+
+    let db = store_dir.join("opencode.db");
+    let connection = Connection::open(&db).expect("create planted db");
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                title TEXT,
+                directory TEXT,
+                cost REAL DEFAULT 0,
+                tokens_input INTEGER DEFAULT 0,
+                tokens_output INTEGER DEFAULT 0,
+                model TEXT DEFAULT 'default',
+                time_created INTEGER,
+                time_updated INTEGER
+            );
+            INSERT INTO session (id, title, directory, tokens_input, tokens_output, time_created, time_updated)
+            VALUES ('sess_relocated', 'Relocated store', '/zzz-relocated-cwd', 111, 222, 1764750000000, 1764750060000);
+            "#,
+        )
+        .expect("seed planted v2 store");
+    connection.close().expect("close planted db");
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(Some(&store_dir));
+        assert_eq!(
+            sessions.len(),
+            1,
+            "an empty-of-json dir holding only a sqlite store must yield its sessions"
+        );
+        let session = &sessions[0];
+        assert_eq!(session.name, "Relocated store");
+        assert_eq!(session.cwd, "/zzz-relocated-cwd");
+        assert!(session.metrics.tokens_input >= 111);
+        assert!(session.metrics.tokens_output >= 222);
+    });
+
+    let _ = fs::remove_dir_all(&root);
+}

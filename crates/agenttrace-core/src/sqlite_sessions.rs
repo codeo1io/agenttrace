@@ -121,6 +121,14 @@ pub struct SqliteIngestReport {
     /// `--doctor`), never silently skipped: the numbers are honest but
     /// the user should learn their backup lives inside the glob.
     pub duplicate_dbs: Vec<SqliteDuplicateDb>,
+    /// rm-1562: session rows loaded from a relocated opencode store
+    /// via the explicit `-d DIR` arm — that arm used to walk
+    /// json/jsonl only, so a store copied out of
+    /// ~/.local/share/opencode read as "No session files found"
+    /// (live research host 2026-10-17: 310 sessions invisible to
+    /// `-d ~/.local/share/opencode`). Zero on the auto arm; keeps
+    /// the two arms separable in disclosure.
+    pub explicit_dir_sqlite_rows: usize,
 }
 
 /// rm-607: a sibling sqlite database whose sessions were fully or
@@ -251,6 +259,30 @@ pub fn load_sqlite_backed_sessions_reported(
     for path in opencode_db_paths(&home) {
         let loaded = load_opencode_sqlite_sessions(&path, since, &mut report);
         extend_deduped(&mut sessions, &mut report, &mut seen, loaded, &path);
+    }
+    (sessions, report)
+}
+
+/// rm-1562: load a RELOCATED opencode store — `opencode.db` sitting
+/// directly under an explicitly requested `-d DIR` — through the
+/// identical per-db loader the auto arm uses, so column-presence
+/// guards, row decodes, dedupe, and skipped-db disclosure cannot
+/// drift between the two call sites. Any other layout under DIR
+/// (json storage trees, foreign dbs) is left to the json walk that
+/// owns the rest of the explicit-dir lane; a dir with no db at the
+/// expected name reports an empty report, not an error.
+pub fn load_relocated_opencode_store(
+    dir: &Path,
+    since: Option<DateTime<Utc>>,
+) -> (Vec<Session>, SqliteIngestReport) {
+    let mut sessions = Vec::new();
+    let mut report = SqliteIngestReport::default();
+    let db = dir.join("opencode.db");
+    if db.is_file() {
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let loaded = load_opencode_sqlite_sessions(&db, since, &mut report);
+        extend_deduped(&mut sessions, &mut report, &mut seen, loaded, &db);
+        report.explicit_dir_sqlite_rows = sessions.len();
     }
     (sessions, report)
 }

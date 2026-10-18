@@ -2244,6 +2244,16 @@ fn disclose_sqlite_ingest(ingest: &agenttrace_core::SqliteIngestReport) {
             db.sample
         );
     }
+    // rm-1562: the explicit `-d DIR` arm now ingests a relocated
+    // opencode store (opencode.db directly under the requested
+    // directory); the row count is reported so the sqlite presence
+    // is observable on the text surface too.
+    if ingest.explicit_dir_sqlite_rows > 0 {
+        eprintln!(
+            "agenttrace: relocated opencode store under the requested directory: ingested {} session row(s) from its sqlite db",
+            ingest.explicit_dir_sqlite_rows
+        );
+    }
 }
 
 /// rm-835 residual arm: the stderr advisory text for a load that

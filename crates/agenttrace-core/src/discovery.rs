@@ -576,19 +576,37 @@ pub fn load_sessions_with_progress_from_cache_mode(
     if cache.is_dirty() {
         let _ = save_session_cache(cache);
     }
-    let mut sqlite_ingest = crate::sqlite_sessions::SqliteIngestReport::default();
+    let sqlite_ingest;
     // rm-548: the JSON storage lane's fork exclusions (counted during
     // file discovery) seed the total; the sqlite lane adds its own —
     // zero after the rm-791 supersession (its parent_id rows are
     // retained, attributed children), but the lane-level sum keeps the
     // shared carrier honest for both lanes.
     let mut opencode_fork_excluded = json_fork_excluded;
-    if dir.is_none() {
-        let (sqlite_sessions, ingest) =
-            crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
-        sessions.extend(sqlite_sessions);
-        sqlite_ingest = ingest;
-        opencode_fork_excluded += sqlite_ingest.fork_excluded;
+    match dir {
+        None => {
+            let (sqlite_sessions, ingest) =
+                crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
+            sessions.extend(sqlite_sessions);
+            sqlite_ingest = ingest;
+            opencode_fork_excluded += sqlite_ingest.fork_excluded;
+        }
+        Some(explicit_dir) => {
+            // rm-1562: the explicit `-d DIR` arm used to walk
+            // json/jsonl only, so a RELOCATED store (the db copied
+            // out of ~/.local/share/opencode) read as "No session
+            // files found" — live research host 2026-10-17: 310
+            // sessions invisible to `-d ~/.local/share/opencode`.
+            // The dir now gets the SAME sqlite treatment through
+            // the identical per-db loader the auto arm uses; the
+            // auto arm's call above stays byte-unchanged, and the
+            // report field keeps the arms separable in disclosure.
+            let (sqlite_sessions, ingest) =
+                crate::sqlite_sessions::load_relocated_opencode_store(explicit_dir, options.since);
+            sessions.extend(sqlite_sessions);
+            sqlite_ingest = ingest;
+            opencode_fork_excluded += sqlite_ingest.fork_excluded;
+        }
     }
     if options.preserve_history {
         // rm-787: attribute BEFORE preserving so the derived record

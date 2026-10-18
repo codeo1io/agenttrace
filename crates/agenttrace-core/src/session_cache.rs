@@ -1498,7 +1498,12 @@ fn lock_sibling(path: &Path) -> PathBuf {
 
 /// Bounded advisory lock over a cache rewrite (rm-298 residual).
 ///
-/// Protocol (MSRV-1.80 std-only — `File::try_lock` is 1.89):
+/// Protocol (a token-bearing lock file, deliberately not std's
+/// `File::try_lock` — MSRV 1.89 makes std locking available now, but
+/// it is anonymous: it carries no owner identity, so staleness could
+/// not be decided content-first and a release could not be kept from
+/// deleting a peer's stolen lock; the `<pid>-<unique>` token below
+/// provides both):
 /// - acquire = `create_new` (O_EXCL) on the lock sibling, fenced by a
 ///   `<pid>-<unique>` token written into it;
 /// - release = remove the file only if it still carries our token

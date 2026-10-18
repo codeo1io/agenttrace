@@ -4,6 +4,38 @@
 
 ### Added
 
+- store & usage truth (rm-1562/rm-1561/rm-1563/rm-1564, run
+  b3baf997 cycle 3): the explicit `-d DIR` arm used to walk json/jsonl
+  only, so a RELOCATED opencode store (`opencode.db` copied out of
+  `~/.local/share/opencode`) read as "No session files found" — live
+  research host: 310 sessions invisible to `-d`. The dir now gets the
+  same per-db read-only loader the auto arm uses (column guards, row
+  decodes, dedupe, skipped-db disclosure shared between the arms), with
+  an `explicit_dir_sqlite_rows` report field and a stderr row keeping
+  the two arms separable; json trees and foreign dbs under the dir are
+  still the json walk's lane. pi >=1.1 usage recognition: `reasoning`
+  tokens fold as their own breakdown class — on the wire the Gemini
+  adapters' `output` already includes the thoughts (`reasoning` is a
+  subset there; agenttrace mirrors that settled model and never folds
+  its `reasoning` class into its `output` class) — and the wire's
+  `totalTokens` integrity total is honored against the billable fold
+  (input+output+cache classes, `reasoning` never an addend — review
+  5ad3619a F1): agreement silent (live census: 597/597 blocks),
+  disagreement disclosed once per block
+  (`pi_total_tokens_mismatch_blocks`) without rewriting the parsed
+  classes — and `responseModel` (the SERVED model; `model` stays the
+  requested one) now drives attribution with a
+  `pi_response_model_differs_blocks` disclosure on provider-side
+  substitution; journals without the fields parse byte-identically
+  (fleet census: 0 occurrences of either today). Windows drive-prefix
+  projectIDs (`C:x`) degrade to the disclosed unknown-project fallback
+  on every platform — on Windows `Path::join` with a prefix-bearing
+  component replaces the accumulated base, so a planted
+  `storage/project/C:x.json` could previously import project
+  attribution from outside the store; multi-letter `ab:x` ids stay
+  admissible. Docs: the session-cache lock protocol comment no longer
+  claims a dead MSRV-1.80 constraint (the MSRV is 1.89; the token-bearing
+  lock file is kept for owner identity, not std availability).
 - Claude org-dimension truth (rm-1405 reap, run 4f2af62e5b7e cycle 1):
   claude-code 2.1.29x+ journals carry an identity envelope
   (`$.session.identity.orgIdentifier` / `loginEmail`) that the parsers

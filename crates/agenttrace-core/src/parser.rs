@@ -2745,6 +2745,11 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                         .entry("pi_cache_write_1h_blocks".to_string())
                         .or_insert(0) += 1;
                 }
+                oh_my_pi_disclose_total_tokens_integrity(
+                    obj.get("usage"),
+                    usage.as_ref(),
+                    &mut counters,
+                );
                 if usage.is_some() || recorded_cost_usd.is_some() {
                     *counters
                         .entry(disclosure_key("pi_compaction_usage_counted", typ))
@@ -2795,6 +2800,11 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                         .entry("pi_cache_write_1h_blocks".to_string())
                         .or_insert(0) += 1;
                 }
+                oh_my_pi_disclose_total_tokens_integrity(
+                    obj.get("usage"),
+                    usage.as_ref(),
+                    &mut counters,
+                );
                 // F-C (review 06e542d5): an entry whose usage block
                 // carries no token class at all can still record a
                 // real upstream cost — emit the meta event whenever
@@ -3030,6 +3040,24 @@ fn oh_my_pi_message_events(
     if let Some(next_model) = string(message.get("model")).filter(|value| !value.is_empty()) {
         *model = next_model.to_string();
     }
+    // rm-1561: pi >=1.1 writes the SERVED model on the wire as
+    // `responseModel`, keeping `model` as the REQUESTED one (dist
+    // agent-session.js `responseModel ?? model`). Attribution
+    // follows the served model — the one that actually generated
+    // and priced the turn; a provider-side substitution is
+    // disclosed once per block, never silently rekeyed. Without
+    // the field (pre-1.1 writers; live census 2026-10-17: 0
+    // occurrences on the 25,680-file fleet) journals parse
+    // byte-identically.
+    if let Some(served) = string(message.get("responseModel")).filter(|value| !value.is_empty()) {
+        let requested = string(message.get("model")).filter(|value| !value.is_empty());
+        if requested.map(|requested| requested != served) != Some(false) {
+            *counters
+                .entry("pi_response_model_differs_blocks".to_string())
+                .or_insert(0) += 1;
+        }
+        *model = served.to_string();
+    }
 
     let mut events = Vec::new();
     // rm-253 (cycle 2): the message arm honors the SAME upstream-
@@ -3070,6 +3098,7 @@ fn oh_my_pi_message_events(
             .entry("pi_cache_write_1h_blocks".to_string())
             .or_insert(0) += 1;
     }
+    oh_my_pi_disclose_total_tokens_integrity(message.get("usage"), usage.as_ref(), counters);
     if usage.is_some() || recorded_cost_usd.is_some() {
         events.push(Event {
             role: "meta".to_string(),
@@ -3228,6 +3257,16 @@ fn oh_my_pi_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     // recognition plus the `pi_cache_write_1h_blocks` parse counter are
     // the disclosure.
     let cache_write_1h = first_present(obj, &["cacheWrite1h", "cache_write_1h_input_tokens"]);
+    // rm-1561: pi >=1.1 `combineUsage` spreads billed reasoning
+    // tokens as `reasoning` — a SUBSET of output on the wire (the
+    // Gemini writer serializes `output` = candidates + thoughts
+    // with `reasoning` = thoughts), never a class added on top of
+    // it; agenttrace mirrors that settled model with its own
+    // canonical class (wording per review 5ad3619a F1 / c19277b0
+    // F2). Live census 2026-10-17: 0 occurrences on the 25,680-file
+    // fleet (no reasoning-capable hosts yet), so this is
+    // recognition-only (rm-499 precedent for the 1h tier).
+    let reasoning = first_present(obj, &["reasoning", "reasoning_tokens"]);
     // rm-408 residual (pi arm): insert every RECOGNIZED class, zeros
     // included — the claude-family contract (usage_from_value_with
     // _keys) inserts a class whenever a wire key yields a number. The
@@ -3256,6 +3295,9 @@ fn oh_my_pi_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     if recognized(&["cacheWrite1h", "cache_write_1h_input_tokens"]) {
         usage.insert("cache_write_1h_tokens".to_string(), cache_write_1h);
     }
+    if recognized(&["reasoning", "reasoning_tokens"]) {
+        usage.insert("reasoning_tokens".to_string(), reasoning);
+    }
     // A PRESENT block whose recognized classes are all zero surfaces
     // as measured zeros — the event emits and lib's zero_usage_events
     // disclosure counts it (the rm-408 contract). A block with no
@@ -3265,6 +3307,109 @@ fn oh_my_pi_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
         None
     } else {
         Some(usage)
+    }
+}
+
+// rm-1561: pi >=1.1 journals carry `totalTokens` on every usage
+// block (live census 2026-10-17 over 597 blocks on the 25,680-file
+// fleet: present 597/597, == the sum of the recognized classes
+// 597/597). It is the wire's own integrity total — never folded as
+// a token class. The identity it is honored against is the
+// BILLABLE fold agenttrace itself computes — input + output +
+// cache_read + cache_write — with `reasoning_tokens` AND
+// `cache_write_1h_tokens` deliberately NOT addends: on every
+// writer lane both are SUBSET breakdowns the wire total already
+// contains. `reasoning` is a subset of output (pi's Gemini
+// adapters serialize `output` = candidates + thoughts with
+// `reasoning` = thoughts; review 5ad3619a F1), and the 1h tier
+// is a subset of cacheWrite: the anthropic writer serializes
+// `cacheWrite` = cache_creation_input_tokens (the TOTAL creation
+// count) with `cacheWrite1h` = cache_creation.ephemeral_1h_input_
+// tokens as its breakdown, and its `totalTokens` = input + output
+// + cacheRead + cacheWrite with no separate 1h addend (dist chunk
+// anthropic-messages-UIH6DSZT.js:227-228/:295); pi's own cost
+// model splits the same way (`longWrite = cacheWrite1h ?? 0;
+// shortWrite = cacheWrite - longWrite`, calculateCost; review
+// c19277b0 F1). agenttrace's settled model carries both as subset
+// breakdown classes (lib.rs Metrics::tokens_reasoning, pass-9
+// CU-20; the 1h tier's own canonical class, rm-499), so adding
+// either on top double-counts and false-fires on the first
+// reasoning-capable or long-retention host (live p1: cacheWrite
+// 1000 all of it 1h, totalTokens 1150 — the pre-fix fold said
+// 2150 and disclosed). A total that disagrees with the
+// billable fold is disclosed once per block
+// (`pi_total_tokens_mismatch_blocks`), parsed classes standing
+// unchanged — the total is the wire's claim about OUR fold, so a
+// mismatch means a class agenttrace does not model yet, which is a
+// disclosure, never a rewrite. The sum is computed in i128: a
+// hostile journal carrying ~i64::MAX in several classes must
+// disclose, not panic (review 5ad3619a F2 — the i64 sum used to
+// overflow the discovery worker in debug, rc=101; release wrapped
+// silently).
+fn oh_my_pi_disclose_total_tokens_integrity(
+    raw_usage: Option<&Value>,
+    usage: Option<&BTreeMap<String, i64>>,
+    counters: &mut BTreeMap<String, i64>,
+) {
+    let (Some(raw), Some(usage)) = (raw_usage, usage) else {
+        return;
+    };
+    let Some(object) = raw.as_object() else {
+        return;
+    };
+    let Some(total) = object
+        .get("totalTokens")
+        .or_else(|| object.get("total_tokens"))
+        .and_then(number_as_i64)
+    else {
+        return;
+    };
+    // The billable fold, summed in i128: classes individually
+    // clamped to i64::MAX (number_as_i64, rm-726) must not overflow
+    // the comparison itself — a hostile journal carrying ~9.9e18 in
+    // four classes used to panic ('attempt to add with overflow',
+    // debug) inside the discovery worker (review 5ad3619a F2, live
+    // rc=101); release wrapped silently into a nonsense disclosure.
+    // i128 has no realistic overflow for token counts and keeps the
+    // check total-ordering.
+    let billable: i128 = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .filter_map(|key| usage.get(*key).copied())
+    .map(i128::from)
+    .sum();
+    // Review 5ad3619a F1: `reasoning_tokens` is never an addend of
+    // the honored identity. pi's Gemini writer serializes
+    // `output = candidatesTokenCount + thoughtsTokenCount` and
+    // `reasoning = thoughtsTokenCount` — a SUBSET of output on the
+    // wire — and agenttrace's settled model treats reasoning as a
+    // subset breakdown class (downstream Session metrics read the
+    // specific input/output keys, never a whole-map sum, so the
+    // recognized `reasoning_tokens` key cannot double-count).
+    // Review c19277b0 F1: `cache_write_1h_tokens` is never an
+    // addend either — the 1h tier is the anthropic writer's
+    // BREAKDOWN of cacheWrite (`cacheWrite` =
+    // cache_creation_input_tokens, the total creation count;
+    // `cacheWrite1h` = its ephemeral_1h portion), no totalTokens
+    // writer in the dist adds it separately (anthropic ×2 and
+    // openai-completions fold input+output+cacheRead+cacheWrite;
+    // google passes totalTokenCount through; responses/bedrock
+    // pass total_tokens through), and pi's calculateCost splits
+    // shortWrite = cacheWrite - longWrite. Folding the tier on
+    // top double-counted it and false-disclosed on genuine
+    // PI_CACHE_RETENTION=long journals (live p1: input 100,
+    // output 50, cacheWrite 1000, cacheWrite1h 1000, totalTokens
+    // 1150; pre-fix fold 2150). The wire total is the writer's
+    // claim about the billable fold, and only that fold is
+    // compared.
+    if billable != i128::from(total) {
+        *counters
+            .entry("pi_total_tokens_mismatch_blocks".to_string())
+            .or_insert(0) += 1;
     }
 }
 
@@ -6823,6 +6968,22 @@ fn opencode_session_directory(storage_root: &Path, session: &Map<String, Value>)
     // segments; anything else degrades to the disclosed unknown-project
     // fallback instead of reading outside the store.
     if project_id.contains('/') || project_id.contains('\\') || project_id.starts_with("..") {
+        return String::new();
+    }
+    // rm-1563: a Windows drive-prefix id ("C:x" — std's Windows path
+    // parsing) must also degrade to the unknown fallback: on
+    // Windows, `Path::join` with a prefix-bearing component REPLACES
+    // the accumulated base (std `components`/`Prefix` semantics), so
+    // storage_root.join("project").join("C:x.json") resolves
+    // outside the store and a planted doc could be imported as
+    // project attribution. `Path::new(project_id).prefix()` is
+    // Windows-only, so the equivalent lexical rule rejects an ASCII
+    // letter + ':' prefix on every platform (identical admission
+    // surface; Unix was already rejecting the '/'-bearing forms and
+    // keeps accepting multi-letter "ab:x", which is not a drive
+    // prefix under std's rule).
+    let bytes = project_id.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return String::new();
     }
     let project_doc = storage_root
@@ -12540,4 +12701,254 @@ fn oh_my_pi_usage_cache_write_1h_is_own_class() {
     let usage = oh_my_pi_usage(Some(&snake)).expect("snake alias yields usage");
     assert_eq!(usage.get("cache_write_1h_tokens"), Some(&7));
     assert!(!usage.contains_key("cache_creation_input_tokens"));
+}
+
+// rm-1561: pi >=1.1 (dist usage-totals.js `combineUsage` spread)
+// serializes reasoning tokens under `reasoning`; agenttrace folds
+// them as their own breakdown class and never adds them into
+// input/output — on the Gemini adapters' wire `output` already
+// contains the thoughts (subset semantics, review 5ad3619a F1),
+// which is also the settled fleet model (lib.rs
+// Metrics::tokens_reasoning, pass-9 CU-20). Live census
+// 2026-10-17: 0 occurrences on the 25,680-file fleet, so this is
+// recognition-only until reasoning-capable hosts appear (rm-499
+// precedent for the 1h tier).
+#[test]
+fn oh_my_pi_usage_reasoning_is_own_class() {
+    let camel = serde_json::json!({
+        "input": 100,
+        "output": 50,
+        "reasoning": 64,
+    });
+    let usage = oh_my_pi_usage(Some(&camel)).expect("reasoning block yields usage");
+    assert_eq!(usage.get("reasoning_tokens"), Some(&64));
+    assert_eq!(usage.get("input_tokens"), Some(&100));
+    assert_eq!(usage.get("output_tokens"), Some(&50));
+
+    let snake = serde_json::json!({ "reasoning_tokens": 7 });
+    let usage = oh_my_pi_usage(Some(&snake)).expect("snake alias yields usage");
+    assert_eq!(usage.get("reasoning_tokens"), Some(&7));
+}
+
+// rm-1561: the wire integrity total is honored — agreement is
+// silent (597/597 live blocks), disagreement is disclosed once per
+// block and never rewrites the parsed classes.
+#[test]
+fn oh_my_pi_total_tokens_integrity_is_disclosed() {
+    let mut counters = std::collections::BTreeMap::new();
+    let agreeing = serde_json::json!({ "input": 10, "output": 5, "totalTokens": 15 });
+    let usage = oh_my_pi_usage(Some(&agreeing)).expect("usage folds");
+    oh_my_pi_disclose_total_tokens_integrity(Some(&agreeing), Some(&usage), &mut counters);
+    assert!(!counters.contains_key("pi_total_tokens_mismatch_blocks"));
+
+    let mut counters = std::collections::BTreeMap::new();
+    let disagreeing = serde_json::json!({ "input": 10, "output": 5, "totalTokens": 99 });
+    let usage = oh_my_pi_usage(Some(&disagreeing)).expect("usage folds");
+    oh_my_pi_disclose_total_tokens_integrity(Some(&disagreeing), Some(&usage), &mut counters);
+    assert_eq!(counters.get("pi_total_tokens_mismatch_blocks"), Some(&1));
+
+    // A block without the total is not an integrity claim — nothing
+    // to honor, nothing to disclose (live pre-1.1 journals).
+    let mut counters = std::collections::BTreeMap::new();
+    let bare = serde_json::json!({ "input": 10 });
+    let usage = oh_my_pi_usage(Some(&bare)).expect("usage folds");
+    oh_my_pi_disclose_total_tokens_integrity(Some(&bare), Some(&usage), &mut counters);
+    assert!(counters.is_empty());
+}
+
+// Review 5ad3619a F1: pi's Gemini writer serializes
+// output = candidates + thoughts and reasoning = thoughts — a
+// SUBSET of output, not an additive class. The block's own total
+// matches the classes WITHOUT adding reasoning on top, so it must
+// stay silent (pre-fix it falsely disclosed on every such block:
+// live PoC f1.out had pi_total_tokens_mismatch_blocks: 1).
+#[test]
+fn oh_my_pi_total_tokens_integrity_honors_gemini_subset_reasoning() {
+    let mut counters = std::collections::BTreeMap::new();
+    let gemini = serde_json::json!({
+        "input": 5,
+        "output": 15,
+        "reasoning": 5,
+        "totalTokens": 20,
+    });
+    let usage = oh_my_pi_usage(Some(&gemini)).expect("usage folds");
+    oh_my_pi_disclose_total_tokens_integrity(Some(&gemini), Some(&usage), &mut counters);
+    assert!(
+        !counters.contains_key("pi_total_tokens_mismatch_blocks"),
+        "subset-reasoning blocks honor the total via the base sum"
+    );
+    assert_eq!(usage.get("reasoning_tokens"), Some(&5));
+}
+
+// Review 5ad3619a F2: a hostile journal carrying ~9.9e18 in four
+// classes used to overflow the i64 class sum and PANIC the
+// discovery worker ('attempt to add with overflow', live rc=101);
+// release wrapped into a nonsense disclosure. The i128 sum must
+// disclose the mismatch instead of dying.
+#[test]
+fn oh_my_pi_total_tokens_integrity_hostile_magnitudes_disclose_not_panic() {
+    let mut counters = std::collections::BTreeMap::new();
+    let hostile = serde_json::json!({
+        "input": 9_900_000_000_000_000_000u64,
+        "output": 9_900_000_000_000_000_000u64,
+        "cacheRead": 9_900_000_000_000_000_000u64,
+        "cacheWrite": 9_900_000_000_000_000_000u64,
+        "totalTokens": 1,
+    });
+    let usage = oh_my_pi_usage(Some(&hostile)).expect("usage folds");
+    oh_my_pi_disclose_total_tokens_integrity(Some(&hostile), Some(&usage), &mut counters);
+    assert_eq!(
+        counters.get("pi_total_tokens_mismatch_blocks"),
+        Some(&1),
+        "magnitude hostility is disclosed, never a panic or silent wrap"
+    );
+}
+
+// Review 5ad3619a F1 (identity pin): `reasoning_tokens` is NOT an
+// addend of the honored identity. A block whose total equals the
+// classes PLUS reasoning (an additive-reasoning writer shape)
+// still disagrees with the billable fold agenttrace computes — the
+// wire is claiming a total agenttrace does not bill, which is
+// exactly the disagreement the counter exists to disclose. pi
+// 1.3.0 emits no such writer (Gemini is subset-shaped, the census
+// saw zero reasoning fields), so this arm pins the identity, not a
+// live shape.
+#[test]
+fn oh_my_pi_total_tokens_integrity_reasoning_is_never_an_addend() {
+    let mut counters = std::collections::BTreeMap::new();
+    let additive = serde_json::json!({
+        "input": 10,
+        "output": 5,
+        "reasoning": 64,
+        "totalTokens": 79,
+    });
+    let usage = oh_my_pi_usage(Some(&additive)).expect("usage folds");
+    oh_my_pi_disclose_total_tokens_integrity(Some(&additive), Some(&usage), &mut counters);
+    assert_eq!(
+        counters.get("pi_total_tokens_mismatch_blocks"),
+        Some(&1),
+        "the wire total includes a class the billable fold excludes — disclosed"
+    );
+}
+
+// Review c19277b0 F1 (identity pin): `cache_write_1h_tokens` is
+// NOT an addend of the honored identity — the 1h tier is the
+// anthropic writer's BREAKDOWN of cacheWrite (cacheWrite =
+// cache_creation_input_tokens, the total creation count;
+// cacheWrite1h = its ephemeral_1h portion), and the writer's
+// totalTokens = input + output + cacheRead + cacheWrite with no
+// separate 1h addend. A genuine PI_CACHE_RETENTION=long journal
+// (cacheWrite 1000, all of it 1h, total 1150) must stay silent —
+// pre-fix it false-disclosed (live p1 had
+// pi_total_tokens_mismatch_blocks: 1).
+#[test]
+fn oh_my_pi_total_tokens_integrity_honors_anthropic_1h_subset_cache_write() {
+    let mut counters = std::collections::BTreeMap::new();
+    let long_retention = serde_json::json!({
+        "input": 100,
+        "output": 50,
+        "cacheRead": 0,
+        "cacheWrite": 1000,
+        "cacheWrite1h": 1000,
+        "totalTokens": 1150,
+    });
+    let usage = oh_my_pi_usage(Some(&long_retention)).expect("usage folds");
+    oh_my_pi_disclose_total_tokens_integrity(Some(&long_retention), Some(&usage), &mut counters);
+    assert!(
+        !counters.contains_key("pi_total_tokens_mismatch_blocks"),
+        "the 1h tier is inside cacheWrite on the wire — genuine long-retention stays silent"
+    );
+    assert_eq!(usage.get("cache_creation_input_tokens"), Some(&1000));
+    assert_eq!(usage.get("cache_write_1h_tokens"), Some(&1000));
+}
+
+// rm-1561: pi >=1.1 attributes the SERVED model on the wire as
+// `responseModel`, keeping `model` as the REQUESTED one (dist
+// agent-session.js: `responseModel ?? model`). Attribution follows
+// the served model; a provider-side substitution is disclosed with
+// one counter per block — never a silent rekey. Without
+// `responseModel`, the requested model stands and nothing is
+// counted (pre-1.1 journals parse byte-identically).
+#[test]
+fn oh_my_pi_response_model_differs_is_disclosed_and_served_wins() {
+    let mut model = String::from("requested-model");
+    let mut counters = std::collections::BTreeMap::new();
+    let substituted = serde_json::json!({
+        "role": "assistant",
+        "model": "requested-model",
+        "responseModel": "served-model",
+        "timestamp": "2026-10-16T18:55:43.000Z",
+        "usage": {"input": 10, "output": 5, "totalTokens": 15},
+    });
+    let events = oh_my_pi_message_events(
+        substituted.as_object().expect("object"),
+        "",
+        &mut model,
+        "pi",
+        &mut counters,
+    );
+    assert_eq!(model, "served-model");
+    assert_eq!(counters.get("pi_response_model_differs_blocks"), Some(&1));
+    assert!(events
+        .iter()
+        .any(|event| event.model_used == "served-model"));
+
+    let mut model = String::from("requested-model");
+    let mut counters = std::collections::BTreeMap::new();
+    let plain = serde_json::json!({
+        "role": "assistant",
+        "model": "requested-model",
+        "timestamp": "2026-10-16T18:55:43.000Z",
+    });
+    oh_my_pi_message_events(
+        plain.as_object().expect("object"),
+        "",
+        &mut model,
+        "pi",
+        &mut counters,
+    );
+    assert_eq!(model, "requested-model");
+    assert!(!counters.contains_key("pi_response_model_differs_blocks"));
+}
+
+// rm-1561 live-corpus pin: a journal shaped like the real 1.3.0
+// fleet wire (every usage block carrying camelCase classes plus
+// `totalTokens`, the camelCase 1h tier, zero-cost cliproxy blocks;
+// census 2026-10-17 over 597 blocks) must parse with classes folded
+// and NO integrity disclosures — the recognition additions are
+// silent on today's wire. `totalTokens` must never appear as a
+// folded class.
+#[test]
+fn oh_my_pi_1_3_wire_shape_parses_silently() {
+    let header: JsonObject = serde_json::from_str(
+        r#"{"type":"session","id":"sess_1_3","timestamp":"2026-10-16T18:55:42.703Z","cwd":"/work/x"}"#,
+    )
+    .expect("header line");
+    let message: JsonObject = serde_json::from_str(
+        r#"{"type":"message","timestamp":"2026-10-16T18:55:43.000Z","message":{"role":"assistant","model":"glm-5.2","content":"Reply text","timestamp":"2026-10-16T18:55:43.000Z","usage":{"input":500,"output":250,"cacheRead":1000,"cacheWrite":50,"cacheWrite1h":30,"totalTokens":1800,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop"}}"#,
+    )
+    .expect("message line");
+    let events = parse_oh_my_pi_jsonl(
+        "2026-10-16T18-55-42-703Z_conductor-x-primary-pi.jsonl",
+        &[header, message],
+    )
+    .expect("1.3.0 wire shape parses");
+    let folded = events
+        .iter()
+        .find(|event| event.usage.contains_key("cache_write_1h_tokens"))
+        .expect("usage classes folded onto an event");
+    assert_eq!(folded.usage.get("input_tokens"), Some(&500));
+    assert_eq!(folded.usage.get("cache_write_1h_tokens"), Some(&30));
+    assert!(
+        !folded.usage.contains_key("totalTokens"),
+        "totalTokens is a wire integrity total, never a folded class"
+    );
+    for event in &events {
+        assert!(!event
+            .disclosure_counters
+            .contains_key("pi_total_tokens_mismatch_blocks"));
+        assert!(!event
+            .disclosure_counters
+            .contains_key("pi_response_model_differs_blocks"));
+    }
 }

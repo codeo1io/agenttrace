@@ -247,3 +247,58 @@ fn oversize_project_doc_is_capped_before_read() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// rm-1563: the separator/`..` confinement still admitted Windows
+// drive-prefix ids — on Windows, `Path::join` with a prefix-bearing
+// component ("C:x", std's Windows path parsing) REPLACES the
+// accumulated base, so a planted doc could be read from OUTSIDE the
+// store as project attribution. Red-first pin: the payload is
+// planted INSIDE the store at storage/project/C:x.json, so the
+// pre-fix guard admits the id on every platform and imports the
+// payload's directory; post-fix the id degrades to the disclosed
+// unknown fallback. Multi-letter "ab:x" is NOT a drive prefix under
+// std's rule and must stay admissible (no over-rejection).
+#[test]
+fn windows_drive_prefix_project_ids_are_rejected() {
+    let tmp = std::env::temp_dir();
+    let root = tmp.join(format!("at_rm1563_drive_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("opencode/storage/project")).unwrap();
+    fs::write(
+        root.join("opencode/storage/project/C:x.json"),
+        r#"{"directory": "/zzz-pwned-marker/drive"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("opencode/storage/project/ab:x.json"),
+        r#"{"directory": "/legit-marker/at-colon"}"#,
+    )
+    .unwrap();
+
+    let session_file = write_session_doc(
+        &root,
+        "sess_drive",
+        r#"{"id": "sess_drive", "slug": "drive", "projectID": "C:x", "title": "Drive", "time": {"created": 1764750000000, "updated": 1764750004000}}"#,
+    );
+    write_message(&root, "sess_drive");
+    let session = parse_file(&session_file).unwrap();
+    assert_eq!(
+        session.cwd, "",
+        "a drive-prefix projectID must degrade to the unknown fallback: {}",
+        session.cwd
+    );
+
+    let session_file = write_session_doc(
+        &root,
+        "sess_colon",
+        r#"{"id": "sess_colon", "slug": "colon", "projectID": "ab:x", "title": "Colon", "time": {"created": 1764750000000, "updated": 1764750004000}}"#,
+    );
+    write_message(&root, "sess_colon");
+    let session = parse_file(&session_file).unwrap();
+    assert_eq!(
+        session.cwd, "/legit-marker/at-colon",
+        "a multi-letter colon id is not a Windows drive prefix and must stay admissible"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
