@@ -4275,6 +4275,14 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     // `analyze` is last-wins, so the freshest snapshot a journal
     // carried is the one the report serves.
     let mut codex_rate_wire: BTreeMap<String, String> = BTreeMap::new();
+    // rm-1949 (run e4bff731 cycle 1): the codex 0.147+ turn-boundary
+    // triple — task_started / task_complete / user_message — ledgered
+    // across the loop below and landed on one terminal meta event.
+    let mut codex_turns_started: usize = 0;
+    let mut codex_turns_completed: usize = 0;
+    let mut codex_interactive_user_turns: usize = 0;
+    let mut codex_turn_first_started: Option<String> = None;
+    let mut codex_turn_last_complete: Option<String> = None;
     // Accounting-truth batch (rm-251 R1 rider): set when a
     // rate-limit-only line updated the wire without producing an
     // event — the terminal carrier below lands it.
@@ -4619,6 +4627,48 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                         wire_metadata: wire,
                         ..Event::default()
                     });
+                } else if matches!(
+                    payload_type,
+                    Some("task_started") | Some("task_complete") | Some("user_message"),
+                ) {
+                    // rm-1949 (run e4bff731 cycle 1): codex 0.147+
+                    // journals turn boundaries as event_msg payloads
+                    // (live census 2026-10-17: 29/29 fresh host
+                    // rollouts). They carry no usage and used to vanish
+                    // into codex_ignorable_line wholesale; the arms
+                    // below ledger them as named turn evidence —
+                    // counts on the non-loss disclosure channel,
+                    // first/last boundary timestamps on the wire
+                    // channel — so journals without the triple stay
+                    // byte-identical while per-turn visibility stops
+                    // being silent. arm d (the replay guardrail in
+                    // codex_replay.rs) consumes the task_started
+                    // evidence.
+                    match payload_type {
+                        Some("task_started") => {
+                            codex_turns_started += 1;
+                            if codex_turn_first_started.is_none() {
+                                codex_turn_first_started = Some(ts.clone());
+                            }
+                        }
+                        Some("task_complete") => {
+                            codex_turns_completed += 1;
+                            codex_turn_last_complete = Some(ts.clone());
+                        }
+                        Some("user_message") => {
+                            // Interactive user turn iff the body parses
+                            // to non-empty text. The wire's
+                            // response_item user rows already ledger
+                            // the content itself, so only the boundary
+                            // count is taken — no duplicate Events.
+                            if let Some(body) = string(payload.get("message")) {
+                                if !body.trim().is_empty() {
+                                    codex_interactive_user_turns += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             "response_item" => {
@@ -5042,6 +5092,55 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
             ..Event::default()
         });
     }
+    // rm-1949: land the turn-boundary ledger once per journal on one
+    // terminal meta event — counts on the non-loss disclosure channel,
+    // first/last boundary timestamps on the wire channel. Journals
+    // without the triple (every pre-0.147 rollout) emit nothing and stay
+    // byte-identical.
+    if saw_codex
+        && (codex_turns_started > 0
+            || codex_turns_completed > 0
+            || codex_interactive_user_turns > 0)
+    {
+        let mut disclosure = BTreeMap::new();
+        if codex_turns_started > 0 {
+            disclosure.insert(
+                "codex_turns_started".to_string(),
+                codex_turns_started as i64,
+            );
+        }
+        if codex_turns_completed > 0 {
+            disclosure.insert(
+                "codex_turns_completed".to_string(),
+                codex_turns_completed as i64,
+            );
+        }
+        if codex_interactive_user_turns > 0 {
+            disclosure.insert(
+                "codex_interactive_user_turns".to_string(),
+                codex_interactive_user_turns as i64,
+            );
+        }
+        let mut wire = BTreeMap::new();
+        if let Some(first) = codex_turn_first_started.as_deref() {
+            wire.insert("codex_turn_first_started".to_string(), first.to_string());
+        }
+        if let Some(last) = codex_turn_last_complete.as_deref() {
+            wire.insert("codex_turn_last_complete".to_string(), last.to_string());
+        }
+        events.push(Event {
+            role: "meta".to_string(),
+            timestamp: codex_turn_last_complete
+                .clone()
+                .or_else(|| events.last().map(|event| event.timestamp.clone()))
+                .unwrap_or_default(),
+            model_used: model.clone(),
+            source_tool: "codex_cli".to_string(),
+            disclosure_counters: disclosure,
+            wire_metadata: wire,
+            ..Event::default()
+        });
+    }
     if saw_codex {
         non_empty(events).map(|events| (events, counters))
     } else {
@@ -5082,6 +5181,9 @@ fn codex_line_is_ignorable(line: &str) -> bool {
     json_key_present_top_level(head, r#""type":"event_msg""#)
         && !json_key_present(line, r#""type":"token_count""#)
         && !json_key_present(line, r#""type":"session_configured""#)
+        && !json_key_present(line, r#""type":"task_started""#)
+        && !json_key_present(line, r#""type":"task_complete""#)
+        && !json_key_present(line, r#""type":"user_message""#)
 }
 
 /// True when `needle` occurs in `line` at a JSON key position (the byte
@@ -13421,6 +13523,118 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         drop(_env);
+    }
+
+    #[test]
+    fn codex_turn_boundary_triple_is_ledgered() {
+        // rm-1949 (run e4bff731 cycle 1): codex 0.147+ journals turn
+        // boundaries as event_msg {task_started, task_complete,
+        // user_message} (live census 2026-10-17: 29/29 fresh host
+        // rollouts carry the triple). The boundaries must land on the
+        // disclosure channel (counts) and the wire channel
+        // (first/last timestamps) instead of vanishing into
+        // codex_ignorable_line.
+        let json = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"timestamp\":\"2026-10-17T10:00:00Z\"},\"timestamp\":\"2026-10-17T10:00:00Z\"}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\",\"started_at\":1790000000},\"timestamp\":\"2026-10-17T10:01:00Z\"}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"do it\"},\"timestamp\":\"2026-10-17T10:01:30Z\"}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"},\"timestamp\":\"2026-10-17T10:02:00Z\"}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t2\",\"started_at\":1790000100},\"timestamp\":\"2026-10-17T10:03:00Z\"}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"   \"},\"timestamp\":\"2026-10-17T10:03:10Z\"}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t2\"},\"timestamp\":\"2026-10-17T10:04:00Z\"}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"timestamp\":\"2026-10-17T10:04:05Z\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":10,\"cache_creation_input_tokens\":5,\"output_tokens\":50,\"reasoning_output_tokens\":0}}},\"timestamp\":\"2026-10-17T10:04:05Z\"}\n",
+        );
+        let session =
+            parse_raw_session("codex", "turn-triple.jsonl", json).expect("triple journal parses");
+        let metrics = &session.metrics;
+        assert_eq!(
+            metrics.tokens_input, 90,
+            "net input after cached subtraction"
+        );
+        assert_eq!(metrics.tokens_output, 50);
+        assert_eq!(
+            metrics.disclosure_counters.get("codex_turns_started"),
+            Some(&2)
+        );
+        assert_eq!(
+            metrics.disclosure_counters.get("codex_turns_completed"),
+            Some(&2)
+        );
+        // A whitespace-only user_message body is not an interactive turn.
+        assert_eq!(
+            metrics
+                .disclosure_counters
+                .get("codex_interactive_user_turns"),
+            Some(&1)
+        );
+        assert_eq!(
+            metrics
+                .wire_metadata
+                .get("codex_turn_first_started")
+                .map(String::as_str),
+            Some("2026-10-17T10:01:00Z")
+        );
+        assert_eq!(
+            metrics
+                .wire_metadata
+                .get("codex_turn_last_complete")
+                .map(String::as_str),
+            Some("2026-10-17T10:04:00Z")
+        );
+    }
+
+    #[test]
+    fn codex_journals_without_turn_boundaries_gain_nothing() {
+        // Pre-0.147 journals never carried the triple; parsing must
+        // stay identical in totals and free of turn counters (the
+        // additive-only contract of rm-1949 arm b).
+        let json = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"timestamp\":\"2026-10-17T10:00:00Z\"},\"timestamp\":\"2026-10-17T10:00:00Z\"}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message_delta\",\"delta\":\"hi\"},\"timestamp\":\"2026-10-17T10:00:30Z\"}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"timestamp\":\"2026-10-17T10:04:05Z\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":10,\"cache_creation_input_tokens\":5,\"output_tokens\":50,\"reasoning_output_tokens\":0}}},\"timestamp\":\"2026-10-17T10:04:05Z\"}\n",
+        );
+        let session =
+            parse_raw_session("codex", "no-triple.jsonl", json).expect("pre-triple journal parses");
+        let metrics = &session.metrics;
+        assert_eq!(
+            metrics.tokens_input, 90,
+            "net input after cached subtraction"
+        );
+        assert_eq!(metrics.tokens_output, 50);
+        for key in [
+            "codex_turns_started",
+            "codex_turns_completed",
+            "codex_interactive_user_turns",
+        ] {
+            assert!(!metrics.disclosure_counters.contains_key(key), "{key}");
+        }
+        assert!(!metrics
+            .wire_metadata
+            .contains_key("codex_turn_first_started"));
+        assert!(!metrics
+            .wire_metadata
+            .contains_key("codex_turn_last_complete"));
+        // Non-turn chatter keeps filtering as ignorable noise.
+        assert!(codex_line_is_ignorable(
+            r#"{"type":"event_msg","payload":{"type":"agent_message_delta","delta":"x"}}"#
+        ));
+        // ...while the turn-boundary triple escapes the filter (arm a).
+        assert!(!codex_line_is_ignorable(
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#
+        ));
+    }
+
+    #[test]
+    fn codex_turn_boundary_lines_escape_the_noise_filter() {
+        // rm-1949 arm a: the triple is rescued from codex_line_is_ignorable
+        // so the parse loop can ledger it.
+        for kind in ["task_started", "task_complete", "user_message"] {
+            let line = format!("{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"{kind}\"}}}}");
+            assert!(
+                !codex_line_is_ignorable(&line),
+                "{kind} must reach the parse loop"
+            );
+        }
     }
 
     #[test]

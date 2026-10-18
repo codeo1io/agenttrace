@@ -4,6 +4,47 @@
 
 ### Added
 
+- codex turn-boundary ledger + replay guardrail (rm-1949, run
+  e4bff731 cycle 1): codex 0.147+ journals turn boundaries as `event_msg`
+  payloads — `task_started`, `task_complete`, `user_message` (live census
+  2026-10-17: 29/29 fresh host rollouts carry the triple; previously these
+  lines vanished wholesale into `codex_ignorable_line` — 301 triple lines
+  across 100 host sessions, re-derived by grep over `~/.codex/sessions`:
+  task_started 101 / user_message 103 / task_complete 97). The triple is
+  now rescued from the noise filter and ledgered: per-journal counts on
+  the non-loss disclosure channel
+  (`codex_turns_started`, `codex_turns_completed`,
+  `codex_interactive_user_turns` — a whitespace-only `user_message` body does
+  not count) and first/last boundary timestamps on the wire channel
+  (`codex_turn_first_started`, `codex_turn_last_complete`), landed once per
+  journal on a terminal meta event. Journals without the triple (every
+  pre-0.147 rollout) parse byte-identically — no new counters, no new events
+  (pinned). The evidence doubles as a guardrail for the multiagent replay
+  reconcile (rm-402 surface): a family reconciles only when EVERY member's
+  journal carries `task_started` evidence, so pre-0.147 families — whose
+  content tie is uncorroborated — skip conservatively: usage stays fully
+  counted (over-billed, never erased), the would-be child discloses
+  `codex_multiagent_replay_family_no_task_started`, and a new
+  `families_skipped_no_task_started` stat names the skip
+  (`tests/codex_multiagent_replay.rs`). Fixtures: the three family fixture
+  sets were regenerated to carry one `task_started` boundary each, and a
+  `codex-multiagent-v2-no-turn-evidence` corpus (pre-edit byte-copy) pins
+  the guardrail's conservative path.
+
+  Integration seam (2026-10-18, conflict case a240e400, landing onto a
+  wall that had since integrated run cd6782b46fb4's rm-1956 (campaign-
+  local numeral rm-1541) + rm-1542):
+  the family map key is now the composed `(fingerprint, cwd)` —
+  corroboration is BOTH the `session_meta.payload.cwd` project linkage
+  AND the turn boundary — and the rm-1956 positive-control corpus
+  (`codex-multiagent-v2-false-family`, authored on the wall after this
+  run's fixture regen and so still boundary-free despite its
+  cli_version 0.163.0, which the census shows always carries the
+  triple) was regenerated the same way to carry one `task_started`
+  boundary per journal, so the same-project control still reconciles
+  under the composed gate while the cross-project refusal and the
+  no-evidence skip both keep their conservative paths.
+
 - daybreak money truth + hostile-org bound + per-row pricing basis
   (rm-1570 + rm-1571 + rm-1574, run fd0e91a2 cycle 3): the gpt-daybreak
   family is codex 0.163.0's DEFAULT model set, and LiteLLM publishes the
