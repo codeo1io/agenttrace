@@ -78,6 +78,15 @@ pub struct CodexReplayAdjustment {
     /// exceeds theirs on some field (concurrent-spawn shape) — a saturating
     /// rebase would erase real usage (review af521003 F3).
     pub children_below_baseline: usize,
+    /// rm-451 rider (run 5cbd75e3 cycle 2): rollout files refused by the
+    /// scan because their on-disk size exceeded the named-file read cap
+    /// (`AGENTTRACE_FILE_CAP_BYTES`, default 256 MiB) — the same cap the
+    /// parse lane enforces, applied at the lane that runs PER CODEX
+    /// SESSION. Counted, never silently skipped: a refused rollout
+    /// contributes no family evidence, exactly like a decode failure,
+    /// but the refusal is disclosed instead of reading as "no replay
+    /// families found".
+    pub read_cap_refused: usize,
     /// Replayed tokens removed from children, per class.
     pub tokens_input_dropped: i64,
     pub tokens_cache_read_dropped: i64,
@@ -145,6 +154,38 @@ struct RolloutScan {
     /// Total `response_item` lines (not just fingerprinted ones) — a
     /// replay child by definition continues past the shared opening.
     response_items: usize,
+    /// rm-451 rider: the scan refused to read this rollout whole
+    /// because its size exceeded the named-file read cap. A typed
+    /// marker, not a boolean, so the disclosure can name the size and
+    /// the cap that refused it. `None` on every normal read.
+    read_cap_refused: Option<RolloutReadCapRefused>,
+}
+
+/// rm-451 rider (run 5cbd75e3 cycle 2): a rollout file the scan
+/// refused to materialize because its on-disk size exceeded the
+/// named-file read cap — the typed-refusal half of the guard, the
+/// scan-level sibling of the parser's `ReadCapRefused` for a lane
+/// that reports rather than errors (reconciliation must never turn a
+/// parse-level refusal into a second error, so the marker rides the
+/// scan and is counted by the caller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RolloutReadCapRefused {
+    /// On-disk size at refusal (compressed bytes for zstd rollouts —
+    /// the allocation the cap bounds).
+    size: u64,
+    /// The cap that refused it (`file_read_cap_bytes()` at scan time).
+    cap: u64,
+}
+
+impl std::fmt::Display for RolloutReadCapRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rollout scan refused: file is {} bytes, over the {}-byte read cap \
+             (AGENTTRACE_FILE_CAP_BYTES)",
+            self.size, self.cap
+        )
+    }
 }
 
 /// Stream a rollout file once: hash the opening `response_item` payloads,
@@ -162,16 +203,47 @@ struct RolloutScan {
 /// actually writes. A decode failure here yields no evidence, not an error:
 /// the parser has already failed loudly for that file at parse time, and
 /// reconciliation must never turn one parse-level refusal into a second one.
+///
+/// rm-451 rider (run 5cbd75e3 cycle 2): the read is BOUNDED — stat-first
+/// refusal past `file_read_cap_bytes()` with `take(cap + 1)` on the read,
+/// the same metadata-lie guard the parser lane uses. This lane runs once
+/// per codex session during reconciliation, so an unbounded read here
+/// fully materialized a multi-GB rollout in RSS before this guard; a
+/// refusal yields no evidence (like a decode failure) but carries the
+/// typed marker so the adjustment counts it loudly.
 fn scan_rollout(path: &Path) -> RolloutScan {
     let mut scan = RolloutScan {
         fingerprint: None,
         total: TotalSnapshot::default(),
         first_timestamp: None,
         response_items: 0,
+        read_cap_refused: None,
     };
-    let Ok(mut raw) = std::fs::read(path) else {
+    let cap = crate::parser::file_read_cap_bytes();
+    let refused = |size: u64| RolloutReadCapRefused { size, cap };
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > cap {
+            scan.read_cap_refused = Some(refused(metadata.len()));
+            return scan;
+        }
+    }
+    let mut raw = {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        match std::fs::File::open(path)
+            .map(|file| file.take(cap.saturating_add(1)))
+            .and_then(|mut file| file.read_to_end(&mut bytes).map(|_| bytes))
+        {
+            Ok(bytes) => bytes,
+            Err(_) => return scan,
+        }
+    };
+    // Metadata-lie / TOCTOU guard: a file that grew between stat and
+    // read still cannot allocate past one byte over the cap — refuse.
+    if raw.len() as u64 > cap {
+        scan.read_cap_refused = Some(refused(raw.len() as u64));
         return scan;
-    };
+    }
     // The zstd magic `28 B5 2F FD` — same probe as `parse_session_bytes`
     // (rm-992). Plain rollouts take the direct path byte-for-byte.
     if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
@@ -302,6 +374,12 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
             continue;
         };
         let scan = scan_rollout(&path);
+        if scan.read_cap_refused.is_some() {
+            // Counted loud refusal, no evidence — same stance as a
+            // decode failure, but never invisible.
+            stats.read_cap_refused += 1;
+            continue;
+        }
         let Some(fingerprint) = scan.fingerprint else {
             continue;
         };
@@ -442,4 +520,107 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
         }
     }
     stats
+}
+
+/// rm-451 rider (run 5cbd75e3 cycle 2): the read-cap guard's refusal
+/// battery. The cap is exercised with a SPARSE file whose logical size
+/// exceeds [`crate::parser::FILE_READ_CAP_BYTES`] — no environment
+/// mutation (the knob is process-global and the lib test binary runs
+/// lanes that read it), and no 256 MiB allocation (the refusal fires on
+/// the metadata fast-path).
+#[cfg(test)]
+mod read_cap_tests {
+    use super::*;
+
+    /// A file whose on-disk SIZE exceeds the cap while occupying two
+    /// blocks: seek to the cap, write the trailing byte.
+    fn sparse_over_cap_file(tag: &str) -> PathBuf {
+        let cap = crate::parser::file_read_cap_bytes();
+        let path = std::env::temp_dir().join(format!(
+            "codex-rollout-overcap-{}-{tag}.jsonl",
+            std::process::id()
+        ));
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::File::create(&path).expect("create sparse rollout");
+            file.seek(SeekFrom::Start(cap)).expect("seek to cap");
+            file.write_all(b"{}").expect("byte past the cap");
+        }
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > cap,
+            "fixture: logical size must exceed the cap"
+        );
+        path
+    }
+
+    #[test]
+    fn over_cap_rollout_scan_refuses_with_typed_marker() {
+        let path = sparse_over_cap_file("scan");
+        let scan = scan_rollout(&path);
+        let refusal = scan
+            .read_cap_refused
+            .expect("over-cap rollout must refuse, not read");
+        assert_eq!(refusal.cap, crate::parser::file_read_cap_bytes());
+        assert!(refusal.size > refusal.cap);
+        assert_eq!(refusal.size, std::fs::metadata(&path).unwrap().len());
+        // No evidence rides a refusal — same shape as a decode failure.
+        assert!(scan.fingerprint.is_none());
+        assert_eq!(scan.response_items, 0);
+        // The typed marker is the loud half: it names size and cap.
+        let message = refusal.to_string();
+        assert!(message.contains("AGENTTRACE_FILE_CAP_BYTES"));
+        assert!(message.contains(&refusal.size.to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn over_cap_refusal_counts_in_adjustment_and_never_adjusts() {
+        // Reconcile level: a codex session whose rollout is refused
+        // contributes NO family evidence (like a decode failure) but
+        // the refusal is COUNTED on the adjustment — never the silent
+        // "no families found" of a swallowed multi-GB file.
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex-multiagent-v2/parent.jsonl");
+        let raw = std::fs::read_to_string(&fixture)
+            .unwrap_or_else(|error| panic!("read {}: {error}", fixture.display()));
+        let mut session =
+            crate::parser::parse_raw_session("codex", fixture.to_str().unwrap(), &raw)
+                .expect("parse parent fixture");
+        let tokens_before = session.metrics.tokens_input;
+
+        let huge = sparse_over_cap_file("reconcile");
+        session.metrics.source_tool = "codex_cli".to_string();
+        session.path = huge.to_string_lossy().to_string();
+
+        let mut sessions = vec![session];
+        let stats = reconcile_codex_multiagent_replays(&mut sessions);
+        assert_eq!(stats.read_cap_refused, 1, "the refusal is counted loudly");
+        assert_eq!(stats.families, 0, "a refused rollout yields no evidence");
+        assert_eq!(stats.children_adjusted, 0);
+        assert_eq!(
+            sessions[0].metrics.tokens_input, tokens_before,
+            "a refusal never mutates usage"
+        );
+        let _ = std::fs::remove_file(&huge);
+    }
+
+    #[test]
+    fn under_cap_fixture_still_finds_its_family() {
+        // Guard rail: the default cap must leave the shipped fixture's
+        // normal lane untouched (the guard fires only past the cap).
+        let fixture = |name: &str| {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex-multiagent-v2")
+                .join(name);
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            crate::parser::parse_raw_session("codex", path.to_str().unwrap(), &raw)
+                .unwrap_or_else(|error| panic!("parse {name}: {error}"))
+        };
+        let mut sessions = vec![fixture("parent.jsonl"), fixture("child.jsonl")];
+        let stats = reconcile_codex_multiagent_replays(&mut sessions);
+        assert_eq!(stats.read_cap_refused, 0);
+        assert_eq!(stats.families, 1, "the normal lane still works");
+        assert_eq!(stats.children_adjusted, 1);
+    }
 }

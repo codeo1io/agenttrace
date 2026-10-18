@@ -1579,6 +1579,18 @@ fn attach_admission_disclosures(
                 .collect::<Vec<_>>()),
         );
     }
+    // rm-1888 (run 5cbd75e3 cycle 2): files whose (size, fast-hash)
+    // signature matched a banked file but whose bytes verified
+    // DISTINCT — kept, never suppressed. The dedup decision byte-
+    // verifies on a signature hit, so a stale memo (mtime+size vouch)
+    // or an FNV collision can no longer swallow a mutated journal;
+    // when it happens the audit names how many were verified distinct.
+    if report.content_signature_conflicts > 0 {
+        map.insert(
+            "content_signature_conflicts".to_string(),
+            serde_json::json!(report.content_signature_conflicts),
+        );
+    }
     let negative_rejected: usize = sessions
         .iter()
         .filter_map(|session| {
@@ -2313,7 +2325,11 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // rm-402: reconcile codex multi-agent replay families on the assembled
     // corpus — discovery lanes see parent and child rollouts together, and a
     // replayed prefix billed inside both would double the family's usage.
-    agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
+    // rm-451 rider (run 5cbd75e3 cycle 2): the scan's read-cap refusals
+    // are loud — without this a refused over-cap rollout reads as "no
+    // replay families found" for that session.
+    let replay = agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
+    disclose_rollout_read_cap_refused(replay.read_cap_refused);
     ensure_output_is_not_an_input(args, &sessions, &report.parse_failure_paths)?;
     Ok((sessions, Some(report)))
 }
@@ -2327,6 +2343,20 @@ fn disclose_unlinked_subagents(count: usize) {
     if count > 0 {
         eprintln!(
             "agenttrace: warning: {count} subagent transcript(s) have no parent session in the loaded corpus; they render as standalone rows and roll into no parent"
+        );
+    }
+}
+
+/// rm-451 rider (run 5cbd75e3 cycle 2, batch "Verify, don't trust"):
+/// one stderr line when the codex replay scan refused to read rollout
+/// files over the named-file read cap (`AGENTTRACE_FILE_CAP_BYTES`,
+/// default 256 MiB) — a refused rollout contributes no family evidence
+/// and would otherwise read as "no replay families found" for that
+/// session. Report output on stdout is unaffected (rm-799 pattern).
+fn disclose_rollout_read_cap_refused(count: usize) {
+    if count > 0 {
+        eprintln!(
+            "agenttrace: warning: {count} codex rollout file(s) exceeded the file read cap (AGENTTRACE_FILE_CAP_BYTES) and were not scanned for replay families; those sessions keep unreconciled usage"
         );
     }
 }
@@ -2483,7 +2513,10 @@ fn prepare_explicit_sessions(
     // rm-402: codex MultiAgent V2 replay families must be reconciled
     // wherever a full corpus assembles — the explicit lane can load a
     // parent/child pair via repeated positional files.
-    agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
+    // rm-451 rider (run 5cbd75e3 cycle 2): read-cap refusals disclosed
+    // here too — the explicit lane is the one that names the files.
+    let replay = agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
+    disclose_rollout_read_cap_refused(replay.read_cap_refused);
     filter_cli_sessions(sessions, args)
 }
 

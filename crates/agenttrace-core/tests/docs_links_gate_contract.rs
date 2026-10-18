@@ -106,3 +106,142 @@ fn gate_fails_on_a_dangling_relative_link_fixture() {
     );
     let _ = fs::remove_dir_all(&repo);
 }
+
+/// rm-1894 (run 5cbd75e3 cycle 2): both rider legs, fixture-pinned.
+/// The scan gap was syntactic — reference-style definitions were
+/// invisible to it — and the existence test was `-f`, which reads a
+/// DIRECTORY target as broken. Each leg builds its own throwaway
+/// repository because the gate scans TRACKED files only.
+fn fixture_repo(tag: &str) -> std::path::PathBuf {
+    let repo = std::env::temp_dir().join(format!("at-docs-links-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&repo);
+    fs::create_dir_all(repo.join("docs")).expect("create fixture repo");
+    // A placeholder tracked file: an empty tree (bare directory) has
+    // nothing to commit and the fixture assert would misfire.
+    fs::write(repo.join("README.md"), "# Fixture\n").expect("write placeholder readme");
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["-c", "user.name=fixture"])
+            .args(["-c", "user.email=fixture@example.invalid"])
+            .args(args)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    };
+    assert!(
+        git(&["init", "-q"]) && git(&["add", "."]) && git(&["commit", "-q", "-m", "fixture"]),
+        "fixture repo must commit its tracked markdown"
+    );
+    repo
+}
+
+#[test]
+fn gate_fails_on_a_dangling_reference_style_link_fixture() {
+    // Red-first for the rm-1894 form gap: every INLINE link resolves,
+    // so the pre-rider gate left this tree green — only the
+    // `[label]: destination` definition dangles.
+    let repo = std::env::temp_dir().join(format!("at-docs-links-refstyle-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&repo);
+    fs::create_dir_all(repo.join("docs")).expect("create fixture repo");
+    fs::write(
+        repo.join("README.md"),
+        "# Fixture\n\nSee [the guide][guide].\n\n[guide]: docs/gone.md\n",
+    )
+    .expect("write fixture readme");
+    fs::write(repo.join("docs/here.md"), "# Here\n").expect("write a real target");
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["-c", "user.name=fixture"])
+            .args(["-c", "user.email=fixture@example.invalid"])
+            .args(args)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    };
+    assert!(
+        git(&["init", "-q"]) && git(&["add", "."]) && git(&["commit", "-q", "-m", "fixture"]),
+        "fixture repo must commit its tracked markdown"
+    );
+    let output = Command::new("bash")
+        .arg(script_path())
+        .current_dir(&repo)
+        .output()
+        .expect("run gate against reference-style fixture");
+    assert!(
+        !output.status.success(),
+        "a dangling reference-style definition must fail the gate"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("README.md") && stderr.contains("docs/gone.md"),
+        "the failure must name the file and the missing reference-style target: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn gate_accepts_directory_targets() {
+    // Red-first for the rm-1894 `-f` misfire: a link to an existing
+    // DIRECTORY (`](docs)`) is legitimate — the pre-rider gate read it
+    // as broken and would have failed any tree that used one.
+    let repo = fixture_repo("dir-target");
+    fs::write(
+        repo.join("docs/here.md"),
+        "# Here\n\nBack to [the docs root](..).\n",
+    )
+    .expect("write directory-target link");
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["-c", "user.name=fixture"])
+            .args(["-c", "user.email=fixture@example.invalid"])
+            .args(args)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    };
+    assert!(
+        git(&["add", "."]) && git(&["commit", "-q", "-m", "dir target"]),
+        "fixture must commit the directory-target link"
+    );
+    let output = Command::new("bash")
+        .arg(script_path())
+        .current_dir(&repo)
+        .output()
+        .expect("run gate against directory-target fixture");
+    assert!(
+        output.status.success(),
+        "a directory target is a valid relative link: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn gate_lints_the_standing_fixture_for_every_covered_form() {
+    // The standing fixture doc (docs/quality-gates/relative-link-
+    // forms.md) exercises every form in the TREE the gate lints. It
+    // only joins `git ls-files` at commit time, so this leg pins the
+    // doc's SHAPE by direct containment: both syntaxes and all three
+    // semantics must be present in the file the gate will lint once
+    // the batch lands. The behavioral legs above prove the gate's
+    // handling; this leg keeps the fixture from silently shedding a
+    // covered form in a future edit.
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let doc = fs::read_to_string(repo_root.join("docs/quality-gates/relative-link-forms.md"))
+        .expect("read the standing fixture doc");
+    // Inline file target.
+    assert!(doc.contains("(../../README.md)"), "inline file target");
+    // Inline DIRECTORY target — the `-e` semantics.
+    assert!(
+        doc.contains("(../quality-gates)"),
+        "inline directory target"
+    );
+    // Reference-style definitions, including a fragment target — the
+    // syntax and the stripped-anchor semantics.
+    assert!(doc.contains("[contributing]: ../../CONTRIBUTING.md"));
+    assert!(doc.contains("[changelog head]: ../../CHANGELOG.md#unreleased"));
+    assert!(doc.contains("[quality-gates dir]: ./"));
+}

@@ -327,6 +327,10 @@ struct DoctorDiscovery {
     subagent_artifact_files: usize,
     duplicate_session_files: usize,
     duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-1888 (run 5cbd75e3 cycle 2): signature hits that byte-verified
+    /// DISTINCT — kept files a (size, hash) match would have wrongly
+    /// suppressed (stale memo or hash collision; same presentation).
+    content_signature_conflicts: usize,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -415,6 +419,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         subagent_artifact_files: suppressed.subagent_artifact_files,
         duplicate_session_files: suppressed.duplicate_session_files,
         duplicate_session_file_pairs: suppressed.duplicate_session_file_pairs,
+        content_signature_conflicts: suppressed.content_signature_conflicts,
     }
 }
 
@@ -442,6 +447,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         subagent_artifact_files,
         duplicate_session_files,
         duplicate_session_file_pairs,
+        content_signature_conflicts,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -504,6 +510,17 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         disclosures.insert(
             "duplicate_session_files".to_string(),
             duplicate_session_files,
+        );
+    }
+    // rm-1888 (run 5cbd75e3 cycle 2): the verified-distinct counterpart
+    // — files whose signature hit another journal but whose bytes did
+    // NOT match, so the dedup kept them. Disclosed so "no duplicates"
+    // and "a signature match that verified distinct" stay tellable
+    // apart in doctor (the same counter rides the --audit JSON).
+    if content_signature_conflicts > 0 {
+        disclosures.insert(
+            "content_signature_conflicts".to_string(),
+            content_signature_conflicts,
         );
     }
     let mut report = DoctorReport {
@@ -1477,6 +1494,17 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
         if count > 0 {
             recommendations.push(format!(
                 "{} byte-identical session file copy/copies were counted once (content signature match); keep ONE canonical copy per journal so tooling that ignores content identity stays honest.",
+                count
+            ));
+        }
+    }
+    // rm-1888 (run 5cbd75e3 cycle 2): the byte-verify outranks a
+    // signature hit — these were KEPT because their bytes verified
+    // distinct under a signature they share with another journal.
+    if let Some(&count) = report.disclosures.get("content_signature_conflicts") {
+        if count > 0 {
+            recommendations.push(format!(
+                "{} session file(s) shared a size+hash signature with another journal but byte-verified distinct and were kept (not deduplicated); distinct bytes under one signature are expected only for tiny or adversarial files — inspect them if unexpected.",
                 count
             ));
         }
