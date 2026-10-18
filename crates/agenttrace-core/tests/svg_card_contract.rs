@@ -175,22 +175,37 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
             .unwrap_or("<no date labels>")
     );
     // The card must not leak the wall clock into the corpus-anchored
-    // axis — but the disclosure footer is a different lane (pricing
-    // catalog identity, rm-176): it legitimately carries the bundled
-    // snapshot's date, which on refresh day IS today. Strip the pricing
-    // footer line before the oracle or every same-day CI run after a
-    // snapshot refresh false-positives here (first observed 2026-10-17,
-    // the 466-key adjudication refresh, run 389e223a cycle 1).
-    let card_minus_pricing_footer = card
+    // axis — but the disclosure footer's pinned SNAPSHOT DATE is a
+    // different lane (pricing catalog identity, rm-176): it legitimately
+    // carries the bundled snapshot's date, which on refresh day IS
+    // today. Strip ONLY that pinned date token — never the whole
+    // LiteLLM-bearing line — and pin the footer's shape while at it, so
+    // a future wall-clock token added anywhere on the disclosure lane
+    // (e.g. a rendered-at date) fails this oracle instead of riding a
+    // line-level exemption into the goldens (refresh-day false-positive
+    // first observed 2026-10-17, run 389e223a cycle 1; line-level strip
+    // narrowed by review d77fa453 F3, fix round 2026-10-18).
+    let footer = card
         .lines()
-        .filter(|line| !line.contains("LiteLLM"))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .find(|line| line.contains("LiteLLM snapshot"))
+        .expect("pricing footer line missing from the card");
+    let prefix = "LiteLLM snapshot ";
+    let date_start = footer.find(prefix).expect("footer prefix") + prefix.len();
+    let snapshot_date: String = footer[date_start..]
+        .chars()
+        .take_while(|c| *c != ' ' && *c != ';')
+        .collect();
+    let pinned = format!("{prefix}{snapshot_date} (bundled)");
+    assert!(
+        snapshot_date.len() == 10 && footer.contains(&pinned),
+        "pricing footer lost its pinned `LiteLLM snapshot YYYY-MM-DD (bundled)` shape: {footer}"
+    );
+    let card_minus_pinned_date = card.replace(&pinned, "LiteLLM snapshot <pinned-date> (bundled)");
     // The demo corpus's fixed timestamps are far from today; if the card
     // were anchored to `Utc::now()` today's date would leak in.
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     assert!(
-        !card_minus_pricing_footer.contains(&today),
+        !card_minus_pinned_date.contains(&today),
         "wall-clock date leaked into a corpus-anchored card"
     );
 }
