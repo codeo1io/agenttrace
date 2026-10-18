@@ -147,7 +147,7 @@ agenttrace --doctor
 #   A '#' opens a comment at line start or after whitespace; a '#'
 #   embedded in an unquoted value (like /tmp/a#b.toml) stays part of
 #   the value — quote it to be explicit (rm-918).
-agenttrace --budget                # weekly window: per-day spend over the trailing 7 calendar days vs budget
+agenttrace --budget                # weekly window: per-day spend over the trailing 7 calendar days vs budget (UTC day boundaries)
 agenttrace --statusline-report     # same journal; "Budget: ... remaining" line
 ```
 
@@ -513,7 +513,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--history-dir <PATH>` |  | Override the history directory: highest precedence, then the config files, then `AGENTTRACE_HISTORY_DIR` (rm-384) |
 | `--pricing-file <PATH>` |  | Override the pricing override file: highest precedence, then the config files, then `AGENTTRACE_PRICING_FILE` (rm-384) |
 | `--weekly-budget <USD>` |  | Weekly spend budget in USD for `--statusline-report` and `--budget`: highest precedence, then config `weekly_budget_usd` (rm-385) |
-| `--budget` |  | Show the weekly budget window-burn view: per-day spend from the statusline journal against the resolved weekly budget; the window is the trailing 7 CALENDAR days ending today — stale journals disclose instead of verdicting, and hostile capture costs (negative or non-finite `total_cost_usd`) plus unparsable journal lines are discarded and disclosed, never folded into the total, with `remaining_usd` floored to [0, budget] in the JSON arms (rm-385, rm-917) |
+| `--budget` |  | Show the weekly budget window-burn view: per-day spend from the statusline journal against the resolved weekly budget; the window is the trailing 7 CALENDAR days ending today on UTC day boundaries, so the week turns at 00:00 UTC — a local day at UTC+13/+14 can sit up to two days off that window (rm-385, rm-917, rm-1985) — stale journals disclose instead of verdicting, and hostile capture costs (negative or non-finite `total_cost_usd`) plus unparsable journal lines are discarded and disclosed, never folded into the total, with `remaining_usd` floored to [0, budget] in the JSON arms |
 | `--version` |  | Print the version banner and exit 0; wins over action validation |
 | `--demo` |  | Use the built-in demo corpus instead of discovered agent homes (stable epoch-anchored sessions) |
 | `--doctor` |  | Run environment self-checks (config paths, cache consistency, agent homes) and exit non-zero on failure |

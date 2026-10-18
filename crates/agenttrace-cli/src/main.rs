@@ -188,7 +188,10 @@ struct Args {
     weekly_budget: Option<f64>,
     /// Show the weekly budget window-burn view: per-day spend from
     /// the statusline journal against the resolved weekly budget
-    /// (rm-385).
+    /// (rm-385). The window is the trailing 7 calendar days ending
+    /// today on UTC day boundaries (rm-1985): the week turns at
+    /// 00:00 UTC, so a local day at UTC+13/+14 can sit up to two
+    /// days off the window.
     #[arg(long)]
     budget: bool,
     /// Print the version banner and exit 0; wins over action

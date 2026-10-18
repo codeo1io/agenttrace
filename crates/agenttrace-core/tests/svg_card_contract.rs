@@ -149,6 +149,39 @@ fn empty_corpus_renders_a_valid_card() {
     );
 }
 
+/// rm-176 acceptance extension: the honesty footer's pricing segment
+/// (`LiteLLM snapshot <date> (bundled); … priced models…`, reports.rs
+/// `CardFooter.pricing` ← pricing::pricing_source()) embeds the
+/// SANCTIONED bundle snapshot date. A same-UTC-day merge of the weekly
+/// pricing-drift refresh legitimately carries today's date THERE — the
+/// pre-carve wall-clock scan red on exactly that (red-first proof:
+/// /tmp/at-impl-7167f1ac/g1-red.log, snapshot date set to today,
+/// `sparkline_is_anchored…` FAILED at the today-scan). Redact that one
+/// sanctioned segment — and only it — before scanning; every other
+/// surface (the sparkline axis above all) stays under the scan, and
+/// the positive control below proves the redaction cannot blind it.
+fn redact_sanctioned_pricing_disclosure(card: &str) -> String {
+    const START: &str = "pricing ";
+    const END: &str = " · data confidence ";
+    let mut out = String::with_capacity(card.len());
+    let mut rest = card;
+    while let Some(start) = rest.find(START) {
+        let after = &rest[start + START.len()..];
+        match after.find(END) {
+            Some(rel) => {
+                out.push_str(&rest[..start + START.len()]);
+                out.push_str("<sanctioned snapshot disclosure>");
+                rest = &after[rel + END.len()..];
+            }
+            // No closing separator: not the honesty footer (e.g. the
+            // word "pricing" inside a corpus label) — keep scanning.
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[test]
 fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
     let mut sessions = demo_sessions().expect("demo sessions parse");
@@ -176,10 +209,28 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
     );
     // The demo corpus's fixed timestamps are far from today; if the card
     // were anchored to `Utc::now()` today's date would leak in.
+    // rm-176: the ONE sanctioned carrier of today's date — the footer's
+    // pricing disclosure, when the weekly snapshot refresh merged the
+    // same UTC day — is redacted first (see helper above).
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let redacted = redact_sanctioned_pricing_disclosure(&card);
     assert!(
-        !card.contains(&today),
-        "wall-clock date leaked into a corpus-anchored card"
+        !redacted.contains(&today),
+        "wall-clock date leaked into a corpus-anchored card outside the \
+         sanctioned pricing disclosure"
+    );
+    // Positive control: the carve must not blind the scan — a today-date
+    // planted OUTSIDE the pricing footer (a model label) is still caught,
+    // so the redaction covers the footer and nothing else.
+    let mut leaky = demo_sessions().expect("demo sessions parse");
+    leaky[0].metrics.model_used = today.clone();
+    let leaky_overview = compute_overview(&leaky);
+    let leaky_card = report_overview_svg(&leaky_overview, &leaky, SvgCardTheme::Light);
+    let leaky_redacted = redact_sanctioned_pricing_disclosure(&leaky_card);
+    assert!(
+        leaky_redacted.contains(&today),
+        "the redaction must cover only the pricing footer — a model-label \
+         today-date must still fail the scan"
     );
 }
 

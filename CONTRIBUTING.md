@@ -35,6 +35,28 @@ target/release/agenttrace --demo --doctor
 target/release/agenttrace --demo --overview -f json
 ```
 
+## Maintenance Records and the Retention Bound
+
+Stewardship records (`docs/stewardship/`) are append-only evidence for the
+maintenance campaigns: one file per attempt phase, named
+`YYYY-MM-DD-cycle<N>-<phase>-record…md`. They are never edited after the
+run that writes them.
+
+The inline directory is not a landfill (`rm-1984`): only the **12
+most-recent maintenance cycles** stay under `docs/stewardship/`. When a
+new cycle pushes the count past the bound:
+
+1. `git mv docs/stewardship/<file> docs/archive/stewardship/<file>`
+   (flat move, original basename — the date prefixes keep names unique);
+2. `scripts/ci/check-stewardship-retention.sh --regen-index` rebuilds
+   `docs/archive/stewardship/INDEX.md`, which maps every archived record
+to its original inline path — cite either form; the index is the bridge;
+3. `scripts/ci/check-stewardship-retention.sh` (also a CI gate) must pass.
+
+Historical citations in ROADMAP banners and review/research docs keep
+their original inline-path spelling on purpose — that is why the archive
+is flat and the index maps both directions.
+
 ## Translations
 
 All user-visible text lives in `crates/agenttrace-core/locales/en.yml` and

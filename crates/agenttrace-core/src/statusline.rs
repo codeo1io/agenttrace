@@ -1388,6 +1388,9 @@ pub fn render_statusline_report(
             value["budget"] = serde_json::json!({
                 "weekly_budget_usd": budget,
                 "spend_7d_usd": series.total,
+                // rm-1985: the weekly window's day basis, machine-
+                // readable (same clause as the --budget json arm).
+                "day_basis": "utc_calendar_days",
                 "remaining_usd": remaining_usd,
                 // "Statusline budget truth" (run 80336dfb): the same
                 // hostile-sample disclosure the --budget json arm
@@ -2085,6 +2088,10 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
                 }))
                 .collect::<Vec<_>>(),
             "spend_7d_usd": series.total,
+            // rm-1985: the weekly window's day basis, machine-readable
+            // (mirrors the header's UTC clause and README's --budget
+            // row; budget_window_disclosure_contract.rs pins it).
+            "day_basis": "utc_calendar_days",
             // "Statusline budget truth" (run 80336dfb): hostile cost
             // samples are discarded from every spend number in this
             // object and disclosed here — never silently.
@@ -2124,7 +2131,15 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
     // is the ONE rm-684/rm-898 shared single-read computation above —
     // the candidate's text arm re-read the journal here (superseded
     // mechanics, dropped at integration).
-    let mut out = String::from("Weekly budget — trailing 7 calendar days (statusline journal)\n");
+    // rm-1985: the window basis is UTC calendar days (utc_day), so the
+    // basis is named in the header instead of being guessed — a
+    // UTC+13/+14 local day can sit up to two days off this window.
+    // README's --budget row and the JSON `day_basis` field carry the
+    // same clause (budget_window_disclosure_contract.rs pins all
+    // three surfaces).
+    let mut out = String::from(
+        "Weekly budget — trailing 7 calendar days, UTC day boundaries (statusline journal)\n",
+    );
     for (day, spend) in &series.daily {
         out.push_str(&format!("  {day}  ${spend:.2}\n"));
     }

@@ -2,7 +2,8 @@
 # drift-check.sh — provable freshness for the bundled pricing catalog (rm-176 + assess A1 + rm-006 fold).
 #
 # Posture (recorded 2026-10-05, run 84c45ccd cycle 1; full table in
-# docs/stewardship/2026-10-05-cycle1-implementation-record-run84c45ccd.md):
+# docs/stewardship/2026-10-05-cycle1-implementation-record-run84c45ccd.md, archived at
+# docs/archive/stewardship/2026-10-05-cycle1-implementation-record-run84c45ccd.md):
 #   the fork keeps the OFFLINE-FIRST BUNDLED catalog (byte-deterministic reports, no network in the
 #   hot path) and automates freshness with a SCHEDULED PR-BUMP gate. Rejected postures: ccusage-style
 #   hourly auto-push (no unreviewed mutation of the money table) and upstream-style runtime fetch
