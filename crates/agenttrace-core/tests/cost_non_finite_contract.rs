@@ -108,7 +108,7 @@ fn non_finite_cost_is_excluded_from_governance_folds() {
     // poisoned members — both now skip-while-counting like the
     // overview lanes.
     let sessions = sessions_with_one_poisoned_cost();
-    let audit = agenttrace_core::governance::cost_audit(&sessions);
+    let audit = agenttrace_core::cost_audit(&sessions);
     assert!(
         audit.total_estimated_cost.is_finite(),
         "cost_audit total folded a non-finite cost"

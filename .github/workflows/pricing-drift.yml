@@ -128,7 +128,11 @@ jobs:
           fi
 
           git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs
-          git add tests/fixtures/svg-card/demo-auto.svg tests/fixtures/svg-card/demo-dark.svg tests/fixtures/svg-card/demo-light.svg
+          # GOLDEN_DIR is relative to the crate root (cargo runs test binaries
+          # there), so the regenerated goldens land under crates/agenttrace-core/ —
+          # a bare tests/… pathspec would match nothing and fail this step under
+          # set -euo pipefail before the commit ever happens.
+          git add crates/agenttrace-core/tests/fixtures/svg-card/demo-auto.svg crates/agenttrace-core/tests/fixtures/svg-card/demo-dark.svg crates/agenttrace-core/tests/fixtures/svg-card/demo-light.svg
           git commit -m "chore(pricing): refresh bundled snapshot to $new_date (pricing-drift gate)"
 
           counts="$(grep -E 'costed-chat models' refresh-check.txt | tr -s ' ' | tr '\n' ';')"

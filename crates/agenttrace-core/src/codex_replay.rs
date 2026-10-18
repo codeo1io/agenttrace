@@ -439,9 +439,7 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
             // output legs — parsed-data-fed counters on a hostile
             // corpus must not panic a debug build or wrap a release
             // total.
-            stats.tokens_input_dropped = stats
-                .tokens_input_dropped
-                .saturating_add(dropped_input);
+            stats.tokens_input_dropped = stats.tokens_input_dropped.saturating_add(dropped_input);
             stats.tokens_cache_read_dropped = stats.tokens_cache_read_dropped.saturating_add(
                 before_cache_r
                     .saturating_sub(session.metrics.tokens_cache_r)
@@ -452,9 +450,11 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
                     .saturating_sub(session.metrics.tokens_cache_w)
                     .max(0),
             );
-            stats.tokens_output_dropped = stats
-                .tokens_output_dropped
-                .saturating_add(before_output.saturating_sub(session.metrics.tokens_output).max(0));
+            stats.tokens_output_dropped = stats.tokens_output_dropped.saturating_add(
+                before_output
+                    .saturating_sub(session.metrics.tokens_output)
+                    .max(0),
+            );
             stats.tokens_reasoning_dropped = stats.tokens_reasoning_dropped.saturating_add(
                 before_reasoning
                     .saturating_sub(session.metrics.tokens_reasoning)

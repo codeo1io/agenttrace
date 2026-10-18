@@ -750,6 +750,12 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         sessions
             .iter()
             .map(|session| session.metrics.cost_estimated)
+            // rm-1500 (run 22f0c980 cycle 2): the audit total sums the
+            // same skip-while-counting rule the per-row folds use — a
+            // poisoned member is skipped from the arithmetic (its
+            // census lives in the data-health `non_finite_costs`),
+            // never allowed to NaN the whole audit total.
+            .filter(|cost| cost.is_finite())
             .sum(),
     );
     let current_estimated_cost_usd = by_provider_model

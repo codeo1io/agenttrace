@@ -383,11 +383,13 @@ fn dropped_counters_saturate_instead_of_overflowing() {
     let stats = reconcile_codex_multiagent_replays(&mut sessions);
     assert_eq!(stats.children_adjusted, 2, "both children rebase");
     assert_eq!(
-        stats.tokens_input_dropped, i64::MAX,
+        stats.tokens_input_dropped,
+        i64::MAX,
         "the accumulator saturates — it must never wrap past zero"
     );
     assert_eq!(
-        stats.tokens_output_dropped, i64::MAX,
+        stats.tokens_output_dropped,
+        i64::MAX,
         "the output accumulator saturates too"
     );
     // The rebased members stay non-negative: saturation kept the
