@@ -193,6 +193,25 @@ fn per_file_paths_surface_in_delivery_evidence() {
     );
 }
 
+/// Review fix b1602265 F3: rm-1926 acceptance (a) says the disclosure
+/// names the STORE PATH + the unreadable column — with several
+/// opencode stores on one machine, the column alone cannot say which
+/// db holds the poisoned row. The evidence line must carry the
+/// planted store path.
+#[test]
+fn unreadable_disclosure_names_the_store_path() {
+    let sessions = loaded("opencode-summary-diffs/opencode-summary-unreadable.db");
+    let lines = evidence_for(&sessions, "null summary integers");
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("cross-check not runnable")
+                && line.contains("summary column unreadable")
+                && line.contains("opencode.db")
+        }),
+        "the unreadable-column disclosure must name the store path; got {lines:?}"
+    );
+}
+
 /// rm-1926 (d): the disclosure must survive the snapshot cache — a
 /// warm read (unchanged size/mtime fingerprint, schema-14 snapshot)
 /// replays the same counter and the same evidence line, never a
