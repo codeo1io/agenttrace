@@ -229,6 +229,14 @@ pub struct DoctorReport {
     /// snapshot's date, model count, and age, so reports can disclose
     /// how current the prices behind `cost_estimated` are.
     pub pricing: String,
+    /// rm-1978: present exactly when the bundled demo corpus failed to
+    /// parse under `--doctor --demo` (build-time content corruption);
+    /// the report then renders zero sessions and names the error in a
+    /// recommendation instead of panicking. `None` on every valid
+    /// corpus, so report bytes are unchanged from pre-rm-1978
+    /// binaries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demo_corpus_error: Option<String>,
     /// rm-734 riding the landed rm-753 ingest report: sqlite session
     /// databases that exist but could not be read — the doctor's job
     /// is to name them (path + lane + reason) with a repair
@@ -327,6 +335,12 @@ struct DoctorDiscovery {
     subagent_artifact_files: usize,
     duplicate_session_files: usize,
     duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    opencode_info_docs_skipped_over_cap: usize,
+    /// rm-1978: set exactly when the bundled demo corpus failed to
+    /// parse under `--doctor --demo` (build-time content corruption,
+    /// never operator input) — the report then carries zero sessions
+    /// and names the error instead of panicking mid-diagnosis.
+    demo_corpus_error: Option<String>,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -342,6 +356,17 @@ struct DoctorDiscovery {
 /// strings.
 fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
     if demo {
+        // rm-1978: a demo-corpus parse failure is a broken build-time
+        // invariant, disclosed in the report (`demo_corpus_error` + a
+        // recommendation) with zero sessions rendered — never a panic
+        // mid-diagnosis, never a silent empty report. Failure-mode PoC:
+        // a parser refactor that breaks the bundled fixtures turns
+        // `--doctor --demo` from a crash into a visible, named error
+        // row; nothing changes on a valid corpus.
+        let (sessions, demo_corpus_error) = match crate::demo_sessions() {
+            Ok(sessions) => (sessions, None),
+            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        };
         return DoctorDiscovery {
             cache: SessionCacheReport {
                 path: session_cache_path(),
@@ -351,24 +376,27 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             },
             cache_size_bytes: 0,
             files: Vec::new(),
-            sessions: crate::demo_sessions().expect("bundled demo corpus"),
+            sessions,
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
             subagent_artifact_files: 0,
             duplicate_session_files: 0,
             duplicate_session_file_pairs: Vec::new(),
+            opencode_info_docs_skipped_over_cap: 0,
+            demo_corpus_error,
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, suppressed) = if dir.is_none() {
+    let (files, suppressed, opencode_info_docs_skipped_over_cap) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
         (
             find_session_files(dir),
             crate::discovery::SuppressedSessions::default(),
+            0,
         )
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
@@ -415,6 +443,8 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         subagent_artifact_files: suppressed.subagent_artifact_files,
         duplicate_session_files: suppressed.duplicate_session_files,
         duplicate_session_file_pairs: suppressed.duplicate_session_file_pairs,
+        opencode_info_docs_skipped_over_cap,
+        demo_corpus_error: None,
     }
 }
 
@@ -442,6 +472,8 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         subagent_artifact_files,
         duplicate_session_files,
         duplicate_session_file_pairs,
+        opencode_info_docs_skipped_over_cap,
+        demo_corpus_error,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -504,6 +536,15 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         disclosures.insert(
             "duplicate_session_files".to_string(),
             duplicate_session_files,
+        );
+    }
+    // rm-451 walk-lane arm: the over-cap info-doc skip is disclosed with
+    // its own key so a planted or bloated corpus is visible in `--doctor`,
+    // exactly like the fork exclusion above — never a silent skip.
+    if opencode_info_docs_skipped_over_cap > 0 {
+        disclosures.insert(
+            "opencode_info_docs_skipped_over_cap".to_string(),
+            opencode_info_docs_skipped_over_cap,
         );
     }
     let mut report = DoctorReport {
@@ -580,11 +621,34 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             crate::pricing::bundled_snapshot_date(),
             crate::pricing::bundled_snapshot_model_count(),
             snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1))
-        ) + &doctor_deprecation_suffix(),
+        ) + &doctor_deprecation_suffix()
+            // rm-1978: when the embedded models.dev extract failed to
+            // parse, the pricing provenance names the degradation —
+            // extract-only models then miss through the ordinary
+            // unpriced-model disclosure (absence, never a wrong
+            // number), and the doctor states why.
+            + &crate::pricing::models_dev_parse_failure()
+                .map(|error| {
+                    format!(
+                        "; models.dev extract FAILED TO PARSE (rm-1978 \
+                         disclosure — extract rows unserved): {error}"
+                    )
+                })
+                .unwrap_or_default(),
+        demo_corpus_error,
         sqlite_read_failures: sqlite_ingest.unreadable,
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
+    // rm-1978: the demo-corpus failure rides the recommendations lane
+    // too, so both the JSON field and the human-readable report name
+    // the broken build-time invariant.
+    if let Some(error) = &report.demo_corpus_error {
+        report.recommendations.push(format!(
+            "bundled demo corpus failed to parse — build-time content \
+             corruption (rm-1978 disclosure): {error}; rebuild the binary"
+        ));
+    }
     // rm-1554: drained last so every knob read inside this build is
     // covered (root bound, sqlite budget, and the scan-partial
     // note's re-read of the sqlite total).
@@ -878,11 +942,12 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
 
 fn find_reportable_session_files(
     dir: Option<&Path>,
-) -> (Vec<PathBuf>, crate::discovery::SuppressedSessions) {
+) -> (Vec<PathBuf>, crate::discovery::SuppressedSessions, usize) {
     if dir.is_some() {
         return (
             find_session_files(dir),
             crate::discovery::SuppressedSessions::default(),
+            0,
         );
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
@@ -899,11 +964,12 @@ fn find_reportable_session_files(
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, suppressed) = crate::discovery::find_session_files_cached(None, &mut cache, true);
+    let (files, suppressed, opencode_info_docs_skipped_over_cap) =
+        crate::discovery::find_session_files_cached(None, &mut cache, true);
     // A cache write failure must never fail the doctor (the cache is
     // an optimization; the inventory answer is already correct).
     let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, suppressed)
+    (files, suppressed, opencode_info_docs_skipped_over_cap)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite

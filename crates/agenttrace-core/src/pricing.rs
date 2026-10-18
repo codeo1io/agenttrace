@@ -22,6 +22,7 @@ const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
+static MODELS_DEV_PARSE_FAILURE: OnceLock<String> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
 static PRICING_OVERRIDE_STATUS: OnceLock<PricingOverrideStatus> = OnceLock::new();
 
@@ -297,50 +298,72 @@ struct ModelsDevCatalog {
 
 fn models_dev_catalog() -> &'static ModelsDevCatalog {
     MODELS_DEV_CATALOG.get_or_init(|| {
-        let mut catalog = ModelsDevCatalog::default();
-        // The file's first key is `_snapshot` — provenance prose, not a
-        // row — so the map parses as JSON values first and each row
-        // converts individually. A malformed row fails loudly at
-        // startup (binary build-time content, never operator input).
-        let map: BTreeMap<String, serde_json::Value> =
-            serde_json::from_str(MODELS_DEV_SNAPSHOT_JSON)
-                .expect("rm-1532: embedded models_dev_snapshot.json must parse");
-        for (id, value) in map {
-            if id == "_snapshot" {
-                continue;
-            }
-            let row: ModelsDevRow = serde_json::from_value(value).unwrap_or_else(|error| {
-                panic!("rm-1532: models_dev_snapshot.json row {id} must parse: {error}")
-            });
-            // Key: the model id after its "provider/" prefix — the raw
-            // dated id a session records. Lowercased to match the
-            // primary catalog's canonicalization.
-            let key = id
-                .rsplit_once('/')
-                .map(|(_, model)| model)
-                .unwrap_or(&id)
-                .to_ascii_lowercase();
-            catalog.entries.insert(
-                key.clone(),
-                Price {
-                    input: row.input,
-                    output: row.output,
-                    // rm-1508 discipline carried into the second catalog:
-                    // an unpublished extract cache rate stays `None`
-                    // (bills at the disclosed fallback), a published
-                    // number — explicit $0 included — stays `Some`.
-                    // Every row this extract ships today publishes both
-                    // rates, so served prices are byte-identical to the
-                    // rm-1532 landing.
-                    cr: row.cache_read,
-                    cw: row.cache_write,
-                    ..Price::default()
-                },
-            );
-            catalog.providers.insert(key, row.provider);
-        }
-        catalog
+        // rm-1978: build-time content corruption degrades LOUDLY, never
+        // panics mid-report and never silently falsifies a lookup. The
+        // extract is a fallback enrichment lane: when it cannot serve,
+        // extract-only models miss and disclose through the ordinary
+        // unpriced-model path (absence, never a wrong number), and the
+        // recorded parse failure is named verbatim in `--doctor`'s
+        // pricing provenance line via [`models_dev_parse_failure`].
+        parse_models_dev_snapshot(MODELS_DEV_SNAPSHOT_JSON).unwrap_or_else(|error| {
+            let _ = MODELS_DEV_PARSE_FAILURE.set(error);
+            ModelsDevCatalog::default()
+        })
     })
+}
+
+/// rm-1978: the recorded parse failure for the embedded models.dev
+/// extract, present exactly when the snapshot failed to parse
+/// (build-time content corruption, never operator input). Surfaced by
+/// the doctor's pricing provenance so the degradation is named, not
+/// silent.
+pub(crate) fn models_dev_parse_failure() -> Option<&'static str> {
+    MODELS_DEV_PARSE_FAILURE.get().map(String::as_str)
+}
+
+/// rm-1978: pure snapshot parser so the corruption failure mode is
+/// unit-pinnable (the old `rm-1532` expect could only fail at runtime).
+/// The file's first key is `_snapshot` — provenance prose, not a row —
+/// so the map parses as JSON values first and each row converts
+/// individually; a malformed row names itself in the returned error.
+fn parse_models_dev_snapshot(raw: &str) -> Result<ModelsDevCatalog, String> {
+    let mut catalog = ModelsDevCatalog::default();
+    let map: BTreeMap<String, serde_json::Value> = serde_json::from_str(raw)
+        .map_err(|error| format!("embedded models_dev_snapshot.json failed to parse: {error}"))?;
+    for (id, value) in map {
+        if id == "_snapshot" {
+            continue;
+        }
+        let row: ModelsDevRow = serde_json::from_value(value)
+            .map_err(|error| format!("models_dev_snapshot.json row {id} must parse: {error}"))?;
+        // Key: the model id after its "provider/" prefix — the raw
+        // dated id a session records. Lowercased to match the
+        // primary catalog's canonicalization.
+        let key = id
+            .rsplit_once('/')
+            .map(|(_, model)| model)
+            .unwrap_or(&id)
+            .to_ascii_lowercase();
+        catalog.entries.insert(
+            key.clone(),
+            Price {
+                input: row.input,
+                output: row.output,
+                // rm-1508 discipline carried into the second catalog:
+                // an unpublished extract cache rate stays `None`
+                // (bills at the disclosed fallback), a published
+                // number — explicit $0 included — stays `Some`.
+                // Every row this extract ships today publishes both
+                // rates, so served prices are byte-identical to the
+                // rm-1532 landing.
+                cr: row.cache_read,
+                cw: row.cache_write,
+                ..Price::default()
+            },
+        );
+        catalog.providers.insert(key, row.provider);
+    }
+    Ok(catalog)
 }
 
 /// rm-1532: which catalog serves a session id — the ONE seam the rate
@@ -2897,6 +2920,38 @@ fn write_pricing_header(out: &mut String, name_width: usize) {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn rm1978_models_dev_snapshot_corruption_degrades_loudly_never_panics() {
+        // Red-first pin of the restructured failure mode (rm-1978
+        // cohort, pricing.rs site): pre-restructure this exact input
+        // PANICKED inside the OnceLock initializer (rm-1532's expect),
+        // taking down any report that touched pricing. Now a malformed
+        // snapshot is a named error and a degraded empty catalog — the
+        // extract lane stops serving (lookups miss through the ordinary
+        // unpriced-model disclosure, absence never a wrong number) and
+        // [`models_dev_parse_failure`] names the cause for `--doctor`.
+        let whole_file_corrupt = parse_models_dev_snapshot("{ not json").unwrap_err();
+        assert!(whole_file_corrupt.contains("models_dev_snapshot.json"));
+        assert!(whole_file_corrupt.contains("failed to parse"));
+
+        let row_corrupt =
+            parse_models_dev_snapshot(r#"{"_snapshot":"ok","anthropic/claude-3-5":42}"#)
+                .unwrap_err();
+        assert!(row_corrupt.contains("row anthropic/claude-3-5"));
+        assert!(row_corrupt.contains("must parse"));
+
+        // A snapshot of only provenance prose parses to an empty but
+        // valid catalog (zero rows is legal — absence is honest).
+        let prose_only = parse_models_dev_snapshot(r#"{"_snapshot":"ok"}"#).unwrap();
+        assert!(prose_only.entries.is_empty());
+        assert!(prose_only.providers.is_empty());
+
+        // The bundled snapshot itself parses clean — the invariant the
+        // disclosure exists to guard. A regression here fails this pin
+        // instead of panicking inside a user's report.
+        assert!(parse_models_dev_snapshot(MODELS_DEV_SNAPSHOT_JSON).is_ok());
+    }
 
     #[test]
     fn pricing_cache_path_honors_session_cache_env() {

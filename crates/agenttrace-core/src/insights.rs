@@ -50,16 +50,16 @@ pub enum TimeRange {
 /// can sit an hour off true local midnight, which is strictly better than
 /// anchoring every non-UTC user to UTC midnight every day.
 fn day_start_for_offset(now: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
+    // rm-1978: midnight-of-day and fixed-offset conversion are total
+    // functions — the previous `expect`s were panics parked behind
+    // hand-written invariants. `NaiveTime::MIN` is midnight by
+    // construction, and subtracting a `FixedOffset` from a naive
+    // timestamp is the definition of reading it as UTC.
     let midnight = now
         .with_timezone(&offset)
         .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always representable");
-    midnight
-        .and_local_timezone(offset)
-        .single()
-        .expect("fixed offsets have no DST ambiguity")
-        .with_timezone(&Utc)
+        .and_time(chrono::NaiveTime::MIN);
+    (midnight - offset).and_utc()
 }
 
 impl TimeRange {

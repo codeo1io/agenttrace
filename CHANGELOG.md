@@ -957,6 +957,54 @@
 
 ### Fixed
 
+- Statusline journal writers no longer hang forever behind a wedged journal
+  lock (rm-686 production lock-wait arm, run c0a02f64 cycle 1):
+  `open_locked_journal` called `File::lock` with no deadline — the retry
+  bound (`JOURNAL_LOCK_ATTEMPTS`) limited only the inode-race loop, never
+  the wait — so a foreign or stuck holder (observed live: a compactor
+  spinning at ~80% CPU while writers piled up) blocked every statusline
+  writer indefinitely. The wait is now bounded by
+  `JOURNAL_LOCK_WAIT` (10s) via a `try_lock` ladder — `Interrupted` is
+  retried, non-`WouldBlock` errors propagate, and `WouldBlock` sleeps in
+  5ms steps to the deadline before failing with a loud `TimedOut` refusal
+  naming rm-686. Every expiry bumps a `lock_wait_expiries` counter
+  disclosed on `statusline_journal_stats` (serde skip-if-zero), and
+  `JOURNAL_LOCK_ATTEMPTS` keeps its inode-race meaning. Pinned red-first
+  by a fixture that holds the lock past the bound: bounded loud refusal,
+  a strict counter delta, and a release-then-acquire positive control.
+
+- The opencode fork-parent probe no longer reads session-info docs
+  unbounded (rm-451 info-doc admission arm, run c0a02f64 cycle 1):
+  `opencode_session_fork_parent` did `fs::read_to_string` on
+  `storage/session/info/*.json` with no byte cap, re-reading per fork
+  parent per scan, and the rm-212 file-kind gates admit symlinked regular
+  files by design — an unbounded read surface in the same family the
+  statusline and zstd lanes already cap. The probe now stats and refuses
+  over-cap docs without materializing them
+  (`OPENCODE_INFO_DOC_READ_CAP_BYTES`, 1 MiB), a strict
+  `is_opencode_session_info_doc` predicate makes the walk counter count
+  exactly the docs the probe reads, and skips are disclosed instead of
+  crashing or silently dropping (`LoadReport.opencode_info_docs_skipped_over_cap`
+  plus a doctor key). Pinned by two contract tests: over-cap docs are
+  skipped and disclosed, under-cap docs still drive fork exclusion.
+
+- A corrupt bundled models.dev snapshot now degrades loudly instead of
+  panicking, and the guarded-invariant cohort fails loud everywhere
+  (rm-1978, run c0a02f64 cycle 1): `parse_models_dev_snapshot` returns a
+  `Result` and a whole-file- or row-corrupt snapshot records the failure
+  in a `MODELS_DEV_PARSE_FAILURE` disclosure surfaced through doctor
+  provenance (the bundled snapshot parses clean, so a healthy tree is
+  unaffected); `expect` sites across main.rs, doctor.rs and
+  session_cache.rs became named-invariant bail/error paths
+  (`demo_corpus_error` is now `Option<String>`, skip-if-None — output
+  byte-identical on valid corpora), the two `unreachable!()` arms in the
+  TUI explorer became exhaustive matches, `render_session_list`
+  propagates errors instead of unwrapping, and `DataHealth` gains
+  `fallback_with_base_available` (`-f json`) naming models that fell
+  back while a base rate existed. Zero behavior change on valid inputs;
+  pinned red-first (whole-file corrupt / row-corrupt / prose-only /
+  bundled-clean).
+
 - Non-finite cost folds are gated across the aggregate census (rm-1500,
   run e4209f0c cycle 5, extended by the independent-review fix round): the
   cycle's first pass closed the three band-pinned folds — the cost-audit

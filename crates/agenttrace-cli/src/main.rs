@@ -994,7 +994,7 @@ fn run() -> anyhow::Result<()> {
                     sessions.len()
                 );
             }
-            let out = render_session_list(&sessions, &args.format, args.limit);
+            let out = render_session_list(&sessions, &args.format, args.limit)?;
             let out = dispatch_sanitize(&args.format, out);
             write_output(&args.output, &(out.clone() + "\n"))?;
             write_stdout(&out)?;
@@ -1034,11 +1034,21 @@ fn run() -> anyhow::Result<()> {
                 total,
                 &sessions,
             ));
-            &sessions[index]
+            Some(&sessions[index])
         } else if args.latest {
-            latest_session(&sessions).expect("sessions checked non-empty")
+            latest_session(&sessions)
         } else {
-            sessions.first().expect("sessions checked non-empty")
+            sessions.first()
+        };
+        // rm-1978: the hand-written non-empty guard no longer feeds a
+        // panic — selection lands in an Option and a broken invariant
+        // fails loudly, naming itself, instead of via `expect`.
+        let Some(session) = session else {
+            anyhow::bail!(
+                "rm-1978: session selection found no session — the list was \
+                 checked non-empty before --inspect/--latest selection, so this \
+                 is a broken invariant, not operator input"
+            );
         };
         let mut out = render_diagnostics(session, &sessions, &args.format, language)?;
         if let Some(header) = inspect_header {
@@ -2953,7 +2963,7 @@ fn matches_number(value: f64, filter: &str) -> bool {
     matches_numeric_filter(value, filter)
 }
 
-fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> String {
+fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> anyhow::Result<String> {
     // rm-798: --limit is a DISPLAY cap, and a capped machine format
     // must never read as the whole corpus: the json arm wraps the rows
     // with matched/returned/truncated counts, and the csv arm gets a
@@ -2968,7 +2978,16 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
             "limit": limit,
             "sessions": sessions,
         }))
-        .expect("sessions serialize");
+        // rm-1978: serialization of a `serde_json::Value` cannot fail on
+        // operator input — the error path exists so the invariant is
+        // named and loud, not so it can fire.
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "rm-1978: session-list JSON serialization failed — a \
+                 `serde_json::Value` has no unserializable content, so this \
+                 is a broken invariant: {error}"
+            )
+        });
     }
     if format == "csv" {
         // rm-409: RFC 4180 statement export. rm-383 sanitation composes
@@ -2994,7 +3013,7 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
                 parent_session: sanitize_line_segment(&session.metrics.parent_session),
             })
             .collect::<Vec<_>>();
-        return csv_export::sessions_csv_bounded(&rows, matched, limit);
+        return Ok(csv_export::sessions_csv_bounded(&rows, matched, limit));
     }
     let mut lines = vec![
         "SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES\tSUBAGENTS\tSUBAGENT_COST"
@@ -3033,7 +3052,7 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
             session.metrics.subagent_cost
         )
     }));
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
 fn render_diagnostics(
@@ -3906,7 +3925,7 @@ mod tests {
         };
         session.metrics.subagent_count = 2;
         session.metrics.subagent_cost = 0.0053;
-        let tsv = render_session_list(std::slice::from_ref(&session), "tsv", 20);
+        let tsv = render_session_list(std::slice::from_ref(&session), "tsv", 20).unwrap();
         let header = tsv.lines().next().expect("header");
         assert!(
             header.contains("SUBAGENTS") && header.contains("SUBAGENT_COST"),
@@ -3946,8 +3965,8 @@ mod tests {
             })
             .collect();
         for limit in [20usize, 2] {
-            let via_text = render_session_list(&sessions, "text", limit);
-            let via_tsv = render_session_list(&sessions, "tsv", limit);
+            let via_text = render_session_list(&sessions, "text", limit).unwrap();
+            let via_tsv = render_session_list(&sessions, "tsv", limit).unwrap();
             assert_eq!(
                 via_text, via_tsv,
                 "-f tsv and the default text lane must be byte-identical (limit {limit})"
@@ -3980,14 +3999,14 @@ mod tests {
                 diagnostics: agenttrace_core::Diagnostics::default(),
             })
             .collect();
-        let full = render_session_list(&sessions, "json", 20);
+        let full = render_session_list(&sessions, "json", 20).unwrap();
         let payload = serde_json::from_str::<serde_json::Value>(&full).expect("valid json");
         assert_eq!(payload["matched_sessions"], 5);
         assert_eq!(payload["returned_sessions"], 5);
         assert_eq!(payload["truncated"], false);
         assert_eq!(payload["limit"], 20);
         assert_eq!(payload["sessions"].as_array().map(Vec::len), Some(5));
-        let capped = render_session_list(&sessions, "json", 2);
+        let capped = render_session_list(&sessions, "json", 2).unwrap();
         let payload = serde_json::from_str::<serde_json::Value>(&capped).expect("valid json");
         assert_eq!(payload["matched_sessions"], 5);
         assert_eq!(payload["returned_sessions"], 2);
@@ -4027,7 +4046,7 @@ mod tests {
         child.metrics.subagent_count = 0;
         child.metrics.subagent_cost = 0.0;
         child.metrics.parent_session = "/tmp/parent.jsonl".to_string();
-        let csv = render_session_list(&[parent.clone(), child.clone()], "csv", 20);
+        let csv = render_session_list(&[parent.clone(), child.clone()], "csv", 20).unwrap();
         let header = csv.lines().nth(1).expect("header");
         assert!(
             header.ends_with("zero_usage_events,subagents,subagent_cost,parent_session"),
@@ -4042,7 +4061,7 @@ mod tests {
         let cells: Vec<&str> = child_row.split(',').collect();
         assert_eq!(cells[cells.len() - 1], "/tmp/parent.jsonl");
         assert!(!csv.contains("# truncated"));
-        let capped = render_session_list(&[parent, child], "csv", 1);
+        let capped = render_session_list(&[parent, child], "csv", 1).unwrap();
         assert!(
             capped
                 .lines()
@@ -4075,7 +4094,7 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: agenttrace_core::Diagnostics::default(),
         };
-        let tsv = render_session_list(std::slice::from_ref(&session), "tsv", 20);
+        let tsv = render_session_list(std::slice::from_ref(&session), "tsv", 20).unwrap();
         assert!(
             tsv.lines()
                 // Tab is the TSV separator itself; no OTHER control byte
@@ -4087,7 +4106,7 @@ mod tests {
         assert!(tsv.contains("]52;c;aGVsbG8="));
         // JSON output keeps the bytes, escaped — data integrity over
         // terminal trust, by design.
-        let json = render_session_list(&[session], "json", 20);
+        let json = render_session_list(&[session], "json", 20).unwrap();
         assert!(json.contains("\\u001b"));
     }
 
@@ -4423,7 +4442,9 @@ mod tests {
         let filtered = prepare_cli_view(vec![healthy, critical], &args).expect("filter");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "critical");
-        assert!(render_session_list(&filtered, "json", 20).contains("\"critical\""));
+        assert!(render_session_list(&filtered, "json", 20)
+            .unwrap()
+            .contains("\"critical\""));
         let diagnostics = render_diagnostics(&filtered[0], &filtered, "json", ReportLanguage::En)
             .expect("diagnostics");
         assert!(diagnostics.contains("\"diagnostics\""));
