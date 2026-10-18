@@ -851,6 +851,61 @@
 
 ### Fixed
 
+- Codex replay families corroborate on cwd, and warm-cache totals flip
+  LOUDLY instead of silently (rm-1956 at this landing — campaign-local
+  numeral rm-1541, run cd6782b46fb4 cycle 2, batch "replay-family
+  determinism pair"; the numeral twin reconciled at the commit gate per
+  the rm-708 convention — this wall's landed rm-1541 doctor-walk row
+  owns the numeral, so the false-family row takes the next free wall
+  numeral rm-1956 past def-max rm-1955; rm-1542 lands unrenumbered,
+  title-unique): family FORMATION keyed on bare `OpeningFingerprint`
+  equality with no cwd/project corroboration
+  (`reconcile_codex_multiagent_replays` in codex_replay.rs), so two
+  INDEPENDENT sessions in different projects sharing a ~1.4kB templated
+  company-preamble opening (not a replay) formed ONE false family — the
+  overview rebased the second session away (1500 reported vs 2500
+  honest) while emitting a FALSE
+  `codex_multiagent_replayed_tokens_dropped` = 1000 disclosure, with
+  by_project still counting both projects. Families are now re-keyed on
+  `(OpeningFingerprint, cwd)`: `scan_rollout` captures
+  `session_meta.payload.cwd` (first session_meta wins — the formerly
+  ignored arm) and a rollout without cwd cannot corroborate and never
+  joins a family (the conservative pre-rm-402 behavior for that file);
+  the signal is re-derived from the rollout file every pass, so warm
+  and cold corpora agree. Second, the warm path's totals silently
+  flipped with child-rollout readability (a chmod-000'd child flipped
+  the total 1500→2500 rc0 with zero disclosure, because the fresh parse
+  drops the unreadable child while the warm path trusts the cached
+  family shape): `RolloutScan` gains an `unreadable` arm and reconcile
+  pass 1 keeps the session's full conservative usage on canonicalize
+  failure or unreadable scan while disclosing per-session
+  `codex_multiagent_reconcile_skipped_unreadable` (the deliberate
+  `reconcile_` prefix preserves the no-disclosure contract on
+  non-family sessions; consumers verified generic — reports
+  disclosures fold unfiltered, governance prefix filters, doctor
+  generic fold). Pinned red-first in
+  `crates/agenttrace-core/tests/codex_multiagent_replay.rs` —
+  `cross_project_templated_opening_is_not_a_family`,
+  `same_project_templated_opening_still_reconciles` (positive control:
+  the child's cwd rewritten to the parent's still forms the family and
+  rebases 1500→500 — cwd is the discriminator, the opening-equality
+  rebase itself untouched),
+  `false_family_refusal_is_stable_without_session_timestamps` (warm
+  arm) and `unreadable_rollout_discloses_reconciliation_skip`
+  (deleted-child control reconciles, counts [1400,1700] preserved,
+  counter == 1 on the child only; the chmod-000 arm unix + non-root
+  guarded) — over the vendored fixture corpus
+  `tests/fixtures/codex-multiagent-v2-false-family/{alpha,beta}.jsonl`.
+  Black-box: cold AND warm overviews agree at 2500 / 2 projects / zero
+  disclosures where base reported 1500 plus the FALSE 1000-drop; a
+  warm chmod-000'd child now stays conservative at 3100 with a LOUD
+  counter. Validated at the run's base (implement 86ac94fb; targeted
+  9f1f74ef 897/0; full e8d6106c workspace 1205/0, clippy/fmt rc0),
+  independently reviewed APPROVED (99e01c04) with release-integrity
+  PASS (7ce23b68), salvage-landed b6a2186 and landed here by
+  integration (conflict case 03075502) composing cleanly over master's
+  post-base rm-1508 seam in `rebase_cost` (cw/cr ride the
+  absence-preserving billed ladder — disjoint hunks, both sides live).
 - Reasoning-effort-suffixed model ids price at their in-catalog base instead of the builtin Claude default (rm-1511, run 0915f736 cycle 4): clients append a reasoning-effort tier to the id — Antigravity CLI emits `claude-sonnet-5-5-medium`/-low (tokscale #1425 same-day datum), models.dev carries `:thinking` variants — and no catalog (bundled 3,131 keys or LiteLLM main) keys effort-suffixed ids, so the id's variant candidate list was `[raw, normalized]` only — `lookup_price_in`'s catalog-first variant arm (`matching_catalog_key`, unchanged by this batch) had nothing to match and the session billed at the default 3/15 rates while the exact base sat in the catalog: the recorded PoC priced `claude-sonnet-5-5-medium` at 1000in/500out for $0.0105 (200k ctx) against the base's $0.007 (1M ctx) — a 1.5x output over-bill rendered `priced`, disclosed only by the aggregate `fallback_pricing` counter. `match_variants` gains an effort arm (`-low/-medium/-high/-thinking/:thinking`, stripped to the base id) so the candidate list contains the in-catalog base, which the pre-existing catalog-first variant arm (`matching_catalog_key`, unchanged by this batch) resolves; `lookup_price_in` additionally expands variants-of-variants against the catalog before any builtin fallback (`has_specific_price` walks the same candidate list and agreed pre-batch — no divergence existed; review fix 1a615b64 corrected this entry's original claim to the contrary). The raw id keeps the tier so tier-aware lanes compose unchanged (`pricing::effort_tier_of` re-derives it), and the data-health fallback lane names the residual class instead of only counting: a new additive `fallback_with_base_available` list (bounded to 5 distinct ids) carries models whose unrecognized suffix tail hides a catalogued base, in the `--overview -f json` `data_health` lane (text/markdown health blocks render the aggregate counter only — review fix 1a615b64 scoped this entry's original wording, which quoted an annotation string that rendered nowhere). No snapshot change: `pricing_snapshot.json` is byte-identical (the base keys were already bundled). Pinned red-first by `pricing_effort_alias_contract.rs` — the recorded PoC flips 0.0105 → 0.007 through the real parse path, alias-matrix + case-insensitivity + `:thinking` arms, the suffixed-keys-absent-from-catalog guard (forces a conscious contract update if a suffixed key ever lands), tier re-derivation, unknown-base-stays-default negatives, and the disclosure naming (`fallback_pricing` drops to 0 for the priced class while `-ultra`-style unknowns surface their base). The pricing catalog itself is byte-identical — no snapshot change — but the repricing moves derived `cost_estimated` for UNCHANGED files while the rm-196 catalog-identity freshness gate keys an unchanged digest (the rm-485 class), so the integration lands a session-cache schema rung 70 → 71 (candidate carried none) to regenerate warm entries, pinned by `pricing_effort_alias_warm_cache.rs` and swept with the schema-bump oracle family. Review fix 1a615b64 (independent review ed20477f) added three arms: an Antigravity-shaped fixture (`PLANNER_RESPONSE`/`usageStats`/`modelConfigId`, the rm-947 lane) exercising the alias end-to-end through the real parse path, the second-order variant-of-variant catalog-loop pin, and the `effort_tier_of` tier-marker-on-catalogued-SKU limitation pin (48 such keys price exactly; only the lexical tier helper reports a marker) — 12 tests, fixture dirs unique per invocation (the rm-369 collision class).
 - The statusline budget truth lane clamps and discloses hostile capture costs instead of folding them into every budget surface (rm-1887 at this landing — campaign-local numeral rm-1503, run 80336dfb cycle 2, batch "Statusline budget truth: clamp-and-disclose hostile capture costs and unparsable journal lines"; title-keyed per the stewardship request, the numeral twin reconciles by title at the commit gate and takes the next free wall numeral here; composed at integration over the landed rm-1388 shared-predicate gate): at the run's base `capture_cost_usd` returned `cost.total_cost_usd` raw, so a negative capture rendered `7d total $-50.00` on a $10 budget with `$60.00 remaining` — a hostile editor hook literally bought budget headroom — while a non-representable sample (a `1e400` literal, which serde rejects at line-parse time, or a `null`/string/bool cost node) vanished from every budget surface with zero disclosure (`"lines": 1, "daily": []`, `captures_unknown_payload: 0`). Cost samples are now classified before the day fold — riding the same `parser::recorded_cost_sample_is_valid` predicate rm-1388 landed, so the classification can never drift from the fold's gate: finite non-negative spend enters unchanged (the rm-771 first-seen/baseline-unknown discipline is untouched), a finite negative is discarded and counted, and a present-but-not-finite node is discarded and counted separately — `negative_capture_cost_samples` / `invalid_capture_cost_samples` on the series, surfaced in `--budget -f json` and in `--statusline-report -f json`'s budget block, plus a text disclosure line in both views (`N hostile cost sample(s) discarded (X negative, Y not a finite number) — excluded from the 7d total/spend`) alongside rm-1388's own `invalid_cost_samples` line and counter (the two disclosure families share one classification pass at this integration; `capture_cost_usd` remains pinned as the Spend-only view). `remaining_usd` is floored into `[0, budget]` in both JSON arms (the text arms keep their OVER verdict; a hostile negative `--weekly-budget` cannot panic the floor), and the journal-stats census gained `unparsable_lines` — a torn or `1e400` line still counts in `lines` but is disclosed (`N unparsable journal line(s) — counted in the totals above, excluded from every capture stat`) so a lines-vs-captures gap has a visible cause. Pinned red-first by `crates/agenttrace-core/tests/statusline_budget_truth.rs` (11 tests: 3 hostile-negative behavioral pins, 4 disclosure/counting pins, 2 completion-turn pins for the `remaining_usd` floor and the `--statusline-report` arms, and 2 adoption-turn pins for non-numeric cost nodes — the reachable NaN/±inf shapes — and the zero-noise healthy corpus; the first seven were red or un-compilable on the pre-fix tree).
 - **rm-540 residual — `--search` evidence rows guard the VALUE, not the joined line (run 7fd83ab2 cycle 2, batch "evidence-lane paste-safety + claude-lane format-compat", assess cbf457f4 F1 live-proven)**. Every search evidence row joins `label: value` in `add_match` and the render loop applied `guarded_segment` to the JOINED item — but `guard_formula_cell` only neutralizes an introducer at the FIRST non-whitespace byte, so behind the label (`- tool: `, `- name: `, `- tool argument: `, …) the guard could never fire: a transcript carrying the hostile tool name `+cmd|' /C calc'!A0` or the session name `=HYPERLINK("http://evil.example","click-me") please review` rendered its payload raw in the text search lane (live PoCs on the formula-lane fixtures; the summary row was the only one guarded — it never carries a label). Text-to-columns and `": "`-aware paste targets make the value a cell of its own, so the fix splits the fixed label off and routes the VALUE through the same rm-985 stack (`sanitize_line_segment` then the formula guard): evidence rows now render `- tool: '+cmd|' /C calc'!A0`, `- name: '=HYPERLINK(…`, and the lane contract is upgraded to the strict every-occurrence-marker-preceded form. The JSON search lane stays byte-lossless by design (the guard is a text-render concern; the stored match item keeps its raw value — pinned). Label-less items and the summary row take the unchanged whole-item path.

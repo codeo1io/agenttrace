@@ -362,3 +362,200 @@ fn unrelated_short_opening_is_not_a_family() {
         );
     }
 }
+
+/// rm-1541: two INDEPENDENT projects that instantiate the same
+/// templated opening (the company-preamble shape — four shared items,
+/// ~2kB serialized, comfortably past every af521003 F4 volume guard)
+/// must NOT form a replay family. Opening equality alone tied them at
+/// base (assess e3967694 F1 PoC: /work/alpha + /work/beta reported a
+/// 1,500 total against the honest 2,500, with a FALSE 1,000-token
+/// replayed-prefix disclosure); family formation now also requires the
+/// corroboration the wire carries and the scan used to ignore — the
+/// `session_meta.payload.cwd` project linkage.
+#[test]
+fn cross_project_templated_opening_is_not_a_family() {
+    let mut sessions = vec![
+        load_dir("codex-multiagent-v2-false-family", "alpha.jsonl"),
+        load_dir("codex-multiagent-v2-false-family", "beta.jsonl"),
+    ];
+    let naive: i64 = sessions.iter().map(|s| s.metrics.tokens_input).sum();
+    assert_eq!(
+        naive, 2_500,
+        "PoC shape: independent 1,000 + 1,500 rollouts"
+    );
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(
+        stats.families, 0,
+        "cross-project template must not corroborate"
+    );
+    assert_eq!(stats.children_adjusted, 0);
+    let counts: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    assert!(
+        counts.contains(&1_000) && counts.contains(&1_500),
+        "{counts:?}"
+    );
+    for session in &sessions {
+        assert!(
+            session
+                .metrics
+                .disclosure_counters
+                .iter()
+                .all(|(k, _)| !k.starts_with("codex_multiagent_replay")),
+            "non-family session must carry no replay disclosures"
+        );
+    }
+}
+
+/// rm-1541 positive control: the SAME two rollouts with the second
+/// project's cwd rewritten onto the first still reconcile — the
+/// opening-equality rebase itself is untouched, and the cwd linkage is
+/// the discriminator (a same-project instantiation of the template is
+/// exactly the shape reconciliation may not refuse).
+#[test]
+fn same_project_templated_opening_still_reconciles() {
+    let dir = std::env::temp_dir().join(format!("agenttrace-rm1541-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-multiagent-v2-false-family");
+    let alpha_text = std::fs::read_to_string(base.join("alpha.jsonl")).unwrap();
+    let beta_text = std::fs::read_to_string(base.join("beta.jsonl"))
+        .unwrap()
+        .replace("/work/beta", "/work/alpha");
+    let alpha_path = dir.join("alpha.jsonl");
+    let beta_path = dir.join("beta.jsonl");
+    std::fs::write(&alpha_path, alpha_text).unwrap();
+    std::fs::write(&beta_path, beta_text).unwrap();
+    let mut sessions = vec![
+        agenttrace_core::parse_file(&alpha_path).expect("alpha parses"),
+        agenttrace_core::parse_file(&beta_path).expect("beta parses"),
+    ];
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 1, "same-project template corroborates");
+    assert_eq!(stats.children_adjusted, 1);
+    assert_eq!(stats.tokens_input_dropped, 1_000);
+    let counts: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    assert!(
+        counts.contains(&1_000) && counts.contains(&500),
+        "{counts:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// rm-1541 warm-cache arm: corroboration is re-derived from the rollout
+/// files themselves (never from cached session state), so a cache-shaped
+/// corpus — session timestamps stripped by the serde round-trip, the
+/// exact af521003 F1 warm state — refuses the false family exactly like
+/// a cold one. Warm and cold agree.
+#[test]
+fn false_family_refusal_is_stable_without_session_timestamps() {
+    let mut sessions = vec![
+        load_dir("codex-multiagent-v2-false-family", "alpha.jsonl"),
+        load_dir("codex-multiagent-v2-false-family", "beta.jsonl"),
+    ];
+    for session in &mut sessions {
+        session.metrics.timestamps.clear();
+    }
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(
+        stats.families, 0,
+        "warm cache must not resurrect the false family"
+    );
+    let naive: i64 = sessions.iter().map(|s| s.metrics.tokens_input).sum();
+    assert_eq!(naive, 2_500);
+}
+
+/// rm-1542: a cache-armed corpus whose child rollout can no longer be
+/// read from disk (deleted or chmod-000'd after the session cache
+/// captured it) used to flip the family total silently — assess
+/// e3967694 F2 PoC: cache_hits=2 with the child unreadable reported
+/// the naive total with ZERO disclosures while a cold run reported the
+/// reconciled total plus the adjustment disclosure. The reconciliation
+/// scans every codex rollout from disk at each of its call sites, so an
+/// unreadable rollout now carries a loud reconciliation-skip counter
+/// and keeps its full (conservative, possibly double-counted) usage
+/// instead of silently opting out of the family.
+#[test]
+fn unreadable_rollout_discloses_reconciliation_skip() {
+    let dir = std::env::temp_dir().join(format!("agenttrace-rm1542-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-multiagent-v2");
+    let parent_text = std::fs::read_to_string(base.join("parent.jsonl")).unwrap();
+    let child_text = std::fs::read_to_string(base.join("child.jsonl")).unwrap();
+    let parent_path = dir.join("parent.jsonl");
+    let child_path = dir.join("child.jsonl");
+    std::fs::write(&parent_path, &parent_text).unwrap();
+    std::fs::write(&child_path, &child_text).unwrap();
+
+    // Control: with both files readable the family reconciles and
+    // nothing is flagged unreadable.
+    let mut control = vec![
+        agenttrace_core::parse_file(&parent_path).expect("parent parses"),
+        agenttrace_core::parse_file(&child_path).expect("child parses"),
+    ];
+    let control_stats = reconcile_codex_multiagent_replays(&mut control);
+    assert_eq!(control_stats.families, 1);
+    assert_eq!(control_stats.rollouts_unreadable, 0);
+
+    // Warm-cache shape: the child session survives only because the
+    // cache holds it — the rollout file itself is gone.
+    let parent = agenttrace_core::parse_file(&parent_path).unwrap();
+    let child = agenttrace_core::parse_file(&child_path).unwrap();
+    std::fs::remove_file(&child_path).expect("child rollout disappears after caching");
+    let mut sessions = vec![parent, child];
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(
+        stats.families, 0,
+        "one readable member cannot form a family"
+    );
+    assert_eq!(stats.children_adjusted, 0);
+    assert_eq!(stats.rollouts_unreadable, 1);
+    // The unverifiable child keeps its full usage (conservative) ...
+    let counts: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    assert_eq!(counts, vec![1_400, 1_700], "usage must not be destroyed");
+    // ... and says so loudly through the disclosure channel; the
+    // readable parent stays silent.
+    assert_eq!(
+        sessions[1]
+            .metrics
+            .disclosure_counters
+            .get("codex_multiagent_reconcile_skipped_unreadable"),
+        Some(&1),
+        "the cache-armed unreadable rollout must disclose the skip"
+    );
+    assert!(
+        !sessions[0]
+            .metrics
+            .disclosure_counters
+            .contains_key("codex_multiagent_reconcile_skipped_unreadable"),
+        "readable rollouts carry no skip disclosure"
+    );
+
+    // The chmod-000 variant of the same hazard (file present but
+    // unreadable) — guarded because chmod cannot deny root.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&child_path, &child_text).unwrap();
+        let mut chmodded = vec![
+            agenttrace_core::parse_file(&parent_path).unwrap(),
+            agenttrace_core::parse_file(&child_path).unwrap(),
+        ];
+        std::fs::set_permissions(&child_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&child_path).is_err() {
+            let stats = reconcile_codex_multiagent_replays(&mut chmodded);
+            assert_eq!(stats.rollouts_unreadable, 1);
+            assert_eq!(
+                chmodded[1]
+                    .metrics
+                    .disclosure_counters
+                    .get("codex_multiagent_reconcile_skipped_unreadable"),
+                Some(&1),
+                "chmod-000'd rollout must disclose the skip"
+            );
+            let counts: Vec<i64> = chmodded.iter().map(|s| s.metrics.tokens_input).collect();
+            assert_eq!(counts, vec![1_400, 1_700]);
+        }
+        std::fs::set_permissions(&child_path, std::fs::Permissions::from_mode(0o644)).ok();
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
