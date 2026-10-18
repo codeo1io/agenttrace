@@ -203,6 +203,7 @@ discovery 声明的根目录上，新注册的根目录无法绕过文档落地�
 | OpenCode | `~/.local/share/opencode/storage` |
 | OpenCode（macOS） | `~/Library/Application Support/opencode/storage` |
 | Cline（VS Code） | `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks` |
+| Cline CLI | `~/.cline/data/sessions` |
 
 扫描时识别的迁移变量：`CODEX_HOME`（Codex 会话与归档会话）、
 `CLAUDE_CONFIG_DIR`（Claude Code 转写与 projects）、`XDG_CONFIG_HOME`

@@ -1257,9 +1257,48 @@ fn max_session_dir_depth(dir: &Path) -> usize {
 }
 
 fn is_cline_task_dir(path: &Path) -> bool {
+    is_cline_roo_task_dir(path) || is_cline_store_dir(path)
+}
+
+/// The VS Code extension task-dir shape (Roo trio).
+fn is_cline_roo_task_dir(path: &Path) -> bool {
     path.join("api_conversation_history.json").is_file()
         || path.join("ui_messages.json").is_file()
         || path.join("task_metadata.json").is_file()
+}
+
+/// rm-1435: the cline CLI persisted store shape — `session.json` + a
+/// `*.messages.json` document. A store dir is admitted whole (one
+/// session per id dir; its files never surface as separate items), the
+/// same contract the Roo task dirs already have. The canonical layout
+/// names the document after the dir (`<dir>.messages.json`, the
+/// `messages_path` basename pinned by the upstream SDK fixtures); the
+/// read_dir fallback admits non-canonical/resumed stores too. It only
+/// runs when a `session.json` sits in the dir, so the cost on unrelated
+/// directories is one `stat`.
+fn is_cline_store_dir(path: &Path) -> bool {
+    if !path.join("session.json").is_file() {
+        return false;
+    }
+    let canonical = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.messages.json"));
+    if let Some(canonical) = canonical {
+        if path.join(canonical).is_file() {
+            return true;
+        }
+    }
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".messages.json"))
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn is_skipped_session_dir(path: &Path) -> bool {

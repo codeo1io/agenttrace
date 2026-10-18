@@ -4,6 +4,39 @@
 
 ### Added
 
+- The cline CLI's stable persisted session store is discovered and
+  parsed with upstream-exact usage (rm-1435 lead + rm-1975, run
+  c8efc995 cycle 3, batch "Cline CLI lane completion + CLI
+  truthfulness"): the CLI shipped 2026-10-17 (sdk v0.0.95 / cli-v3.0.73)
+  persists `~/.cline/data/sessions/<id>/{session.json,
+  <id>.messages.json}` with per-assistant-message metrics —
+  `agenttrace` was blind to the whole lane (discovery only knew the
+  VS Code globalStorage tasks dir). Discovery now registers the
+  store root and admits a store id-dir whole (one session, its
+  manifest/messages files never surface separately); the parser gains
+  a conservative standalone probe (`is_cline_cli_store_document`:
+  envelope + carrier sibling, never a bare filename) so a store
+  document handed over without its directory still parses, with the
+  manifest `model` winning attribution and `modelInfo.id` as the
+  document-only fallback. Usage folding follows upstream
+  `getApiMetrics.ts`/`combineApiRequests.ts` exactly (rm-1975): the
+  say pair `api_req_started` + `api_req_finished` counts ONCE with the
+  finished row's values (key-by-key override-merge; a stale-list
+  sibling is ignored per upstream `combineApiRequests`), the plain
+  VS Code shape (started without metrics) still single-counts, an
+  orphan finished row folds NOTHING and discloses the drop on
+  `cline_orphan_finished_rows`, and the rm-1885 say-vocabulary gate
+  stays the carrier admission rule — token-shaped JSON in a
+  non-usage say row is an echo (content), never usage. Cache basis
+  keeps the rm-1884 rule: `inputTokens` (CLI store) is gross
+  (net-of-cache legs) while `tokensIn` (VS Code renders) is exclusive
+  (identity). Pinned by `cline_cli_store_contract.rs` (8 tests,
+  red-first proven: the pre-batch parser summed a started+finished
+  pair as 200/400 tokens vs the correct 100/200) plus a hostile
+  corpus of generic `.messages.json` conversation documents that must
+  never gain store usage, and a discovery enumeration pin (store dir
+  = ONE session root, direct and parent-walk).
+
 - Standing battery reds get a typed environmental/flaky/defect verdict
   (rm-1507, run a1f6c1f8 cycle 2): `scripts/ci/check-battery-adjudicate.sh`
   re-runs a single failing test N times isolated (fresh mktemp TMPDIR per
@@ -585,6 +618,25 @@
   test and healthy corpora render zero-count clean.
 
 ### Fixed
+
+- The positional mode-word hint no longer misses real flags (rm-1977,
+  run c8efc995 cycle 3, batch "Cline CLI lane completion + CLI
+  truthfulness"): the rm-1506 hint matched a hand-curated 9-word list,
+  so `agenttrace audit` — a flag-order mistake over the REAL `--audit`
+  flag — answered with a plain `session path does not exist: audit`
+  (this run's assess PoC), while `agenttrace cost` hinted fine. The
+  vocabulary is now DERIVED from the live clap surface
+  (`Args::command().get_arguments()`), the single source of truth:
+  every real long flag is hintable the moment it is declared, no hint
+  can ever name a flag that does not exist (the word list IS the flag
+  list), and path-shaped text (slashes/dots/extensions) matches no
+  flag by construction. `--help` is unchanged — the derivation lives
+  entirely in the bail path. Pinned both directions in
+  `admission_mode_word_vocabulary_is_derived_from_the_live_flag_surface`
+  (audit/cost/search/health/overview + `--audit`/`Audit` forms hint;
+  a non-flag word and a path-shaped miss never suggest; the help text
+  keeps showing the real flags), red-first proven by replaying the
+  rm-1506 list against the new test — `hint missing for "audit"`.
 
 - Bare `agenttrace doctor` names the flag-order mistake instead of answering
   it with a path-shaped error (rm-1886, run a1f6c1f8 cycle 2): the mode word

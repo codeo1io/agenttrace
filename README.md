@@ -579,6 +579,7 @@ directory; missing directories are simply skipped.
 | OpenCode | `~/.local/share/opencode/storage` |
 | OpenCode (macOS) | `~/Library/Application Support/opencode/storage` |
 | Cline (VS Code) | `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks` |
+| Cline CLI | `~/.cline/data/sessions` |
 
 Relocations honored at scan time: `CODEX_HOME` (Codex sessions and
 archived sessions), `CLAUDE_CONFIG_DIR` (Claude Code transcripts and

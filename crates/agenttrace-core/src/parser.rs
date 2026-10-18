@@ -228,6 +228,14 @@ pub fn parse_stdin_bytes(raw: Vec<u8>) -> anyhow::Result<Session> {
 }
 
 fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
+    // rm-1435: the cline CLI persisted store shape takes precedence —
+    // `session.json` (v1 manifest: model, started_at/ended_at) +
+    // `<id>.messages.json` (assistant messages with sibling `metrics`).
+    // One session per store dir; the manifest itself never parses as a
+    // second document.
+    if let Some(session) = parse_cline_store_dir(dir) {
+        return Ok(session);
+    }
     let metadata = read_json_value(&dir.join("task_metadata.json")).unwrap_or(Value::Null);
     let model = metadata
         .as_object()
@@ -260,6 +268,40 @@ fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
         .unwrap_or("cline-task")
         .to_string();
     session_from_events(&name, &dir.to_string_lossy(), events)
+}
+
+/// rm-1435: parse a cline CLI persisted store dir (cli-v3.0.73+,
+/// 2026-10-17): the `session.json` manifest attributes the session
+/// (top-level `model` — the CLI's own session-level record outranks the
+/// per-message `modelInfo` snapshots) and the `*.messages.json` document
+/// carries the conversation with sibling `metrics` usage. Returns `None`
+/// for a dir that is not a store (no manifest or no messages document) or
+/// a store with no parseable events — the Roo task-dir arms then apply.
+fn parse_cline_store_dir(dir: &Path) -> Option<Session> {
+    if !dir.join("session.json").is_file() {
+        return None;
+    }
+    let messages_path = cline_store_messages_path(dir)?;
+    let manifest = read_json_value(&dir.join("session.json")).unwrap_or(Value::Null);
+    let model = manifest
+        .as_object()
+        .map(cline_model)
+        .unwrap_or_else(|| "unknown".to_string());
+    let raw = read_json_value(&messages_path)?;
+    let events = parse_cline_ui_messages(&raw, &model);
+    if events.is_empty() {
+        return None;
+    }
+    let mut events = events;
+    if let Some(manifest) = manifest.as_object() {
+        apply_cline_metadata_timestamps(&mut events, manifest);
+    }
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cline-store")
+        .to_string();
+    session_from_events(&name, &dir.to_string_lossy(), events).ok()
 }
 
 /// rm-778: journal-derived session cwd is hostile-input surface. A
@@ -687,6 +729,16 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
         if let Some(events) = parse_kimi_value(&value) {
             return session_from_events(name, path, events);
+        }
+        // rm-1435: the cline CLI persisted-store document (an object
+        // whose `messages` entries carry `modelInfo`/sibling `metrics`)
+        // parses through the cline lane even without its directory —
+        // the conservative probe below — because parse_cline_value
+        // would claim the messages array but drop the usage.
+        // Codex/OpenAI `messages` exports carry neither sibling, so the
+        // claim rule cannot steal their lane.
+        if is_cline_cli_store_document(&value) {
+            return session_from_events(name, path, parse_cline_ui_messages(&value, "unknown"));
         }
         if let Some(events) = parse_cline_value(&value, "unknown") {
             return session_from_events(name, path, events);
@@ -7784,6 +7836,20 @@ struct ClineUsageState {
     cost_carriers: i64,
     reported_cost: f64,
     last_ts: String,
+    /// rm-1975: started/finished pairs folded into one carrier
+    /// (combineApiRequests.ts:66-77 parity).
+    pairs_merged: i64,
+    /// rm-1975: metrics-bearing `api_req_finished` rows with no
+    /// preceding started row — seen and deliberately dropped, exactly as
+    /// upstream `getApiMetrics` drops them.
+    orphan_finished: i64,
+    /// rm-1884 basis truth for the CLI-store vocabulary: carriers whose
+    /// `inputTokens` is cache-INCLUSIVE that were netted to the
+    /// exclusive basis agenttrace records.
+    gross_netted: i64,
+    /// Gross carriers whose cache legs exceeded the inclusive input
+    /// (clamped to zero rather than going negative).
+    gross_underflow: i64,
 }
 
 /// One absorbed metrics carrier; fields present-but-unparseable count
@@ -7795,6 +7861,15 @@ struct ClineCarrier {
     cache_write: Option<i64>,
     cost: Option<f64>,
     unparsed_fields: i64,
+    /// rm-1884 hard rule: the two cline vocabularies carry OPPOSITE
+    /// input bases. The VS Code render journal's `tokensIn` is
+    /// cache-EXCLUSIVE (legacy-task-handling.ts:160 reconstructs total
+    /// input as tokensIn+cacheReads+cacheWrites); the CLI persisted
+    /// store's `metrics.inputTokens` is cache-INCLUSIVE (sdk/packages/
+    /// core/src/services/usage.ts:71-72: "inputTokens is already the full
+    /// prompt size, including any cache-read/cache-write portions. Do not
+    /// add [cache legs]"). `true` = the inclusive store basis.
+    gross_basis: bool,
 }
 
 fn cline_metric_i64(value: Option<&Value>) -> Option<i64> {
@@ -7834,6 +7909,15 @@ fn cline_carrier_from_object(object: &Value) -> Option<ClineCarrier> {
     if !TOKEN_KEYS.iter().any(|key| fields.contains_key(*key)) {
         return None;
     }
+    // rm-1884: vocabulary decides the basis. The render vocabulary
+    // (tokensIn/cacheReads/…) is exclusive; the store vocabulary
+    // (inputTokens/cacheReadTokens/…) is inclusive. A mixed object is
+    // pathological — the render vocabulary wins, since that is what
+    // getApiMetrics.ts reads key-by-key upstream.
+    let exclusive = ["tokensIn", "tokensOut", "cacheReads", "cacheWrites"]
+        .iter()
+        .any(|key| fields.contains_key(*key));
+    let gross_basis = !exclusive;
     let token = |key: &str| -> Option<i64> { cline_metric_i64(fields.get(key)) };
     let input = token("tokensIn").or_else(|| token("inputTokens"));
     let output = token("tokensOut").or_else(|| token("outputTokens"));
@@ -7856,6 +7940,7 @@ fn cline_carrier_from_object(object: &Value) -> Option<ClineCarrier> {
         cache_write,
         cost,
         unparsed_fields,
+        gross_basis,
     })
 }
 
@@ -7868,6 +7953,40 @@ fn cline_text_metrics_carrier(text: &str) -> Option<ClineCarrier> {
     }
     let value: Value = serde_json::from_str(trimmed).ok()?;
     cline_carrier_from_object(&value)
+}
+
+/// rm-1975: a say-row text parsed exactly the way upstream's fold
+/// does — `JSON.parse(text || "{}")` at combineApiRequests.ts:69-77,
+/// whose result feeds the spread at :73
+/// (`{ ...startedJson, ...finishedJson }`). Empty text parses as the
+/// empty object (upstream substitutes "{}"), any other valid JSON
+/// value parses (a non-object spread folds to nothing, so it opens
+/// with the empty object, mirroring JS spread of non-spreadable
+/// values), and text that is NOT valid JSON is a `continue` upstream —
+/// `None` here: the row opens no pair at all and a later finished row
+/// stays claimable by a LATER started row.
+fn cline_text_object(text: &str) -> Option<Map<String, Value>> {
+    if text.is_empty() {
+        return Some(Map::new());
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(map)) => Some(map),
+        Ok(_) => Some(Map::new()),
+        Err(_) => None,
+    }
+}
+
+/// rm-1975: `{ ...started, ...finished }` — finished wins key-by-key
+/// (combineApiRequests.ts:73).
+fn cline_override_merge(
+    started: Map<String, Value>,
+    finished: &Map<String, Value>,
+) -> Map<String, Value> {
+    let mut merged = started;
+    for (key, value) in finished {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
 }
 
 fn cline_clamped(state: &mut ClineUsageState, value: i64) -> i64 {
@@ -7899,15 +8018,47 @@ fn cline_absorb_carrier(state: &mut ClineUsageState, carrier: ClineCarrier, ts: 
     let output = cline_clamped(state, carrier.output.unwrap_or(0));
     let cache_read = cline_clamped(state, carrier.cache_read.unwrap_or(0));
     let cache_write = cline_clamped(state, carrier.cache_write.unwrap_or(0));
-    // rm-1884: identity input basis. Upstream Cline `tokensIn` is
-    // cache-EXCLUSIVE — the persisted journal meters uncached input only,
-    // and the cache legs are disjoint subset counters (cline/cline
-    // apps/vscode/src/sdk/legacy-task-handling.ts:160 reconstructs total
-    // input as tokensIn+cacheReads+cacheWrites; Anthropic bills cache
-    // reads/writes separately from input_tokens). The rm-600 net fold
-    // subtracted cache legs from an already-exclusive basis, driving
-    // input_tokens to ~0 on every cache-hit request; record as-is.
-    let net_input = input;
+    // rm-1884: basis-aware input fold.
+    //
+    // VS Code render journal (`tokensIn`): IDENTITY. Upstream Cline
+    // `tokensIn` is cache-EXCLUSIVE — the persisted journal meters
+    // uncached input only, and the cache legs are disjoint subset
+    // counters (cline/cline apps/vscode/src/sdk/legacy-task-handling.ts:160
+    // reconstructs total input as tokensIn+cacheReads+cacheWrites;
+    // Anthropic bills cache reads/writes separately from input_tokens).
+    // The rm-600 net fold subtracted cache legs from an already-exclusive
+    // basis, driving input_tokens to ~0 on every cache-hit request;
+    // record as-is.
+    //
+    // CLI persisted store (`inputTokens`, rm-1435): NET THE CACHE LEGS
+    // OUT. The store's `metrics.inputTokens` is cache-INCLUSIVE (sdk/
+    // packages/core/src/services/usage.ts:71-72 — "inputTokens is already
+    // the full prompt size, including any cache-read/cache-write
+    // portions"), so recording it as-is would double-represent the cached
+    // span (once inside input, once on the cache-read line). The store
+    // writer's own arithmetic proves the basis on real data: fixture
+    // session.messages.json msg2 reads input 35912 ≈ cacheRead 34332 +
+    // 1580 new, and msg1's 34334 reappears whole as msg2's cacheRead.
+    // The qwen/codex inclusive-source precedent (rm-602/rm-616) nets the
+    // cache legs out and records them on their own lines; a net that
+    // underflows (legs > input) clamps to zero and discloses
+    // `cline_input_basis:net_underflow` instead of going negative.
+    let net_input = if carrier.gross_basis {
+        let legs = cache_read.saturating_add(cache_write);
+        if legs > 0 {
+            state.gross_netted += 1;
+        }
+        if input > legs {
+            input - legs
+        } else {
+            if input > 0 {
+                state.gross_underflow += 1;
+            }
+            0
+        }
+    } else {
+        input
+    };
     let mut add = |key: &str, value: i64| {
         if let Some(total) = state.usage.get_mut(key) {
             *total = total.saturating_add(value);
@@ -7934,7 +8085,10 @@ fn cline_absorb_carrier(state: &mut ClineUsageState, carrier: ClineCarrier, ts: 
 /// precedent) — appended after the text stream so text events are
 /// additive-untouched.
 fn cline_usage_event(state: &ClineUsageState, model: &str) -> Option<Event> {
-    if state.carriers == 0 {
+    // rm-1975: an orphaned metrics-bearing finished row carries no usage
+    // but its drop is a disclosed fact — the event survives on the
+    // orphan counter alone so the drop is never silent.
+    if state.carriers == 0 && state.orphan_finished == 0 {
         return None;
     }
     let mut disclosure_counters = BTreeMap::new();
@@ -7949,6 +8103,27 @@ fn cline_usage_event(state: &ClineUsageState, model: &str) -> Option<Event> {
         disclosure_counters.insert(
             "cline_metrics_unparsed_fields".to_string(),
             state.unparsed_fields,
+        );
+    }
+    if state.pairs_merged > 0 {
+        disclosure_counters.insert("cline_pairs_merged".to_string(), state.pairs_merged);
+    }
+    if state.orphan_finished > 0 {
+        disclosure_counters.insert(
+            "cline_orphan_finished_rows".to_string(),
+            state.orphan_finished,
+        );
+    }
+    if state.gross_netted > 0 {
+        disclosure_counters.insert(
+            "cline_input_basis:cache_netted".to_string(),
+            state.gross_netted,
+        );
+    }
+    if state.gross_underflow > 0 {
+        disclosure_counters.insert(
+            "cline_input_basis:net_underflow".to_string(),
+            state.gross_underflow,
         );
     }
     let mut wire_metadata = BTreeMap::new();
@@ -8963,11 +9138,73 @@ fn non_empty(events: Vec<Event>) -> Option<Vec<Event>> {
     }
 }
 
+/// rm-1435: conservative claim rule for a standalone cline CLI store
+/// document (no directory handed to the parser). Requires the object
+/// form with a `messages` array where at least one message carries the
+/// store's identifying siblings — a `modelInfo` object or a `metrics`
+/// carrier. Pure conversation exports (codex/OpenAI `messages`) carry
+/// neither and keep their own lane.
+fn is_cline_cli_store_document(value: &Value) -> bool {
+    let Value::Object(object) = value else {
+        return false;
+    };
+    let Some(messages) = object.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    messages.iter().any(|message| {
+        message.as_object().is_some_and(|message| {
+            message
+                .get("modelInfo")
+                .and_then(Value::as_object)
+                .is_some()
+        }) || message
+            .get("metrics")
+            .and_then(cline_carrier_from_object)
+            .is_some()
+    })
+}
+
 fn is_cline_task_file(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some("api_conversation_history.json" | "ui_messages.json" | "task_metadata.json")
-    )
+    match path.file_name().and_then(|name| name.to_str()) {
+        // rm-1435: the CLI persisted store names — a bare `session.json`
+        // routes to the cline dir lane only when its directory is an
+        // actual store (a `*.messages.json` sibling), so foreign
+        // `session.json` files keep their generic lane.
+        Some("api_conversation_history.json" | "ui_messages.json" | "task_metadata.json") => true,
+        Some("session.json") => path
+            .parent()
+            .map(cline_store_messages_path)
+            .is_some_and(|messages| messages.is_some()),
+        Some(name) => name.ends_with(".messages.json"),
+        None => false,
+    }
+}
+
+/// rm-1435: the messages document of a cline CLI persisted store dir —
+/// the canonical upstream layout names it after the session id
+/// (`<dir>/<dir>.messages.json`, the `messages_path` basename of the
+/// SDK fixtures); a non-canonical name (resumed/renamed stores) still
+/// resolves via a sorted scan for any `*.messages.json` sibling.
+fn cline_store_messages_path(dir: &Path) -> Option<PathBuf> {
+    let name = dir.file_name()?.to_str()?.to_string();
+    let canonical = dir.join(format!("{name}.messages.json"));
+    if canonical.is_file() {
+        return Some(canonical);
+    }
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".messages.json"))
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
 }
 
 fn read_json_value(path: &Path) -> Option<Value> {
@@ -9007,18 +9244,63 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
     };
     let mut events = Vec::new();
     let mut usage_state = ClineUsageState::default();
+    // rm-1435: the CLI store document names its own model per message
+    // (`modelInfo.id`); when the caller has no manifest model to offer
+    // ("unknown" — the standalone document probe), the last modelInfo
+    // observed attributes the session and each event its own message's
+    // model. A manifest model (the dir lane) always wins: the CLI's own
+    // session-level record outranks per-message snapshots.
+    let mut last_model_info: Option<String> = None;
+    // rm-1975: open api_req_started rows awaiting their finished row —
+    // (parsed text object, ts). A plain-text started row still opens a
+    // pair (the persisted metrics live on the finished row); a
+    // non-object text folds to the empty object, matching JS spread
+    // semantics upstream.
+    let mut open_requests: VecDeque<(Map<String, Value>, String)> = VecDeque::new();
     for message in messages {
         let Some(message) = message.as_object() else {
             continue;
         };
+        // rm-1435: store messages carry an ARRAY `content` of provider
+        // blocks; text blocks join with newlines (the say-vocabulary
+        // string arms are unchanged — a Roo journal never has array
+        // content).
+        let array_content_text = message
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter(|block| string(block.get("type")).as_deref() == Some("text"))
+                    .filter_map(|block| string(block.get("text")))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
         let text = string(message.get("text"))
-            .or_else(|| string(message.get("content")))
-            .or_else(|| string(message.get("message")))
-            .unwrap_or("");
+            .map(str::to_string)
+            .or_else(|| string(message.get("content")).map(str::to_string))
+            .or_else(|| (!array_content_text.is_empty()).then_some(array_content_text))
+            .or_else(|| string(message.get("message")).map(str::to_string))
+            .unwrap_or_default();
         let ts = cline_timestamp(
             first_value(message, &["ts", "timestamp", "createdAt", "created_at"])
                 .unwrap_or(&Value::Null),
         );
+        let model_info_id = message
+            .get("modelInfo")
+            .and_then(Value::as_object)
+            .and_then(|info| string(info.get("id")))
+            .filter(|id| !id.is_empty());
+        if let Some(id) = &model_info_id {
+            last_model_info = Some((*id).to_string());
+        }
+        let event_model = if model != "unknown" {
+            model
+        } else {
+            model_info_id.as_deref().unwrap_or(model)
+        };
         // rm-1430: absorb usage carriers — a say entry whose text is a
         // JSON metrics object, and/or a sibling `metrics` object (Cline
         // CLI envelope). Text events are unaffected: metrics presence
@@ -9028,21 +9310,57 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
         // `metrics` object (the CLI envelope carrier) wins; the text-JSON
         // carrier (the Roo task-dir shape) folds only when the entry has
         // no sibling carrier and sits in a say-type that carries usage
-        // upstream (getApiMetrics.ts: api_req_started, deleted_api_reqs,
-        // subagent_usage — plus api_req_finished, whose row is where the
-        // persisted metrics live, because combineApiRequests merges
-        // started/finished only at render time). Both shapes on one
-        // message are ONE measurement, not two; token-shaped JSON in any
-        // other say-type is content (an echo, an export), not usage
-        // evidence.
+        // upstream. Both shapes on one message are ONE measurement, not
+        // two; token-shaped JSON in any other say-type is content (an
+        // echo, an export), not usage evidence.
+        //
+        // rm-1975: `api_req_started`/`api_req_finished` no longer absorb
+        // directly — they PAIR. Upstream combineApiRequests.ts:66-77
+        // removes every finished row and override-merges it into its
+        // immediately preceding started row (finished wins key-by-key),
+        // and getApiMetrics.ts:49-53 sums only the merged vocabulary, so
+        // a pair is ONE measurement. An orphan finished row folds
+        // nothing (its drop is disclosed, never silent), and the started
+        // rows a pairing scan crossed flush their own-carrier fields —
+        // the exact upstream render totals.
+        let say = string(message.get("say")).unwrap_or("");
         let sibling_carrier = message.get("metrics").and_then(cline_carrier_from_object);
         if let Some(carrier) = sibling_carrier {
             cline_absorb_carrier(&mut usage_state, carrier, &ts);
-        } else if !text.is_empty()
-            && cline_say_carries_usage(string(message.get("say")).unwrap_or(""))
-        {
-            if let Some(carrier) = cline_text_metrics_carrier(text) {
-                cline_absorb_carrier(&mut usage_state, carrier, &ts);
+        } else {
+            match say {
+                "api_req_started" => {
+                    open_requests
+                        .push_back((cline_text_object(&text).unwrap_or_default(), ts.clone()));
+                }
+                "api_req_finished" => {
+                    if let Some((started, _started_ts)) = open_requests.pop_front() {
+                        let finished = cline_text_object(&text).unwrap_or_default();
+                        let merged = cline_override_merge(started, &finished);
+                        if let Some(carrier) = cline_carrier_from_object(&Value::Object(merged)) {
+                            usage_state.pairs_merged += 1;
+                            cline_absorb_carrier(&mut usage_state, carrier, &ts);
+                        }
+                        // Upstream's pairing scan jumps past the starteds
+                        // a pair crossed; those started rows surface alone
+                        // (their own fields, nothing else).
+                        for (leftover, leftover_ts) in open_requests.drain(..) {
+                            if let Some(carrier) =
+                                cline_carrier_from_object(&Value::Object(leftover))
+                            {
+                                cline_absorb_carrier(&mut usage_state, carrier, &leftover_ts);
+                            }
+                        }
+                    } else if cline_text_metrics_carrier(&text).is_some() {
+                        usage_state.orphan_finished += 1;
+                    }
+                }
+                _ if !text.is_empty() && cline_say_carries_usage(say) => {
+                    if let Some(carrier) = cline_text_metrics_carrier(&text) {
+                        cline_absorb_carrier(&mut usage_state, carrier, &ts);
+                    }
+                }
+                _ => {}
             }
         }
         if text.is_empty() {
@@ -9050,24 +9368,44 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
         }
         let kind = string(message.get("type")).unwrap_or("");
         let ask = string(message.get("ask")).unwrap_or("");
-        let say = string(message.get("say")).unwrap_or("");
-        let mut role = "assistant";
-        if kind == "ask" || !ask.is_empty() {
-            role = "user";
-        }
-        if say == "tool" || ask == "tool" {
-            role = "assistant";
-        }
+        // rm-1435: store messages carry their own role vocabulary
+        // (user/assistant); the say/ask journal classification is
+        // unchanged and applies only when no role field is present.
+        let role = match string(message.get("role")) {
+            Some(field) => cline_role(&field),
+            None => {
+                let mut role = "assistant";
+                if kind == "ask" || !ask.is_empty() {
+                    role = "user";
+                }
+                if say == "tool" || ask == "tool" {
+                    role = "assistant";
+                }
+                role.to_string()
+            }
+        };
         events.push(Event {
-            role: role.to_string(),
-            content: text.to_string(),
+            role,
+            content: text,
             timestamp: ts,
-            model_used: model.to_string(),
+            model_used: event_model.to_string(),
             source_tool: "cline".to_string(),
             ..Event::default()
         });
     }
-    if let Some(event) = cline_usage_event(&usage_state, model) {
+    // rm-1975: started rows that never finished surface alone — upstream
+    // renders them with whatever fields they carry.
+    for (leftover, leftover_ts) in open_requests {
+        if let Some(carrier) = cline_carrier_from_object(&Value::Object(leftover)) {
+            cline_absorb_carrier(&mut usage_state, carrier, &leftover_ts);
+        }
+    }
+    let usage_model = if model != "unknown" {
+        model.to_string()
+    } else {
+        last_model_info.unwrap_or_else(|| "unknown".to_string())
+    };
+    if let Some(event) = cline_usage_event(&usage_state, &usage_model) {
         events.push(event);
     }
     events
@@ -11561,14 +11899,25 @@ mod tests {
             .iter()
             .find(|event| event.role == "session_meta")
             .expect("cli envelope metrics fold");
-        // rm-1884: identity basis — the envelope inputTokens alias records
-        // as-is (1500); cache legs are separate counters, never subtracted.
-        assert_eq!(meta.usage.get("input_tokens"), Some(&1500));
+        // rm-1435 rm-1884: the vocabulary decides the basis. The store
+        // vocabulary (inputTokens/cacheReadTokens/…) is GROSS — pinned by
+        // the SDK fixture's own arithmetic (session.messages.json msg-0002
+        // reads input 35912 ≈ cacheRead 34334 + 1578 fresh; msg-0001's
+        // 34334 reappears whole as msg-0002's cacheRead) — so exclusive
+        // input is netted (inputTokens − cacheRead − cacheWrite, the
+        // qwen/codex inclusive-source precedent rm-602/rm-616) and the
+        // netting is disclosed, never silent.
+        assert_eq!(meta.usage.get("input_tokens"), Some(&700));
         assert_eq!(meta.usage.get("output_tokens"), Some(&900));
         assert_eq!(meta.usage.get("cache_read_input_tokens"), Some(&600));
         assert_eq!(meta.usage.get("cache_creation_input_tokens"), Some(&200));
         assert_eq!(meta.recorded_cost_usd, Some(0.045));
         assert_eq!(meta.model_used, "unknown");
+        assert_eq!(
+            meta.disclosure_counters.get("cline_input_basis:cache_netted"),
+            Some(&1),
+            "a netted gross carrier must disclose its basis"
+        );
     }
 
     #[test]

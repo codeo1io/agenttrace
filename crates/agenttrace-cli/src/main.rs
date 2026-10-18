@@ -3299,16 +3299,35 @@ fn admit_session_path(path: &std::path::Path) -> anyhow::Result<()> {
 /// "assess-truth closeout"): `agenttrace doctor` parses the bare word as
 /// the session path, and the not-exist bail used to answer a flag-order
 /// mistake with a path-shaped error. When the missing path's text names
-/// one of the CLI's action flags (dash and case tolerant), the bail
-/// carries the flag-form remediation instead. Word list = the action
-/// flags a user plausibly types positionally; keep it aligned with the
-/// `#[arg(long)]` action cluster at the top of `Args`.
-fn mode_word_hint(raw: &str) -> Option<&'static str> {
-    const MODE_WORDS: &[&str] = &[
-        "doctor", "overview", "search", "sessions", "cost", "health", "budget", "demo", "version",
-    ];
+/// one of the CLI's real long flags (dash and case tolerant), the bail
+/// carries the flag-form remediation instead.
+///
+/// rm-1977 (run c8efc995 cycle 3, batch "Cline CLI lane completion + CLI
+/// truthfulness"): the vocabulary is now DERIVED from the live clap
+/// surface (`Args::command()`), the single source of truth — the rm-1506
+/// hand-curated list missed real flags (`agenttrace audit` answered a
+/// flag-order mistake with a plain path error; `--audit` exists), so the
+/// rule is now: every real long flag is hintable the moment it is
+/// declared, and no hint can ever name a nonexistent flag because the
+/// word list IS the flag list. Path-shaped text (slashes, dots,
+/// whitespace, extensions) matches no flag by construction.
+fn mode_word_hint(raw: &str) -> Option<String> {
+    use clap::CommandFactory;
     let trimmed = raw.trim_start_matches('-').to_ascii_lowercase();
-    MODE_WORDS.iter().find(|word| **word == trimmed).copied()
+    // A mode word is a bare flag NAME — anything carrying a path
+    // character cannot be one; this guard is a fast reject, the flag
+    // match below is the actual admission rule.
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return None;
+    }
+    Args::command()
+        .get_arguments()
+        .filter_map(|arg| arg.get_long().map(|long| long.to_string()))
+        .find(|long| long.as_str() == trimmed)
 }
 
 // Review fix (2026-10-07, round 2 MF1): this variant imports
@@ -5433,6 +5452,61 @@ mod tests {
             "got: {plain}"
         );
         assert!(!plain.contains("did you mean"), "hint leaked: {plain}");
+    }
+
+    #[test]
+    fn admission_mode_word_vocabulary_is_derived_from_the_live_flag_surface() {
+        // rm-1977 (run c8efc995 cycle 3, batch "Cline CLI lane completion
+        // + CLI truthfulness"): the rm-1506 hand-curated MODE_WORDS missed
+        // real flags — `agenttrace audit` answered a flag-order mistake
+        // with a plain path error (this run's assess PoC) even though
+        // --audit exists. The hint vocabulary is now DERIVED from the
+        // live clap surface, so both directions hold by construction:
+        // every real flag name is hintable, and no hint can ever name a
+        // flag that does not exist (a non-flag word suggests nothing).
+        for form in [
+            "audit", "cost", "search", "health", "overview", "--audit", "Audit",
+        ] {
+            let err = admit_session_path(std::path::Path::new(form))
+                .expect_err("bare flag word is not an existing path");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("did you mean"),
+                "hint missing for {form:?}: {msg}"
+            );
+            let expected = format!("--{}", form.trim_start_matches('-').to_ascii_lowercase());
+            assert!(
+                msg.contains(&expected),
+                "flag form {expected} missing: {msg}"
+            );
+        }
+        // Negative: a non-flag word names no real flag — no suggestion.
+        let plain = admit_session_path(std::path::Path::new("banana"))
+            .expect_err("missing non-flag path must still fail");
+        let plain = plain.to_string();
+        assert!(
+            plain.contains("session path does not exist"),
+            "got: {plain}"
+        );
+        assert!(!plain.contains("did you mean"), "hint leaked: {plain}");
+        // Path-shaped text never suggests (no path string is a flag name).
+        let path_like = admit_session_path(std::path::Path::new("./cost.jsonl"))
+            .expect_err("missing path must still fail");
+        assert!(
+            !path_like.to_string().contains("did you mean"),
+            "path-shaped miss must not hint: {path_like}"
+        );
+        // Single source of truth: every hintable word is a REAL flag the
+        // help text shows — the derived list cannot drift from the CLI
+        // surface, and --help stays unchanged by the derivation.
+        use clap::CommandFactory;
+        let help = Args::command().render_help().to_string();
+        assert!(help.contains("--audit"), "--audit must stay a real flag");
+        assert!(help.contains("--cost"), "--cost must stay a real flag");
+        assert!(
+            !help.contains("mode word"),
+            "--help must not change for the hint: {help}"
+        );
     }
 
     #[test]
