@@ -454,6 +454,40 @@ fn generic_fallback_recovers_recoverable_lines_and_reports_the_rest() {
 }
 
 #[test]
+fn claude_code_fixture_renders_a_named_by_agent_row() {
+    // rm-039 golden test (acceptance letter): a real claude-code
+    // fixture must render a NAMED row in the overview's By Agent
+    // section — the bug this item closed was an unlabeled row
+    // (`|  | 3 | $0.0033`) for sessions whose agent bucket was empty
+    // or unmapped.
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("testdata/claude-code-preamble.jsonl");
+    let session = parse_file(&fixture).expect("claude-code fixture parses");
+    assert_eq!(
+        session.metrics.source_tool, "claude_code",
+        "fixture must be recognized as a claude-code session"
+    );
+    let overview = agenttrace_core::compute_overview(&[session]);
+    let text = agenttrace_core::report_overview_text(&overview, &[]);
+    let by_agent = text
+        .split("── By Agent ──")
+        .nth(1)
+        .expect("overview text has a By Agent section");
+    assert!(
+        by_agent.contains("Claude Code"),
+        "claude-code fixture must render a named agent row, got:{by_agent}"
+    );
+    // Named means labeled: no row may carry an empty agent label.
+    for line in by_agent.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            panic!("unlabeled By Agent row survived: {line:?}");
+        }
+    }
+}
+
+#[test]
 fn unicode_escape_hostile_file_does_not_kill_directory_scans() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -2307,10 +2341,20 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
     // parsed from out-of-scope sessions.
     let root = temp_root("agenttrace-range-health");
     fs::create_dir_all(&root).expect("create range-health dir");
-    let recent = r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
-{"role":"user","content":"recent work","timestamp":"2026-09-01T10:00:00Z"}
-{"role":"assistant","content":"done","timestamp":"2026-09-01T10:00:01Z"}
-"#;
+    // The in-window fixture must be relative to now, not a hardcoded
+    // date: the original 2026-09-01 fixture passed on 2026-09-30 and
+    // silently fell out of the 30-day window on 2026-10-18 (caught by
+    // the review-fix gate re-run). The out-of-window fixture stays
+    // hardcoded — 2020 is always out.
+    let recent_ts = (chrono::Utc::now() - chrono::Duration::days(2))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let recent = format!(
+        r#"{{"role":"session_meta","timestamp":"{recent_ts}","ModelUsed":"claude-sonnet-4"}}
+{{"role":"user","content":"recent work","timestamp":"{recent_ts}"}}
+{{"role":"assistant","content":"done","timestamp":"{recent_ts}"}}
+"#
+    );
     let old = r#"{"role":"session_meta","timestamp":"2020-01-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
 {"role":"user","content":"ancient work","timestamp":"2020-01-02T10:00:00Z"}
 {"role":"assistant","content":"done","timestamp":"2020-01-02T10:00:01Z"}

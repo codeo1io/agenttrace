@@ -108,4 +108,102 @@
 - evidence: golden JSON tests covering search truncation disclosure, rates-total computation, and reason-fallback rendering; full suite green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 - cycle-2 anchor: deliberately deferred this cycle (prioritization a818550b — three sub-defects × golden-test scaffolding ≈ a full session alone); untouched this cycle, anchors assess AF-1..AF-3
 
+<!-- New items 2026-09-30 (run 52465b9e assess 9431a48f + research cea11f48, attempt 56eb6993): numbered rm-034+ to stay disjoint from every live claimant — origin/master 9d88b36 holds rm-001..027+rm-033 (PRs #16/#17/#18 all merged), this tree in rm-001..011; record-not-renumber: on integration, renumber campaign-local IDs to the next free range per this comment if any surface claims rm-034+ first -->
+
+### Ship a unified render-safety boundary for session-derived strings
+
+- id: rm-034
+- track: security
+- priority: high
+- status: done
+- done-evidence: implement 5d935c96 + review-fix 58d33778 at ce27969 — live probes re-run against the rebuilt binary over EVERY terminal-text sink incl. --sessions and --search (review cd9a253b F1/F2 closed: 0 raw ESC/BEL/C1, U+FFFD neutralization); html_escape regression test + TUI terminal_safe_report tests added (review F4); review 14f25886 F1 closed the last sibling sink: --doctor provider paths, symlink targets, and parse-failure sample file names now route through sanitize_line_segment with a doctor payload test
+- signals: security.control_sequence_injection:crates/agenttrace-core/src/reports.rs::L290 and ::L891-893 (terminal-text paths interpolate untrusted session strings raw), security.false_safe:terminal_safe_report transliterates box-drawing but passes ESC verbatim (`_ => ch`), security.undocumented_guard:agenttrace-tui relies on ratatui zero-width grapheme dropping with no in-code note
+- acceptance: one shared sanitization policy in agenttrace-core serves every consumer of session-derived strings (model, agent, session name, project path) across terminal-text, markdown, HTML, JSON, and TUI; the text and markdown report paths emit no raw ESC/OSC/CSI bytes originating from untrusted strings (golden test with an OSC-52 + SGR payload fixture run through --overview text, single-session text, and markdown); statusline's sanitizer folds into the shared module with its hostile-payload test carried over unchanged; the HTML sink keeps html_escape with a regression test; the TUI either routes through the policy or documents the ratatui reliance in-code; assess AF-1 anchors re-verified gone at the shipping HEAD
+- evidence: assess phase 9431a48f at HEAD ce27969 — AF-1 live E2E: crafted session model `EVIL\u001b]52;c;aGVsbG8=\u0007\u001b[31mRED` emitted verbatim (raw ESC count 2) through `agenttrace --overview` and the single-session report (reports.rs:290, :891-893); HTML verified escaping at sink via live probe (html_escape reports.rs:2364); statusline sanitized with hostile test (statusline.rs:187, :873, rm-012 lineage); TUI proven safe only by ratatui width-0 drop via pty frame capture; research pass 11 candidate 71 — first 'sanitize' claim in the research ledger (grep across docs/ideation 2026-09-02 + docs/research passes 4-9 + spool passes 5/6/10)
+
+### Close the CLI argument-surface contract gaps (missing long forms, silent --format drop)
+
+- id: rm-035
+- track: developer-experience
+- priority: medium
+- status: done
+- done-evidence: implement 5d935c96 + review-fix 58d33778 at ce27969 — live probes re-run against the rebuilt binary; golden guard test over 7 argument orders added (review F4a). SUPERSESSION (review F6): the pre-batch Go-flag tolerance test's `-f json` case was deliberately rewritten (`go_flag_compatible_args_ignore_unknown_flags_after_positional_path` now drops an unknown legacy flag) because hoisting known value flags makes the old expectation obsolete by design. KNOWN HALF-OPEN: boolean (non-value) flags after the positional path are still silently dropped (within this item's value-bearing acceptance letter) — follow-up noted in the close comment
+- signals: dx.missing_long_form:crates/agenttrace-cli/src/main.rs::L36/L58/L60 (-d/-m/-o have no --dir/--model/--output), dx.misleading_error:clap suggests `--delivery-evidence` when `--dir` is typed, dx.silent_drop:main.rs::L711-714 go-flag-compat shim breaks at the first positional discarding trailing value flags, dx.guard_bypass:main.rs::L174-182 markdown/html guard reads post-shim format and never fires when --format was dropped
+- acceptance: --dir/--model/--output exist and behave identically to the short forms, with help text updated and the flag_takes_value allowlist (main.rs:727) kept in sync by a parity test against the arg declarations; a value-bearing flag after the positional path is either honored or rejected with an explicit error naming the dropped flag — never silently dropped (test: `agenttrace session.jsonl --format json` yields JSON or a hard error); the markdown/html format guard fires on every argument order (golden test); the existing Go-flag tolerance tests (main.rs:1318, :1336) stay green
+- evidence: assess 9431a48f AF-2/AF-3 live at ce27969 — pty-captured `--dir /tmp` error suggesting `--delivery-evidence`; `agenttrace /tmp/agenttrace-ov-probe/m.jsonl --format json` returned the text report with exit 0; `--format markdown` and `--format html` identical (guard never fired); control `--latest -d <dir> --format json` returned valid JSON
+
+### Emit a session source manifest (`agenttrace sources`)
+
+- id: rm-036
+- track: compatibility
+- priority: medium
+- status: candidate
+- signals: compat.silent_format_drift:crates/agenttrace-core/src/discovery.rs::L215 (a mid-file parse error drops the whole session into `skipped` with only aggregate visibility), upstream demand: open issues #236 "[Radar] Track Gemini CLI to Antigravity CLI transition" and #237 "[Radar] Track Qwen Code export and dual-output session surfaces"
+- acceptance: `agenttrace sources [--dir]` prints per detected format family: file count, parsed / skipped / downgraded-to-generic counts, first and last session timestamps, and a note when the generic fallback path was hit; output shape is stable for scripting; fully offline; golden test over a mixed-format fixture directory including one malformed file
+- evidence: research pass 11 candidate 72 — upstream open issues #236/#237 (2026-05-19) show CLI transitions silently breaking session surfaces upstream; discovery.rs:215 skip path; no `sources` subcommand exists in main.rs; session_cache persists the detected source per session so the data is already available
+
+### Accept session input on stdin (`agenttrace -`)
+
+- id: rm-037
+- track: developer-experience
+- priority: low
+- status: candidate
+- signals: dx.no_stdin:crates/agenttrace-cli/src/main.rs has zero stdin handling (grep verified), workflow friction: piping a session from a remote host or smoke-testing a parser upgrade requires a temp file today
+- acceptance: `-` (or `--stdin`) as the positional reads stdin to EOF, detects the format from content, and emits the standard report; stdin sessions are read-only (no cache writes unless explicitly enabled); documented in README; test pipes a fixture through and byte-compares key fields against the file-path invocation
+- evidence: research pass 11 candidate 73 — `grep stdin crates/agenttrace-cli/src/main.rs` → 0 matches; the parser layer already operates in-memory over byte slices (jsonl_objects), so no structural change is needed below the CLI boundary; pipe-first UX is table stakes for CLI analyzers (jq, rippgrep)
+
+### Reconcile with origin/master and port the remaining upstream batch (diagnostics collision first)
+
+- id: rm-038
+- track: compatibility
+- priority: high
+- status: candidate
+- signals: compat.lineage_divergence:branch merge-base vs upstream/master = 6848aa1 (#284), behind 9 (#285..#293) while origin/master 9d88b36 is already past be25c4c (#286) and behind only 7 (#287..#293), compat.same_name_collision:fork diagnostics.rs:10 LoopFingerprint (9eba8cf counting semantics, 11 golden tests) vs upstream #286 LoopFingerprint (attention thresholds) — both sides of the lineage/master merge carry the name with divergent semantics
+- acceptance: the lineage-to-master reconciliation resolves the LoopFingerprint collision explicitly (fork counting semantics preserved or consciously merged with #286's thresholds, decision recorded in the merge or PR body) and all existing golden diagnostics tests pass unmodified at the merged HEAD; #285 (MSVC static CRT) is evaluated on the Windows release lane with the build-profile outcome recorded; #287..#293 CI/docs deltas are folded without duplicating what rm-010 already landed here (deny.toml, badges); open upstream PRs #259/#272/#278/#279 are each tracked adopt-or-close with rationale
+- evidence: research pass 11 ground facts — `git merge-base HEAD upstream/master` = 6848aa1 (#284), ahead 43 / behind 9; `git merge-base origin/master upstream/master` = be25c4c (#286), master behind 7; origin/master 9d88b36 ROADMAP holds rm-001..027+rm-033 (verified via gh pr diff on PRs #16/#17/#18, all MERGED)
+
+### Fill empty agent labels in overview attribution
+
+- id: rm-039
+- track: correctness
+- priority: medium
+- status: done
+- done-evidence: implement 5d935c96 + review-fix 58d33778 at ce27969 — live probes re-run against the rebuilt binary; golden test now pins the real claude-code fixture testdata/claude-code-preamble.jsonl rendering a named 'Claude Code' row (review F4d: discovery_contract claude_code_fixture_renders_a_named_by_agent_row)
+- signals: correctness.empty_attribution:overview "By Agent" groups claude-code-family sessions under an empty name (live probe row `|  | 3 | $0.0033` at ce27969)
+- acceptance: every By-Agent row carries a non-empty label derived from session metadata or an explicit localized 'unknown agent' bucket; golden test pins a claude-code fixture rendering a named row; no session lands in an unlabeled group
+- evidence: research pass 11 PE-1 refresh row — live `--overview -f markdown` probe at ce27969 with three claude-code fixtures produced the empty-label row; attribution completeness was never claimed as a prior capability (ledger grep)
+
+<!-- 2026-09-30 compound-c1 close (run 52465b9e, campaign 5cdbf259 cycle 1) — pre-review record.
+     Batch rm-034 + rm-035 + rm-039 implemented uncommitted at ce27969; validated:
+     targeted gate envelope result-3634171-325836455.json and full gate envelope
+     result-3983123-325916121.json, both 251 passed / 0 failed / 0 ignored; digest
+     validation:v1:669d910daa8cec0a72eb68da55eab39ac03c9e1fafa003f0fc06bb1e962262b9
+     (base ce279697). Learning shipped: docs/solutions/security-issues/
+     2026-09-30-untrusted-session-strings-render-boundary.md; CONCEPTS.md seeded.
+     Done-flips above reflect implement+validation only — commit gate confirms after
+     independent review. Next-cycle anchors: rm-036 (sources manifest), rm-037
+     (stdin), rm-038 (lineage/master reconciliation + LoopFingerprint collision);
+     research pass 11 candidates 71-73 (spool research-candidates-2026-09-30-
+     run52465b9e-cea11f48.md).
+     2026-09-30 independent review cd9a253b (NEEDS_CHANGES, 7 findings) → review-fix
+     58d33778 (tree work from the prior 5c4b3e1d attempt whose envelope
+     was lost to a provider 429, re-verified and completed here): F1/F2
+     closed live (search text + session list now sanitize via
+     render::sanitize_line_segment; 0 raw ESC/BEL over the hostile corpus), F4
+     acceptance-test clauses shipped (guard golden test 7 orders, html_escape
+     regression test, terminal_safe_report tests, claude-code fixture golden
+     test), F3/F5 doc corrections. Post-fix full gate re-run at the review-fix
+     tree: envelope result-943650-326456486.json, 256 passed / 0 failed /
+     0 ignored (251 + 5 new review-fix tests), independently reproduced at
+     the same tree by envelope result-3229376-328130582.json in the completing
+     attempt; digest validation:v1:669d910d…
+     re-derived at base ce279697 (unchanged — the review-fix delta touched only
+     .rs/.md surfaces, none of the policy's 19 executable digest inputs).
+     Follow-ups recorded, deliberately not in
+     this batch: (1) boolean (non-value) flags after the positional path are
+     still silently dropped by the go-flag shim (rm-035 was value-flag
+     scoped); (2) html output still carries raw control bytes — markup-only
+     escaping is the documented negative on html_escape, treat generated
+     HTML as untrusted text; terminal-safe HTML variant would be a new item. -->
+
 <!-- managed by hermes-roadmap render; do not edit by hand -->
