@@ -21,6 +21,18 @@ pub fn search_sessions(sessions: &[Session], query: &str, limit: usize) -> Vec<S
     let mut results = Vec::new();
 
     for session in canonical_sessions(sessions) {
+        // rm-1515 (cycle 5, run e4209f0c assess F4): check the limit BEFORE
+        // pushing. The old push-then-break order admitted the first match at
+        // limit == 0 (a caller asking for NOTHING got one row) — the CLI
+        // hard-errors limit == 0 (main.rs rm-988 battery), so the exposed
+        // surface was every other caller: library consumers and any host
+        // surface that forwards a user-supplied limit verbatim. limit == 0
+        // now returns zero rows for the same reason
+        // the blank-query guard above returns zero: a caller asking for
+        // nothing must get nothing, never a wildcard-shaped single row.
+        if results.len() >= limit {
+            break;
+        }
         let matches = search_session_evidence(&session, &query);
         if matches.is_empty() {
             continue;
@@ -36,9 +48,6 @@ pub fn search_sessions(sessions: &[Session], query: &str, limit: usize) -> Vec<S
             tokens: total_tokens(&session),
             matches,
         });
-        if results.len() >= limit {
-            break;
-        }
     }
 
     results
@@ -381,6 +390,51 @@ mod tests {
                 "blank query {blank:?} must match nothing (not everything)"
             );
         }
+    }
+
+    /// rm-1515 (cycle 5, run e4209f0c assess F4): a limit of ZERO must
+    /// return ZERO rows. The old push-then-break order admitted the first
+    /// match before checking, so limit=0 yielded exactly 1 row — the CLI
+    /// rejects 0 (rm-988 battery), leaving library consumers and any host
+    /// surface that forwards a limit verbatim exposed.
+    /// Pinned red-first: the fixture matches a real query (so the zero below
+    /// is the guard, not a dead corpus), and limit=1 still returns exactly 1
+    /// to pin that the loop-top check did not over-truncate.
+    #[test]
+    fn limit_zero_returns_zero_rows_not_one() {
+        let session = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "01-healthy-ship".to_string(),
+            path: "demo://01-healthy-ship.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                source_tool: "pi".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let sessions = [session];
+
+        assert_eq!(
+            search_sessions(&sessions, "healthy", 20).len(),
+            1,
+            "the fixture must match a real query, or the zero below is vacuous"
+        );
+        assert_eq!(
+            search_sessions(&sessions, "healthy", 0).len(),
+            0,
+            "limit=0 asks for nothing; it must return nothing (was exactly 1)"
+        );
+        assert_eq!(
+            search_sessions(&sessions, "healthy", 1).len(),
+            1,
+            "limit=1 must still return exactly one row"
+        );
     }
 
     #[test]

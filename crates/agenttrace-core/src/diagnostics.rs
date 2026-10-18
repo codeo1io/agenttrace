@@ -712,6 +712,11 @@ fn finding(
 }
 
 pub fn loop_waste_percent(loop_cost: f64, total_cost: f64) -> f64 {
+    // rm-1500 (cycle 5, run e4209f0c): guard BOTH inputs — a NaN loop_cost
+    // survived NaN.clamp() as NaN and propagated into the waste score.
+    if !loop_cost.is_finite() || loop_cost <= 0.0 {
+        return 0.0;
+    }
     if !total_cost.is_finite() || total_cost <= 0.0 {
         return 0.0;
     }

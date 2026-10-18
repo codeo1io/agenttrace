@@ -972,7 +972,15 @@ fn card_daily_series(sessions: &[Session], days: usize) -> Vec<(chrono::NaiveDat
             Some(current) if current >= day => current,
             _ => day,
         });
-        *buckets.entry(day).or_insert(0.0) += session.metrics.cost_estimated;
+        // rm-1500 (cycle 5, run e4209f0c): the daily series folded cost_estimated
+        // without the finiteness gate the lib.rs overview arms carry — the one
+        // fold the "every aggregate fold" acceptance missed. Poisoned sessions
+        // contribute 0.0 here and stay counted by overview.non_finite_costs.
+        *buckets.entry(day).or_insert(0.0) += if session.metrics.cost_estimated.is_finite() {
+            session.metrics.cost_estimated
+        } else {
+            0.0
+        };
     }
     let mut series = Vec::with_capacity(days);
     match latest {
@@ -2713,29 +2721,38 @@ fn top_cost_driver_rows(sessions: &[Session], limit: usize) -> Vec<CostDriverRow
     if limit == 0 {
         return Vec::new();
     }
-    let total: f64 = sessions
-        .iter()
-        .map(|session| session.metrics.cost_estimated)
-        .sum();
+    // rm-1500 (review b346cf8b): gate the fold AND the per-row value — a NaN
+    // session cost would poison `total`, every `share_pct` division, and the
+    // total_cmp ranking; the session stays listed with an honest 0.0.
+    let finite_cost = |session: &Session| {
+        if session.metrics.cost_estimated.is_finite() {
+            session.metrics.cost_estimated
+        } else {
+            0.0
+        }
+    };
+    let total: f64 = sessions.iter().map(finite_cost).sum();
     let mut ranked: Vec<&Session> = sessions.iter().collect();
     ranked.sort_by(|a, b| {
-        b.metrics
-            .cost_estimated
-            .total_cmp(&a.metrics.cost_estimated)
+        finite_cost(b)
+            .total_cmp(&finite_cost(a))
             .then_with(|| a.name.cmp(&b.name))
     });
     ranked
         .into_iter()
         .take(limit)
-        .map(|session| CostDriverRow {
-            session: session.name.clone(),
-            cost: session.metrics.cost_estimated,
-            share_pct: if total > 0.0 {
-                session.metrics.cost_estimated / total * 100.0
-            } else {
-                0.0
-            },
-            note: possible_cost_driver_note_strict(session),
+        .map(|session| {
+            let cost = finite_cost(session);
+            CostDriverRow {
+                session: session.name.clone(),
+                cost,
+                share_pct: if total > 0.0 {
+                    cost / total * 100.0
+                } else {
+                    0.0
+                },
+                note: possible_cost_driver_note_strict(session),
+            }
         })
         .collect()
 }
@@ -4018,6 +4035,89 @@ mod tests {
         let sessions = vec![session.clone(), session];
         let summary = overview_summary(&crate::Overview::default(), &sessions);
         assert_eq!(summary["total_tokens"].as_i64(), Some(i64::MAX));
+    }
+
+    #[test]
+    fn card_daily_series_skips_non_finite_cost() {
+        // rm-1500 (cycle 5, run e4209f0c assess F2): the daily cost series
+        // folded cost_estimated without the finiteness gate the overview
+        // arms carry — one NaN journal poisoned the whole card series.
+        let session = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "poisoned".to_string(),
+            path: "/tmp/poisoned.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                cost_estimated: f64::NAN,
+                session_end: chrono::Utc::now().to_rfc3339(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let series = card_daily_series(&[session], 14);
+        assert!(
+            !series.is_empty(),
+            "the poisoned session's day must still appear (it is counted)"
+        );
+        for (_, cost) in series {
+            assert!(
+                cost.is_finite(),
+                "non-finite cost leaked into the daily series"
+            );
+        }
+    }
+
+    #[test]
+    fn top_cost_driver_shares_skip_non_finite_cost() {
+        // rm-1500 (review b346cf8b fix round): the top-cost-driver table
+        // totaled cost_estimated with a bare `.sum()` — one NaN member made
+        // `total` NaN, so `total > 0.0` was false and EVERY share collapsed
+        // to 0.0 while the poisoned row's own cost serialized as null. The
+        // finite_cost gate covers the total, the total_cmp ranking, and the
+        // per-row value; the poisoned session stays listed at an honest 0.0.
+        let finite = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "finite".to_string(),
+            path: "/tmp/finite.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                cost_estimated: 3.0,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let mut poisoned = finite.clone();
+        poisoned.name = "poisoned".to_string();
+        poisoned.path = "/tmp/poisoned.jsonl".to_string();
+        poisoned.metrics.cost_estimated = f64::NAN;
+        let rows = top_cost_driver_rows(&[finite, poisoned], 5);
+        assert_eq!(rows.len(), 2, "both sessions stay listed");
+        assert_eq!(
+            rows[0].session, "finite",
+            "the finite member ranks first (the NaN no longer sorts equal)"
+        );
+        for row in &rows {
+            assert!(
+                row.cost.is_finite() && row.share_pct.is_finite(),
+                "non-finite cost leaked into the driver table: {} / {}",
+                row.cost,
+                row.share_pct
+            );
+        }
+        let poisoned_row = rows.iter().find(|r| r.session == "poisoned").unwrap();
+        assert_eq!(poisoned_row.cost, 0.0);
+        let finite_row = rows.iter().find(|r| r.session == "finite").unwrap();
+        assert!((finite_row.share_pct - 100.0).abs() < 1e-9);
     }
 
     #[test]

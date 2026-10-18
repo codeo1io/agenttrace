@@ -3168,6 +3168,64 @@ fn zstd_rollouts_fail_with_a_named_error_not_generic_utf8() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn codex_compressed_rollout_is_admitted_by_name_and_decoded() {
+    // rm-992 (cycle 5, run e4209f0c assess F1 + research 30082665): the
+    // discovery walk used to reject `.jsonl.zst` NAMES before the parser's
+    // magic sniff could decode them, so a codex home migrated by
+    // `codex migrate_rollouts` (compression stable-adjacent since 0.163.0,
+    // 2026-10-15) silently undercounted — a zst-only home reported "No
+    // session files found" while identical bytes under a plain `.jsonl`
+    // name parsed fine (assess PoC, wall-binary arms A/B/C). This fixture is
+    // a REAL zstd frame (zstd -3 of the codex-multiagent-v2 parent journal)
+    // carrying its REAL upstream name, exercising admission + sniff +
+    // bounded decode end to end.
+    let root = temp_root("agenttrace-codex-zst-admission");
+    let sessions = root.join(".codex/sessions/2026/10/15");
+    fs::create_dir_all(&sessions).expect("create codex sessions dir");
+    let zst = sessions.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst");
+    fs::write(
+        &zst,
+        include_bytes!(
+            "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"
+        ),
+    )
+    .expect("write real-named compressed rollout");
+
+    // Production reaches this exact walk via discover_session_dirs():
+    // the codex root is `<home>/.codex/sessions` (env_home("CODEX_HOME",
+    // ...) in discovery.rs) and find_session_files collects it through
+    // collect_session_files on that path — passing the root directly
+    // here reproduces the production walk depth-for-depth (the date
+    // tree `2026/10/15` sits three levels under the root, inside the
+    // codex depth cap) WITHOUT the with_home env lane, which does not
+    // clear CODEX_HOME and would couple this exact-count assertion to
+    // whatever corpus a developer machine points that var at.
+    let found = find_session_files(Some(&sessions));
+    assert_eq!(
+        found.len(),
+        1,
+        "the .jsonl.zst name must be admitted by the walk: {found:?}"
+    );
+    assert_eq!(zst, found[0], "the real upstream name survives the walk");
+
+    let parsed = parse_file(&zst).expect("compressed rollout decodes through the sniff");
+    assert!(
+        total_tokens(&parsed) > 0,
+        "decoded rollout must carry the fixture's usage (got {})",
+        total_tokens(&parsed)
+    );
+    assert!(
+        parsed.name.starts_with("Fix the parser regression"),
+        "session name derives from the decoded first user message (codex \
+         title naming, not the file stem) — this string lives only inside \
+         the compressed frame, so it is proof the decoded bytes fed the \
+         parser: {}",
+        parsed.name
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn symlinked_child_directories_are_discovered_and_cycles_terminate() {

@@ -4,6 +4,49 @@
 
 ### Added
 
+- Compressed codex rollouts (`.jsonl.zst`) are admitted by discovery and
+  decoded (rm-992, run e4209f0c cycle 5): upstream codex `migrate_rollouts`
+  compresses rollouts to `<name>.jsonl.zst` (compression stable-adjacent
+  since 0.163.0, published 2026-10-15 — `rollout/src/compression.rs`
+  `COMPRESSED_SUFFIX = ".zst"` with transparent readers on read). The
+  agenttrace parser has decoded zstd frames transparently by magic sniff
+  since the bounded decoder landed (the rm-1516 lane), but the discovery
+  walk rejected `.jsonl.zst` NAMES before the sniff ever ran, so a home
+  migrated by `codex migrate_rollouts` silently undercounted: a zst-only
+  home reported "No session files found" while identical bytes under a
+  plain `.jsonl` name parsed fine (assess PoC arms A/B/C on the wall
+  binary). `is_session_file_name` now admits the suffix; a frame that
+  fails to decode still lands in skipped_files with the existing honest
+  `zstd-compressed` error naming the `zstd -d` recipe. Pinned end to end
+  by `codex_compressed_rollout_is_admitted_by_name_and_decoded`
+  (discovery_contract) over a REAL zstd frame — `zstd -3` of the
+  codex-multiagent-v2 parent journal under a real upstream rollout name —
+  through admission, sniff, bounded decode, usage accounting, and codex
+  title naming (the decoded first user message).
+
+- The MCP server emits the result members the 2026-07-28 revision requires
+  (rm-455, run e4209f0c cycle 5): the server advertises and negotiates
+  2026-07-28 first (rm-780) but its results carried none of that revision's
+  required members — `resultType` is REQUIRED on every result (the `Result`
+  base interface, SEP-2322; clients of older servers must treat absence as
+  `"complete"`) and the CacheableResult pair (SEP-2549) is REQUIRED on
+  `tools/list`. Every result now carries `resultType: "complete"`,
+  inserted at the single serialization seam (a read-only reporting server
+  never enters the multi-round-trip `input_required` shape), and
+  `tools/list` additionally carries `ttlMs: 3600000` and
+  `cacheScope: "public"` — the caching guide's own recommendation for
+  tool lists identical for all users; the list is compiled into the
+  binary and `initialize` declares `listChanged: false`, so TTL-based
+  freshness is the only invalidation channel a host has. `tools/call`
+  deliberately emits no caching hints: it is not one of the revision's
+  cacheable operations, and a per-corpus report must not look cacheable
+  across users. The members are additive on the older revisions this
+  server also speaks (`Result` is index-signature extensible), so emission
+  is unconditional instead of keeping per-connection negotiation state.
+  Contract: `tools_list_carries_2026_07_28_cache_hints` (tests/mcp_server.rs),
+  mirrored from `schema/2026-07-28/schema.ts` and its canonical examples at
+  the spec tag; docs/guides/mcp-server.md documents the members.
+
 - Implausible token magnitudes are pinned to bill-as-parsed-with-disclosure
   (rm-600 verify-arm, run bbf61fbd cycle 3): the cycle's hostile-corpus PoC
   ($1.69e14 overview total rendered from repeated i64::MAX usage rows) proved
@@ -572,6 +615,44 @@
   test and healthy corpora render zero-count clean.
 
 ### Fixed
+
+- Non-finite cost folds are gated across the aggregate census (rm-1500,
+  run e4209f0c cycle 5, extended by the independent-review fix round): the
+  cycle's first pass closed the three band-pinned folds — the cost-audit
+  by-provider/model row, the SVG card daily series, and
+  `loop_waste_percent`/waste scoring — and the review then censused four
+  more sites of the same latent class, gated in the same
+  skip-while-counting style by the fix round: the overview per-org fold,
+  the context-trends aggregate cost (the `output_cost_per_million_tokens`
+  basis), the cost-audit stored-side total the anomaly ratios are measured
+  against, and the top-cost-driver table's total/ranking/shares (one NaN
+  member used to collapse every share to 0.0 and serialize the poisoned
+  row's cost as null). JSON has no NaN/Infinity, so a leaked value
+  serializes as `null` and poisons downstream sort/aggregation lanes.
+  `loop_waste_percent` now guards BOTH inputs (a NaN `loop_cost` survived
+  `NaN.clamp()` as NaN and propagated into the waste score — clamp is not
+  a sanitiser for NaN); every other gated fold skips non-finite members
+  while still counting them (`overview.non_finite_costs`). Pinned red-first
+  by `cost_by_model_folds_skip_non_finite_cost` and
+  `stored_side_group_fold_skips_non_finite_cost` (governance),
+  `card_daily_series_skips_non_finite_cost` and
+  `top_cost_driver_shares_skip_non_finite_cost` (reports),
+  `overview_org_fold_skips_non_finite_cost` (overview),
+  `context_aggregate_folds_skip_non_finite_cost` and
+  `audit_totals_skip_non_finite_cost` (context trends / cost-audit), and
+  `poisoned_session_yields_zero_loop_percent_and_finite_waste` (waste,
+  end to end over a poisoned session).
+
+- `search_sessions` with `limit == 0` returns zero rows, not one
+  (rm-1515, run e4209f0c cycle 5): the loop pushed a match and THEN
+  checked the limit, so the boundary admitted the first match at
+  limit 0 — a caller asking for nothing got one row. The CLI
+  hard-errors `--limit 0` (rm-988 battery), so the exposed surface was
+  every other caller: library consumers and any host surface that
+  forwards a user-supplied limit verbatim. The limit is now checked
+  BEFORE the push. Pinned by `limit_zero_returns_zero_rows_not_one`
+  (search), which also pins limit 1 still returning exactly 1 so the
+  moved check did not over-truncate.
 
 - An `AGENTTRACE_PRICING_FILE` rate naming a regional twin's exact catalog
   id corrects that row alone (rm-1053 override lane, run bbf61fbd cycle 3,

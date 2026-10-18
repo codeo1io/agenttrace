@@ -1294,3 +1294,125 @@ fn rm1918_poisoned_names_escape_on_the_wire_with_cli_parity() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn tools_list_carries_2026_07_28_cache_hints() {
+    // rm-455 (run e4209f0c cycle 5, research RC3): the 2026-07-28
+    // revision — the newest this server advertises (rm-780) — makes
+    // `resultType` REQUIRED on every result (the `Result` base
+    // interface, SEP-2322; clients of older servers treat absence as
+    // "complete") and the CacheableResult pair (SEP-2549) REQUIRED on
+    // `tools/list`. Mirrored from the spec tree at the 2026-07-28
+    // tag: schema/2026-07-28/schema.ts (`CacheableResult { ttlMs:
+    // number (minimum 0), cacheScope: "public" | "private" }`,
+    // `ListToolsResult extends PaginatedResult, CacheableResult`),
+    // examples/ListToolsResult/tools-list-with-cursor-and-ttl.json,
+    // and docs/specification/2026-07-28/server/utilities/caching.mdx
+    // ("public" is the recommended scope for tool lists identical for
+    // all users). The session below negotiates exactly that revision
+    // and pins every emitted member against the schema's own
+    // constraints — the same lens the schema's canonical examples
+    // demonstrate.
+    let (home, cache) = seed_home("ttl", true);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"usage_overview","arguments":{"range":"all"}}}"#,
+        "\n",
+    );
+    let (code, responses, stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code, "clean session exits rc0");
+    assert_eq!(4, responses.len());
+    assert!(stderr.trim().is_empty(), "no diagnostics: {stderr}");
+
+    let init = &responses[0]["result"];
+    assert_eq!(
+        Some("2026-07-28"),
+        init["protocolVersion"].as_str(),
+        "the newest mutual revision is answered"
+    );
+    assert_eq!(
+        Some("complete"),
+        init["resultType"].as_str(),
+        "initialize results carry resultType (Result base interface)"
+    );
+
+    assert_eq!(
+        Some("complete"),
+        responses[1]["result"]["resultType"].as_str(),
+        "ping results carry resultType too"
+    );
+
+    let tools_result = &responses[2]["result"];
+    assert_eq!(
+        Some("complete"),
+        tools_result["resultType"].as_str(),
+        "tools/list carries resultType — caching hints are only legal \
+         on complete results"
+    );
+    let ttl = tools_result["ttlMs"].as_u64().expect("ttlMs is a number");
+    // The schema pins `minimum: 0` (0 = immediately stale). The
+    // server's contract is a real freshness hint, not a legal
+    // zero: the tool list is compiled into the binary and cannot
+    // change without an upgrade (initialize declares
+    // `listChanged: false`).
+    assert!(ttl > 0, "ttlMs must be a positive integer, got {ttl}");
+    assert_eq!(
+        Some("public"),
+        tools_result["cacheScope"].as_str(),
+        "the tool list is identical for all users — the caching guide's \
+         own recommendation for cacheScope"
+    );
+    let names: Vec<&str> = tools_result["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert_eq!(names, vec!["usage_overview", "by_model_breakdown"]);
+
+    // tools/call is NOT one of the revision's cacheable operations —
+    // caching hints there would tell a host to cache a per-corpus
+    // report. resultType still applies (CallToolResult extends
+    // Result).
+    let call = &responses[3]["result"];
+    assert_eq!(false, call["isError"]);
+    assert_eq!(Some("complete"), call["resultType"].as_str());
+    assert!(
+        call.get("ttlMs").is_none() && call.get("cacheScope").is_none(),
+        "tools/call results must not carry caching hints"
+    );
+
+    // The members are additive on older revisions: a 2025-06-18
+    // session still negotiates its own version and still sees the
+    // complete wire (older clients ignore unknown result members —
+    // `Result` is index-signature extensible).
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(2, responses.len());
+    assert_eq!(
+        Some("2025-06-18"),
+        responses[0]["result"]["protocolVersion"].as_str()
+    );
+    assert_eq!(
+        Some("complete"),
+        responses[1]["result"]["resultType"].as_str()
+    );
+    assert!(
+        responses[1]["result"]["ttlMs"].as_u64().is_some()
+            && responses[1]["result"]["cacheScope"].as_str() == Some("public"),
+        "the emission is unconditional and additive — documented, not \
+         version-gated (the server keeps no per-connection state)"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}

@@ -96,6 +96,19 @@ const CODE_INVALID_PARAMS: i64 = -32602;
 /// rmcp-adoption rider tracks.
 const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "2025-06-18"];
 
+/// `tools/list` cache hint (rm-455, run e4209f0c cycle 5): the
+/// 2026-07-28 revision's CacheableResult rule (SEP-2549) makes
+/// `ttlMs` REQUIRED on `tools/list` results. One hour is honest
+/// here: the tool list is compiled into the binary (it changes only
+/// with a binary upgrade, and `initialize` declares `listChanged:
+/// false`), TTL-based freshness is the only invalidation channel a
+/// host has, and the value matches the canonical
+/// `ListToolsResultResponse` example in the spec tree at the
+/// 2026-07-28 tag. Raising or lowering it is a deliberate, tested
+/// act (the `tools_list_carries_2026_07_28_cache_hints` contract
+/// pins the field's presence, not this literal).
+const TOOLS_LIST_TTL_MS: u64 = 3_600_000;
+
 /// Per-line stdin cap. rm-782 first framed the read at byte level
 /// (`BufRead::lines()` has no bound of its own and cannot answer a
 /// non-UTF-8 line at all); landed rm-923 pinned the refusal contract
@@ -423,10 +436,42 @@ fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
     };
     Some(match result {
         Ok(value) => {
-            wire_sanitize(json!({"jsonrpc": "2.0", "id": id, "result": value}).to_string())
+            // rm-455: the single serialization seam where every
+            // result gains its required `resultType` member (see
+            // [`with_result_type`]).
+            let result = with_result_type(value);
+            wire_sanitize(json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
         }
         Err((code, message)) => error_response(Some(id), code, &message),
     })
+}
+
+/// rm-455 (run e4209f0c cycle 5): the 2026-07-28 revision — the
+/// newest this server advertises and negotiates — makes `resultType`
+/// REQUIRED on every result (the `Result` base interface in
+/// schema/2026-07-28/schema.ts at the spec tag: "Servers implementing
+/// this protocol version MUST include this field", SEP-2322's MRTR
+/// work; clients of older servers MUST treat the absent member as
+/// `"complete"`). Every result this server builds is complete — the
+/// multi-round-trip `input_required` shape is elicit/sampling
+/// territory a read-only reporting server never enters — so the
+/// member is inserted once, at this seam, and covers all four
+/// method results (initialize, ping, tools/list, tools/call)
+/// identically. It stays additive on the older revisions this server
+/// also speaks: their `Result` shapes are index-signature
+/// extensible, so an older client ignores the unknown member rather
+/// than failing (the same posture the spec demands of clients
+/// reading results from servers of that era).
+fn with_result_type(result: Value) -> Value {
+    match result {
+        Value::Object(mut object) => {
+            object
+                .entry("resultType".to_string())
+                .or_insert_with(|| json!("complete"));
+            Value::Object(object)
+        }
+        other => other,
+    }
 }
 
 /// `initialize` result (rm-780): answer with the newest protocol
@@ -474,6 +519,14 @@ fn initialize_result(params: Value) -> Result<Value, (i64, String)> {
 
 /// `tools/list` result. Descriptions state the read-only posture so a
 /// host that surfaces them to the model carries the contract too.
+/// rm-455 (run e4209f0c cycle 5): the 2026-07-28 revision REQUIRES the
+/// CacheableResult pair (SEP-2549) on this result — `ttlMs` plus
+/// `cacheScope`. `"public"` is the spec's own recommendation
+/// (docs/specification/2026-07-28/server/utilities/caching.mdx) for
+/// lists of tools "identical for all users", which these are: the
+/// list is static per binary and carries no user or corpus data.
+/// `resultType` is added centrally by [`with_result_type`] (it is
+/// required on all results, not just this one).
 fn tools_list_result() -> Value {
     let range_schema = || {
         json!({
@@ -493,6 +546,11 @@ fn tools_list_result() -> Value {
         })
     };
     json!({
+        // rm-455 (run e4209f0c cycle 5): CacheableResult pair REQUIRED on
+        // tools/list by the 2026-07-28 revision (SEP-2549) — see the
+        // function docs for the value choices.
+        "ttlMs": TOOLS_LIST_TTL_MS,
+        "cacheScope": "public",
         "tools": [
             {
                 "name": "usage_overview",
