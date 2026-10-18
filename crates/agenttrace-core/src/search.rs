@@ -34,6 +34,12 @@ pub struct TranscriptScanSummary {
     pub skipped_budget: usize,
     pub file_byte_cap: u64,
     pub total_byte_budget: u64,
+    /// rm-992: `.jsonl.zst` files whose frame decoded within the shared
+    /// cap — counted so the tail can distinguish them from plain scans.
+    pub zstd_decoded_files: usize,
+    /// rm-992 (disclosure arm): zstd frames that failed to decode or
+    /// exceeded the decode cap — skipped WITH a reason, never silently.
+    pub skipped_zstd_decode: usize,
 }
 
 impl TranscriptScanSummary {
@@ -49,6 +55,8 @@ impl TranscriptScanSummary {
             skipped_budget: 0,
             file_byte_cap,
             total_byte_budget,
+            zstd_decoded_files: 0,
+            skipped_zstd_decode: 0,
         }
     }
 
@@ -68,6 +76,7 @@ impl TranscriptScanSummary {
             ("over byte cap", self.skipped_oversized),
             ("non-file", self.skipped_non_file),
             ("read budget exhausted", self.skipped_budget),
+            ("zstd decode failed", self.skipped_zstd_decode),
         ] {
             if count > 0 {
                 parts.push(format!("{count} skipped: {label}"));
@@ -535,7 +544,38 @@ fn transcript_evidence(
         scan.skipped_unreadable += 1;
         return (Vec::new(), "skipped: unreadable".to_string());
     }
+    // rm-992: admitted `.jsonl.zst` rollouts decode through the SAME
+    // bounded lane the parser uses (`decode_zstd_rollout_bounded` —
+    // one cap, one format), so search sees the bytes sessions see.
+    // Byte accounting is by DECOMPRESSED size: a compressed stat would
+    // report a corpus far smaller than the one actually scanned.
+    if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        match crate::parser::decode_zstd_rollout_bounded(std::mem::take(&mut bytes), path) {
+            Ok(decoded) => {
+                bytes = decoded;
+                scan.zstd_decoded_files += 1;
+            }
+            Err(decode_error) => {
+                scan.skipped_zstd_decode += 1;
+                return (
+                    Vec::new(),
+                    format!("skipped: zstd decode failed ({decode_error})"),
+                );
+            }
+        }
+    }
     let read = bytes.len() as u64;
+    // Post-decode guard: the pre-checks above saw the COMPRESSED
+    // size; a decompressed frame larger than the remaining budget
+    // skips with disclosure instead of underflowing it (the decode
+    // lane's own cap already bounds the absolute size).
+    if read > *budget_left {
+        scan.skipped_budget += 1;
+        return (
+            Vec::new(),
+            format!("skipped: read budget exhausted ({read} decompressed bytes)"),
+        );
+    }
     *budget_left -= read;
     scan.scanned_files += 1;
     scan.scanned_bytes += read;
