@@ -360,7 +360,11 @@ never fatal: `--doctor` reports them as `read-cap refused` per directory
 (and as a `read_cap_refused` field in its JSON), and a directory scan's
 stderr advisory names the count. The bound is an admission knob, not a
 format contract: split the file or pipe it through stdin to analyze
-oversized transcripts.
+oversized transcripts. The codex replay reconcile's on-disk
+re-read honors the same bound (rm-2020): an over-cap rollout keeps
+its full usage, joins no replay family, and carries a
+`codex_multiagent_reconcile_skipped_cap_exceeded` disclosure so a cap
+refusal is never mistaken for a missing file.
 
 ### Compressed (zstd) Codex rollouts
 
