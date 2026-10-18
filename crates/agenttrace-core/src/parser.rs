@@ -268,6 +268,70 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
 // K1 rider history: this fn once carried a module-level CheckpointSnapshot
 // alias to stay under clippy's type_complexity budget (rm-538's rider);
 // rm-551's per-model fold removed the nested shape and the alias with it.
+/// rm-851: one read of a Copilot credit meter (`totalNanoAiu`) whose
+/// JSON shape may have drifted or been forged hostile. `.as_f64()`
+/// alone drops JSON strings ("250000000") without a trace, silently
+/// zeroing the credit bill — the read never silently vanishes instead:
+/// a parseable string coerces behind a disclosure counter, and a
+/// present-but-unusable value is rejected with its own counter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CreditMeterRead {
+    Absent,
+    Usable(f64),
+    CoercedString(f64),
+    Rejected(&'static str),
+}
+
+fn read_credit_meter(value: Option<&Value>) -> CreditMeterRead {
+    let Some(value) = value else {
+        return CreditMeterRead::Absent;
+    };
+    match value {
+        Value::Number(_) => match value.as_f64() {
+            Some(number) if number.is_finite() => CreditMeterRead::Usable(number),
+            _ => CreditMeterRead::Rejected("non_finite_number"),
+        },
+        Value::String(text) => match text.trim().parse::<f64>() {
+            Ok(number) if number.is_finite() => CreditMeterRead::CoercedString(number),
+            _ => CreditMeterRead::Rejected("non_numeric_string"),
+        },
+        Value::Null => CreditMeterRead::Rejected("null"),
+        Value::Bool(_) => CreditMeterRead::Rejected("bool"),
+        Value::Array(_) => CreditMeterRead::Rejected("array"),
+        Value::Object(_) => CreditMeterRead::Rejected("object"),
+    }
+}
+
+impl CreditMeterRead {
+    /// Fold the read into a meter value, minting the rm-594-capped
+    /// disclosure counter for every coercion and rejection so the
+    /// credit lane stays observable end to end.
+    fn usable(self, disclosures: &mut BTreeMap<String, i64>) -> Option<f64> {
+        match self {
+            CreditMeterRead::Absent => None,
+            CreditMeterRead::Usable(number) => Some(number),
+            CreditMeterRead::CoercedString(number) => {
+                *disclosures
+                    .entry(disclosure_key(
+                        "copilot_credit_meter_coerced",
+                        "totalNanoAiu",
+                    ))
+                    .or_insert(0) += 1;
+                Some(number)
+            }
+            CreditMeterRead::Rejected(shape) => {
+                *disclosures
+                    .entry(disclosure_key(
+                        "copilot_credit_meter_rejected",
+                        &format!("totalNanoAiu:{shape}"),
+                    ))
+                    .or_insert(0) += 1;
+                None
+            }
+        }
+    }
+}
+
 fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     if !objs
         .iter()
@@ -303,6 +367,10 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // Name every un-counted entry type instead of letting it vanish (the
     // disclosure rule rm-584 landed for the codex lane).
     let mut uncounted: BTreeMap<String, i64> = BTreeMap::new();
+    // rm-851: coerced/rejected totalNanoAiu meter reads, keyed through
+    // the same rm-594 capped+sanitized disclosure_key mint as every
+    // other journal-derived counter.
+    let mut meter_disclosures: BTreeMap<String, i64> = BTreeMap::new();
     let mut max_credit_nano: f64 = 0.0;
     // Review 3e3a2198 F4: per-model credit meters (modelMetrics[m].
     // totalNanoAiu). Each entry is one model's OWN bill (codeburn #1651
@@ -404,13 +472,20 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         // totalNanoAiu is absent there), so credits must read
                         // both shapes — max-fold, matching the rm-485
                         // family's repeated-snapshot semantics.
-                        if let Some(nano) = metric.get("totalNanoAiu").and_then(Value::as_f64) {
-                            if nano.is_finite() {
-                                let slot =
-                                    per_model_credit_nano.entry(model.clone()).or_insert(0.0);
-                                if nano > *slot {
-                                    *slot = nano;
-                                }
+                        // rm-851: the meter read never silently vanishes.
+                        // A hostile or drifted agent-host can carry the
+                        // meter as a JSON string ("250000000"), which
+                        // `.as_f64()` drops without a trace — the credit
+                        // bill would read zero. A parseable string
+                        // coerces behind a disclosure counter; a
+                        // present-but-unusable value is rejected with
+                        // its own counter (see `read_credit_meter`).
+                        if let Some(nano) = read_credit_meter(metric.get("totalNanoAiu"))
+                            .usable(&mut meter_disclosures)
+                        {
+                            let slot = per_model_credit_nano.entry(model.clone()).or_insert(0.0);
+                            if nano > *slot {
+                                *slot = nano;
                             }
                         }
                         if let Some(mut usage) = metric.get("usage").and_then(usage_from_value) {
@@ -446,11 +521,12 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     }
                 }
                 latest_shutdown_timestamp = later_rfc3339(&latest_shutdown_timestamp, &timestamp);
-                if let Some(nano) = data
-                    .and_then(|data| data.get("totalNanoAiu"))
-                    .and_then(Value::as_f64)
+                // rm-851: never-vanish read of the top-level meter too.
+                if let Some(nano) =
+                    read_credit_meter(data.and_then(|data| data.get("totalNanoAiu")))
+                        .usable(&mut meter_disclosures)
                 {
-                    if nano.is_finite() && nano > max_credit_nano {
+                    if nano > max_credit_nano {
                         max_credit_nano = nano;
                     }
                 }
@@ -472,13 +548,16 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         // shutdown arm — checkpoints carry modelMetrics
                         // with totalNanoAiu on live agent-host sessions
                         // (top-level nanoAiu but no tokens, #1651).
-                        if let Some(nano) = metric.get("totalNanoAiu").and_then(Value::as_f64) {
-                            if nano.is_finite() {
-                                let slot =
-                                    per_model_credit_nano.entry(model.clone()).or_insert(0.0);
-                                if nano > *slot {
-                                    *slot = nano;
-                                }
+                        // rm-851: same never-vanish meter read as the
+                        // shutdown arm — string meters coerce behind a
+                        // disclosure counter, unusable shapes are
+                        // rejected with one.
+                        if let Some(nano) = read_credit_meter(metric.get("totalNanoAiu"))
+                            .usable(&mut meter_disclosures)
+                        {
+                            let slot = per_model_credit_nano.entry(model.clone()).or_insert(0.0);
+                            if nano > *slot {
+                                *slot = nano;
                             }
                         }
                         if let Some(mut usage) = metric.get("usage").and_then(usage_from_value) {
@@ -513,11 +592,12 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 }
                 latest_checkpoint_timestamp =
                     later_rfc3339(&latest_checkpoint_timestamp, &timestamp);
-                if let Some(nano) = data
-                    .and_then(|data| data.get("totalNanoAiu"))
-                    .and_then(Value::as_f64)
+                // rm-851: never-vanish read of the top-level meter too.
+                if let Some(nano) =
+                    read_credit_meter(data.and_then(|data| data.get("totalNanoAiu")))
+                        .usable(&mut meter_disclosures)
                 {
-                    if nano.is_finite() && nano > max_credit_nano {
+                    if nano > max_credit_nano {
                         max_credit_nano = nano;
                     }
                 }
@@ -550,6 +630,20 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             Event {
                 role: "meta".to_string(),
                 disclosure_counters: counters,
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            },
+        );
+    }
+    // rm-851: the string-meter disclosure rides its own meta event —
+    // coerced and rejected reads are fold-observable, never a silent
+    // zero bill.
+    if !meter_disclosures.is_empty() {
+        events.insert(
+            0,
+            Event {
+                role: "meta".to_string(),
+                disclosure_counters: meter_disclosures,
                 source_tool: "copilot_cli".to_string(),
                 ..Event::default()
             },

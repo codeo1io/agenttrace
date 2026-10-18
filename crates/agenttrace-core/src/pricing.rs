@@ -65,6 +65,29 @@ pub struct Price {
     pub deprecation_date: Option<String>,
 }
 
+/// rm-852: the disclosed carrier choice behind one catalog name.
+/// When several carrier-prefixed rows collapse onto the same bare
+/// name, pricing that bare id is a CHOICE — which carrier's rate it
+/// inherits — and the choice is recorded here, never made silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarrierSummary {
+    /// The carrier catalog key whose rate the bare name resolves to
+    /// (`zai/glm-5.3`).
+    pub key: String,
+    /// That carrier's provider label (mirrors `providers`).
+    pub provider: String,
+    /// How many carrier rows in the source collapsed onto this name.
+    pub carriers: usize,
+    /// How many of those rows agree on the winning rate. Equals
+    /// `carriers` on unanimity, exceeds `carriers / 2` on consensus,
+    /// and is the winner's lone vote (`1`) when contested.
+    pub agreeing: usize,
+    /// True when no strict majority of carriers agreed on a rate: the
+    /// recorded winner is the legacy priority-collapse choice, kept
+    /// for stability but now disclosed as contested instead of silent.
+    pub contested: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PricingCatalog {
     pub entries: BTreeMap<String, Price>,
@@ -75,6 +98,13 @@ pub struct PricingCatalog {
     /// (rm-245). Read-only attribution data: provenance and freshness
     /// semantics stay with pricing_source_for and are untouched here.
     pub providers: BTreeMap<String, String>,
+    /// rm-852: for every catalog name that exists only through
+    /// carrier-prefixed source rows (`zai/glm-5.3`,
+    /// `openrouter/z-ai/glm-5.3` both normalize to `glm-5.3`), the
+    /// disclosed carrier choice behind that name's single rate. Read by
+    /// `carrier_resolution_note`; empty when every name maps to a
+    /// first-party row (no carrier collapsed onto it).
+    pub carriers: BTreeMap<String, CarrierSummary>,
     /// The catalog's own vintage as YYYYMMDD (rm-419): the bundled
     /// snapshot's pinned date, a cached catalog's fetch date, or today
     /// for a just-refreshed remote fetch. Deprecation disclosure
@@ -368,6 +398,43 @@ fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
         .filter(|provider| !provider.trim().is_empty())
 }
 
+/// rm-852: disclosure sentence for a model id whose rate only exists
+/// because carrier-prefixed rows collapsed onto one entry. A journal
+/// naming the bare id (`glm-5.3`) is priced at a CARRIER's rate; which
+/// carrier won — and whether the carriers even agree — is disclosed
+/// here so a reseller's rate can never silently pass for another's.
+pub fn carrier_resolution_note(model: &str) -> Option<String> {
+    let catalog = pricing_catalog();
+    let normalized = normalize_model(model);
+    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    // A user-set rate is its own provenance (rm-419): the carrier
+    // collapse it overrode is no longer the priced truth.
+    if pricing_override_models().contains(&resolved) {
+        return None;
+    }
+    carrier_resolution_note_for(&resolved, catalog)
+}
+
+fn carrier_resolution_note_for(key: &str, catalog: &PricingCatalog) -> Option<String> {
+    let summary = catalog.carriers.get(key)?;
+    if summary.contested {
+        Some(format!(
+            "bare id priced via contested carrier collapse onto {} ({} carriers disagree on the rate)",
+            summary.key, summary.carriers
+        ))
+    } else if summary.agreeing < summary.carriers {
+        Some(format!(
+            "bare id resolved via carrier {} ({} of {} carriers agree on the rate)",
+            summary.key, summary.agreeing, summary.carriers
+        ))
+    } else {
+        Some(format!(
+            "bare id resolved via carrier {} ({} carriers agree on the rate)",
+            summary.key, summary.carriers
+        ))
+    }
+}
+
 fn pricing_source_for_catalog(
     model: &str,
     catalog: &PricingCatalog,
@@ -378,7 +445,7 @@ fn pricing_source_for_catalog(
     let Some(key) = matching_catalog_key(&resolved, &catalog.entries) else {
         return "built-in fallback".to_string();
     };
-    if override_models.contains(&key) {
+    let label = if override_models.contains(&key) {
         // rm-419: a user-set rate keeps the vendor retirement
         // disclosure — the status is catalog knowledge, not a rate
         // claim, so it carries no "unverified" qualifier.
@@ -435,6 +502,15 @@ fn pricing_source_for_catalog(
         }
     } else {
         catalog_source(catalog)
+    };
+    // rm-852: when the matched key only exists because carrier rows
+    // collapsed onto it, the provenance string names the chosen
+    // carrier. A bare model id is priced at a carrier's rate — which
+    // carrier won is part of the pricing truth, so it rides the same
+    // line (user-set rates are their own provenance and stay bare).
+    match carrier_resolution_note_for(&key, catalog) {
+        Some(note) if !override_models.contains(&key) => format!("{label}; {note}"),
+        _ => label,
     }
 }
 
@@ -453,6 +529,7 @@ pub fn update_pricing() -> anyhow::Result<usize> {
         aliases: BTreeMap::new(),
         source: "remote".to_string(),
         providers: converted.providers,
+        carriers: converted.carriers,
         reference_date: today_ymd(),
     };
     let override_models = apply_pricing_overrides(&mut catalog);
@@ -575,6 +652,7 @@ fn fallback_catalog() -> PricingCatalog {
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: None,
         };
     }
@@ -583,6 +661,7 @@ fn fallback_catalog() -> PricingCatalog {
         aliases: BTreeMap::new(),
         source: "snapshot".to_string(),
         providers: converted.providers,
+        carriers: converted.carriers,
         reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
     }
 }
@@ -640,6 +719,7 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
         aliases: BTreeMap::new(),
         source: if stale { "cache(stale)" } else { "cache" }.to_string(),
         providers: converted.providers,
+        carriers: converted.carriers,
         // A cached catalog's vintage is its fetch date (rm-419); when
         // the provenance stamp is missing (pre-rm-167 cache) fall back
         // to the bundled snapshot date as a conservative anchor.
@@ -878,6 +958,20 @@ fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
 struct ConvertedCatalog {
     entries: BTreeMap<String, Price>,
     providers: BTreeMap<String, String>,
+    /// rm-852: for names that only exist through carrier rows, the
+    /// disclosed choice of carrier (see `CarrierSummary`).
+    carriers: BTreeMap<String, CarrierSummary>,
+}
+
+/// rm-852 candidate row: one raw source key that normalizes onto a
+/// shared catalog name.
+#[derive(Clone)]
+struct CarrierCandidate {
+    key: String,
+    provider: String,
+    priority: i32,
+    depth: usize,
+    price: Price,
 }
 
 fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
@@ -885,9 +979,28 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         return ConvertedCatalog {
             entries: BTreeMap::new(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
         };
     };
-    let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
+    // rm-852: the previous selection kept ONE winner per normalized
+    // name decided by provider priority alone — so `openrouter/z-ai/glm-5.3`
+    // (priority 8) silently displaced the first-party `zai/glm-5.3`
+    // (priority 0), and every journal naming bare `glm-5.3` inherited a
+    // reseller's rate with no record of the choice. Selection is now
+    // the carrier ladder:
+    //   1. a first-party row (raw key == the bare name) always wins —
+    //      an id that exactly equals a catalog key prices at that key;
+    //   2. otherwise a STRICT majority of carriers agreeing on the full
+    //      four-rate tuple wins, and the named carrier is the
+    //      shallowest carrier path (fewest `/`), then provider
+    //      priority, then source order;
+    //   3. otherwise (contested) the legacy priority winner keeps the
+    //      rate — the built-in default would be further from every
+    //      carrier's real price — but the contest is recorded in
+    //      `carriers` so the disclosure surface can say so.
+    // Every carrier-only name gets a `CarrierSummary`; pricing a bare
+    // id is a choice and choices are disclosed, never silent.
+    let mut groups: BTreeMap<String, Vec<CarrierCandidate>> = BTreeMap::new();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
@@ -927,21 +1040,122 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         {
             continue;
         }
-        let priority = provider_priority(&model.provider);
-        match selected.get(&normalized) {
-            Some((existing, _, _)) if *existing >= priority => {}
-            _ => {
-                selected.insert(normalized, (priority, price, model.provider));
-            }
-        }
+        groups
+            .entry(normalized)
+            .or_default()
+            .push(CarrierCandidate {
+                key: key.clone(),
+                priority: provider_priority(&model.provider),
+                provider: model.provider,
+                depth: key.matches('/').count(),
+                price,
+            });
+    }
+    fn rate_key(price: &Price) -> (u64, u64) {
+        // Consensus identity is the LIST rate (input, output). Cache
+        // rates differ by carrier POLICY on the same list price —
+        // `zai/glm-5.3` and `openrouter/z-ai/glm-5.3` both list
+        // $1.40/$4.40 while charging different cache-read rates — so
+        // including them would splinter every consensus into
+        // singletons. The winner's cache rates ride its row. f64 is
+        // not Ord, so the key is the bit pattern; rates here are
+        // finite (checked above) and -0.0/0.0 canonicalize to one key.
+        let canonical = |rate: f64| if rate == 0.0 { 0.0f64 } else { rate };
+        (
+            canonical(price.input).to_bits(),
+            canonical(price.output).to_bits(),
+        )
     }
     let mut entries = BTreeMap::new();
     let mut providers = BTreeMap::new();
-    for (name, (_, price, provider)) in selected {
+    let mut carriers = BTreeMap::new();
+    for (name, candidates) in groups {
+        let bare = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.key == name)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let winner = if !bare.is_empty() {
+            // Ladder step 1: the first-party row wins (highest priority
+            // among bare rows, first seen breaks ties — the legacy
+            // behavior among first-party rows).
+            bare.iter()
+                .copied()
+                .max_by_key(|index| (candidates[*index].priority, std::cmp::Reverse(*index)))
+                .unwrap()
+        } else {
+            // Ladder step 2: strict price consensus.
+            let mut tally: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+            for (index, candidate) in candidates.iter().enumerate() {
+                tally
+                    .entry(rate_key(&candidate.price))
+                    .or_default()
+                    .push(index);
+            }
+            let mut ranked = tally.values().collect::<Vec<_>>();
+            ranked.sort_by_key(|agreers| std::cmp::Reverse(agreers.len()));
+            let majority = ranked.first().filter(|top| {
+                top.len() * 2 > candidates.len()
+                    && ranked
+                        .get(1)
+                        .map(|second| top.len() > second.len())
+                        .unwrap_or(true)
+            });
+            match majority {
+                Some(agreers) => agreers
+                    .iter()
+                    .copied()
+                    .min_by_key(|index| {
+                        (
+                            candidates[*index].depth,
+                            std::cmp::Reverse(candidates[*index].priority),
+                            *index,
+                        )
+                    })
+                    .unwrap(),
+                // Ladder step 3: contested — keep the legacy
+                // priority-collapse winner (max priority, first seen on
+                // ties), now disclosed as contested.
+                None => (0..candidates.len())
+                    .max_by_key(|index| (candidates[*index].priority, std::cmp::Reverse(*index)))
+                    .unwrap(),
+            }
+        };
+        let summary = if bare.is_empty() {
+            let winner_rate = rate_key(&candidates[winner].price);
+            let agreeing = candidates
+                .iter()
+                .filter(|candidate| rate_key(&candidate.price) == winner_rate)
+                .count();
+            Some(CarrierSummary {
+                key: candidates[winner].key.clone(),
+                provider: candidates[winner].provider.clone(),
+                carriers: candidates.len(),
+                agreeing,
+                contested: agreeing * 2 <= candidates.len(),
+            })
+        } else {
+            None
+        };
+        let CarrierCandidate {
+            key: _,
+            provider,
+            priority: _,
+            depth: _,
+            price,
+        } = candidates.into_iter().nth(winner).unwrap();
+        if let Some(summary) = summary {
+            carriers.insert(name.clone(), summary);
+        }
         providers.insert(name.clone(), provider);
         entries.insert(name, price);
     }
-    ConvertedCatalog { entries, providers }
+    ConvertedCatalog {
+        entries,
+        providers,
+        carriers,
+    }
 }
 
 fn provider_priority(provider: &str) -> i32 {
@@ -1967,6 +2181,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: source.to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2019,6 +2234,7 @@ mod tests {
             aliases: BTreeMap::from([("alias-model".to_string(), "catalog-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: None,
         };
         let overrides = BTreeSet::from(["override-model".to_string()]);
@@ -2054,6 +2270,7 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "retired-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         // Plain catalog arm.
@@ -2081,6 +2298,7 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         assert_eq!(
@@ -2092,6 +2310,7 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2139,6 +2358,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
 
@@ -2332,6 +2552,7 @@ mod tests {
             aliases: BTreeMap::from([("wide-alias".to_string(), "wide-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2379,6 +2600,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "snapshot".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         let overrides = BTreeSet::new();
@@ -2421,6 +2643,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         assert_eq!(
@@ -2432,6 +2655,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2459,9 +2683,11 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: None,
         };
         let same_content = PricingCatalog {
+            carriers: BTreeMap::new(),
             source: "cache(stale)".to_string(),
             reference_date: Some(2026_1004),
             ..base.clone()
@@ -2472,6 +2698,7 @@ mod tests {
             "source and reference_date must not affect the identity"
         );
         let repriced = PricingCatalog {
+            carriers: BTreeMap::new(),
             entries: BTreeMap::from([(
                 "model-a".to_string(),
                 Price {
@@ -2484,11 +2711,13 @@ mod tests {
         };
         assert_ne!(catalog_identity_of(&base), catalog_identity_of(&repriced));
         let aliased = PricingCatalog {
+            carriers: BTreeMap::new(),
             aliases: BTreeMap::from([("alias".to_string(), "model-a".to_string())]),
             ..base.clone()
         };
         assert_ne!(catalog_identity_of(&base), catalog_identity_of(&aliased));
         let windowed = PricingCatalog {
+            carriers: BTreeMap::new(),
             entries: BTreeMap::from([(
                 "model-a".to_string(),
                 Price {
@@ -2574,6 +2803,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            carriers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
 
@@ -2625,5 +2855,152 @@ mod tests {
             catalog.entries["brand-new-model"].max_input_tokens, None,
             "an override for an unknown model has nothing to backfill from"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // rm-852: bare model id -> carrier-prefixed pricing ladder with a
+    // disclosed choice. `glm-5.3` exists in the bundled snapshot ONLY
+    // through carrier rows (`zai/glm-5.3`, `openrouter/z-ai/glm-5.3`,
+    // `novita/zai/glm-5.3`, `aihubmix/glm-5.3`); the old
+    // priority-collapse let `openrouter` (priority 8) silently
+    // displace first-party `zai`, and journals naming the bare id
+    // inherited the reseller row with zero record of the choice.
+    // ------------------------------------------------------------------
+
+    fn carrier_probe(source_json: &str) -> ConvertedCatalog {
+        convert_litellm(source_json.as_bytes())
+    }
+
+    #[test]
+    fn rm852_glm_bare_id_prices_at_zai_carrier_rate_with_disclosure() {
+        // Shipped-snapshot acceptance: bare `glm-5.3` resolves to the
+        // first-party carrier rate ($1.40/$4.40 per million), not the
+        // $3/$15 default — and the choice is disclosed, not silent.
+        let price = lookup_price("glm-5.3");
+        assert_eq!((price.input, price.output), (1.4, 4.4));
+        assert_eq!(provider_for("glm-5.3").as_deref(), Some("zai"));
+        assert!(has_specific_price("glm-5.3"));
+        let note = carrier_resolution_note("glm-5.3")
+            .expect("bare glm-5.3 is a carrier collapse and must disclose its carrier");
+        assert!(
+            note.contains("zai/glm-5.3"),
+            "disclosure names the winning carrier key: {note}"
+        );
+        assert!(
+            note.contains("carriers agree"),
+            "consensus strength rides the disclosure: {note}"
+        );
+        let source = pricing_source_for("glm-5.3");
+        assert!(
+            source.contains("zai/glm-5.3"),
+            "pricing provenance names the carrier: {source}"
+        );
+    }
+
+    #[test]
+    fn rm852_prefixed_carrier_id_still_prices_exactly_and_discloses_the_collapse() {
+        let price = lookup_price("zai/glm-5.3");
+        assert_eq!((price.input, price.output), (1.4, 4.4));
+        assert_eq!(provider_for("zai/glm-5.3").as_deref(), Some("zai"));
+        // The prefixed id normalizes onto the same collapsed entry, so
+        // the provenance line still discloses which carrier's rate the
+        // name carries — useful when a reseller's discount differs.
+        let source = pricing_source_for("aihubmix/glm-5.3");
+        assert!(
+            source.contains("bare id resolved via carrier"),
+            "any id hitting a carrier-collapsed entry discloses the carrier: {source}"
+        );
+    }
+
+    #[test]
+    fn rm852_convert_ladder_picks_shallowest_majority_carrier() {
+        // Fixture snapshot mirroring the shipped glm-5.3 shape: three
+        // carriers agree on the first-party rate, one reseller
+        // discounts. The ladder must pick zai (shallowest path among
+        // the majority) and record 3-of-4 agreement — NOT the old
+        // priority-collapse onto openrouter (priority 8 > zai 0).
+        let source = r#"{
+            "zai/glm-5.3": {"input_cost_per_token": 1.4e-6, "output_cost_per_token": 4.4e-6, "mode": "chat", "litellm_provider": "zai"},
+            "novita/zai/glm-5.3": {"input_cost_per_token": 1.4e-6, "output_cost_per_token": 4.4e-6, "mode": "chat", "litellm_provider": "novita"},
+            "openrouter/z-ai/glm-5.3": {"input_cost_per_token": 1.4e-6, "output_cost_per_token": 4.4e-6, "mode": "chat", "litellm_provider": "openrouter"},
+            "aihubmix/glm-5.3": {"input_cost_per_token": 1.19e-6, "output_cost_per_token": 3.74e-6, "mode": "chat", "litellm_provider": "aihubmix"}
+        }"#;
+        let converted = carrier_probe(source);
+        let price = converted
+            .entries
+            .get("glm-5.3")
+            .expect("carrier rows collapse onto the bare name");
+        assert_eq!((price.input, price.output), (1.4, 4.4));
+        assert_eq!(
+            converted.providers.get("glm-5.3").map(String::as_str),
+            Some("zai")
+        );
+        let summary = converted
+            .carriers
+            .get("glm-5.3")
+            .expect("carrier-only name records its choice");
+        assert_eq!(summary.key, "zai/glm-5.3");
+        assert_eq!(summary.carriers, 4);
+        assert_eq!(summary.agreeing, 3);
+        assert!(!summary.contested);
+    }
+
+    #[test]
+    fn rm852_contested_carriers_keep_legacy_rate_but_disclose_the_contest() {
+        // No strict majority (2 carriers, two different rates): the
+        // legacy priority winner keeps the rate — falling to the $3/$15
+        // built-in default would be further from every carrier's real
+        // price — and the disclosure says the collapse is contested.
+        let source = r#"{
+            "deepinfra/deepseek-r1": {"input_cost_per_token": 0.14e-6, "output_cost_per_token": 0.55e-6, "mode": "chat", "litellm_provider": "deepinfra"},
+            "nscale/deepseek-r1": {"input_cost_per_token": 0.10e-6, "output_cost_per_token": 0.40e-6, "mode": "chat", "litellm_provider": "nscale"}
+        }"#;
+        let converted = carrier_probe(source);
+        let summary = converted
+            .carriers
+            .get("deepseek-r1")
+            .expect("contested collapse is still recorded");
+        assert!(summary.contested, "2-vs-1/2 has no strict majority");
+        assert_eq!(summary.agreeing, 1);
+        let price = &converted.entries["deepseek-r1"];
+        assert_eq!((price.input, price.output), (0.14, 0.55));
+        let note = carrier_resolution_note("deepseek-r1")
+            .expect("contested carrier name discloses the contest");
+        assert!(note.contains("contested"));
+    }
+
+    #[test]
+    fn rm852_first_party_bare_row_outranks_carrier_rows_undisclosed() {
+        // A first-party row (raw key == bare name) is an exact key
+        // match: it wins over every carrier row and needs no
+        // disclosure — there is no choice to disclose.
+        let source = r#"{
+            "glm-5.3": {"input_cost_per_token": 1.4e-6, "output_cost_per_token": 4.4e-6, "mode": "chat", "litellm_provider": "zai"},
+            "openrouter/z-ai/glm-5.3": {"input_cost_per_token": 0.9e-6, "output_cost_per_token": 3.0e-6, "mode": "chat", "litellm_provider": "openrouter"}
+        }"#;
+        let converted = carrier_probe(source);
+        assert_eq!(converted.carriers.get("glm-5.3"), None);
+        let price = &converted.entries["glm-5.3"];
+        assert_eq!((price.input, price.output), (1.4, 4.4));
+        // No CarrierSummary exists for the name, so `pricing_source_for`
+        // appends no carrier clause: an exact first-party key match has
+        // no choice to disclose (see rm852_glm_bare_id... for the
+        // shipped-snapshot counterpart).
+    }
+
+    #[test]
+    fn rm852_single_carrier_name_discloses_its_only_carrier() {
+        let source = r#"{
+            "zai/glm-4.6": {"input_cost_per_token": 0.6e-6, "output_cost_per_token": 2.2e-6, "mode": "chat", "litellm_provider": "zai"}
+        }"#;
+        let converted = carrier_probe(source);
+        let summary = converted
+            .carriers
+            .get("glm-4.6")
+            .expect("single-carrier collapse is still a choice that gets disclosed");
+        assert_eq!(summary.key, "zai/glm-4.6");
+        assert_eq!(summary.carriers, 1);
+        assert_eq!(summary.agreeing, 1);
+        assert!(!summary.contested);
     }
 }

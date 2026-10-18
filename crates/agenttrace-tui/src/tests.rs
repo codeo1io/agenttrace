@@ -2327,3 +2327,82 @@ fn delivery_evidence_confidence_localizes_bare_words_and_states_note_once() {
         "legacy composite shape must not leak"
     );
 }
+
+#[test]
+fn delivery_confidence_localizes_the_high_tier() {
+    // rm-853 (run 6b369f2f cycle-1 batch): the zh delivery-confidence
+    // arm localized medium/low but carried no `high` tier, so a
+    // `high`-confidence row fell through raw — an English fragment in a
+    // zh report. The tier vocabulary is high/medium/low; the zh arm
+    // must localize all three.
+    use agenttrace_core::{DeliveryEvidence, DeliverySummary, SessionDeliveryEvidence};
+    let report = DeliveryEvidence {
+        methodology: "Lightweight heuristic".to_string(),
+        confidence_note: "note".to_string(),
+        summary: DeliverySummary::default(),
+        sessions: vec![SessionDeliveryEvidence {
+            session: "s1".to_string(),
+            project: "proj".to_string(),
+            level: "strong".to_string(),
+            evidence: Vec::new(),
+            confidence: "high".to_string(),
+        }],
+    };
+    let zh = super::presentation::delivery_evidence_text(&report, Language::Zh);
+    assert!(
+        zh.contains("高"),
+        "a bare `high` row must render as 高, not fall through raw: {zh}"
+    );
+    assert!(
+        !zh.contains("high"),
+        "no English tier fragment may leak into the zh lane: {zh}"
+    );
+}
+
+#[test]
+fn delivery_confidence_closes_the_tier_vocabulary_for_every_shipped_locale() {
+    // rm-853 acceptance completion (review fix 5f237ee9, run 6b369f2f
+    // cycle-1 review 1de66b0c F4): the minted acceptance says "every
+    // locale's tier vocabulary closed; a locale-vocabulary test pins
+    // ALL tier arms for EVERY shipped locale" — not just the zh `high`
+    // arm the implement phase pinned. This test iterates the shipped
+    // locale set (En passthrough, Zh localized) against the full source
+    // tier vocabulary (high/medium/low) in one report, so adding a tier
+    // or a locale without closing its vocabulary fails here.
+    use agenttrace_core::{DeliveryEvidence, DeliverySummary, SessionDeliveryEvidence};
+    let row = |session: &str, confidence: &str| SessionDeliveryEvidence {
+        session: session.to_string(),
+        project: "proj".to_string(),
+        level: "strong".to_string(),
+        evidence: Vec::new(),
+        confidence: confidence.to_string(),
+    };
+    let report = DeliveryEvidence {
+        methodology: "轻量启发式".to_string(),
+        confidence_note: "note".to_string(),
+        summary: DeliverySummary::default(),
+        sessions: vec![row("s1", "high"), row("s2", "medium"), row("s3", "low")],
+    };
+
+    let en = super::presentation::delivery_evidence_text(&report, Language::En);
+    for tier in ["high", "medium", "low"] {
+        assert!(
+            en.contains(tier),
+            "the En lane passes every tier through verbatim; `{tier}` missing: {en}"
+        );
+    }
+
+    let zh = super::presentation::delivery_evidence_text(&report, Language::Zh);
+    for localized in ["高", "中等", "较低"] {
+        assert!(
+            zh.contains(localized),
+            "the zh lane must localize every tier arm; `{localized}` missing: {zh}"
+        );
+    }
+    for tier in ["high", "medium", "low"] {
+        assert!(
+            !zh.contains(tier),
+            "no English tier fragment may leak into the zh lane (`{tier}`): {zh}"
+        );
+    }
+}

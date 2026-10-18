@@ -4,6 +4,61 @@
 
 ### Added
 
+- Pricing carrier ladder with disclosure (rm-852): a journal that names a
+  BARE model id (`glm-5.3`) no longer prices at the catch-all
+  $3/$1M-$15/$1M default. Catalog conversion now groups every
+  carrier-prefixed source row that normalizes onto the same bare name
+  and resolves the entry through a disclosed ladder — an exact
+  first-party row wins; otherwise a strict majority of carriers agreeing
+  on the LIST rate (input/output) wins, naming the shallowest carrier
+  path (`zai/glm-5.3`, 6 of 9 carriers agree — previously `openrouter/z-ai/glm-5.3`
+  won silently on a reseller-priority tiebreak and priced every bare
+  `glm-5.3` journal at the reseller's rate); with no majority the legacy
+  priority winner keeps the rate but the contest is disclosed as
+  contested. Both cost-audit lanes (`agenttrace --cost-audit`, per-session
+  governance) append the choice to `pricing_note` — `bare id resolved via
+  carrier zai/glm-5.3 (6 of 9 carriers agree on the rate)` — and the
+  provenance `pricing_source` line carries it too, so a reseller's rate
+  can never silently pass for a first-party one (run 6b369f2f8a4e cycle 1,
+  research 34eeaef0 §1 — citation corrected at review 1de66b0c F1:
+  findings.md carries no pricing finding).
+- Bit-exact float parsing for cached numbers (rm-902): serde_json now
+  builds with the `float_roundtrip` feature, so the session cache's
+  serialize→re-read cycle (durations, costs, token counts) is bit-exact
+  instead of drifting one ULP per refresh on shortest-literal straddlers
+  (`11.005401611328125` re-read as `11.00540161132812322`;
+  `9007199254740993.0` as `9007199254740994.0` under the default
+  fast-path parser). Pinned by two red-first tests in
+  `tests/report_numeric_truthfulness.rs` (run 6b369f2f8a4e cycle 1, assess
+  e7015d58 F1/P3 (citation corrected at review 1de66b0c F1); title-twin of unlanded rm-834/rm-803 on sibling
+  lineages — reconcile by title at integration).
+
+### Fixed
+
+- Hostile string-typed Copilot credit meters no longer zero the bill
+  silently (rm-851): every `totalNanoAiu` read (modelMetrics arms and the
+  top-level shutdown/checkpoint arms) goes through a shape-tolerant
+  never-silent read — a parseable JSON string (`"250000000"`) coerces to
+  the numeric value behind a `copilot_credit_meter_coerced:totalNanoAiu`
+  disclosure counter, and a present-but-unusable shape (bool/array/
+  object/null/non-numeric string/non-finite number) is rejected with its
+  own `copilot_credit_meter_rejected:totalNanoAiu:<shape>` counter.
+  Previously `.as_f64()` dropped a string meter without a trace and the
+  credit bill read $0.0 (assess P1 PoC: string journal folded to
+  credit_usd=0.0 with no disclosure vs the numeric control's $0.0025).
+  Numeric meters stay silent — no false disclosure (run 6b369f2f8a4e
+  cycle 1, assess e7015d58 F3 (citation corrected at review 1de66b0c
+  F1); the overflow arm of the same family was
+  already landed by rm-831).
+- The zh locale renders the `high` delivery-confidence tier (rm-853):
+  `delivery_confidence`'s zh match localized medium/低 but had no `high`
+  arm, so a high-confidence row fell through as a raw English fragment
+  inside a zh report. Now renders 高, pinned by a locale test that also
+  asserts no English tier fragment leaks (run 6b369f2f8a4e cycle 1, assess
+  F5).
+
+### Added
+
 - Local read-only MCP server: `agenttrace mcp` speaks newline-delimited JSON-RPC 2.0 over stdio (initialize, ping, tools/list, tools/call; notifications stay silent; malformed JSON, unknown methods, bad tool params, and batch requests answer the spec error arms -32700/-32600/-32601/-32602) so a coding agent can ask about its own token usage from inside the session that burned it. Two read-only tools render the SAME locally discovered sessions the CLI reports on — `usage_overview` (the `--overview -f json` document) and `by_model_breakdown` (the `by_model` rollup) — with the CLI's `today|7d|30d|all` range windows; a discovered-but-empty corpus is a tool-level `isError` result, the twin of the CLI's rc1 bail, and the server keeps serving. The server opens no sockets, performs no network probes, and writes nothing outside the agenttrace session cache; it serves until stdin closes (host disconnect is a clean exit 0). Hand-rolled JSON-RPC — no new dependencies (the SDK-vs-hand-rolled decision is recorded in the rm-455 lane). Keyword host-command wiring lands with the rm-505 help/guard routes; guide at docs/guides/mcp-server.md with registration snippets and a tool-call transcript; e2e wire contract pinned by tests/mcp_server.rs (rm-455, run 90f54faf cycle 3).
 
 ### Fixed

@@ -659,3 +659,132 @@ fn unknown_usage_key_disclosure_is_bounded_and_sanitized() {
     );
     assert!(key.contains("…#"), "digest form present: {key:?}");
 }
+
+// ---------------------------------------------------------------------------
+// rm-851 (run 6b369f2f cycle-1 batch "cost truthfulness end-to-end"):
+// Copilot credit meters (`totalNanoAiu`) read through a shape-tolerant,
+// never-silent read. The assess PoC (e7015d58 probe P1) showed a journal
+// carrying the meter as a JSON string ("250000000") folded to
+// credit_usd=0.0 with no disclosure — `.as_f64()` dropped the value with
+// no trace. The contract now: a parseable string coerces behind a
+// disclosure counter, a present-but-unusable shape is rejected with its
+// own counter, and numeric meters stay silent (no false disclosure).
+// ---------------------------------------------------------------------------
+
+fn rm851_journal(top_level: serde_json::Value, model_meter: serde_json::Value) -> String {
+    [
+        serde_json::json!({
+            "type": "session.start",
+            "timestamp": "2026-10-07T01:00:00Z",
+            "data": {"context": {"cwd": "/tmp/rm851"}}
+        })
+        .to_string(),
+        serde_json::json!({
+            "type": "session.usage_checkpoint",
+            "timestamp": "2026-10-07T01:05:00Z",
+            "data": {
+                "modelMetrics": {
+                    "gpt-4.1": {
+                        "usage": {"inputTokens": 100, "outputTokens": 10},
+                        "totalNanoAiu": model_meter
+                    }
+                },
+                "totalNanoAiu": top_level
+            }
+        })
+        .to_string(),
+    ]
+    .join("\n")
+}
+
+#[test]
+fn rm851_string_credit_meters_coerce_behind_a_disclosure_counter() {
+    // Pre-fix red (assess P1): credit_usd == 0.0 and no counters.
+    // Post-fix: both meters coerce (250,000,000 nanoAIU * $0.01/1e9 =
+    // $0.0025) and EACH coercion mints one counter increment.
+    let session = agenttrace_core::parse_raw_session(
+        "t",
+        "session.jsonl",
+        &rm851_journal(
+            serde_json::json!("250000000"),
+            serde_json::json!("250000000"),
+        ),
+    )
+    .expect("string-meter journal parses");
+    let m = &session.metrics;
+    assert_eq!(m.source_tool, "copilot_cli");
+    assert!(
+        (m.credit_usd - 0.0025).abs() < 1e-9,
+        "string meter must price identically to its numeric form, got {}",
+        m.credit_usd
+    );
+    assert_eq!(
+        m.disclosure_counters
+            .get("copilot_credit_meter_coerced:totalNanoAiu"),
+        Some(&2),
+        "both meter reads (modelMetrics + top-level) disclose the coercion: {:?}",
+        m.disclosure_counters
+    );
+}
+
+#[test]
+fn rm851_hostile_meter_shapes_are_rejected_with_their_own_counter() {
+    // A bool (and an array) at the meter site is present but unusable:
+    // it must not price, and it must not vanish either — each rejected
+    // shape gets its own disclosure key.
+    let session = agenttrace_core::parse_raw_session(
+        "t",
+        "session.jsonl",
+        &rm851_journal(serde_json::json!([1, 2, 3]), serde_json::json!(true)),
+    )
+    .expect("hostile-meter journal still parses");
+    let m = &session.metrics;
+    assert_eq!(
+        m.credit_usd, 0.0,
+        "no usable meter, no credit — but see the rejection counters below"
+    );
+    assert_eq!(
+        m.disclosure_counters
+            .get("copilot_credit_meter_rejected:totalNanoAiu:bool"),
+        Some(&1),
+        "bool-shaped meter discloses its rejection: {:?}",
+        m.line_skips
+    );
+    assert_eq!(
+        m.disclosure_counters
+            .get("copilot_credit_meter_rejected:totalNanoAiu:array"),
+        Some(&1),
+        "array-shaped meter discloses its rejection: {:?}",
+        m.disclosure_counters
+    );
+    assert!(
+        !m.disclosure_counters
+            .contains_key("copilot_credit_meter_coerced:totalNanoAiu"),
+        "rejection is not misfiled as coercion: {:?}",
+        m.disclosure_counters
+    );
+}
+
+#[test]
+fn rm851_numeric_credit_meters_stay_silent() {
+    // Control: the honest numeric journal prices and discloses nothing —
+    // no false coercion/rejection counters on healthy data.
+    let session = agenttrace_core::parse_raw_session(
+        "t",
+        "session.jsonl",
+        &rm851_journal(
+            serde_json::json!(250_000_000),
+            serde_json::json!(250_000_000),
+        ),
+    )
+    .expect("numeric-meter journal parses");
+    let m = &session.metrics;
+    assert!((m.credit_usd - 0.0025).abs() < 1e-9);
+    assert!(
+        !m.disclosure_counters
+            .keys()
+            .any(|key| key.starts_with("copilot_credit_meter_")),
+        "numeric meters carry no disclosure: {:?}",
+        m.disclosure_counters
+    );
+}

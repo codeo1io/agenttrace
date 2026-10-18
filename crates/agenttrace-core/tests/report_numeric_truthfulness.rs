@@ -131,3 +131,70 @@ fn context_trends_project_cost_per_million_matches_totals() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// rm-902 (run 6b369f2f cycle-1 batch "cost truthfulness end-to-end"):
+// serde_json parses floats bit-exactly (workspace feature
+// `float_roundtrip`). The assess probe (e7015d58, /tmp/at-assess-a6e8/
+// fparsetest, serde_json 1.0.150 default features) showed the default
+// parser loses the LAST ULP on shortest-round-trip literals:
+// 11.005401611328125 parsed back as 11.00540161132812322
+// (bits 0x402602c3ffffffff) and 9007199254740993.0 as
+// 9007199254740994.0. The session cache is serialized WITH
+// serde_json::to_string and re-read with from_str, so every cached
+// duration/cost could silently drift one ULP per refresh cycle. The
+// feature arm makes parse(serialize(x)) == x bit-exactly; these tests
+// were red against the default-feature build.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn serde_float_roundtrip_is_bit_exact_on_straddle_values() {
+    // Shortest-literal straddlers: each value's exact f64 prints without
+    // full mantissa digits, so the default fast-path parser (power-of-ten
+    // accumulate, then one corrective multiply) can land one ULP low.
+    for value in [
+        11.005401611328125_f64,
+        0.004500000000000001,
+        2300.5000000000005,
+        9007199254740993.0, // 2^53+1: one ULP above the exact integer
+    ] {
+        let text = serde_json::to_string(&value).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            back.as_f64().unwrap().to_bits(),
+            value.to_bits(),
+            "serialize/parse round-trip must be bit-exact for {text}"
+        );
+    }
+}
+
+#[test]
+fn serde_float_roundtrip_is_bit_exact_through_a_cache_shaped_document() {
+    // The exact assess PoC shape: a session-cache style document whose
+    // duration_sec straddles. Pre-fix, the re-read value's low bit was
+    // lost (0x402602c400000000 became 0x402602c3ffffffff).
+    let cache_doc = r#"{
+        "schema_version": 35,
+        "sessions": [
+            {
+                "id": "ulp-straddle",
+                "duration_sec": 11.005401611328125,
+                "cost_usd": 0.004500000000000001,
+                "tokens": 9007199254740993.0
+            }
+        ]
+    }"#;
+    let value: serde_json::Value = serde_json::from_str(cache_doc).unwrap();
+    let row = &value["sessions"][0];
+    for (field, expected) in [
+        ("duration_sec", 11.005401611328125_f64),
+        ("cost_usd", 0.004500000000000001_f64),
+        ("tokens", 9007199254740993.0_f64),
+    ] {
+        assert_eq!(
+            row[field].as_f64().unwrap().to_bits(),
+            expected.to_bits(),
+            "cache field {field} must survive parse bit-exactly"
+        );
+    }
+}

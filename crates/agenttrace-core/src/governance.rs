@@ -333,6 +333,15 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             } else {
                 pricing_note.to_string()
             };
+            // rm-852: when this model id is priced through a carrier
+            // collapse (bare id, carrier-prefixed catalog rows), the
+            // chosen carrier — and any carrier disagreement — rides the
+            // same note, so a reseller's rate can never silently pass
+            // for another's in the per-model audit row.
+            let pricing_note = match crate::pricing::carrier_resolution_note(&model) {
+                Some(carrier) => format!("{pricing_note}; {carrier}"),
+                None => pricing_note,
+            };
             let (rates_per_million_usd, component_cost_usd, estimated_cost_usd) = current
                 .map(|(_, rates, components)| {
                     let total = components.total;
@@ -436,6 +445,12 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         )
     } else {
         pricing_note.to_string()
+    };
+    // rm-852: same disclosure at session level — a bare model id priced
+    // via a carrier collapse names the carrier in the audit note.
+    let pricing_note = match crate::pricing::carrier_resolution_note(&model) {
+        Some(carrier) => format!("{pricing_note}; {carrier}"),
+        None => pricing_note,
     };
     let pricing_source = current
         .as_ref()
@@ -1460,6 +1475,52 @@ mod tests {
                 .contains(&GIT_PROBE_TIMEOUT.as_secs().to_string()),
             "methodology must disclose the probe bound: {}",
             report.methodology
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // rm-852 (run 6b369f2f cycle-1 batch "cost truthfulness
+    // end-to-end"): a session whose journal names the BARE model id
+    // (`glm-5.3`) is priced through a carrier collapse — the catalog
+    // only knows that id via `zai/glm-5.3` and sibling carrier rows.
+    // Both audit lanes must name the chosen carrier in pricing_note so
+    // a reseller's rate can never silently pass for another's.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rm852_carrier_resolved_models_disclose_their_carrier_in_the_audit_note() {
+        let glm = {
+            let mut session = session("glm-5.3");
+            session.metrics.model_used = "glm-5.3".to_string();
+            session
+        };
+        let audit = cost_audit(std::slice::from_ref(&glm));
+        let model_row = audit
+            .by_provider_model
+            .iter()
+            .find(|row| row.model.contains("glm-5.3"))
+            .expect("glm row present");
+        assert_eq!(model_row.pricing_status, "catalog_estimate");
+        assert!(
+            model_row.pricing_note.contains("zai/glm-5.3"),
+            "per-model row names the chosen carrier: {}",
+            model_row.pricing_note
+        );
+        assert!(
+            model_row.pricing_note.contains("carriers agree"),
+            "consensus strength rides the note: {}",
+            model_row.pricing_note
+        );
+        let session_audit = session_cost_audit(&glm);
+        assert!(
+            session_audit.pricing_note.contains("zai/glm-5.3"),
+            "session-level audit names the chosen carrier: {}",
+            session_audit.pricing_note
+        );
+        assert!(
+            session_audit.pricing_source.contains("zai/glm-5.3"),
+            "provenance line names the chosen carrier: {}",
+            session_audit.pricing_source
         );
     }
 }

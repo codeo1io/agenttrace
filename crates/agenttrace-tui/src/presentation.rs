@@ -1492,6 +1492,11 @@ fn delivery_confidence(value: &str, language: Language) -> String {
     match value.split(':').next().unwrap_or(value).trim() {
         "medium" => "中等".to_string(),
         "low" => "较低".to_string(),
+        // rm-853: the source tiers are high/medium/low (delivery
+        // confidence), so the zh arm must carry 高 too — before rm-853 a
+        // `high: …` composite fell through raw, rendering an English
+        // fragment inside a zh report while medium/low localized.
+        "high" => "高".to_string(),
         other => other.to_string(),
     }
 }
