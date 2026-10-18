@@ -4,6 +4,43 @@
 
 ### Added
 
+- `--quota` is plan-aware: user-declared subscription caps reconcile
+  against corpus truth, and the 5-hour window gained its billing-block
+  shape (rm-1950, run 63488b83 cycle 4). The view keeps its
+  credentials-free stance — it now accepts a DECLARED plan profile and
+  never invents one: `--five-hour-limit`/`--weekly-limit` flags or the
+  `five_hour_limit_usd`, `weekly_limit_usd`, `plan_effective_utc`, and
+  `weekly_model_allowances` (`model = USD, …` pairs) config keys, flags
+  winning over files, every value validated loudly (positive finite
+  USD; RFC 3339 activation; `label = USD` pairs with duplicate labels
+  rejected instead of silently discarding the earlier one). With a
+  profile, `agenttrace.quota/1` gains `limits` (caps plus the verbatim
+  provenance sentence) and `reconciliation`: the 5h arm reconciles the
+  CURRENT BILLING BLOCK — `five_hour_blocks` tiles fixed 5-hour blocks
+  from a corpus first-use anchor (`anchor_utc`, earliest placeable
+  timestamp, clamped at the cutoff, never calendar midnight and never
+  the provider's ledger, `anchor_basis` says so) with
+  `current_block_*` identifying the block containing the cutoff and
+  `blocks_total`/`blocks_emitted`/`truncated`/`truncation_basis`
+  capping the emitted tail so a months-old anchor cannot flood the
+  JSON; the weekly and per-model arms reconcile the trailing 7-day
+  window. Each arm carries `observed_usd` (API-rate corpus truth on
+  the same pro-rata attribution the rolling windows already use —
+  never a second, drifting attribution), `within`, `headroom_usd`,
+  and `overage_at_api_rates_usd` (a breach priced at API rates — a
+  planning signal, not an invoice). `plan_effective_utc` partitions
+  spend: rows strictly before the activation are excluded from every
+  `observed_usd` with `pre_plan.excluded_usd` disclosing the excluded
+  amounts per window, so a long-lived corpus does not bill a plan that
+  started yesterday; corpus models with weekly spend but no declared
+  allowance are listed in `unmatched_models` instead of silently
+  folding into another model's cap. With NO profile declared the
+  seams stay null-with-basis exactly as before. The rm-037 usage-
+  restart shape is covered end to end: a session whose events straddle
+  a block boundary bills pro rata into both blocks and the pair sums
+  to the whole session's cost (fixture-pinned across boundary,
+  truncation, cap-edge, pre-plan, unmatched-model, and text-lane
+  cases).
 - Cline CLI envelope intake works on every production path, and its
   canonical store is auto-discovered (rm-1881 + rm-1882, run e30a8801
   cycle 1): the Cline CLI `.messages.json` envelope carries usage as
@@ -667,6 +704,19 @@
 
 ### Fixed
 
+- An unknown flag after the positional session path now names the typo
+  instead of being silently dropped by the rm-505 order guard (rm-558
+  arm F5, run 63488b83 cycle 4): `agenttrace FILE --snice 5` used to
+  exit with only the order-guard's "would be silently dropped" message
+  naming the WHOLE dropped tail, so a one-typo flag looked like a
+  placement error. The guard now recognizes a leading unknown flag and
+  reports `unknown flag `--snice` (dropped: …); it follows the
+  positional session path, so clap never saw it and cannot report the
+  typo — check the spelling, or place known flags before the positional
+  path`, while genuine placement errors (known flags in the tail) keep
+  the original diagnostic. Single-flag and multi-flag tails, negative
+  numbers, `--flag=value` forms, and the known-flag tail are pinned in
+  tests.
 - Reasoning-effort-suffixed model ids price at their in-catalog base instead of the builtin Claude default (rm-1511, run 0915f736 cycle 4): clients append a reasoning-effort tier to the id — Antigravity CLI emits `claude-sonnet-5-5-medium`/-low (tokscale #1425 same-day datum), models.dev carries `:thinking` variants — and no catalog (bundled 3,131 keys or LiteLLM main) keys effort-suffixed ids, so the id's variant candidate list was `[raw, normalized]` only — `lookup_price_in`'s catalog-first variant arm (`matching_catalog_key`, unchanged by this batch) had nothing to match and the session billed at the default 3/15 rates while the exact base sat in the catalog: the recorded PoC priced `claude-sonnet-5-5-medium` at 1000in/500out for $0.0105 (200k ctx) against the base's $0.007 (1M ctx) — a 1.5x output over-bill rendered `priced`, disclosed only by the aggregate `fallback_pricing` counter. `match_variants` gains an effort arm (`-low/-medium/-high/-thinking/:thinking`, stripped to the base id) so the candidate list contains the in-catalog base, which the pre-existing catalog-first variant arm (`matching_catalog_key`, unchanged by this batch) resolves; `lookup_price_in` additionally expands variants-of-variants against the catalog before any builtin fallback (`has_specific_price` walks the same candidate list and agreed pre-batch — no divergence existed; review fix 1a615b64 corrected this entry's original claim to the contrary). The raw id keeps the tier so tier-aware lanes compose unchanged (`pricing::effort_tier_of` re-derives it), and the data-health fallback lane names the residual class instead of only counting: a new additive `fallback_with_base_available` list (bounded to 5 distinct ids) carries models whose unrecognized suffix tail hides a catalogued base, in the `--overview -f json` `data_health` lane (text/markdown health blocks render the aggregate counter only — review fix 1a615b64 scoped this entry's original wording, which quoted an annotation string that rendered nowhere). No snapshot change: `pricing_snapshot.json` is byte-identical (the base keys were already bundled). Pinned red-first by `pricing_effort_alias_contract.rs` — the recorded PoC flips 0.0105 → 0.007 through the real parse path, alias-matrix + case-insensitivity + `:thinking` arms, the suffixed-keys-absent-from-catalog guard (forces a conscious contract update if a suffixed key ever lands), tier re-derivation, unknown-base-stays-default negatives, and the disclosure naming (`fallback_pricing` drops to 0 for the priced class while `-ultra`-style unknowns surface their base). The pricing catalog itself is byte-identical — no snapshot change — but the repricing moves derived `cost_estimated` for UNCHANGED files while the rm-196 catalog-identity freshness gate keys an unchanged digest (the rm-485 class), so the integration lands a session-cache schema rung 70 → 71 (candidate carried none) to regenerate warm entries, pinned by `pricing_effort_alias_warm_cache.rs` and swept with the schema-bump oracle family. Review fix 1a615b64 (independent review ed20477f) added three arms: an Antigravity-shaped fixture (`PLANNER_RESPONSE`/`usageStats`/`modelConfigId`, the rm-947 lane) exercising the alias end-to-end through the real parse path, the second-order variant-of-variant catalog-loop pin, and the `effort_tier_of` tier-marker-on-catalogued-SKU limitation pin (48 such keys price exactly; only the lexical tier helper reports a marker) — 12 tests, fixture dirs unique per invocation (the rm-369 collision class).
 - The statusline budget truth lane clamps and discloses hostile capture costs instead of folding them into every budget surface (rm-1887 at this landing — campaign-local numeral rm-1503, run 80336dfb cycle 2, batch "Statusline budget truth: clamp-and-disclose hostile capture costs and unparsable journal lines"; title-keyed per the stewardship request, the numeral twin reconciles by title at the commit gate and takes the next free wall numeral here; composed at integration over the landed rm-1388 shared-predicate gate): at the run's base `capture_cost_usd` returned `cost.total_cost_usd` raw, so a negative capture rendered `7d total $-50.00` on a $10 budget with `$60.00 remaining` — a hostile editor hook literally bought budget headroom — while a non-representable sample (a `1e400` literal, which serde rejects at line-parse time, or a `null`/string/bool cost node) vanished from every budget surface with zero disclosure (`"lines": 1, "daily": []`, `captures_unknown_payload: 0`). Cost samples are now classified before the day fold — riding the same `parser::recorded_cost_sample_is_valid` predicate rm-1388 landed, so the classification can never drift from the fold's gate: finite non-negative spend enters unchanged (the rm-771 first-seen/baseline-unknown discipline is untouched), a finite negative is discarded and counted, and a present-but-not-finite node is discarded and counted separately — `negative_capture_cost_samples` / `invalid_capture_cost_samples` on the series, surfaced in `--budget -f json` and in `--statusline-report -f json`'s budget block, plus a text disclosure line in both views (`N hostile cost sample(s) discarded (X negative, Y not a finite number) — excluded from the 7d total/spend`) alongside rm-1388's own `invalid_cost_samples` line and counter (the two disclosure families share one classification pass at this integration; `capture_cost_usd` remains pinned as the Spend-only view). `remaining_usd` is floored into `[0, budget]` in both JSON arms (the text arms keep their OVER verdict; a hostile negative `--weekly-budget` cannot panic the floor), and the journal-stats census gained `unparsable_lines` — a torn or `1e400` line still counts in `lines` but is disclosed (`N unparsable journal line(s) — counted in the totals above, excluded from every capture stat`) so a lines-vs-captures gap has a visible cause. Pinned red-first by `crates/agenttrace-core/tests/statusline_budget_truth.rs` (11 tests: 3 hostile-negative behavioral pins, 4 disclosure/counting pins, 2 completion-turn pins for the `remaining_usd` floor and the `--statusline-report` arms, and 2 adoption-turn pins for non-numeric cost nodes — the reachable NaN/±inf shapes — and the zero-noise healthy corpus; the first seven were red or un-compilable on the pre-fix tree).
 - **rm-540 residual — `--search` evidence rows guard the VALUE, not the joined line (run 7fd83ab2 cycle 2, batch "evidence-lane paste-safety + claude-lane format-compat", assess cbf457f4 F1 live-proven)**. Every search evidence row joins `label: value` in `add_match` and the render loop applied `guarded_segment` to the JOINED item — but `guard_formula_cell` only neutralizes an introducer at the FIRST non-whitespace byte, so behind the label (`- tool: `, `- name: `, `- tool argument: `, …) the guard could never fire: a transcript carrying the hostile tool name `+cmd|' /C calc'!A0` or the session name `=HYPERLINK("http://evil.example","click-me") please review` rendered its payload raw in the text search lane (live PoCs on the formula-lane fixtures; the summary row was the only one guarded — it never carries a label). Text-to-columns and `": "`-aware paste targets make the value a cell of its own, so the fix splits the fixed label off and routes the VALUE through the same rm-985 stack (`sanitize_line_segment` then the formula guard): evidence rows now render `- tool: '+cmd|' /C calc'!A0`, `- name: '=HYPERLINK(…`, and the lane contract is upgraded to the strict every-occurrence-marker-preceded form. The JSON search lane stays byte-lossless by design (the guard is a text-render concern; the stored match item keeps its raw value — pinned). Label-less items and the summary row take the unchanged whole-item path.

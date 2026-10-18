@@ -761,7 +761,7 @@ fn run() -> anyhow::Result<()> {
         // as a session report action for exactly that reason.
         // rm-1950 (run 63488b83 cycle 4): the user-declared plan
         // profile rides along — limits, blocks, reconciliation.
-        let plan = quota_plan_profile(&args, resolved)?;
+        let plan = quota_plan_profile(&args, &resolved)?;
         let sessions = load_sessions(&args)?;
         let out = agenttrace_core::render_quota_view(&args.format, &sessions, &plan)?;
         let out = dispatch_sanitize(&args.format, out);
@@ -3359,6 +3359,20 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
 
 /// The report flag that selected the governance branch, for gate-evidence
 /// `inspect` hints that reproduce the gated run (rm-346 arm-a).
+fn governance_inspect_flag(args: &Args) -> &'static str {
+    if args.audit {
+        "--audit"
+    } else if args.recommend {
+        "--recommend"
+    } else if args.mcp_governance {
+        "--mcp-governance"
+    } else if args.context_trends {
+        "--context-trends"
+    } else {
+        "--delivery-evidence"
+    }
+}
+
 /// rm-1950 (run 63488b83 cycle 4): assemble the user-declared
 /// [`agenttrace_core::QuotaPlanProfile`] for the `--quota` view from
 /// the resolved config plus the `--five-hour-limit` / `--weekly-limit`
@@ -3383,10 +3397,7 @@ fn quota_plan_profile(
     }
     let five_hour_usd = args.five_hour_limit.or(resolved.five_hour_limit);
     let weekly_usd = args.weekly_limit.or(resolved.weekly_limit);
-    let weekly_model_allowances = resolved
-        .weekly_model_allowances
-        .clone()
-        .unwrap_or_default();
+    let weekly_model_allowances = resolved.weekly_model_allowances.clone().unwrap_or_default();
     let effective_utc = resolved.plan_effective;
     if five_hour_usd.is_none()
         && weekly_usd.is_none()
@@ -3406,20 +3417,6 @@ fn quota_plan_profile(
                 it against any vendor plan"
             .to_string(),
     })
-}
-
-fn governance_inspect_flag(args: &Args) -> &'static str {
-    if args.audit {
-        "--audit"
-    } else if args.recommend {
-        "--recommend"
-    } else if args.mcp_governance {
-        "--mcp-governance"
-    } else if args.context_trends {
-        "--context-trends"
-    } else {
-        "--delivery-evidence"
-    }
 }
 
 /// rm-212: describe a non-regular, non-directory filesystem object for the
@@ -3658,6 +3655,8 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
         history_dir: None,
         pricing_file: None,
         weekly_budget: None,
+        five_hour_limit: None,
+        weekly_limit: None,
         budget: false,
         dir,
         compare: true,

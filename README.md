@@ -144,6 +144,10 @@ agenttrace --doctor
 #   pricing_file = "pricing-overrides.json"     # per-model price overrides
 #   weekly_budget_usd = 25.0                     # weekly USD spend budget
 #   session_cache_entries = 5000                 # parsed-session cache bound (rm-298)
+#   five_hour_limit_usd = 5.0                    # declared plan cap for --quota (rm-1950)
+#   weekly_limit_usd = 40.0                      # declared weekly plan cap for --quota (rm-1950)
+#   plan_effective_utc = "2026-10-01T00:00:00Z"  # when the plan took effect (rm-1950)
+#   weekly_model_allowances = "claude-sonnet-4-5 = 10.0, claude-opus-4-6 = 30.0"  # per-model weekly caps (rm-1950)
 #   A '#' opens a comment at line start or after whitespace; a '#'
 #   embedded in an unquoted value (like /tmp/a#b.toml) stays part of
 #   the value — quote it to be explicit (rm-918).
@@ -426,10 +430,15 @@ warm-cache sessions (which do not carry event timestamps). The report
 discloses the attribution census and bills unplaceable rows at zero
 instead of guessing.
 
-The view never reads credentials and knows no plan limits, so limits are
-disclosed-unknown rather than invented; a config-provided limit is a
-planned extension. The provider's own window anchors (a first-use 5h
-start, a weekly 7am-UTC Monday reset) are equally unknowable without
+The view never reads credentials, so vendor plan limits are always
+disclosed-unknown rather than invented. Your own declared caps are a
+different matter (rm-1950): `--five-hour-limit`/`--weekly-limit` flags
+or the `five_hour_limit_usd`/`weekly_limit_usd`/`plan_effective_utc`/
+`weekly_model_allowances` config keys fill the `limits` and
+`reconciliation` seams above — every declared value is a user
+declaration carrying a provenance `basis` sentence, never verified
+against a vendor plan. The provider's own window anchors (a first-use
+5h start, a weekly 7am-UTC Monday reset) are equally unknowable without
 credentials — both windows are rolling and the JSON says so in
 `corpus.window_anchor`, and `corpus.cutoff_utc` discloses the corpus age
 so a stale corpus cannot masquerade as a live quota.
@@ -453,6 +462,44 @@ lane summarizes the same numbers. The view is corpus-scope: `--range`,
 loudly, and pairing `--quota` with any other report action is a usage
 error (every discovered session bills the window — view filters would
 distort it).
+
+**Billing blocks** (`five_hour_blocks`, rm-1950): the 5h window above is
+rolling, but subscription plans meter in fixed 5-hour blocks from first
+use. The view therefore also tiles the corpus into a block sequence
+anchored at `anchor_utc` — the earliest placeable event timestamp or
+`session_start` across the loaded corpus, clamped at the cutoff and
+`anchor_basis` says so. It is never calendar midnight and never the
+provider's own block ledger (unknowable without credentials). Fixed
+5-hour steps tile forward from that anchor; `current_block_index`,
+`current_block_start_utc`, and `current_block_resets_at_utc` identify
+the block containing the cutoff, and `spend_basis` states that each
+block bills sessions pro rata on the same attribution as the windows,
+clamped at the cutoff (the rm-1402 skew guard discards can never bill).
+`blocks_total` carries the full sequence length; only the trailing
+`blocks_emitted` are emitted (a cap that `truncated`/`truncation_basis`
+disclose with the counts), so a months-old first-use anchor cannot
+flood the JSON.
+
+**Plan-aware reconciliation** (rm-1950): `--quota` accepts a
+user-declared plan profile — `--five-hour-limit`/`--weekly-limit` flags
+or `five_hour_limit_usd`/`weekly_limit_usd`/`plan_effective_utc`/
+`weekly_model_allowances` config keys (flags win over files). With a
+profile declared, `limits` carries the caps plus the verbatim provenance
+sentence, and `reconciliation` compares corpus truth against them:
+`five_hour` reconciles the CURRENT BLOCK (the plan's metering shape, not
+the rolling window) while `weekly` and per-model entries reconcile the
+trailing 7-day window; each carries `observed_usd` (API-rate priced
+corpus truth), `within`, `headroom_usd`, and `overage_at_api_rates_usd`
+(a cap breach priced at API rates — a planning signal, never an
+invoice). `plan_effective_utc` partitions spend: corpus rows strictly
+before the activation are excluded from every `observed_usd` and
+`pre_plan.excluded_usd` discloses the excluded amounts per window, so a
+long-lived corpus does not bill a plan that started yesterday.
+`unmatched_models` lists corpus models with weekly spend but no declared
+allowance instead of silently folding them into another model's cap.
+With NO profile declared, `limits` and `reconciliation` stay null-with-
+basis exactly as before — agenttrace reads no credentials and never
+invents plan data.
 
 ### Statusline capture
 
@@ -521,13 +568,15 @@ fails when the README table drifts from the binary's actual flag count
 | `--list-models` |  | List the models the pricing catalog knows, with rate coverage; `--test-match` shows the resolution probes. Region/vendor-qualified ids (e.g. `us.anthropic.…`, `bedrock/us-gov-east-1/…`) are their own catalog rows and bill at their own regional rates (rm-1053) |
 | `--update-pricing` |  | Refresh the vendored pricing-catalog snapshots from their upstream sources, then report the drift |
 | `--test-match` |  | Print the catalog-resolution table for a probe set of model identifiers (alias and rate-match verification) |
-| `--quota` |  | Show the plan-window quota view (rm-201): current 5h and 7d ROLLING spend windows over the discovered corpus, TTL-correct (a session's cost enters a window pro rata by its event timestamps; warm-cache sessions by their start-to-end span), with `resets_at` full-decay horizons and a corpus-cutoff disclosure. The cutoff clamps at the newest at-or-before-now instant — future-dated timestamps are discarded at a disclosed clock-skew guard (rm-1402) so a hostile or skewed journal line cannot hide the real spend. `-f json` emits the stable `agenttrace.quota/1` schema, the default a text summary; every other format is rejected loudly. Limits are disclosed-unknown — agenttrace reads no credentials and no plan data. Corpus-scope: `--range`, `--project`, `--source`, `--model-filter`, and the sample/history flags do not apply to it and are refused loudly |
+| `--quota` |  | Show the plan-window quota view (rm-201): current 5h and 7d ROLLING spend windows over the discovered corpus, TTL-correct (a session's cost enters a window pro rata by its event timestamps; warm-cache sessions by their start-to-end span), with `resets_at` full-decay horizons and a corpus-cutoff disclosure. The cutoff clamps at the newest at-or-before-now instant — future-dated timestamps are discarded at a disclosed clock-skew guard (rm-1402) so a hostile or skewed journal line cannot hide the real spend. `-f json` emits the stable `agenttrace.quota/1` schema, the default a text summary; every other format is rejected loudly. Limits are declared by you (`--five-hour-limit`/`--weekly-limit` or the `five_hour_limit_usd`/`weekly_limit_usd`/`plan_effective_utc`/`weekly_model_allowances` config keys, rm-1950); undeclared limits stay disclosed-unknown — agenttrace reads no credentials and no plan data. Corpus-scope: `--range`, `--project`, `--source`, `--model-filter`, and the sample/history flags do not apply to it and are refused loudly |
 | `--statusline-report` |  | Report on the Claude Code statusline capture journal (candidate 53, cycle 7): limit-pressure windows, reset crossings, and per-session prompt-cache miss causes recorded by `agenttrace statusline` |
 | `--fetch` |  | `agenttrace upstream`: refresh the remote-tracking refs from the network via `git fetch` (and probe the npm registry) before reporting fork-vs-upstream drift. Without it, `agenttrace upstream` is fully offline (rm-024) |
 | `--config <PATH>` |  | Explicit configuration file (rm-384). Layered above the project and user config files; a missing file is an error |
 | `--history-dir <PATH>` |  | Override the history directory: highest precedence, then the config files, then `AGENTTRACE_HISTORY_DIR` (rm-384) |
 | `--pricing-file <PATH>` |  | Override the pricing override file: highest precedence, then the config files, then `AGENTTRACE_PRICING_FILE` (rm-384) |
 | `--weekly-budget <USD>` |  | Weekly spend budget in USD for `--statusline-report` and `--budget`: highest precedence, then config `weekly_budget_usd` (rm-385) |
+| `--five-hour-limit <USD>` |  | Declare the 5-hour plan-block cap for `--quota` (rm-1950): wins over config `five_hour_limit_usd`; must be a positive finite USD amount. Fills `limits.five_hour_usd` and the current-block `reconciliation.five_hour`; never a vendor invoice |
+| `--weekly-limit <USD>` |  | Declare the weekly plan cap for `--quota` (rm-1950): wins over config `weekly_limit_usd`; must be a positive finite USD amount. Fills `limits.weekly_usd` and `reconciliation.weekly`/per-model entries (with `weekly_model_allowances`) |
 | `--budget` |  | Show the weekly budget window-burn view: per-day spend from the statusline journal against the resolved weekly budget; the window is the trailing 7 CALENDAR days ending today — stale journals disclose instead of verdicting, and hostile capture costs (negative or non-finite `total_cost_usd`) plus unparsable journal lines are discarded and disclosed, never folded into the total, with `remaining_usd` floored to [0, budget] in the JSON arms (rm-385, rm-917) |
 | `--version` |  | Print the version banner and exit 0; wins over action validation |
 | `--demo` |  | Use the built-in demo corpus instead of discovered agent homes (stable epoch-anchored sessions) |

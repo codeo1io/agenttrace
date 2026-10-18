@@ -104,7 +104,8 @@ impl ConfigFile {
     }
 }
 
-const SUPPORTED_KEYS: &str = "history_dir, pricing_file, weekly_budget_usd, session_cache_entries, \
+const SUPPORTED_KEYS: &str =
+    "history_dir, pricing_file, weekly_budget_usd, session_cache_entries, \
      five_hour_limit_usd, weekly_limit_usd, plan_effective_utc, weekly_model_allowances";
 
 /// The user-level configuration path:
@@ -276,21 +277,20 @@ pub fn parse_config(text: &str, path: &Path) -> anyhow::Result<ConfigFile> {
             }
             ("plan_effective_utc", Scalar::String(text)) => {
                 let text = text.display().to_string();
-                let parsed = chrono::DateTime::parse_from_rfc3339(text.trim()).map_err(
-                    |error| {
+                let parsed =
+                    chrono::DateTime::parse_from_rfc3339(text.trim()).map_err(|error| {
                         anyhow::anyhow!(
                             "{shown}:{number}: plan_effective_utc must be an \
                              RFC 3339 timestamp (e.g. \"2026-10-01T00:00:00Z\"), \
                              got `{text}`: {error}"
                         )
-                    },
-                )?;
+                    })?;
                 file.plan_effective_utc = Some(parsed.with_timezone(&chrono::Utc));
             }
             ("weekly_model_allowances", Scalar::String(text)) => {
                 file.weekly_model_allowances = Some(parse_model_allowances(
                     &text.display().to_string(),
-                    shown,
+                    &shown.to_string(),
                     number,
                 )?);
             }
@@ -324,7 +324,7 @@ pub fn parse_config(text: &str, path: &Path) -> anyhow::Result<ConfigFile> {
 /// earlier allowance) all name the offending pair with file and line.
 fn parse_model_allowances(
     text: &str,
-    shown: &Path,
+    shown: &str,
     number: usize,
 ) -> anyhow::Result<BTreeMap<String, f64>> {
     let mut allowances = BTreeMap::new();
@@ -1111,6 +1111,10 @@ mod tests {
             pricing_file: None,
             weekly_budget: None,
             session_cache_entries: None,
+            five_hour_limit: None,
+            weekly_limit: None,
+            plan_effective: None,
+            weekly_model_allowances: None,
             env_history_dir: None,
             env_pricing_file: None,
             env_session_cache_entries: Some("999999999".to_string()),
@@ -1119,6 +1123,10 @@ mod tests {
                 ("pricing_file", "default"),
                 ("weekly_budget", "default"),
                 ("AGENTTRACE_SESSION_CACHE_ENTRIES", "env"),
+                ("five_hour_limit_usd", "default"),
+                ("weekly_limit_usd", "default"),
+                ("plan_effective_utc", "default"),
+                ("weekly_model_allowances", "default"),
             ],
         };
         let json = disclosure_json(&clamped);
@@ -1146,6 +1154,10 @@ mod tests {
             pricing_file: None,
             weekly_budget: None,
             session_cache_entries: Some(20_000),
+            five_hour_limit: None,
+            weekly_limit: None,
+            plan_effective: None,
+            weekly_model_allowances: None,
             env_history_dir: None,
             env_pricing_file: None,
             env_session_cache_entries: None,
@@ -1154,6 +1166,10 @@ mod tests {
                 ("pricing_file", "default"),
                 ("weekly_budget", "default"),
                 ("session_cache_entries", "config file"),
+                ("five_hour_limit_usd", "default"),
+                ("weekly_limit_usd", "default"),
+                ("plan_effective_utc", "default"),
+                ("weekly_model_allowances", "default"),
             ],
         };
         assert!(!disclosure_json(&in_range).contains("clamped"));
@@ -1167,6 +1183,10 @@ mod tests {
             pricing_file: Some(PathBuf::from("/user-pricing.json")),
             weekly_budget_usd: Some(10.0),
             session_cache_entries: Some(40_000),
+            five_hour_limit_usd: None,
+            weekly_limit_usd: None,
+            plan_effective_utc: None,
+            weekly_model_allowances: None,
         };
         let project = ConfigFile {
             history_dir: Some(PathBuf::from("/project-history")),

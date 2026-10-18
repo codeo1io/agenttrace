@@ -3420,15 +3420,15 @@ fn quota_blocks_json(
     }
     let (current_start, current_end) = quota_block_bounds(anchor, current_index, cutoff);
     let truncated = blocks_total > QUOTA_BLOCKS_EMITTED_MAX as u64;
-    let truncation_basis: serde_json::Value = truncated
-        .then(|| {
-            serde_json::Value::String(format!(
-                "only the trailing {} blocks are emitted (first-use anchor to cutoff spans {} \
-                 blocks); blocks_total carries the full sequence count",
-                QUOTA_BLOCKS_EMITTED_MAX, blocks_total
-            ))
-        })
-        .unwrap_or(serde_json::Value::Null);
+    let truncation_basis: serde_json::Value = if truncated {
+        serde_json::Value::String(format!(
+            "only the trailing {} blocks are emitted (first-use anchor to cutoff spans {} \
+             blocks); blocks_total carries the full sequence count",
+            QUOTA_BLOCKS_EMITTED_MAX, blocks_total
+        ))
+    } else {
+        serde_json::Value::Null
+    };
     serde_json::json!({
         "anchor_utc": quota_ts(&anchor),
         "anchor_basis": "corpus first-use — the earliest placeable event timestamp or \
@@ -3455,7 +3455,11 @@ fn quota_blocks_json(
 /// One cap reconciliation: observed plan-covered spend vs a declared
 /// limit, with the overage priced at API rates (the corpus's own
 /// cost basis) — never presented as a vendor invoice.
-fn quota_cap_json(window_basis: &str, observed_usd: f64, limit_usd: Option<f64>) -> serde_json::Value {
+fn quota_cap_json(
+    window_basis: &str,
+    observed_usd: f64,
+    limit_usd: Option<f64>,
+) -> serde_json::Value {
     match limit_usd {
         Some(limit_usd) => {
             let within = observed_usd <= limit_usd;
@@ -3539,8 +3543,7 @@ fn quota_reconciliation_json(
         quota_ts(&block_start),
         quota_ts(&block_effective_end)
     );
-    let weekly_basis =
-        "trailing 7d rolling window ending at the corpus cutoff";
+    let weekly_basis = "trailing 7d rolling window ending at the corpus cutoff";
 
     let mut models = serde_json::Map::new();
     let mut unmatched: Vec<String> = Vec::new();
@@ -3578,9 +3581,7 @@ fn quota_reconciliation_json(
             {
                 continue;
             }
-            if let Some(share) =
-                quota_cost_share_at_or_after(&session.metrics, &weekly_start, &cutoff, None)
-            {
+            if let Some(share) = quota_cost_share(&session.metrics, &weekly_start, &cutoff) {
                 if share > 0.0 {
                     unmatched.push(label.to_string());
                 }
@@ -3814,8 +3815,7 @@ fn render_quota_text(report: &serde_json::Value) -> String {
             if blocks["truncated"].as_bool().unwrap_or(false) {
                 line.push_str(&format!(
                     "  (trailing {} of {} blocks)",
-                    blocks["blocks_emitted"],
-                    blocks["blocks_total"]
+                    blocks["blocks_emitted"], blocks["blocks_total"]
                 ));
             }
             out.push_str(&line);
@@ -3843,17 +3843,14 @@ fn render_quota_text(report: &serde_json::Value) -> String {
     // rm-1950: the plan reconciliation (caps, model allowances,
     // pre-plan exclusion) renders only when a profile is declared.
     let reconciliation = &report["reconciliation"];
-    let cap_parts: Vec<String> = [
-        ("5h block", "five_hour"),
-        ("7d", "weekly"),
-    ]
-    .into_iter()
-    .filter_map(|(label, key)| {
-        reconciliation[key]
-            .as_object()
-            .map(|cap| format!("{label} {}", quota_cap_text(cap)))
-    })
-    .collect();
+    let cap_parts: Vec<String> = [("5h block", "five_hour"), ("7d", "weekly")]
+        .into_iter()
+        .filter_map(|(label, key)| {
+            reconciliation[key]
+                .as_object()
+                .map(|cap| format!("{label} {}", quota_cap_text(cap)))
+        })
+        .collect();
     if !cap_parts.is_empty() {
         out.push_str(&format!("  vs plan         {}\n", cap_parts.join("; ")));
     }
@@ -3865,7 +3862,10 @@ fn render_quota_text(report: &serde_json::Value) -> String {
             }
         }
         if let Some(unmatched) = reconciliation["unmatched_models"].as_array() {
-            let labels: Vec<&str> = unmatched.iter().filter_map(|value| value.as_str()).collect();
+            let labels: Vec<&str> = unmatched
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect();
             if !labels.is_empty() {
                 line.push_str(&format!("; unmatched corpus models: {}", labels.join(", ")));
             }
@@ -5783,7 +5783,8 @@ mod quota_tests {
         assert!(report["corpus"]["cutoff_utc"].is_null());
         assert!(report["five_hour"].is_null());
         assert!(report["weekly"].is_null());
-        let text = render_quota_view("text", &[], &QuotaPlanProfile::default()).expect("text lane renders");
+        let text = render_quota_view("text", &[], &QuotaPlanProfile::default())
+            .expect("text lane renders");
         assert!(
             text.contains("no session carries placeable time"),
             "empty render says so: {text}"
@@ -5801,7 +5802,8 @@ mod quota_tests {
     #[test]
     fn quota_render_lanes_and_schema_stability() {
         let sessions = vec![quota_session("solo", &["2026-10-12T10:30:00Z"], 0.0105)];
-        let json = render_quota_view("json", &sessions, &QuotaPlanProfile::default()).expect("json lane renders");
+        let json = render_quota_view("json", &sessions, &QuotaPlanProfile::default())
+            .expect("json lane renders");
         let parsed: serde_json::Value =
             serde_json::from_str(json.trim()).expect("json lane is valid JSON");
         assert_eq!(parsed["schema"], "agenttrace.quota/1");
@@ -5826,7 +5828,8 @@ mod quota_tests {
                 "window key {key}"
             );
         }
-        let text = render_quota_view("text", &sessions, &QuotaPlanProfile::default()).expect("text lane renders");
+        let text = render_quota_view("text", &sessions, &QuotaPlanProfile::default())
+            .expect("text lane renders");
         assert!(text.starts_with("Quota view"), "text lane: {text}");
         assert!(
             text.contains("$0.0105"),
@@ -5924,7 +5927,8 @@ mod quota_tests {
         );
         assert_eq!(report["corpus"]["future_discarded_sessions"], 2);
         assert!(report["five_hour"].is_null() && report["weekly"].is_null());
-        let text = render_quota_view("text", &sessions, &QuotaPlanProfile::default()).expect("text lane renders");
+        let text = render_quota_view("text", &sessions, &QuotaPlanProfile::default())
+            .expect("text lane renders");
         assert!(
             text.contains("no session carries placeable time"),
             "fully future corpus renders the undefined-cutoff lane: {text}"
@@ -6168,8 +6172,14 @@ mod quota_tests {
         assert_eq!(five["within"], false);
         assert_eq!(five["headroom_usd"], -1.0);
         assert_eq!(five["overage_at_api_rates_usd"], 1.0);
-        assert_eq!(report["reconciliation"]["weekly"]["limit_usd"], serde_json::Value::Null);
-        assert_eq!(report["reconciliation"]["weekly"]["within"], serde_json::Value::Null);
+        assert_eq!(
+            report["reconciliation"]["weekly"]["limit_usd"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            report["reconciliation"]["weekly"]["within"],
+            serde_json::Value::Null
+        );
 
         // No profile: the reserved seam stays null-with-basis and the
         // reconciliation is null-with-basis (never invented numbers).
@@ -6220,14 +6230,14 @@ mod quota_tests {
             ..Default::default()
         };
         let report = quota_report(&sessions, &opaque);
-        assert_eq!(
-            report["reconciliation"]["weekly"]["observed_usd"],
-            3.0
-        );
+        assert_eq!(report["reconciliation"]["weekly"]["observed_usd"], 3.0);
         let pre_plan = &report["reconciliation"]["pre_plan"];
         assert_eq!(pre_plan["effective_utc"], serde_json::Value::Null);
         assert_eq!(pre_plan["excluded_usd"], serde_json::Value::Null);
-        assert!(pre_plan["basis"].as_str().expect("basis").contains("cannot be separated"));
+        assert!(pre_plan["basis"]
+            .as_str()
+            .expect("basis")
+            .contains("cannot be separated"));
     }
 
     #[test]
@@ -6280,8 +6290,7 @@ mod quota_tests {
             effective_utc: Some(parse_ts("2026-10-12T08:00:00Z").expect("ts")),
             basis: "test profile".to_string(),
         };
-        let text =
-            render_quota_view("text", &sessions, &plan).expect("text lane renders");
+        let text = render_quota_view("text", &sessions, &plan).expect("text lane renders");
         assert!(text.contains("5h blocks"), "block line: {text}");
         assert!(text.contains("first-use anchor 2026-10-12T06:00:00Z"));
         assert!(
