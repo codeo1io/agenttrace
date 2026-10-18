@@ -2094,6 +2094,87 @@ fn openclaw_state_dir_relocation_is_honored() {
 }
 
 #[test]
+fn opencode_info_doc_over_cap_is_skipped_and_disclosed() {
+    // rm-451: a bloated or planted session-info doc must never be
+    // materialized by the fork probe — no fork verdict is derivable, so
+    // the fork transcript stays aggregated and the skip is disclosed on
+    // the load report, never silent.
+    let root = temp_root("agenttrace-opencode-info-doc-cap");
+    let home = root.join("home");
+    let storage = seed_opencode_storage_forks(&home);
+
+    // Plant a fork doc past the walk-lane bound beside the fork
+    // transcript.
+    let info_dir = storage.join("session").join("info");
+    let mut bloated = String::with_capacity(1024 * 1024 + 128);
+    bloated.push_str("{\"id\":\"ses-fork\",\"parentID\":\"ses-parent\",\"padding\":\"");
+    bloated.push_str(&"x".repeat(1024 * 1024 + 64));
+    bloated.push_str("\"}");
+    fs::write(info_dir.join("ses-fork.json"), bloated).expect("plant bloated fork doc");
+
+    with_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        // No fork verdict is derivable without the doc: nothing was
+        // fork-excluded (the probe refused the over-cap read)...
+        assert_eq!(
+            report.opencode_fork_excluded, 0,
+            "nothing was fork-excluded"
+        );
+        // ...and the skipped read is disclosed, never silent.
+        assert_eq!(
+            report.opencode_info_docs_skipped_over_cap, 1,
+            "the skipped read must be disclosed, never silent"
+        );
+        // The bloated doc itself is never parsed (the landed rm-1437
+        // transcript cap owns that refusal): the corpus parses down to
+        // parent + independent.
+        let mut stems: Vec<String> = report
+            .sessions
+            .iter()
+            .map(|session| {
+                session
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(".json")
+                    .to_string()
+            })
+            .collect();
+        stems.sort();
+        assert_eq!(
+            stems,
+            vec!["ses-other".to_string(), "ses-parent".to_string()],
+            "over-cap doc must not enter aggregation"
+        );
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn opencode_info_doc_under_cap_still_drives_fork_exclusion() {
+    // rm-451 companion: a normal-sized fork doc keeps the landed
+    // behavior — the fork transcript is excluded by the probe, and the
+    // over-cap counter stays zero.
+    let root = temp_root("agenttrace-opencode-info-doc-under-cap");
+    let home = root.join("home");
+    let _storage = seed_opencode_storage_forks(&home);
+
+    with_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.opencode_fork_excluded, 1,
+            "normal fork doc still excludes"
+        );
+        assert_eq!(
+            report.opencode_info_docs_skipped_over_cap, 0,
+            "no skip may be fabricated for a normal doc"
+        );
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn openclaw_legacy_clawdbot_state_dir_is_discovered() {
     // rm-1373: ~/.clawdbot is the pre-rename state dir (upstream
     // resolveLegacyStateDirs) and carries the same sessions layout; it

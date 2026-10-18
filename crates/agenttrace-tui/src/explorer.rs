@@ -953,21 +953,21 @@ fn render_explorer_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         horizontal: 3,
         vertical: 1,
     });
-    if app.explorer_view != ExplorerView::Attention
-        && app.explorer_view != ExplorerView::Recent
-        && app.explorer_view != ExplorerView::All
-        && app.explorer_view != ExplorerView::Projects
-    {
-        let text = match app.explorer_view {
-            ExplorerView::Context => context_preview(session, app.language),
-            ExplorerView::Storage => storage_preview(session, app.language),
-            ExplorerView::Cost => cost_preview(session, app.language),
-            ExplorerView::Tools => tools_preview(session, app.language),
-            ExplorerView::Attention
-            | ExplorerView::Recent
-            | ExplorerView::All
-            | ExplorerView::Projects => unreachable!(),
-        };
+    // rm-1978: the preview match is exhaustive and typed — adding an
+    // ExplorerView variant fails compilation here instead of reaching a
+    // guarded `unreachable!()` at runtime. Views without a text preview
+    // yield `None` and fall through to the view-specific renders below.
+    let text = match app.explorer_view {
+        ExplorerView::Context => Some(context_preview(session, app.language)),
+        ExplorerView::Storage => Some(storage_preview(session, app.language)),
+        ExplorerView::Cost => Some(cost_preview(session, app.language)),
+        ExplorerView::Tools => Some(tools_preview(session, app.language)),
+        ExplorerView::Attention
+        | ExplorerView::Recent
+        | ExplorerView::All
+        | ExplorerView::Projects => None,
+    };
+    if let Some(text) = text {
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
         return;
     }
@@ -1434,11 +1434,14 @@ fn render_detail_section(
     section: DetailSection,
     area: Rect,
 ) {
-    if section == DetailSection::Timeline {
-        render_timeline_table(frame, app, session, area);
-        return;
-    }
+    // rm-1978: Timeline renders its table directly and returns from
+    // this arm — the match stays exhaustive by type instead of parking
+    // the case behind a guarded `unreachable!()`.
     let text = match section {
+        DetailSection::Timeline => {
+            render_timeline_table(frame, app, session, area);
+            return;
+        }
         DetailSection::Summary => {
             let summary = detail_summary(session, app.language);
             if app.raw_report_expanded {
@@ -1466,7 +1469,6 @@ fn render_detail_section(
         }
         DetailSection::Context => detail_context(session, app.language),
         DetailSection::Files => detail_files(session, app.language),
-        DetailSection::Timeline => unreachable!(),
     };
     let reason = inspect_reason(session);
     frame.render_widget(

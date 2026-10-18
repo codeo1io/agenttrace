@@ -3015,23 +3015,33 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
             entries.insert(path.clone(), value.clone());
         }
         for (path, entry) in &cache.entries {
-            entries.insert(
-                path.clone(),
-                serde_json::to_value(entry).expect("cache entry serialize"),
-            );
+            // rm-1978: `to_value` on a cache entry cannot fail on operator
+            // input — the error path exists so the broken invariant is
+            // named and loud, not so it can fire.
+            let value = serde_json::to_value(entry).map_err(|error| {
+                anyhow::anyhow!(
+                    "rm-1978: cache entry serialization failed — entries are \
+                     plain data, so this is a broken invariant: {error}"
+                )
+            })?;
+            entries.insert(path.clone(), value);
         }
         doc.insert("entries".to_string(), Value::Object(entries));
         if !cache.dirs.is_empty() {
             let dirs = cache
                 .dirs
                 .iter()
-                .map(|(path, entry)| {
-                    (
-                        path.clone(),
-                        serde_json::to_value(entry).expect("dir cache entry serialize"),
+                .map(|(path, entry)| serde_json::to_value(entry).map(|value| (path.clone(), value)))
+                // rm-1978: same named-invariant contract as the entries
+                // map above — dir entries are plain data.
+                .collect::<Result<_, _>>()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "rm-1978: dir cache entry serialization failed — \
+                         dir entries are plain data, so this is a broken \
+                         invariant: {error}"
                     )
-                })
-                .collect();
+                })?;
             doc.insert("dirs".to_string(), Value::Object(dirs));
         }
         // The invalidation ledger (schema upgrades this store survived) —

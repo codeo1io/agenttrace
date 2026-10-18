@@ -568,6 +568,25 @@ pub fn append_statusline_capture(payload: &Value) -> io::Result<()> {
 /// instead of spinning.
 const JOURNAL_LOCK_ATTEMPTS: usize = 64;
 
+/// rm-686: wall-clock bound on acquiring the journal lock. A wedged or
+/// foreign holder must produce a loud, bounded refusal — never an
+/// indefinite hang that stalls every statusline append (the live wedge
+/// class witnessed on the 0bbc830 assess battery).
+const JOURNAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// rm-686: disclosure counter — journal-lock acquisitions that refused
+/// because the wait bound expired. Process-lifetime: the append and the
+/// report lanes are separate processes; the TUI host is the long-lived
+/// consumer of this counter.
+static JOURNAL_LOCK_WAIT_EXPIRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// rm-686: how many journal-lock acquisitions refused after
+/// [`JOURNAL_LOCK_WAIT`] expired. Read by in-process disclosure lanes.
+pub(crate) fn journal_lock_wait_expiries() -> u64 {
+    JOURNAL_LOCK_WAIT_EXPIRIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Opens the journal for appending under an exclusive cross-process
 /// lock (rm-166).
 ///
@@ -581,9 +600,24 @@ const JOURNAL_LOCK_ATTEMPTS: usize = 64;
 /// revalidated against the path's live inode and the open is retried
 /// when it raced a compaction.
 fn open_locked_journal(path: &Path) -> io::Result<fs::File> {
+    open_locked_journal_within(path, JOURNAL_LOCK_WAIT)
+}
+
+/// rm-686: `open_locked_journal` bounded by `wait` instead of the
+/// production bound. Test entry point for the red fixture that pins
+/// the refusal (never a hang) under a foreign holder.
+fn open_locked_journal_within(path: &Path, wait: std::time::Duration) -> io::Result<fs::File> {
+    let deadline = std::time::Instant::now() + wait;
     for _ in 0..JOURNAL_LOCK_ATTEMPTS {
         let journal = crate::session_cache::open_private_append(path)?;
-        journal.lock()?;
+        // rm-686: try_lock ladder bounded by the deadline. std file locks
+        // are exclusive between processes and between separately-opened
+        // handles inside one process, so a foreign holder is refused
+        // here, loudly, instead of wedging the append.
+        if let Err(error) = lock_journal_with_deadline(&journal, deadline) {
+            drop(journal);
+            return Err(error);
+        }
         if journal_descriptor_is_live(path, &journal) {
             return Ok(journal);
         }
@@ -594,6 +628,38 @@ fn open_locked_journal(path: &Path) -> io::Result<fs::File> {
     Err(io::Error::other(format!(
         "statusline journal lock lost {JOURNAL_LOCK_ATTEMPTS} races with compaction"
     )))
+}
+
+/// rm-686: acquires the exclusive journal lock or fails loudly with
+/// `ErrorKind::TimedOut` once `deadline` passes. Never blocks past the
+/// bound, never silently defaults.
+fn lock_journal_with_deadline(journal: &fs::File, deadline: std::time::Instant) -> io::Result<()> {
+    loop {
+        match journal.try_lock() {
+            Ok(()) => return Ok(()),
+            // rm-686: contention and signals are retryable inside the
+            // deadline; every other failure (permission, closed fd, …)
+            // is a real error and propagates.
+            Err(error) => {
+                let error: io::Error = error.into();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    return Err(error);
+                }
+                if std::time::Instant::now() >= deadline {
+                    JOURNAL_LOCK_WAIT_EXPIRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "statusline journal lock not acquired within the rm-686 wait \
+                         bound; refusing loudly instead of hanging (foreign holder)",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
 }
 
 /// True when `journal`'s descriptor still refers to the inode currently
@@ -1265,12 +1331,23 @@ pub struct StatuslineJournalStats {
     /// lines-vs-samples discrepancy has a visible cause
     /// ("Statusline budget truth" batch, run 80336dfb).
     pub unparsable_lines: usize,
+    /// rm-686: journal-lock acquisitions this process refused after the
+    /// wait bound expired (foreign holder). Serialized only when set so
+    /// benign journals keep identical report bytes.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub lock_wait_expiries: u64,
 }
 
 /// `serde(skip_serializing_if)` helper for the rm-922 truncation
 /// flag: absent from serialized output while `false`.
 fn is_false(flag: &bool) -> bool {
     !*flag
+}
+
+/// `serde(skip_serializing_if)` helper for the rm-686 lock-refusal
+/// counter: absent from serialized output while zero.
+fn is_zero_u64(count: &u64) -> bool {
+    *count == 0
 }
 
 pub fn statusline_journal_stats(path: &Path) -> StatuslineJournalStats {
@@ -1353,6 +1430,7 @@ fn statusline_journal_stats_from_buffer(
         captures_pre_first_input,
         captures_unknown_payload,
         unparsable_lines,
+        lock_wait_expiries: journal_lock_wait_expiries(),
     }
 }
 
@@ -2519,6 +2597,7 @@ mod tests {
                 captures_pre_first_input: 0,
                 captures_unknown_payload: 0,
                 unparsable_lines: 0,
+                lock_wait_expiries: 0,
             },
             &statusline_insights(&[]),
             Some(5.0),
@@ -2771,6 +2850,7 @@ mod tests {
                 captures_pre_first_input: 0,
                 captures_unknown_payload: 0,
                 unparsable_lines: 0,
+                lock_wait_expiries: 0,
             },
             &statusline_insights(&[]),
             Some(10.0),
@@ -3034,6 +3114,7 @@ mod tests {
                 captures_pre_first_input: 0,
                 captures_unknown_payload: 0,
                 unparsable_lines: 0,
+                lock_wait_expiries: 0,
             },
             &statusline_insights(&captures),
             budget,
@@ -3074,6 +3155,7 @@ mod tests {
                 captures_pre_first_input: 0,
                 captures_unknown_payload: 0,
                 unparsable_lines: 0,
+                lock_wait_expiries: 0,
             },
             &statusline_insights(&[]),
             budget,
@@ -3097,6 +3179,7 @@ mod tests {
                 captures_pre_first_input: 2,
                 captures_unknown_payload: 0,
                 unparsable_lines: 0,
+                lock_wait_expiries: 0,
             },
             &statusline_insights(&captures),
             None,
@@ -3485,6 +3568,7 @@ mod tests {
                 captures_pre_first_input: 1,
                 captures_unknown_payload: 0,
                 unparsable_lines: 0,
+                lock_wait_expiries: 0,
             },
             &insights,
             None,
@@ -3685,6 +3769,7 @@ mod tests {
                 captures_pre_first_input: 0,
                 captures_unknown_payload: 0,
                 unparsable_lines: 0,
+                lock_wait_expiries: 0,
             },
             &insights,
             None,
@@ -3724,6 +3809,7 @@ mod tests {
                 captures_pre_first_input: 1,
                 captures_unknown_payload: 0,
                 unparsable_lines: 0,
+                lock_wait_expiries: 0,
             },
             &statusline_insights(&period_only),
             None,
@@ -4810,6 +4896,51 @@ mod tests {
     // test) with AGENTTRACE_JOURNAL_CHILD_ROLE set, taking the child
     // branch below; coordination between processes is marker files in
     // the temp root.
+    #[test]
+    fn journal_lock_wait_is_bounded_and_loud_under_foreign_holder() {
+        // rm-686 red fixture: a foreign holder of the journal lock must
+        // produce a loud, bounded refusal — never an indefinite hang (the
+        // live wedge class from the 0bbc830 assess battery). std file
+        // locks are exclusive between separately-opened handles inside
+        // one process, so a second handle in-process holds exactly like
+        // another process would.
+        let dir = std::env::temp_dir().join(format!("agenttrace-rm686-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let journal_path = dir.join("statusline.jsonl");
+        let holder = crate::session_cache::open_private_append(&journal_path).unwrap();
+        holder.lock().unwrap();
+        let before = journal_lock_wait_expiries();
+        let started = std::time::Instant::now();
+        let outcome =
+            open_locked_journal_within(&journal_path, std::time::Duration::from_millis(75));
+        match outcome {
+            Err(error) => {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut,
+                    "refusal must be a loud timeout, got: {error}"
+                );
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(5),
+                    "wait must be bounded, took {:?}",
+                    started.elapsed()
+                );
+                assert!(
+                    journal_lock_wait_expiries() > before,
+                    "expiry must be disclosed via the counter, not silent"
+                );
+            }
+            Ok(_) => panic!("lock acquired while a live holder owns it — bound not enforced"),
+        }
+        drop(holder);
+        // Positive control: once the holder releases, the bounded open
+        // succeeds with a normal wait.
+        assert!(
+            open_locked_journal_within(&journal_path, std::time::Duration::from_secs(5)).is_ok()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn journal_appends_survive_parallel_compaction() {
         if let Ok(role) = std::env::var("AGENTTRACE_JOURNAL_CHILD_ROLE") {

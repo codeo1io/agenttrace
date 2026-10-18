@@ -2929,21 +2929,22 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
         // A journal whose header carries no cwd has no such event —
         // synthesize one carrier instead of panicking on a lookup that
         // can never hit.
-        let carrier = match meta_events
+        match meta_events
             .iter_mut()
             .find(|event| event.role == "meta" && !event.cwd.is_empty())
         {
-            Some(carrier) => carrier,
-            None => {
-                meta_events.push(Event {
-                    role: "meta".to_string(),
-                    source_tool: source_tool.clone(),
-                    ..Event::default()
-                });
-                meta_events.last_mut().expect("carrier event just pushed")
-            }
+            // rm-1978: the synthesized carrier is constructed with the
+            // counters already attached — the pushed-then-fetched
+            // `last_mut().expect("carrier event just pushed")` panic is
+            // gone, and the match stays exhaustive by type.
+            Some(carrier) => carrier.disclosure_counters = counters,
+            None => meta_events.push(Event {
+                role: "meta".to_string(),
+                source_tool: source_tool.clone(),
+                disclosure_counters: counters,
+                ..Event::default()
+            }),
         };
-        carrier.disclosure_counters = counters;
     }
     Ok(meta_events)
 }

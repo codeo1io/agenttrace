@@ -13,6 +13,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// rm-451 walk-lane arm: opencode session info docs (`…/storage/session/
+/// info/<sid>.json`) are tiny metadata records; this bound mirrors the
+/// landed transcript-read caps (rm-1437 `OPENCODE_TRANSCRIPT_READ_CAP_BYTES`,
+/// rm-503 stdin cap). A doc past the bound is skipped without ever being
+/// materialized — the skip is counted and disclosed, never silent, and
+/// the transcript stays aggregated because no fork verdict is derivable.
+pub(crate) const OPENCODE_INFO_DOC_READ_CAP_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownSessionDir {
     pub name: String,
@@ -49,6 +57,12 @@ pub struct LoadReport {
     /// channel can report the exclusion instead of dropping sessions
     /// silently.
     pub opencode_fork_excluded: usize,
+    /// rm-451 walk-lane arm: opencode session info docs skipped because
+    /// they exceed `OPENCODE_INFO_DOC_READ_CAP_BYTES` (rm-212 admits them
+    /// by file-kind). The skip is disclosed here, never silent, and the
+    /// transcript stays aggregated — no fork verdict is derivable without
+    /// the doc.
+    pub opencode_info_docs_skipped_over_cap: usize,
     /// rm-835 (minted campaign-locally as rm-695 by run f7f81aea, rebound
     /// at integration — the landed wall already holds an rm-695): how many
     /// discovered files failed to parse (the parse share of `skipped`,
@@ -398,6 +412,67 @@ fn override_root_in_effect() -> bool {
 }
 
 #[cfg(test)]
+mod rm451_info_doc_cap_tests {
+    use super::opencode_session_fork_parent;
+    use std::fs;
+
+    fn temp_dir_unique(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-rm451-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        dir
+    }
+
+    #[test]
+    fn probe_refuses_over_cap_doc_without_reading_it() {
+        let dir = temp_dir_unique("probe");
+        let info = dir.join("storage").join("session").join("info");
+        fs::create_dir_all(&info).expect("info dir");
+        let doc = info.join("ses-fork.json");
+        let mut bloated =
+            String::from("{\"id\":\"ses-fork\",\"parentID\":\"ses-parent\",\"padding\":\"");
+        bloated.push_str(&"x".repeat(1024 * 1024 + 64));
+        bloated.push_str("\"}");
+        fs::write(&doc, bloated).expect("write bloated doc");
+        assert!(
+            fs::metadata(&doc).expect("stat").len() > super::OPENCODE_INFO_DOC_READ_CAP_BYTES,
+            "fixture must exceed the bound"
+        );
+        assert_eq!(
+            opencode_session_fork_parent(&doc),
+            None,
+            "over-cap doc must yield no fork verdict (and never be read)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_still_reads_normal_doc() {
+        let dir = temp_dir_unique("probe-ok");
+        let info = dir.join("storage").join("session").join("info");
+        fs::create_dir_all(&info).expect("info dir");
+        let doc = info.join("ses-fork.json");
+        fs::write(
+            &doc,
+            r#"{"id":"ses-fork","parentID":"ses-parent","timeCreated":1780000000000}"#,
+        )
+        .expect("write doc");
+        assert_eq!(
+            opencode_session_fork_parent(&doc),
+            Some("ses-parent".to_string()),
+            "normal doc keeps its fork verdict"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod org_identity_fallback_tests {
     use super::claude_config_dir_fallback_counter;
 
@@ -456,7 +531,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // for org-less claude_code journals served from an override root.
     let override_root = std::env::var_os("CLAUDE_CONFIG_DIR").is_some();
     let mut sessions = Vec::new();
-    let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
+    let (files, json_fork_excluded, opencode_info_docs_skipped_over_cap) =
+        find_session_files_cached(dir, cache, true);
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
@@ -675,6 +751,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         cache_hits,
         sqlite: sqlite_ingest,
         opencode_fork_excluded,
+        opencode_info_docs_skipped_over_cap,
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
@@ -724,15 +801,15 @@ pub(crate) fn find_session_files_cached(
     dir: Option<&Path>,
     cache: &mut SessionCache,
     skip_sqlite_backed: bool,
-) -> (Vec<PathBuf>, usize) {
+) -> (Vec<PathBuf>, usize, usize) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return (vec![dir.to_path_buf()], 0);
+            return (vec![dir.to_path_buf()], 0, 0);
         }
         // rm-548: an explicitly requested directory keeps every file —
         // a forked copy loaded by explicit path still renders (the
         // exclusion is an aggregation rule, not a parse block).
-        return (collect_session_files_cached(dir, cache), 0);
+        return (collect_session_files_cached(dir, cache), 0, 0);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
@@ -764,7 +841,31 @@ pub(crate) fn find_session_files_cached(
     // `opencode_session_fork_parent_cached`) so warm runs stop
     // re-reading every storage session info doc on discovery.
     let mut opencode_fork_excluded = 0usize;
+    let mut opencode_info_docs_skipped_over_cap = 0usize;
     all.retain(|path| {
+        // rm-451 walk-lane arm: an enumerated info doc past the read
+        // cap is skipped without ever being materialized (the probe
+        // refuses the read). Counted at the enumeration site so the
+        // skip is disclosed on warm runs too, where a memoized probe
+        // verdict cannot carry the distinction. The strict layout
+        // predicate mirrors the probe's own gate, so the counter
+        // names exactly the docs that probe would have read;
+        // sibling-derived paths are deliberately NOT counted — every
+        // info doc is enumerated itself (`.json` names are admitted),
+        // so counting via a JSONL sibling could only double-count the
+        // same physical doc.
+        if is_opencode_session_info_doc(path)
+            && fs::metadata(path)
+                .map(|meta| meta.len() > OPENCODE_INFO_DOC_READ_CAP_BYTES)
+                .unwrap_or(false)
+        {
+            opencode_info_docs_skipped_over_cap += 1;
+            // No fork verdict is derivable without the doc: keep the
+            // session admitted (the rm-1437 transcript admission cap
+            // refuses the parse upstream) and disclose the skipped
+            // read — skip, never a crash.
+            return true;
+        }
         if opencode_session_fork_parent_cached(path, cache).is_some() {
             opencode_fork_excluded += 1;
             false
@@ -772,7 +873,30 @@ pub(crate) fn find_session_files_cached(
             true
         }
     });
-    (sort_paths_by_cache(all, cache), opencode_fork_excluded)
+    (
+        sort_paths_by_cache(all, cache),
+        opencode_fork_excluded,
+        opencode_info_docs_skipped_over_cap,
+    )
+}
+
+/// rm-451: strict predicate for an opencode storage session info doc
+/// (`…/storage/session/info/<sid>.json`) — the exact layout the rm-548
+/// fork probe gates on, so the walk-lane skip counter counts precisely
+/// the docs that probe would read.
+fn is_opencode_session_info_doc(path: &Path) -> bool {
+    let mut components = path.components().rev();
+    let file_is_json = components
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        .is_some_and(|name| name.ends_with(".json"));
+    let path_is_session_info = ["info", "session", "storage"].iter().all(|segment| {
+        components
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            .is_some_and(|actual| actual == *segment)
+    });
+    file_is_json && path_is_session_info
 }
 
 /// rm-548: an opencode storage session doc (`.../storage/session/info/
@@ -795,6 +919,17 @@ pub(crate) fn opencode_session_fork_parent(path: &Path) -> Option<String> {
             .is_some_and(|actual| actual == *segment)
     });
     if !file_is_json || !path_is_session_info {
+        return None;
+    }
+    // rm-451: info docs are tiny metadata records. A doc larger than the
+    // bound is anomalous (a planted or foreign file the rm-212 file-kind
+    // gates admit by design) — never materialize it; skip the read and
+    // let the caller disclose the skip.
+    if fs::metadata(path)
+        .map(|meta| meta.len())
+        .unwrap_or(u64::MAX)
+        > OPENCODE_INFO_DOC_READ_CAP_BYTES
+    {
         return None;
     }
     let raw = fs::read_to_string(path).ok()?;
