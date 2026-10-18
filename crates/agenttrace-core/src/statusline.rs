@@ -832,6 +832,19 @@ pub fn render_statusline_report(
                 "weekly_budget_usd": budget,
                 "spend_7d_usd": series.total,
                 "remaining_usd": budget - series.total,
+                // rm-917 residual (run 6603da8916bd): parity with the
+                // --budget arm — this render surface carries the same
+                // calendar-window truth instead of a clean verdict over
+                // a stale or future-polluted journal.
+                "daily": series
+                    .daily
+                    .iter()
+                    .map(|(day, spend)| {
+                        serde_json::json!({"date": day, "spend_usd": spend})
+                    })
+                    .collect::<Vec<_>>(),
+                "excluded_older_days": series.excluded_older_days,
+                "excluded_future_days": series.excluded_future_days,
             });
         }
         return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
@@ -925,6 +938,31 @@ fn render_statusline_report_text(
                 series.total
             ));
         }
+        // rm-917 residual (run 6603da8916bd): the same calendar-window
+        // disclosure the --budget arm prints, so a stale or
+        // future-polluted journal cannot read as a clean window here.
+        if series.excluded_older_days > 0 {
+            out.push_str(&format!(
+                "  ({} older day{} outside the window not counted)\n",
+                series.excluded_older_days,
+                if series.excluded_older_days == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+        if series.excluded_future_days > 0 {
+            out.push_str(&format!(
+                "  ({} future day{} beyond now+1h not counted)\n",
+                series.excluded_future_days,
+                if series.excluded_future_days == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
     }
     if !insights.session_caches.is_empty() {
         out.push_str("Prompt cache per session:\n");
@@ -1009,6 +1047,11 @@ pub struct StatuslineBudgetSeries {
     /// calendar window — excluded from `daily`/`total` and disclosed
     /// by the budget views so a stale journal is visible, not silent.
     pub excluded_older_days: usize,
+    /// rm-941 (run 6603da8916bd): UTC days sampled beyond now+1h.
+    /// Clock skew within the hour clamps into today; anything further
+    /// is future-dated, excluded from the window, and disclosed —
+    /// never silently dropped.
+    pub excluded_future_days: usize,
 }
 
 pub fn statusline_budget_series(
@@ -1079,6 +1122,9 @@ pub fn statusline_budget_series(
             daily: Vec::new(),
             total: 0.0,
             excluded_older_days: daily.len(),
+            // rm-941: a zero-day window has no today to bound against;
+            // the whole journal is already disclosed as excluded above.
+            excluded_future_days: 0,
         };
     }
     let window_start = today - Duration::days(days as i64 - 1);
@@ -1087,6 +1133,33 @@ pub fn statusline_budget_series(
         .filter_map(|(day, spend)| Some((day.parse::<chrono::NaiveDate>().ok()?, spend)))
         .collect();
     let excluded_older_days = by_day.range(..window_start).count();
+    // rm-941 (run 6603da8916bd): bound the sample clock. A capture at
+    // most 1h ahead of `now` is clock-skew tolerance and bills into
+    // today; anything further is future-dated — excluded from the
+    // window AND disclosed through `excluded_future_days`, instead of
+    // silently billing into no window like the `..=today` slice did.
+    let skew_tolerance_day = (now + Duration::hours(1)).date_naive();
+    let mut excluded_future_days = 0usize;
+    let by_day: BTreeMap<chrono::NaiveDate, f64> = by_day
+        .into_iter()
+        .filter_map(|(mut day, spend)| {
+            if day > today {
+                if day <= skew_tolerance_day {
+                    day = today;
+                } else {
+                    excluded_future_days += 1;
+                    return None;
+                }
+            }
+            Some((day, spend))
+        })
+        .fold(
+            BTreeMap::new(),
+            |mut acc: BTreeMap<chrono::NaiveDate, f64>, (day, spend)| {
+                *acc.entry(day).or_insert(0.0) += spend;
+                acc
+            },
+        );
     let any_in_window = by_day.range(window_start..=today).next().is_some();
     let window: Vec<(String, f64)> = if any_in_window {
         // Zero-fill the calendar days inside the window so gaps are
@@ -1116,6 +1189,7 @@ pub fn statusline_budget_series(
         daily: window,
         total,
         excluded_older_days,
+        excluded_future_days,
     }
 }
 
@@ -1152,6 +1226,7 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "spend_7d_usd": series.total,
             // rm-917: stale sampled days the calendar window excluded.
             "excluded_older_days": series.excluded_older_days,
+            "excluded_future_days": series.excluded_future_days,
         });
         if let Some(budget) = weekly_budget {
             value["weekly_budget_usd"] = serde_json::json!(budget);
@@ -1183,6 +1258,18 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "  ({} older day{} outside the window not counted)\n",
             series.excluded_older_days,
             if series.excluded_older_days == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    // rm-941: future-dated days are excluded, not silently dropped.
+    if series.excluded_future_days > 0 {
+        out.push_str(&format!(
+            "  ({} future day{} beyond now+1h not counted)\n",
+            series.excluded_future_days,
+            if series.excluded_future_days == 1 {
                 ""
             } else {
                 "s"

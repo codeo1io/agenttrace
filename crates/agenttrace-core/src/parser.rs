@@ -5848,7 +5848,31 @@ fn add_opencode_tokens(usage: &mut BTreeMap<String, i64>, raw: Option<&Value>) -
         add_usage_value(usage, "cache_read_input_tokens", cache.get("read"));
         add_usage_value(usage, "cache_creation_input_tokens", cache.get("write"));
     }
-    true
+    // rm-619 (run 6603da8916bd): opencode also carries `reasoning` on
+    // the message-level tokens object. It folds on its own channel and
+    // never counts as "the message carried usage": when tokens holds
+    // reasoning alone, the part-level step-finish fallback is the ONLY
+    // input/output source for the message, and the old unconditional
+    // true-return suppressed it (twin PoC: 0 in / 4-estimated where the
+    // control parsed 100/50).
+    add_usage_value(usage, "reasoning_tokens", tokens.get("reasoning"));
+
+    // "message had usage" means this object carried input/output truth
+    // of its own — reasoning-only tokens must leave the part-level
+    // step-finish fallback live.
+    let carried_usage = |value: Option<&Value>| {
+        value
+            .and_then(number_as_i64)
+            .map(|count| count > 0)
+            .unwrap_or(false)
+    };
+    carried_usage(tokens.get("input"))
+        || carried_usage(tokens.get("output"))
+        || tokens
+            .get("cache")
+            .and_then(Value::as_object)
+            .map(|cache| carried_usage(cache.get("read")) || carried_usage(cache.get("write")))
+            .unwrap_or(false)
 }
 
 fn add_usage(dst: &mut BTreeMap<String, i64>, src: &BTreeMap<String, i64>) {

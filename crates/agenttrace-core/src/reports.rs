@@ -604,6 +604,10 @@ pub fn report_overview_json_with_context(
 ) -> String {
     let base = report_overview_json_with_health(overview, sessions, data_health);
     let mut payload: Value = serde_json::from_str(&base).expect("overview JSON is valid");
+    // rm-941 (run 6603da8916bd): future-dated sessions are excluded
+    // from time-windowed series and disclosed, never silently bent.
+    payload["future_dated_sessions_excluded"] =
+        json!(future_dated_session_count(sessions, chrono::Utc::now()));
     if let Some(list) = payload
         .get_mut("recent_sessions")
         .and_then(Value::as_array_mut)
@@ -660,6 +664,15 @@ pub fn report_overview_text_with_context(
         out.push_str(&format!(
             "  Disclosed facts: {}\n",
             counts_cell(&data_health.disclosures)
+        ));
+    }
+    // rm-941 (run 6603da8916bd): future-dated sessions are excluded
+    // from time-windowed series and disclosed, never silently bent.
+    let future_dated = future_dated_session_count(sessions, chrono::Utc::now());
+    if future_dated > 0 {
+        out.push_str(&format!(
+            "  Future-dated sessions excluded: {}\n",
+            future_dated
         ));
     }
     // rm-734: an excluded corpus must be named, never silent.
@@ -908,10 +921,47 @@ fn card_label(value: &str, max_chars: usize) -> String {
 /// Daily cost series over the trailing `days` days of the corpus's own
 /// clock (anchored at the latest event timestamp, never `Utc::now()`),
 /// so a fixed corpus always yields the same series.
-fn card_daily_series(sessions: &[Session], days: usize) -> Vec<(chrono::NaiveDate, f64)> {
+/// rm-941 (run 6603da8916bd): a session is future-dated when its
+/// bucket day (same derivation as [`card_daily_series`]) is beyond
+/// now+1h. The hour is clock-skew tolerance; anything further bends
+/// every time-windowed aggregate and is excluded + disclosed
+/// instead of silently shaping the axis.
+fn future_dated_session_count(sessions: &[Session], now: chrono::DateTime<chrono::Utc>) -> usize {
+    let horizon = (now + chrono::Duration::hours(1)).naive_utc().date();
+    sessions
+        .iter()
+        .filter(|session| {
+            let day = crate::parse_ts(&session.metrics.session_end)
+                .map(|ts| ts.naive_utc().date())
+                .or_else(|| {
+                    session
+                        .metrics
+                        .timestamps
+                        .iter()
+                        .map(|ts| ts.naive_utc().date())
+                        .max()
+                });
+            day.map(|day| day > horizon).unwrap_or(false)
+        })
+        .count()
+}
+
+fn card_daily_series(
+    sessions: &[Session],
+    days: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<(chrono::NaiveDate, f64)>, usize) {
     let mut latest: Option<chrono::NaiveDate> = None;
     let mut buckets: std::collections::BTreeMap<chrono::NaiveDate, f64> =
         std::collections::BTreeMap::new();
+    // rm-941 (run 6603da8916bd): bound the corpus clock. Days within
+    // now+1h are clock-skew tolerance and stay; anything further is
+    // future-dated — excluded from the series, counted, and disclosed
+    // by the caller. The anchor keeps corpus-clock determinism for
+    // surviving days: the latest SURVIVING day, never a hostile
+    // future card anchor.
+    let horizon = (now + chrono::Duration::hours(1)).naive_utc().date();
+    let mut excluded_future = 0usize;
     for session in sessions {
         // rm-911 (arm b): the bucket day comes from the cache-surviving
         // session bounds first. `SessionMetrics::timestamps` is
@@ -936,6 +986,14 @@ fn card_daily_series(sessions: &[Session], days: usize) -> Vec<(chrono::NaiveDat
                     .max()
             });
         let Some(day) = day else { continue };
+        let day = if day > horizon {
+            // rm-941: beyond the clock-skew tolerance — excluded and
+            // disclosed, never a card anchor.
+            excluded_future += 1;
+            continue;
+        } else {
+            day
+        };
         latest = Some(match latest {
             Some(current) if current >= day => current,
             _ => day,
@@ -961,7 +1019,7 @@ fn card_daily_series(sessions: &[Session], days: usize) -> Vec<(chrono::NaiveDat
             }
         }
     }
-    series
+    (series, excluded_future)
 }
 
 fn card_bars(
@@ -1152,7 +1210,23 @@ fn render_usage_card(
         cls("card-fg"),
         p.fg
     ));
-    let series = card_daily_series(canonical, 14);
+    // rm-941 (run 6603da8916bd): bound the corpus clock — future-dated
+    // sessions are excluded from the series and the exclusion is
+    // disclosed on the card, never silently bending the window.
+    let (series, excluded_future) = card_daily_series(canonical, 14, chrono::Utc::now());
+    if excluded_future > 0 {
+        out.push_str(&format!(
+            "<text{} x=\"40\" y=\"372\" fill=\"{}\" font-size=\"13\" font-family=\"ui-monospace, Menlo, monospace\">{} future-dated session{} excluded \u{b7} not binned</text>\n",
+            cls("card-fg"),
+            p.fg,
+            excluded_future,
+            if excluded_future == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
     let peak = series.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
     let base_y = 448.0_f64;
     let chart_h = 56.0_f64;
