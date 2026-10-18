@@ -37,13 +37,20 @@ fn ultrafast_turns_bill_at_the_published_ultrafast_rates() {
     // A tier the catalog has no family for keeps the standard row —
     // including the None a tier-less turn prices at — exactly as
     // before this batch.
-    for tier in [None, Some("default"), Some("priority")] {
+    for tier in [None, Some("default")] {
         assert_eq!(
             per_million(&lookup_price_tiered("gpt-6-astra", tier)),
             (10.0, 50.0),
             "tier {tier:?} is not a priced tier"
         );
     }
+    // rm-1556 (cycle-4, run 1fb751544907): priority left the "not a
+    // priced tier" set — gpt-6-astra's 2026-10-17 row publishes it at
+    // 2x standard ($20/$100 per million) and a priority turn bills it.
+    let priority = lookup_price_tiered("gpt-6-astra", Some("priority"));
+    assert_eq!(per_million(&priority), (20.0, 100.0));
+    assert_eq!(priority.cw, 25.0);
+    assert!((priority.cr - 2.0).abs() < 1e-9);
 }
 
 #[test]

@@ -181,7 +181,10 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
     // wall date on the very day a snapshot ships. The footer is a
     // label, not a data axis, so strip its line before scanning for
     // leakage; the label's presence is separately asserted.
-    assert!(card.contains("LiteLLM snapshot"), "snapshot disclosure label missing");
+    assert!(
+        card.contains("LiteLLM snapshot"),
+        "snapshot disclosure label missing"
+    );
     let axis_only: String = card
         .lines()
         .filter(|l| !l.contains("LiteLLM snapshot"))
