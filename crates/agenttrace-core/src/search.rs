@@ -1,3 +1,4 @@
+use crate::parser::{decode_zstd_rollout_bounded, is_zstd_compressed};
 use crate::reports::{json_float, json_string};
 use crate::{
     canonical_sessions, format_cost, format_tokens, highest_authority_for_metrics, round4,
@@ -32,6 +33,9 @@ pub struct TranscriptScanSummary {
     pub skipped_oversized: usize,
     pub skipped_non_file: usize,
     pub skipped_budget: usize,
+    /// rm-1889: files with zstd content whose frames the shared decoder
+    /// refused — skipped by name, never scanned-as-text.
+    pub skipped_zstd: usize,
     pub file_byte_cap: u64,
     pub total_byte_budget: u64,
 }
@@ -47,6 +51,7 @@ impl TranscriptScanSummary {
             skipped_oversized: 0,
             skipped_non_file: 0,
             skipped_budget: 0,
+            skipped_zstd: 0,
             file_byte_cap,
             total_byte_budget,
         }
@@ -68,6 +73,7 @@ impl TranscriptScanSummary {
             ("over byte cap", self.skipped_oversized),
             ("non-file", self.skipped_non_file),
             ("read budget exhausted", self.skipped_budget),
+            ("zstd undecodable", self.skipped_zstd),
         ] {
             if count > 0 {
                 parts.push(format!("{count} skipped: {label}"));
@@ -87,6 +93,19 @@ impl TranscriptScanSummary {
 pub struct SearchReport {
     pub results: Vec<SearchResult>,
     pub scan: TranscriptScanSummary,
+    /// rm-011 search arm (satisfied through the rm-1890 consolidation):
+    /// evidence items across the RETURNED rows — `count` counts rows,
+    /// this counts matches, so a truncated report still tells the
+    /// consumer how much evidence the visible rows carry.
+    pub total_matches: usize,
+    /// rm-011/rm-1890: the result-limit break stopped the scan with
+    /// candidate sessions still unexamined — this report is NOT the
+    /// whole corpus, and it says so.
+    pub truncated: bool,
+    /// rm-1890: candidate sessions in the canonical corpus the scan ran
+    /// over (considered-vs-total: `scan.files_considered` may be smaller
+    /// after a limit break or a budget stop).
+    pub candidates: usize,
 }
 
 pub fn search_sessions(sessions: &[Session], query: &str, limit: usize) -> Vec<SearchResult> {
@@ -115,6 +134,11 @@ pub fn search_sessions_detailed(
 ) -> SearchReport {
     let query = query.trim().to_ascii_lowercase();
     let mut scan = TranscriptScanSummary::new(file_byte_cap, total_byte_budget);
+    // rm-1890: candidates is the canonical-corpus size the scan RUNS over,
+    // captured before any early exit so every report arm (including the
+    // blank-query one below) can express considered-vs-total.
+    let canonical = canonical_sessions(sessions);
+    let candidates = canonical.len();
     if query.is_empty() {
         // A blank query matches nothing, so the CLI rejects it loudly
         // before ever calling this (agenttrace-cli main.rs, the landed
@@ -129,13 +153,16 @@ pub fn search_sessions_detailed(
         return SearchReport {
             results: Vec::new(),
             scan,
+            total_matches: 0,
+            truncated: false,
+            candidates,
         };
     }
     let mut results = Vec::new();
     let mut budget_left = total_byte_budget;
 
-    for session in canonical_sessions(sessions) {
-        let mut matches = search_session_evidence(&session, &query);
+    for session in &canonical {
+        let mut matches = search_session_evidence(session, &query);
         let (transcript_matches, transcript_scan) = transcript_evidence(
             &session.path,
             &query,
@@ -161,7 +188,7 @@ pub fn search_sessions_detailed(
             model: session.metrics.model_used.clone(),
             health: session.health,
             cost: round4(session.metrics.cost_estimated),
-            tokens: total_tokens(&session),
+            tokens: total_tokens(session),
             matches,
             transcript_scan,
         });
@@ -169,8 +196,20 @@ pub fn search_sessions_detailed(
             break;
         }
     }
-
-    SearchReport { results, scan }
+    // rm-011/rm-1890: a limit break with candidates left unexamined is a
+    // TRUNCATED search — the scan did not finish the corpus, and the
+    // report says so instead of rendering shape-identical to an
+    // exhaustive one. Reaching the limit on the LAST candidate is not
+    // truncation (nothing was left unexamined).
+    let truncated = results.len() >= limit && scan.files_considered < candidates;
+    let total_matches: usize = results.iter().map(|result| result.matches.len()).sum();
+    SearchReport {
+        results,
+        scan,
+        total_matches,
+        truncated,
+        candidates,
+    }
 }
 
 pub fn report_search_json(results: &[SearchResult]) -> String {
@@ -231,8 +270,13 @@ fn write_search_results_json_inner(
             // one key after it, so the array needs its comma back.
             out.pop();
             out.push_str(",\n");
+            // rm-1890: the per-row status string carries its OWN key —
+            // `transcript_scan` names exactly one shape at one level (the
+            // top-level summary object). The pre-1890 detailed lane emitted
+            // the same key as both a row string and an object, so a JSON
+            // consumer could never tell which shape comes next.
             out.push_str(&format!(
-                "      \"transcript_scan\": {}\n",
+                "      \"transcript_scan_status\": {}\n",
                 json_string(&result.transcript_scan)
             ));
         }
@@ -303,6 +347,13 @@ pub fn report_search_json_detailed(report: &SearchReport) -> String {
     let mut out = String::new();
     out.push_str("{\n");
     out.push_str(&format!("  \"count\": {},\n", results.len()));
+    // rm-011 search arm (via rm-1890): truncation disclosure sits at the
+    // top of the object — `count` alone cannot distinguish a complete
+    // scan from a --search-limit break.
+    out.push_str(&format!(
+        "  \"total_matches\": {},\n  \"truncated\": {},\n  \"candidates\": {},\n",
+        report.total_matches, report.truncated, report.candidates
+    ));
     out.push_str("  \"results\": ");
     if results.is_empty() {
         out.push_str("[],\n");
@@ -332,6 +383,7 @@ fn write_transcript_summary_json(out: &mut String, scan: &TranscriptScanSummary)
         ("skipped_oversized", scan.skipped_oversized.to_string()),
         ("skipped_non_file", scan.skipped_non_file.to_string()),
         ("skipped_budget", scan.skipped_budget.to_string()),
+        ("skipped_zstd", scan.skipped_zstd.to_string()),
         ("file_byte_cap", scan.file_byte_cap.to_string()),
         ("total_byte_budget", scan.total_byte_budget.to_string()),
     ];
@@ -352,6 +404,17 @@ pub fn report_search_text_detailed(report: &SearchReport, query: &str) -> String
     if let Some(summary) = report.scan.describe() {
         out.push('\n');
         out.push_str(&summary);
+        out.push('\n');
+    }
+    if report.truncated {
+        // rm-011/rm-1890: considered-vs-total in the text lane — a user
+        // must be able to tell a truncated search from an exhaustive one
+        // without switching to JSON. Numbers only; nothing to sanitize.
+        out.push('\n');
+        out.push_str(&format!(
+            "Search truncated: {} of {} candidate sessions considered before the result limit; {} matching session(s) returned. Raise --search-limit to scan the rest of the corpus.",
+            report.scan.files_considered, report.candidates, report.results.len()
+        ));
         out.push('\n');
     }
     out
@@ -536,12 +599,53 @@ fn transcript_evidence(
         return (Vec::new(), "skipped: unreadable".to_string());
     }
     let read = bytes.len() as u64;
-    *budget_left -= read;
-    scan.scanned_files += 1;
-    scan.scanned_bytes += read;
+    // rm-1889 (run a00b9cf80d99 cycle 1): the parser admits zstd content
+    // by magic sniff under ANY filename (Codex ≥0.152 rollouts, but a
+    // zstd stream under a plain .jsonl name parses today too), so this
+    // lane can legitimately be handed compressed bytes. The pre-1889 arm
+    // lossy-decoded them as text: the needle was invisible and the
+    // disclosure billed compressed units as "scanned". Reuse the
+    // parser's own bounded decoder — one decode lane, one 64 MiB cap,
+    // one refusal wording (the rm-402 discipline) — then search the
+    // DECODED content and bill the decoded size to the budget.
+    let (content, status) = if is_zstd_compressed(&bytes) {
+        let decoded = match decode_zstd_rollout_bounded(bytes, path) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                scan.skipped_zstd += 1;
+                return (Vec::new(), format!("skipped: zstd undecodable ({err})"));
+            }
+        };
+        let decoded_len = decoded.len() as u64;
+        // Budget truth (rm-1889): the corpus budget is spent on the bytes
+        // actually searched — the DECODED size, never the compressed
+        // on-disk size. The decode itself stays bounded by the shared
+        // ZSTD_ROLLOUT_DECODE_MAX_BYTES cap, so this check cannot be
+        // blown past by a decompression bomb.
+        if decoded_len > *budget_left {
+            scan.skipped_budget += 1;
+            return (Vec::new(), "skipped: read budget exhausted".to_string());
+        }
+        *budget_left -= decoded_len;
+        scan.scanned_files += 1;
+        scan.scanned_bytes += decoded_len;
+        (
+            String::from_utf8_lossy(&decoded).into_owned(),
+            format!(
+                "scanned ({decoded_len} bytes; zstd decoded to {decoded_len} bytes from {read} on disk)"
+            ),
+        )
+    } else {
+        *budget_left -= read;
+        scan.scanned_files += 1;
+        scan.scanned_bytes += read;
+        (
+            String::from_utf8_lossy(&bytes).into_owned(),
+            format!("scanned ({read} bytes)"),
+        )
+    };
 
     // Lossy decode: a torn multibyte tail must not abort the scan.
-    let content = String::from_utf8_lossy(&bytes);
     let mut out = Vec::new();
     for line in content.lines() {
         if out.len() >= TRANSCRIPT_MATCHES_PER_SESSION {
@@ -551,7 +655,7 @@ fn transcript_evidence(
             out.push(format!("transcript: {snippet}"));
         }
     }
-    (out, format!("scanned ({read} bytes)"))
+    (out, status)
 }
 
 /// A `…window…` snippet centered on the first case-insensitive hit of

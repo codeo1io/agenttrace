@@ -86,9 +86,14 @@ fn metadata_lanes_stay_verbatim_and_detailed_reports_the_scan() {
         .unwrap_or_else(|err| panic!("detailed search JSON must parse: {err}\n{json}"));
     assert_eq!(parsed["count"], serde_json::json!(1));
     assert_eq!(
-        parsed["results"][0]["transcript_scan"],
+        parsed["results"][0]["transcript_scan_status"],
         serde_json::json!("scanned (431 bytes)")
     );
+    // rm-1890: `transcript_scan` names exactly ONE shape at ONE level —
+    // the top-level summary object. The per-row status string carries its
+    // own key, so a JSON consumer can never meet the same key as two
+    // types (the pre-1890 detailed lane emitted both).
+    assert!(parsed["results"][0].get("transcript_scan").is_none());
     assert_eq!(
         parsed["transcript_scan"]["skipped_oversized"],
         serde_json::json!(0)
@@ -166,6 +171,155 @@ fn missing_and_non_file_paths_disclose_not_panic() {
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].transcript_scan, "skipped: non-file path");
     assert_eq!(report.scan.skipped_non_file, 1);
+}
+
+/// rm-1889 (run a00b9cf80d99 cycle 1): the parser admits zstd content by
+/// magic sniff under ANY filename (Codex ≥0.152 rollouts; also reachable
+/// as .jsonl-named frames), but the transcript re-read lane scanned the
+/// RAW bytes: compressed bytes were lossy-decoded as text, the needle was
+/// invisible, and the disclosure billed compressed units as "scanned".
+#[test]
+fn zstd_content_is_decoded_and_searched_truthfully() {
+    let session =
+        parse_file(&fixture("body-only-zst.jsonl")).expect("zst fixture parses (magic sniff)");
+    let on_disk = std::fs::metadata(fixture("body-only-zst.jsonl"))
+        .unwrap()
+        .len();
+    assert!(
+        on_disk < 431,
+        "fixture hygiene: compressed {on_disk} must be smaller"
+    );
+    let report = search_sessions_detailed(
+        &[session],
+        "zygomorphic",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+    );
+    assert_eq!(
+        report.results.len(),
+        1,
+        "body-only query inside a zstd-content session must hit (rm-1889 red-first)"
+    );
+    assert!(
+        report.results[0]
+            .matches
+            .iter()
+            .any(|m| m.starts_with("transcript: ")),
+        "evidence must cite the DECODED transcript content, got {:?}",
+        report.results[0].matches
+    );
+    assert_eq!(report.scan.scanned_files, 1);
+    assert_eq!(report.scan.skipped_zstd, 0);
+    assert_eq!(
+        report.scan.scanned_bytes, 431,
+        "scanned_bytes must count the DECODED content actually searched, not the {} compressed bytes on disk",
+        on_disk
+    );
+    assert!(
+        report.results[0]
+            .transcript_scan
+            .contains("zstd decoded to 431 bytes"),
+        "the row must disclose the decode, got {:?}",
+        report.results[0].transcript_scan
+    );
+    let text = agenttrace_core::report_search_text_detailed(&report, "zygomorphic");
+    assert!(text.contains("1 file(s) scanned (431 bytes)"));
+}
+
+/// rm-1889 skip arm: a file with the zstd magic whose frames will not
+/// decode is skipped with a NAMED counter — never scanned-as-text and
+/// never silently billed as searched content.
+#[test]
+fn undecodable_zstd_content_is_skipped_and_disclosed() {
+    let session = parse_file(&fixture("body-only.jsonl")).expect("fixture parses");
+    let mut corrupt = session;
+    corrupt.path = fixture("corrupt-zst.jsonl").to_string_lossy().into_owned();
+    // "innocuous" is a metadata (name) hit, so the row still appears —
+    // carrying the truthful skip status.
+    let report = search_sessions_detailed(&[corrupt], "innocuous", 20, 1 << 20, 1 << 20);
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.scan.files_considered, 1);
+    assert_eq!(
+        report.scan.skipped_zstd, 1,
+        "decode refusal must be counted"
+    );
+    assert_eq!(report.scan.scanned_files, 0, "nothing was searched");
+    assert_eq!(
+        report.scan.scanned_bytes, 0,
+        "no bytes may be billed as scanned"
+    );
+    assert!(
+        report.results[0]
+            .transcript_scan
+            .starts_with("skipped: zstd undecodable"),
+        "row must disclose the decode refusal, got {:?}",
+        report.results[0].transcript_scan
+    );
+    let text = agenttrace_core::report_search_text_detailed(&report, "innocuous");
+    assert!(text.contains("1 skipped: zstd undecodable"));
+    let json = agenttrace_core::report_search_json_detailed(&report);
+    assert!(json.contains("\"skipped_zstd\": 1"));
+}
+
+/// rm-011 search arm (via rm-1890, run a00b9cf80d99): a --search-limit
+/// break stops the scan mid-corpus, and that truncation must be
+/// DISCLOSED — considered-vs-total candidates in text, and
+/// total_matches/truncated/candidates fields in the detailed JSON.
+#[test]
+fn limit_truncation_is_disclosed_in_text_and_json() {
+    let first = parse_file(&fixture("body-only.jsonl")).expect("fixture parses");
+    let second = parse_file(&fixture("body-only-2.jsonl")).expect("fixture parses");
+    let exhaustive = search_sessions_detailed(
+        &[first.clone(), second.clone()],
+        "zygomorphic",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+    );
+    assert_eq!(
+        exhaustive.results.len(),
+        2,
+        "both fixtures match the needle"
+    );
+    assert!(!exhaustive.truncated);
+    assert_eq!(exhaustive.candidates, 2);
+
+    let report = search_sessions_detailed(
+        &[first, second],
+        "zygomorphic",
+        1,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+    );
+    assert_eq!(report.results.len(), 1);
+    assert!(report.truncated, "the limit break must be flagged");
+    assert_eq!(report.candidates, 2);
+    assert_eq!(
+        report.scan.files_considered, 1,
+        "one candidate examined before the break"
+    );
+    assert_eq!(
+        report.total_matches,
+        report.results[0].matches.len(),
+        "total_matches is the evidence-item count across returned rows"
+    );
+    let json = agenttrace_core::report_search_json_detailed(&report);
+    let parsed: serde_json::Value = serde_json::from_str(&json)
+        .unwrap_or_else(|err| panic!("detailed search JSON must parse: {err}\n{json}"));
+    assert_eq!(parsed["truncated"], serde_json::json!(true));
+    assert_eq!(parsed["candidates"], serde_json::json!(2));
+    assert_eq!(parsed["count"], serde_json::json!(1));
+    assert_eq!(
+        parsed["total_matches"],
+        serde_json::json!(report.results[0].matches.len())
+    );
+    let text = agenttrace_core::report_search_text_detailed(&report, "zygomorphic");
+    assert!(
+        text.contains("truncated"),
+        "the text lane must say the scan stopped early, got:\n{text}"
+    );
+    assert!(text.contains("1 of 2 candidate sessions"));
 }
 
 #[test]

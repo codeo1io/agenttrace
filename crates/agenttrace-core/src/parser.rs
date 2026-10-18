@@ -55,7 +55,7 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
     // may carry CONCATENATED frames (Codex appends by materializing and
     // re-encoding; upstream's own reader tolerates them), so the decode
     // runs to true EOF, never just the first frame (rm-1516).
-    let raw = if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+    let raw = if is_zstd_compressed(&raw) {
         decode_zstd_rollout_bounded(raw, label)?
     } else {
         raw
@@ -109,6 +109,14 @@ fn zstd_decode_cap_label() -> String {
 /// one decode lane, one cap, one refusal wording (and therefore the same
 /// multi-frame truth: a concatenated rollout parses and fingerprints as
 /// the whole journal on both lanes).
+/// rm-1889: the zstd magic sniff is ONE lane shared by the parser and the
+/// `--search` transcript re-read arm (`search::transcript_evidence`), so
+/// admission and search can never disagree about what counts as
+/// compressed content — a file the parser decodes is a file search decodes.
+pub(crate) fn is_zstd_compressed(raw: &[u8]) -> bool {
+    raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD])
+}
+
 pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
     let total_len = raw.len();

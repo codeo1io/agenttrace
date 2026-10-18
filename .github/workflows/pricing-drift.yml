@@ -75,6 +75,19 @@ jobs:
             echo "mode=bump" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Set up Rust (SVG golden regen gate)
+        if: steps.gate.outputs.mode == 'bump'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          # rm-1888: the bump path now regenerates the SVG card goldens
+          # (svg_card_contract byte-pins demo-{auto,dark,light}.svg, whose
+          # bytes embed the snapshot date + priced-model counts), which
+          # needs a Rust toolchain on the runner. Pinned + versioned
+          # exactly like ci.yml's own Set up Rust step (rm-173: the
+          # rust-toolchain.toml file governs every cargo step; this input
+          # must name the same version).
+          toolchain: "1.98.1"
+
       - name: Regenerate bundle, bump const, open PR
         if: steps.gate.outputs.mode == 'bump'
         env:
@@ -114,8 +127,18 @@ jobs:
             exit 1
           fi
 
-          git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs
-          git commit -m "chore(pricing): refresh bundled snapshot to $new_date (pricing-drift gate)"
+          # rm-1888: the snapshot refresh invalidates the SVG card goldens —
+          # svg_card_contract.rs byte-pins demo-{auto,dark,light}.svg whose
+          # bytes embed the snapshot date and the priced-model counts, so
+          # staging the snapshot pair alone left master's contract red after
+          # merge (the GITHUB_TOKEN PR below runs no CI, so the break only
+          # surfaced post-merge). Regenerate the goldens from the REFRESHED
+          # bundle: UPDATE_CARD_GOLDEN=1 rewrites them and the same run
+          # re-reads and asserts them — a green exit IS the workflow-local
+          # gate on the refreshed pair, before the commit exists.
+          UPDATE_CARD_GOLDEN=1 cargo test --locked -p agenttrace-core --test svg_card_contract
+          git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs crates/agenttrace-core/tests/fixtures/svg-card/
+          git commit -m "chore(pricing): refresh bundled snapshot to $new_date + SVG card goldens (pricing-drift gate)"
 
           counts="$(grep -E 'costed-chat models' refresh-check.txt | tr -s ' ' | tr '\n' ';')"
           {
@@ -130,6 +153,7 @@ jobs:
             cat refresh-check.txt
             echo '```'
             echo "Snapshot date: **$new_date**. $counts"
+            echo "SVG card goldens regenerated from the refreshed bundle; svg_card_contract green on the refreshed pair (workflow-local gate, rm-1888)."
             echo
             echo "Note: PRs authored by the default GITHUB_TOKEN do not trigger CI workflows (GitHub limitation); the post-regeneration gate run above is the validation artifact. Removal guard and desync paths never reach this step — they fail the workflow instead."
           } > pr-body.md
