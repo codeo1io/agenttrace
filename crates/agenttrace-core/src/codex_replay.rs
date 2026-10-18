@@ -58,7 +58,7 @@
 //!   identity is content-based, so a zstd parent and an uncompressed
 //!   child of the same rollout still tie (integration case 4404ce94).
 
-use crate::{lookup_price_tiered, round4, Metrics, Session};
+use crate::{lookup_priced_at, round4, Metrics, Session};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -259,7 +259,14 @@ fn scan_rollout(path: &Path) -> RolloutScan {
 /// `reasoning` is a breakdown of `output` on this wire — rm-603 — so it
 /// carries no separate term, exactly like the canonical formula).
 fn rebase_cost(metrics: &Metrics, uncached_input: i64, rebased: &TotalSnapshot) -> f64 {
-    let price = lookup_price_tiered(&metrics.model_used, metrics.service_tier.as_deref());
+    let price = lookup_priced_at(
+        &metrics.model_used,
+        metrics.service_tier.as_deref(),
+        // rm-1965: price the rollout at the rate live when it ran — the
+        // child rollout's own first event timestamp, not `now()`.
+        metrics.timestamps.first().copied(),
+    )
+    .price;
     // rm-1508 seam at the 2026-10-17 integration (case 7f566ee8): this
     // master-side replay formula was written when cw/cr were plain f64;
     // the landed absence-preserving catalog made them Option, so an

@@ -336,7 +336,14 @@ fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
         .max(0);
     // rm-610: the unpriced-input cost must bill the tier the session
     // ran on (a flex session's wasted input costs the flex input rate).
-    let price = pricing::lookup_price_tiered(&metrics.model_used, metrics.service_tier.as_deref());
+    // rm-1965: price at the rate live at session time (the session's
+    // earliest event), never `now()` — same basis as `cost_estimated`.
+    let price = pricing::lookup_priced_at(
+        &metrics.model_used,
+        metrics.service_tier.as_deref(),
+        metrics.timestamps.first().copied(),
+    )
+    .price;
     let wasted_cost = round4(wasted_tokens as f64 / 1e6 * price.input);
     let (rating, suggestion) = if hit_rate >= 80.0 {
         (

@@ -904,10 +904,13 @@ fn priced_event_cost(event: &Event, session_model: &str) -> Option<f64> {
     if input == 0 && output == 0 {
         return None;
     }
+    // rm-1965: price the event at the rate live when the event ran — never
+    // the newest known rate for a pre-edit session.
+    let at = crate::parse_ts(&event.timestamp);
     let price = if event.model_used.is_empty() || event.model_used == "unknown" {
-        crate::pricing::lookup_price(session_model)
+        crate::pricing::lookup_priced_at(session_model, None, at).price
     } else {
-        crate::pricing::lookup_price(&event.model_used)
+        crate::pricing::lookup_priced_at(&event.model_used, None, at).price
     };
     let calls = event.tool_calls.len().max(1) as f64;
     Some(

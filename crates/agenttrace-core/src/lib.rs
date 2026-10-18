@@ -67,9 +67,10 @@ pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
     cache_rate_census, catalog_identity, has_specific_price, list_pricing, lookup_context_window,
-    lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source, pricing_source_for,
-    provider_for, render_model_pricing_list, render_test_match, update_pricing, CacheRateCensus,
-    Price,
+    lookup_price, lookup_price_tiered, lookup_priced_at, pricing_cache_path, pricing_source,
+    pricing_source_for, provider_for, rate_basis_against_session, rate_history_rows,
+    render_model_pricing_list,
+    render_test_match, update_pricing, CacheRateCensus, Price, PricedAt, RateBasis, RateBasisArm,
 };
 pub use reports::{
     add_baseline_comparison, guard_formula_json_leaves, report_compare, report_compare_json,
@@ -655,6 +656,23 @@ pub struct Metrics {
     pub naive_utc_stamps: usize,
     pub duration_sec: f64,
     pub cost_estimated: f64,
+    /// rm-1965: effective date (YYYY-MM-DD) of the rate row that priced this
+    /// session's `cost_estimated` — the bundled-snapshot date, or a dated
+    /// rate-history row when an edit superseded the bundled rate before the
+    /// session ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_date: Option<String>,
+    /// rm-1965: how that rate row relates to the session — `at_session`, or
+    /// `newer_than_session` when the estimate used a rate that postdates the
+    /// session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_basis: Option<String>,
+    /// rm-1965: source label of the rate row that priced this session —
+    /// the catalog/source label (see `pricing_source_for`), or the
+    /// observed rate-history provenance when a dated state superseded
+    /// the bundled rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_source: Option<String>,
     /// rm-485: session-wide cost-only credit total (USD), folded from meta
     /// events with max semantics. Zero for every non-credit adapter, so the
     /// field stays out of their serialized output.
@@ -1605,9 +1623,22 @@ pub(crate) const PER_BLOCK_PRICING_MARKER: &str = "priced per usage block";
 const IMPLAUSIBLE_TOKEN_MAGNITUDE: i64 = 1_000_000_000_000;
 
 pub fn analyze(events: &[Event], model: &str) -> Metrics {
-    let price = pricing::lookup_price(model);
+    // rm-1965: price the session at the rate live at session time — the
+    // earliest event timestamp, never `now()` — and disclose the basis.
+    let session_ts = events.iter().filter_map(|event| parse_ts(&event.timestamp)).min();
+    let priced_at = pricing::lookup_priced_at(model, None, session_ts);
+    let price = priced_at.price;
     let mut metrics = Metrics {
         model_used: model.to_string(),
+        rate_date: Some(priced_at.basis.rate_date.clone()),
+        rate_basis: Some(
+            match priced_at.basis.basis {
+                pricing::RateBasisArm::AtSession => "at_session",
+                pricing::RateBasisArm::NewerThanSession => "newer_than_session",
+            }
+            .to_string(),
+        ),
+        rate_source: Some(priced_at.basis.rate_source.clone()),
         tool_usage: BTreeMap::new(),
         file_usage: BTreeMap::new(),
         tool_arg_usage: BTreeMap::new(),
@@ -1970,7 +2001,8 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         None
     };
     let catalog_price = match &session_service_tier {
-        Some(tier) => pricing::lookup_price_tiered(model, Some(tier.as_str())),
+        // rm-1965: the tier arm re-resolves at the session-time rate.
+        Some(tier) => pricing::lookup_priced_at(model, Some(tier.as_str()), session_ts).price,
         None => price.clone(),
     };
     // rm-610: record the billed tier on the metrics so every consumer
@@ -2091,7 +2123,8 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             catalog_price.clone()
         } else {
             // rm-610: mirror the tier the turn actually ran on.
-            pricing::lookup_price_tiered(&event.model_used, event.service_tier.as_deref())
+            pricing::lookup_priced_at(&event.model_used, event.service_tier.as_deref(), session_ts)
+                .price
         };
         // rm-1508: the counterfactual prices at the same fallback
         // rates real billing would use, but does NOT fire the
@@ -2203,7 +2236,12 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             } else {
                 // rm-610: price the tier the turn actually ran on —
                 // flex-disclosing turns use the row's flex slots.
-                pricing::lookup_price_tiered(&event.model_used, event.service_tier.as_deref())
+                pricing::lookup_priced_at(
+                    &event.model_used,
+                    event.service_tier.as_deref(),
+                    session_ts,
+                )
+                .price
             };
             // rm-1508: per-block cache rates resolve with the same
             // absent-rate fallback as the session-rate arm, and the
