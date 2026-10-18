@@ -237,7 +237,11 @@ fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
     let mut seen = BTreeSet::new();
 
     if let Some(raw) = read_json_value(&dir.join("api_conversation_history.json")) {
-        if let Some(api_events) = parse_cline_value(&raw, &model) {
+        // rm-1984: the Roo task-dir lane keeps its task-metadata model
+        // as the session carrier and passes no manifest hint (Roo task
+        // dirs have no session.json); envelope modelInfo, when a future
+        // writer adds it, still wins per-message as contract truth.
+        if let Some(api_events) = parse_cline_value(&raw, &model, None) {
             for event in api_events {
                 append_cline_event(&mut events, &mut seen, event);
             }
@@ -721,7 +725,23 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         if let Some(events) = parse_kimi_value(&value) {
             return session_from_events(name, path, events);
         }
-        if let Some(events) = parse_cline_value(&value, "unknown") {
+        // rm-1984: Cline model attribution truth. Messages contract
+        // v1 (sdk/packages/core/docs/messages-contract-v1.md) requires
+        // modelInfo{id, provider} on every assistant message, and the
+        // `session.json` manifest beside every CLI transcript carries
+        // the session-wide model — but this lane hardcoded "unknown",
+        // so the whole Cline CLI store rendered model_used "default"
+        // and billed at fallback pricing (assess F2 PoC on a two-file
+        // corpus: unknown_models 2, fallback_pricing 2). The manifest
+        // is the fast path (manifest wins when present and non-empty);
+        // the envelope's own modelInfo is the fallback and the
+        // per-message truth; a manifest/envelope disagreement is
+        // disclosed, never silently resolved.
+        if let Some(events) = parse_cline_value(
+            &value,
+            "unknown",
+            cline_manifest_model(path).as_deref(),
+        ) {
             return session_from_events(name, path, events);
         }
         if let Some(events) = parse_messages_value(&value, "codex_cli") {
@@ -7621,7 +7641,11 @@ fn path_slash(path: &Path) -> String {
         .join("/")
 }
 
-fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
+fn parse_cline_value(
+    value: &Value,
+    model: &str,
+    manifest_model: Option<&str>,
+) -> Option<Vec<Event>> {
     let messages = match value {
         Value::Array(items) => items.as_slice(),
         Value::Object(obj) => obj
@@ -7633,6 +7657,41 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
         _ => return None,
     };
     let mut events = Vec::new();
+    // rm-1984: model attribution truth. Messages contract v1 requires
+    // modelInfo{id, provider} on every assistant message (the terminal
+    // assistant message of a turn is the authoritative attribution row,
+    // and retry semantics keep the newest row the freshest word, so the
+    // pre-scan keeps the LAST non-empty id). Resolution ladder for the
+    // session-level model: the `session.json` manifest (the fast path —
+    // one sibling read, no per-message walk) wins when present and
+    // non-empty; the envelope's terminal modelInfo.id is the fallback;
+    // the caller's default ("unknown" on the CLI store lane, task
+    // metadata on the Roo lane) is the last resort. Per-message events
+    // still prefer that message's own modelInfo — the per-turn truth.
+    let mut envelope_model: Option<String> = None;
+    let mut envelope_provider: Option<String> = None;
+    for message in messages {
+        let Some(object) = message.as_object() else {
+            continue;
+        };
+        let Some((id, provider)) = cline_modelinfo(object) else {
+            continue;
+        };
+        envelope_model = Some(id);
+        envelope_provider = provider;
+    }
+    let manifest_model = manifest_model.filter(|model| !model.trim().is_empty());
+    let resolved = match (&manifest_model, &envelope_model) {
+        (Some(manifest), _) => (*manifest).to_string(),
+        (None, Some(envelope)) => envelope.clone(),
+        (None, None) => model.to_string(),
+    };
+    // A manifest/envelope disagreement is a disclosed fact about the
+    // journal, never a silent pick — see the mint below.
+    let manifest_envelope_disagreement = match (&manifest_model, &envelope_model) {
+        (Some(manifest), Some(envelope)) => manifest != envelope,
+        _ => false,
+    };
     // rm-1881: the Cline CLI `.messages.json` envelope (messages
     // contract v1) carries usage as a `metrics` sibling on terminal
     // assistant messages — and this role/content walk is the ONLY lane
@@ -7667,9 +7726,15 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
             // carrier).
             usage_state.carriers += 1;
         }
+        // rm-1984: per-message attribution prefers the message's own
+        // modelInfo.id; messages without one (user rows never carry it
+        // per contract) take the session-level resolution above.
+        let message_model = cline_modelinfo(message)
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| resolved.clone());
         let before = events.len();
         if let Some(content) = message.get("content") {
-            cline_content_events(&role, &ts, model, content, &mut events);
+            cline_content_events(&role, &ts, &message_model, content, &mut events);
         }
         if events.len() == before {
             let text = string(message.get("text"))
@@ -7680,7 +7745,7 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
                     role,
                     content: text.to_string(),
                     timestamp: ts,
-                    model_used: model.to_string(),
+                    model_used: message_model.clone(),
                     source_tool: "cline".to_string(),
                     ..Event::default()
                 });
@@ -7693,10 +7758,73 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
     // provenance flips to reported_by_agent downstream. A metrics-free
     // envelope takes none of this path (carriers == 0 gates the event)
     // and renders byte-identically to the pre-rm-1881 walk.
-    if let Some(event) = cline_usage_event(&usage_state, model) {
+    if let Some(event) = cline_usage_event(
+        &usage_state,
+        &resolved,
+        envelope_provider.as_deref(),
+    ) {
         events.push(event);
     }
+    if manifest_envelope_disagreement {
+        // Ride the non-loss disclosure channel on the last event (the
+        // usage event when carriers folded, else the terminal content
+        // event) — analyze() folds event counters into session
+        // metrics, so the mint survives every render path.
+        if let Some(event) = events.last_mut() {
+            *event
+                .disclosure_counters
+                .entry("cline_manifest_model_disagreement".to_string())
+                .or_insert(0) += 1;
+        }
+    }
     non_empty(events)
+}
+
+/// rm-1984: messages contract v1's per-message model identity —
+/// modelInfo{id, provider} is REQUIRED on every assistant message
+/// (user rows never carry it). Returns the pair only when the id is
+/// present and non-empty; an absent or whitespace id attributes
+/// nothing. The provider is provenance, not attribution: it names the
+/// LLM vendor ("anthropic" in the upstream golden fixture), unlike
+/// the manifest's provider fields which name the CLI app itself.
+fn cline_modelinfo(message: &serde_json::Map<String, Value>) -> Option<(String, Option<String>)> {
+    let info = message.get("modelInfo")?;
+    let id = string(info.get("id"))?.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let provider = string(info.get("provider"))
+        .map(|provider| provider.trim().to_string())
+        .filter(|provider| !provider.is_empty());
+    Some((id, provider))
+}
+
+/// rm-1984: the `session.json` manifest messages contract v1 writes
+/// beside every Cline CLI transcript (`~/.cline/data/sessions/<id>/
+/// <id>.messages.json` + `session.json`) carries the session-wide
+/// model identity: top-level `model`, with `metadata.model` as the
+/// documented mirror (the upstream fixture ships both, equal). The
+/// manifest's provider fields name the CLI app itself ("cline" in the
+/// upstream fixture), never the LLM vendor, so they never feed
+/// pricing attribution — vendor provenance comes from the envelope's
+/// modelInfo.provider. A missing, malformed, or silent manifest
+/// degrades to None: attribution falls back to the envelope's
+/// modelInfo, never to a synthesized value.
+fn cline_manifest_model(transcript_path: &str) -> Option<String> {
+    let parent = Path::new(transcript_path).parent()?.join("session.json");
+    let manifest = read_json_value(&parent)?;
+    let object = manifest.as_object()?;
+    for candidate in [
+        object.get("model"),
+        object
+            .get("metadata")
+            .and_then(|metadata| metadata.get("model")),
+    ] {
+        if let Some(model) = string(candidate).map(str::trim).filter(|model| !model.is_empty()) {
+            return Some(model.to_string());
+        }
+    }
+    None
 }
 
 fn cline_content_events(
@@ -8108,7 +8236,11 @@ fn cline_absorb_carrier(state: &mut ClineUsageState, carrier: ClineCarrier, ts: 
 /// native-lane pattern analyze() folds (pi `recorded_cost_usd`
 /// precedent) — appended after the text stream so text events are
 /// additive-untouched.
-fn cline_usage_event(state: &ClineUsageState, model: &str) -> Option<Event> {
+fn cline_usage_event(
+    state: &ClineUsageState,
+    model: &str,
+    provider: Option<&str>,
+) -> Option<Event> {
     if state.carriers == 0 {
         return None;
     }
@@ -8135,6 +8267,15 @@ fn cline_usage_event(state: &ClineUsageState, model: &str) -> Option<Event> {
         wire_metadata.insert(
             "cline_reported_cost_usd_sum".to_string(),
             format!("{:.6}", state.reported_cost),
+        );
+    }
+    if let Some(provider) = provider {
+        // rm-1984: the envelope's modelInfo.provider names the LLM
+        // vendor — ride it as provenance through the same bounded
+        // wire-metadata path as the cost sum.
+        wire_metadata.insert(
+            "cline_modelinfo_provider".to_string(),
+            capped_disclosure_value(provider),
         );
     }
     Some(Event {
@@ -9253,7 +9394,7 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
             ..Event::default()
         });
     }
-    if let Some(event) = cline_usage_event(&usage_state, model) {
+    if let Some(event) = cline_usage_event(&usage_state, model, None) {
         events.push(event);
     }
     events

@@ -1103,6 +1103,7 @@ fn walk_session_files_cached(
             items,
             visited,
             file_targets,
+            cline_manifestless,
         );
     }
 }
@@ -1467,15 +1468,30 @@ fn is_cline_cli_session_file(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
         return false;
     };
-    let Some(dir_name) = parent.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    if path.file_name().and_then(|name| name.to_str())
-        != Some(format!("{dir_name}.messages.json").as_str())
-    {
+    if !is_cline_cli_transcript_name(path) {
         return false;
     }
     parent.join("session.json").is_file()
+}
+
+/// rm-1435: the transcript-shaped name half of the Cline CLI
+/// admission gate — the file must be named exactly
+/// `<dirName>.messages.json` (the session-id stem matching its
+/// session dir, per messages contract v1's
+/// `<sessionId>/<sessionId>.messages.json` layout). Split out so the
+/// walk can tell a refused TRANSCRIPT (worth counting for
+/// disclosure) from the manifest/hooks siblings it refuses alongside
+/// (not transcripts, not sessions, never counted).
+fn is_cline_cli_transcript_name(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(dir_name) = parent.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|file_name| file_name == format!("{dir_name}.messages.json"))
 }
 
 /// Whether a candidate path lives under the Cline CLI canonical store
