@@ -497,7 +497,15 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .cache_read
             .saturating_add(session.metrics.tokens_cache_r);
         row.tokens.total = row.tokens.total.saturating_add(total_tokens(session));
-        row.cost += session.metrics.cost_estimated;
+        // rm-1500 (cycle 5, run e4209f0c): governance rows fold cost_estimated;
+        // gate it like the lib.rs overview arms (the "every aggregate fold"
+        // acceptance named this row and it was missed). Poisoned sessions
+        // contribute 0.0 to the row and stay counted by overview.non_finite_costs.
+        row.cost += if session.metrics.cost_estimated.is_finite() {
+            session.metrics.cost_estimated
+        } else {
+            0.0
+        };
         // rm-520: carry each session's rm-436 recorded-cost basis into
         // the row so the drift comparison prices recorded classes
         // exactly once instead of re-estimating them at catalog rates.
@@ -741,10 +749,21 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             }
         })
         .collect::<Vec<_>>();
+    // rm-1500 (review b346cf8b fix round): the stored-side basis of the
+    // anomaly ratios is itself an aggregate fold — a poisoned session
+    // contributes 0.0 here instead of turning the audit totals (and every
+    // ratio downstream) into NaN; the session itself stays counted in its
+    // model-group row.
     let stored_estimated_cost_usd = round4(
         sessions
             .iter()
-            .map(|session| session.metrics.cost_estimated)
+            .map(|session| {
+                if session.metrics.cost_estimated.is_finite() {
+                    session.metrics.cost_estimated
+                } else {
+                    0.0
+                }
+            })
             .sum(),
     );
     let current_estimated_cost_usd = by_provider_model
@@ -1611,7 +1630,15 @@ fn add_context_session(aggregate: &mut ContextAggregate, session: &Session) {
     aggregate.output = aggregate
         .output
         .saturating_add(session.metrics.tokens_output);
-    aggregate.cost += session.metrics.cost_estimated;
+    // rm-1500 (review b346cf8b fix round): context aggregates are aggregate
+    // folds too — skip-while-counting like the lib.rs arms: a non-finite
+    // session still counts in aggregate.sessions (and the overview's
+    // non_finite_costs) but contributes 0.0 cost, keeping
+    // output_cost_per_million_tokens finite on the totals row and every
+    // project row.
+    if session.metrics.cost_estimated.is_finite() {
+        aggregate.cost += session.metrics.cost_estimated;
+    }
     aggregate.reads += session
         .metrics
         .tool_usage
@@ -1697,6 +1724,112 @@ mod tests {
             health: 80,
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn audit_totals_skip_non_finite_cost() {
+        // rm-1500 (review b346cf8b fix round): the audit-level stored-side
+        // basis — CostAudit.stored_estimated_cost_usd / total_estimated_cost —
+        // folded cost_estimated with a bare `.sum()`, so one poisoned session
+        // NaN'd the totals every per-model anomaly ratio is measured against,
+        // even though the per-model rows themselves were already gated.
+        let mut a = session("finite");
+        a.metrics.model_used = "gpt-x".to_string();
+        a.metrics.cost_estimated = 1.0;
+        let mut b = session("poisoned");
+        b.metrics.model_used = "gpt-x".to_string();
+        b.metrics.cost_estimated = f64::NAN;
+        let audit = cost_audit(&[a, b]);
+        assert!(
+            audit.stored_estimated_cost_usd.is_finite(),
+            "NaN poisoned the audit stored-side total: {}",
+            audit.stored_estimated_cost_usd
+        );
+        assert!(
+            audit.total_estimated_cost.is_finite(),
+            "NaN poisoned the audit total: {}",
+            audit.total_estimated_cost
+        );
+        assert_eq!(
+            audit.stored_estimated_cost_usd, 1.0,
+            "the finite member is folded, the NaN is not"
+        );
+    }
+
+    #[test]
+    fn context_aggregate_folds_skip_non_finite_cost() {
+        // rm-1500 (review b346cf8b fix round): add_context_session folded
+        // cost_estimated into ContextAggregate.cost ungated, so
+        // output_cost_per_million_tokens — the context-trends lane's only
+        // cost surface — went NaN on the totals row and every project row.
+        let mut a = session("finite");
+        a.metrics.cost_estimated = 1.0;
+        let mut b = session("poisoned");
+        b.metrics.cost_estimated = f64::NAN;
+        let trend = context_trends(&[a, b]);
+        assert_eq!(trend.totals.sessions, 2, "both sessions stay counted");
+        assert!(
+            trend.totals.output_cost_per_million_tokens.is_finite(),
+            "NaN poisoned the context-trend total: {}",
+            trend.totals.output_cost_per_million_tokens
+        );
+        for project in &trend.projects {
+            assert!(
+                project.output_cost_per_million_tokens.is_finite(),
+                "NaN poisoned the {} context row: {}",
+                project.project,
+                project.output_cost_per_million_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn stored_side_group_fold_skips_non_finite_cost() {
+        // rm-1500 (cycle 5 implement + review b346cf8b fix round): TWO
+        // sessions in the SAME model group, one poisoned — pins the
+        // implement-phase row gate (the cost_by_model fold) with a MIXED
+        // group, which the implement pin (a lone NaN in its own row) never
+        // exercised: only a sibling makes the fold actually sum against a
+        // non-finite member.
+        let mut a = session("finite");
+        a.metrics.model_used = "gpt-x".to_string();
+        a.metrics.cost_estimated = 1.0;
+        let mut b = session("poisoned");
+        b.metrics.model_used = "gpt-x".to_string();
+        b.metrics.cost_estimated = f64::NAN;
+        let audit = cost_audit(&[a, b]);
+        assert!(
+            !audit.by_provider_model.is_empty(),
+            "the gpt-x group must be represented"
+        );
+        for m in &audit.by_provider_model {
+            assert!(
+                m.stored_estimated_cost_usd.is_finite(),
+                "NaN poisoned the stored-side group fold: {}",
+                m.stored_estimated_cost_usd
+            );
+        }
+    }
+
+    #[test]
+    fn cost_by_model_folds_skip_non_finite_cost() {
+        // rm-1500 (cycle 5, run e4209f0c assess F2): cost_by_model folded
+        // cost_estimated without the finiteness gate the overview arms
+        // carry — one NaN journal poisoned the CSV models lane.
+        let mut poisoned = session("nan-cost");
+        poisoned.metrics.cost_estimated = f64::NAN;
+        poisoned.metrics.model_used = "poison-model".to_string();
+        let audit = cost_audit(&[poisoned]);
+        assert!(
+            !audit.by_provider_model.is_empty(),
+            "the poisoned session's model row must still exist (sessions counted)"
+        );
+        for m in &audit.by_provider_model {
+            assert!(
+                m.stored_estimated_cost_usd.is_finite(),
+                "non-finite cost leaked into the provider/model cost fold"
+            );
         }
     }
 

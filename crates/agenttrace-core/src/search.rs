@@ -135,6 +135,27 @@ pub fn search_sessions_detailed(
     let mut budget_left = total_byte_budget;
 
     for session in canonical_sessions(sessions) {
+        // rm-1515 (cycle 5, run e4209f0c assess F4): check the limit BEFORE
+        // pushing. The old push-then-break order admitted the first match at
+        // limit == 0 (a caller asking for NOTHING got one row) — the CLI
+        // hard-errors limit == 0 (main.rs rm-988 battery), so the exposed
+        // surface was every other caller: library consumers and any host
+        // surface that forwards a user-supplied limit verbatim. limit == 0
+        // now returns zero rows for the same reason
+        // the blank-query guard above returns zero: a caller asking for
+        // nothing must get nothing, never a wildcard-shaped single row.
+        // Integration seam (2026-10-18, conflict case 9cb8b4cc): this
+        // landing composes with the wall's rm-1415 rewrite (run 37101c74),
+        // which moved the loop into `search_sessions_detailed` behind the
+        // `search_sessions` wrapper with the same push-then-break order.
+        // The check sits at THIS loop's top — ahead of both the metadata
+        // evidence and the bounded transcript re-read, so a capped limit
+        // never spends the byte budget either — and the push-side break is
+        // gone: one check, checked first, on the single shared loop both
+        // callers reach.
+        if results.len() >= limit {
+            break;
+        }
         let mut matches = search_session_evidence(&session, &query);
         let (transcript_matches, transcript_scan) = transcript_evidence(
             &session.path,
@@ -165,9 +186,6 @@ pub fn search_sessions_detailed(
             matches,
             transcript_scan,
         });
-        if results.len() >= limit {
-            break;
-        }
     }
 
     SearchReport { results, scan }
@@ -714,6 +732,51 @@ mod tests {
                 "blank query {blank:?} must match nothing (not everything)"
             );
         }
+    }
+
+    /// rm-1515 (cycle 5, run e4209f0c assess F4): a limit of ZERO must
+    /// return ZERO rows. The old push-then-break order admitted the first
+    /// match before checking, so limit=0 yielded exactly 1 row — the CLI
+    /// rejects 0 (rm-988 battery), leaving library consumers and any host
+    /// surface that forwards a limit verbatim exposed.
+    /// Pinned red-first: the fixture matches a real query (so the zero below
+    /// is the guard, not a dead corpus), and limit=1 still returns exactly 1
+    /// to pin that the loop-top check did not over-truncate.
+    #[test]
+    fn limit_zero_returns_zero_rows_not_one() {
+        let session = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "01-healthy-ship".to_string(),
+            path: "demo://01-healthy-ship.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                source_tool: "pi".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let sessions = [session];
+
+        assert_eq!(
+            search_sessions(&sessions, "healthy", 20).len(),
+            1,
+            "the fixture must match a real query, or the zero below is vacuous"
+        );
+        assert_eq!(
+            search_sessions(&sessions, "healthy", 0).len(),
+            0,
+            "limit=0 asks for nothing; it must return nothing (was exactly 1)"
+        );
+        assert_eq!(
+            search_sessions(&sessions, "healthy", 1).len(),
+            1,
+            "limit=1 must still return exactly one row"
+        );
     }
 
     #[test]

@@ -4,6 +4,71 @@
 
 ### Added
 
+- Compressed codex rollouts (`.jsonl.zst`) are admitted by discovery and
+  decoded (rm-992, run e4209f0c cycle 5): upstream codex `migrate_rollouts`
+  compresses rollouts to `<name>.jsonl.zst` (compression stable-adjacent
+  since 0.163.0, published 2026-10-15 — `rollout/src/compression.rs`
+  `COMPRESSED_SUFFIX = ".zst"` with transparent readers on read). The
+  agenttrace parser has decoded zstd frames transparently by magic sniff
+  since the bounded decoder landed (the rm-1516 lane), but the discovery
+  walk rejected `.jsonl.zst` NAMES before the sniff ever ran, so a home
+  migrated by `codex migrate_rollouts` silently undercounted: a zst-only
+  home reported "No session files found" while identical bytes under a
+  plain `.jsonl` name parsed fine (assess PoC arms A/B/C on the wall
+  binary). `is_session_file_name` now admits the suffix; a frame that
+  fails to decode still lands in skipped_files with the existing honest
+  `zstd-compressed` error naming the `zstd -d` recipe. Pinned end to end
+  by `codex_compressed_rollout_is_admitted_by_name_and_decoded`
+  (discovery_contract) over a REAL zstd frame — `zstd -3` of the
+  codex-multiagent-v2 parent journal under a real upstream rollout name —
+  through admission, sniff, bounded decode, usage accounting, and codex
+  title naming (the decoded first user message).
+
+  Integration seam (2026-10-18, conflict case 9cb8b4cc, landing onto a
+  wall that had since integrated sibling discovery work — runs 75172040 /
+  4eeea891 / 77ca5de0 / fd0e91a2 / cd6782b46fb4 / e4bff731): the README
+  paragraph that still documented the boundary this row closes ("One
+  honest boundary: discovery scans admit `.jsonl`/`.json` file names
+  only… not yet by default scans", carried unchanged through the run's
+  base) is rewritten by this landing to state the admitted
+  `.jsonl.zst` name, so the documented contract matches the walk; the
+  wall's content-dedup (rm-1886), artifact-mirror exclusion (rm-1887)
+  and canonical-Cline-store (rm-1881) admission mirrors compose with
+  the new suffix unchanged — they key on bytes and paths, never on the
+  name filter's suffix list. Follow-up seam (2026-10-18, conflict case
+  8956373fb6584ce3b11a8afbcd8b2606): the admission also rides its own
+  `DIR_LISTING_WALK_VERSION` 6 → 7 rung — the dir-listing cache stores
+  only name-admitted files, so a listing written by a pre-admission
+  walk (any v6 listing) replays with no `.jsonl.zst` members and keeps
+  the new suffix invisible on warm caches; the rung retires every
+  stored listing once, the same re-walk-without-reparse shape the
+  Cline canonical-store admission used at 5 → 6, and no schema-side
+  rung rides it because per-file parse semantics are unchanged (the
+  parser already sniffed zstd magic by content).
+
+- The MCP server emits the result members the 2026-07-28 revision requires
+  (rm-455, run e4209f0c cycle 5): the server advertises and negotiates
+  2026-07-28 first (rm-780) but its results carried none of that revision's
+  required members — `resultType` is REQUIRED on every result (the `Result`
+  base interface, SEP-2322; clients of older servers must treat absence as
+  `"complete"`) and the CacheableResult pair (SEP-2549) is REQUIRED on
+  `tools/list`. Every result now carries `resultType: "complete"`,
+  inserted at the single serialization seam (a read-only reporting server
+  never enters the multi-round-trip `input_required` shape), and
+  `tools/list` additionally carries `ttlMs: 3600000` and
+  `cacheScope: "public"` — the caching guide's own recommendation for
+  tool lists identical for all users; the list is compiled into the
+  binary and `initialize` declares `listChanged: false`, so TTL-based
+  freshness is the only invalidation channel a host has. `tools/call`
+  deliberately emits no caching hints: it is not one of the revision's
+  cacheable operations, and a per-corpus report must not look cacheable
+  across users. The members are additive on the older revisions this
+  server also speaks (`Result` is index-signature extensible), so emission
+  is unconditional instead of keeping per-connection negotiation state.
+  Contract: `tools_list_carries_2026_07_28_cache_hints` (tests/mcp_server.rs),
+  mirrored from `schema/2026-07-28/schema.ts` and its canonical examples at
+  the spec tag; docs/guides/mcp-server.md documents the members.
+
 - codex turn-boundary ledger + replay guardrail (rm-1949, run
   e4bff731 cycle 1): codex 0.147+ journals turn boundaries as `event_msg`
   payloads — `task_started`, `task_complete`, `user_message` (live census
@@ -891,6 +956,66 @@
   test and healthy corpora render zero-count clean.
 
 ### Fixed
+
+- Non-finite cost folds are gated across the aggregate census (rm-1500,
+  run e4209f0c cycle 5, extended by the independent-review fix round): the
+  cycle's first pass closed the three band-pinned folds — the cost-audit
+  by-provider/model row, the SVG card daily series, and
+  `loop_waste_percent`/waste scoring — and the review then censused four
+  more sites of the same latent class, gated in the same
+  skip-while-counting style by the fix round: the overview per-org fold,
+  the context-trends aggregate cost (the `output_cost_per_million_tokens`
+  basis), the cost-audit stored-side total the anomaly ratios are measured
+  against, and the top-cost-driver table's total/ranking/shares (one NaN
+  member used to collapse every share to 0.0 and serialize the poisoned
+  row's cost as null). JSON has no NaN/Infinity, so a leaked value
+  serializes as `null` and poisons downstream sort/aggregation lanes.
+  `loop_waste_percent` now guards BOTH inputs (a NaN `loop_cost` survived
+  `NaN.clamp()` as NaN and propagated into the waste score — clamp is not
+  a sanitiser for NaN); every other gated fold skips non-finite members
+  while still counting them (`overview.non_finite_costs`). Pinned red-first
+  by `cost_by_model_folds_skip_non_finite_cost` and
+  `stored_side_group_fold_skips_non_finite_cost` (governance),
+  `card_daily_series_skips_non_finite_cost` and
+  `top_cost_driver_shares_skip_non_finite_cost` (reports),
+  `overview_org_fold_skips_non_finite_cost` (overview),
+  `context_aggregate_folds_skip_non_finite_cost` and
+  `audit_totals_skip_non_finite_cost` (context trends / cost-audit), and
+  `poisoned_session_yields_zero_loop_percent_and_finite_waste` (waste,
+  end to end over a poisoned session).
+
+  Integration seam (2026-10-18, conflict case 9cb8b4cc): the per-org fold
+  gate was landed in parallel on this wall (run 4eeea891's campaign-local
+  rm-1549 reap, 2026-10-17 — the identical skip-while-counting gate,
+  pinned from `cost_non_finite_contract.rs`). The merge keeps ONE gate
+  with both comment lineages and both pin sets; no behavior difference
+  existed to reconcile, and the run's `overview_org_fold_skips_non_finite_cost`
+  pin composes beside the wall's contract suite unchanged.
+
+- `search_sessions` with `limit == 0` returns zero rows, not one
+  (rm-1515, run e4209f0c cycle 5): the loop pushed a match and THEN
+  checked the limit, so the boundary admitted the first match at
+  limit 0 — a caller asking for nothing got one row. The CLI
+  hard-errors `--limit 0` (rm-988 battery), so the exposed surface was
+  every other caller: library consumers and any host surface that
+  forwards a user-supplied limit verbatim. The limit is now checked
+  BEFORE the push. Pinned by `limit_zero_returns_zero_rows_not_one`
+  (search), which also pins limit 1 still returning exactly 1 so the
+  moved check did not over-truncate.
+
+  Integration seam (2026-10-18, conflict case 9cb8b4cc, landing onto a
+  wall that had since integrated run 37101c74's rm-1415 transcript
+  search): the loop this row fixes no longer lives in `search_sessions`
+  directly — the wall's rewrite moved it into `search_sessions_detailed`
+  (metadata evidence, then a byte-capped transcript re-read) behind a
+  thin `search_sessions` wrapper, carrying the same push-then-break
+  order into the new loop. The check lands at that shared loop's top,
+  ahead of BOTH the metadata evidence and the bounded transcript
+  re-read — so a capped limit never spends the scan byte budget either —
+  and the push-side break is removed: one check, checked first, on the
+  single loop both callers reach. The pin runs unchanged through the
+  wrapper, and rm-1415's own scan-accounting pins are untouched (the
+  early break skips the same sessions the post-push break skipped).
 
 - Codex replay families corroborate on cwd, and warm-cache totals flip
   LOUDLY instead of silently (rm-1956 at this landing — campaign-local

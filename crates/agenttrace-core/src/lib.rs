@@ -3022,6 +3022,16 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         if !session.org.is_empty() {
             let org_entry = overview.by_org.entry(session.org.clone()).or_default();
             org_entry.sessions += 1;
+            // rm-1500 (review b346cf8b fix round): the per-org fold is the
+            // same skip-while-counting class as by_project/by_branch above —
+            // a non-finite session still counts in org_entry.sessions and
+            // overview.non_finite_costs but contributes 0.0 cost, so one
+            // poisoned journal can never turn an org's total (or the org
+            // ranking) into NaN.
+            // Integration seam (2026-10-18, conflict case 9cb8b4cc): the
+            // wall landed this same gate in parallel (run 4eeea891's
+            // campaign-local rm-1549 reap, outer comment above) — one gate,
+            // both lineages, both pin sets live.
             if cost_finite {
                 org_entry.cost += session_cost;
             }
@@ -4924,6 +4934,32 @@ mod tests {
         let comparison = compare_session_outcome(&current, &previous);
         assert_eq!(comparison.outcome, "faster_cheaper");
         assert_eq!(comparison.reasons, vec!["fewer_failures"]);
+    }
+
+    #[test]
+    fn overview_org_fold_skips_non_finite_cost() {
+        // rm-1500 (review b346cf8b fix round): the per-org fold in
+        // compute_overview_iter was one of the review-flagged ungated
+        // `cost_estimated` folds — a poisoned session in an org turned the
+        // org's total (and the org ranking) into NaN.
+        let mut a = test_session();
+        a.org = "acme".to_string();
+        a.metrics.cost_estimated = 1.0;
+        let mut b = test_session();
+        b.org = "acme".to_string();
+        b.metrics.cost_estimated = f64::NAN;
+        let overview = compute_overview(&[a, b]);
+        let org = overview.by_org.get("acme").expect("the org row must exist");
+        assert!(
+            org.cost.is_finite(),
+            "NaN poisoned the per-org fold: {}",
+            org.cost
+        );
+        assert_eq!(org.cost, 1.0, "the finite member is folded, the NaN is not");
+        assert_eq!(
+            overview.non_finite_costs, 1,
+            "the poisoned session stays counted"
+        );
     }
 
     fn test_session() -> Session {

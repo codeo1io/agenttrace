@@ -1196,7 +1196,19 @@ const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 /// manifest and `hooks.jsonl` siblings no longer are. A listing stored
 /// by a pre-rm-1881 walk of that root replays the old admission set,
 /// so the lane bumps once to retire every stored listing.
-const DIR_LISTING_WALK_VERSION: i64 = 6;
+///
+/// v7 (rm-992, run e4209f0c cycle 5; rung added at integration, conflict
+/// case 8956373fb6584ce3b11a8afbcd8b2606): discovery admission changed
+/// globally — `is_session_file_name` now admits the `.jsonl.zst` suffix
+/// codex 0.163.0's stable `migrate_rollouts` writes, so a migrated
+/// codex home stops silently undercounting. A stored listing holds only
+/// name-admitted files, so ANY v6 listing written by a pre-rm-992 walk
+/// replays with no `.jsonl.zst` members and hides the very rollouts the
+/// admission exists to surface; the lane bumps once to retire every
+/// stored listing and re-walk. Per-file parse semantics are unchanged
+/// (the parser already sniffed zstd magic), so no schema-side rung
+/// rides it — the same re-walk-without-reparse shape as the v6 rung.
+const DIR_LISTING_WALK_VERSION: i64 = 7;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")
