@@ -7740,6 +7740,25 @@ fn path_slash(path: &Path) -> String {
         .join("/")
 }
 
+/// rm-1994: the Cline envelope's per-message `modelInfo.id` is the
+/// canonical-store lane's only model evidence (there is no
+/// `task_metadata.json` sibling there). Last-wins scan: the most recent
+/// assistant turn's model is the session's model (models can switch
+/// mid-session; the final one is the one in use when the session ended).
+/// Only ever upgrades the `"unknown"` fallback — an explicitly threaded
+/// model (task-dir `task_metadata.json` `apiConfiguration`, the `-m`
+/// override) stays authoritative (precedence documented per rm-1994 d).
+fn cline_envelope_model(messages: &[Value]) -> Option<&str> {
+    messages.iter().rev().find_map(|message| {
+        message
+            .as_object()?
+            .get("modelInfo")?
+            .get("id")?
+            .as_str()
+            .filter(|id| !id.is_empty())
+    })
+}
+
 fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
     let messages = match value {
         Value::Array(items) => items.as_slice(),
@@ -7750,6 +7769,15 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
             .and_then(Value::as_array)
             .map(Vec::as_slice)?,
         _ => return None,
+    };
+    // rm-1994: upgrade the "unknown" fallback from per-message
+    // `modelInfo.id` — the envelope arm has no other model source, so
+    // without this the whole canonical-store lane misattributes models
+    // and bills at fallback pricing.
+    let model = if model == "unknown" {
+        cline_envelope_model(messages).unwrap_or(model)
+    } else {
+        model
     };
     let mut events = Vec::new();
     // rm-1881: the Cline CLI `.messages.json` envelope (messages
@@ -9316,6 +9344,16 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
     };
     let mut events = Vec::new();
     let mut usage_state = ClineUsageState::default();
+    // rm-1994: same envelope-model upgrade as `parse_cline_value` — the
+    // object form of this walk sees the same `.messages.json` envelopes
+    // (per-message `modelInfo.id`, last-wins), and the array form is
+    // harmless to scan (real `ui_messages.json` arrays carry no
+    // modelInfo; an explicitly threaded model still wins).
+    let model = if model == "unknown" {
+        cline_envelope_model(messages).unwrap_or(model)
+    } else {
+        model
+    };
     for message in messages {
         let Some(message) = message.as_object() else {
             continue;
@@ -11983,7 +12021,99 @@ mod tests {
         assert_eq!(meta.usage.get("cache_read_input_tokens"), Some(&600));
         assert_eq!(meta.usage.get("cache_creation_input_tokens"), Some(&200));
         assert_eq!(meta.recorded_cost_usd, Some(0.045));
+        // rm-1994 supersedes the old "unknown" pin: the envelope's
+        // per-message `modelInfo.id` now upgrades the fallback thread
+        // (the rm-1430 fixture message carries modelInfo), so the whole
+        // canonical-store lane stops billing at fallback pricing.
+        assert_eq!(meta.model_used, "claude-sonnet-4-20260514");
+    }
+
+    #[test]
+    fn cline_envelope_modelinfo_feeds_the_model_thread() {
+        // rm-1994 red-first: the Cline CLI `.messages.json` envelope is
+        // parsed by the envelope arm (`parse_cline_value`, "unknown"
+        // fallback) in production — its per-message `modelInfo.id` is the
+        // lane's only model evidence. Both walk shapes must thread it
+        // (last-wins: the most recent assistant turn's model is the
+        // session's carrier model for usage attribution).
+        let doc = serde_json::json!({
+            "sessionId": "cli-2", "agent": "cli",
+            "messages": [
+                {"id":"m1","role":"user","ts":1700000100,"content":[{"type":"text","text":"hi"}]},
+                {"id":"m2","role":"assistant","ts":1700000101,
+                 "content":[{"type":"text","text":"hello"}],
+                 "modelInfo":{"id":"claude-sonnet-4-5-20250929","provider":"anthropic"}},
+                {"id":"m3","role":"assistant","ts":1700000102,
+                 "content":[{"type":"text","text":"later"}],
+                 "modelInfo":{"id":"claude-3-7-sonnet-20250219","provider":"anthropic"},
+                 "metrics":{"inputTokens":30,"outputTokens":5}}
+            ]
+        });
+        let events =
+            parse_cline_value(&doc, "unknown").expect("cli envelope folds usage events");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("envelope walk emits one meta event");
+        assert_eq!(
+            meta.model_used, "claude-3-7-sonnet-20250219",
+            "last-wins: the most recent modelInfo.id carries the session model"
+        );
+        // both fixture ids are real catalog keys — the harvested thread
+        // prices non-fallback by construction (acceptance b)
+        let ui_events = parse_cline_ui_messages(&doc, "unknown");
+        let ui_meta = ui_events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("ui-object walk emits one meta event");
+        assert_eq!(ui_meta.model_used, "claude-3-7-sonnet-20250219");
+    }
+
+    #[test]
+    fn cline_envelope_without_modelinfo_stays_unknown() {
+        // rm-1994 (c): absence stays disclosed — no modelInfo means the
+        // fallback thread ("unknown") survives verbatim; nothing is
+        // silently priced off an invented model.
+        let doc = serde_json::json!({
+            "sessionId": "cli-3", "agent": "cli",
+            "messages": [
+                {"id":"m1","role":"user","ts":1700000100,"content":[{"type":"text","text":"hi"}]},
+                {"id":"m2","role":"assistant","ts":1700000101,
+                 "content":[{"type":"text","text":"hello"}],
+                 "metrics":{"inputTokens":10,"outputTokens":2}}
+            ]
+        });
+        let events =
+            parse_cline_value(&doc, "unknown").expect("modelinfo-less envelope still folds");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("meta event present");
         assert_eq!(meta.model_used, "unknown");
+    }
+
+    #[test]
+    fn cline_task_metadata_model_wins_over_message_modelinfo() {
+        // rm-1994 (d) precedence: an explicitly threaded model (the
+        // task-dir lane's `cline_model` from task_metadata.json /
+        // apiConfiguration) stays authoritative; per-message modelInfo
+        // only upgrades the "unknown" fallback.
+        let doc = serde_json::json!({
+            "messages": [
+                {"id":"m1","role":"user","ts":1700000100,"content":[{"type":"text","text":"hi"}]},
+                {"id":"m2","role":"assistant","ts":1700000101,
+                 "content":[{"type":"text","text":"hello"}],
+                 "modelInfo":{"id":"claude-sonnet-4-5-20250929","provider":"anthropic"},
+                 "metrics":{"inputTokens":10,"outputTokens":2}}
+            ]
+        });
+        let events =
+            parse_cline_value(&doc, "gpt-5.2").expect("explicit model threads through");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("meta event present");
+        assert_eq!(meta.model_used, "gpt-5.2");
     }
 
     #[test]

@@ -39,6 +39,17 @@ pub struct CostAudit {
     /// reasons about.
     #[serde(skip_serializing_if = "usize_is_zero")]
     pub aborted_sessions: usize,
+    /// rm-1993: sessions whose stored `cost_estimated` is non-finite
+    /// (poisoned or overflowing pricing inputs — the same input class
+    /// rm-1500's lib.rs contract acknowledges for the sqlite REAL
+    /// lane). Their cost is EXCLUDED from every stored-cost fold below
+    /// (per-row `Aggregate::cost` and the audit-total
+    /// `stored_estimated_cost_usd`) and counted here instead — one
+    /// poisoned row must never null the whole cost-audit total with
+    /// no trace. Mirrors `Overview::non_finite_costs` (lib.rs) so the
+    /// audit and the overview agree on the exclusion vocabulary.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub non_finite_stored_costs: usize,
     pub stored_estimated_cost_usd: f64,
     pub current_estimated_cost_usd: Option<f64>,
     pub pricing_coverage: PricingCoverage,
@@ -441,10 +452,18 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
     }
     let mut rows: BTreeMap<(String, String), Aggregate> = BTreeMap::new();
     let mut coverage = PricingCoverage::default();
+    // rm-1993: skip-while-counting at every stored-cost fold (the
+    // rm-1500 discipline) — non-finite `cost_estimated` values are
+    // excluded from `Aggregate::cost` and the audit total below, and
+    // disclosed through `CostAudit::non_finite_stored_costs`.
+    let mut non_finite_stored_costs = 0usize;
     // rm-726: the audit discloses the magnitude-clamp census beside the
     // total — clamped values are priced at the i64 bounds, and the
     // summary must say how many there were instead of implying clean
     // arithmetic.
+    // rm-1993 pin: this `.sum()` is over usize disclosure counters —
+    // the non-finite guard belongs to the f64 cost folds only, never
+    // here.
     let clamped_values: usize = sessions
         .iter()
         .map(|session| {
@@ -497,7 +516,15 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .cache_read
             .saturating_add(session.metrics.tokens_cache_r);
         row.tokens.total = row.tokens.total.saturating_add(total_tokens(session));
-        row.cost += session.metrics.cost_estimated;
+        // rm-1993: the row-level stored-cost fold — a non-finite
+        // `cost_estimated` is counted and skipped, never summed into
+        // the row (a NaN row would poison the audit total's sibling
+        // columns and the report would read clean-total-but-NaN-row).
+        if session.metrics.cost_estimated.is_finite() {
+            row.cost += session.metrics.cost_estimated;
+        } else {
+            non_finite_stored_costs += 1;
+        }
         // rm-520: carry each session's rm-436 recorded-cost basis into
         // the row so the drift comparison prices recorded classes
         // exactly once instead of re-estimating them at catalog rates.
@@ -744,6 +771,10 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
     let stored_estimated_cost_usd = round4(
         sessions
             .iter()
+            // rm-1993: the total folds the same finite subset the row
+            // fold admitted (counted in `non_finite_stored_costs`) so
+            // one poisoned session cannot null the audit total.
+            .filter(|session| session.metrics.cost_estimated.is_finite())
             .map(|session| session.metrics.cost_estimated)
             .sum(),
     );
@@ -770,6 +801,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         total_estimated_cost: stored_estimated_cost_usd,
         clamped_values,
         aborted_sessions,
+        non_finite_stored_costs,
         stored_estimated_cost_usd,
         current_estimated_cost_usd,
         pricing_coverage: coverage,
@@ -1157,6 +1189,9 @@ pub fn context_trends(sessions: &[Session]) -> ContextTrend {
                 value.cache_read,
                 value.input.saturating_add(value.cache_read),
             ),
+            // rm-1993 pin: `.sum()` over `saturating_sub` usize counts —
+            // non-finite cannot occur; the guard belongs to f64 cost
+            // folds only.
             repeated_file_reads: value
                 .files
                 .values()
@@ -1635,6 +1670,9 @@ fn context_totals(value: &ContextAggregate) -> ContextTrendTotals {
         sessions: value.sessions,
         context_warning_sessions: value.warnings,
         context_critical_sessions: value.critical,
+        // rm-1993 pin: `.sum()` over `saturating_sub` usize counts —
+        // non-finite cannot occur; the guard belongs to f64 cost
+        // folds only.
         repeated_file_reads: value
             .files
             .values()
@@ -1698,6 +1736,53 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         }
+    }
+
+    #[test]
+    fn cost_audit_total_survives_non_finite_stored_costs() {
+        // rm-1993 red-first: one poisoned `cost_estimated` (NaN — the
+        // rm-1500 sqlite-REAL input class) used to null the whole
+        // cost-audit total through the unguarded `.sum()`, and the
+        // poisoned session's own row stored NaN, with no disclosure
+        // anywhere. Now every stored-cost fold skips-while-counting:
+        // the total stays finite, the row stays finite, and the
+        // poisoned session is counted in `non_finite_stored_costs`
+        // instead of vanishing (it keeps its row — the audit still
+        // SEES it, it just refuses to sum its poison).
+        let mut poisoned = session("poisoned");
+        poisoned.metrics.model_used = "claude-nan-carrier".to_string();
+        poisoned.metrics.cost_estimated = f64::NAN;
+        let finite = session("finite");
+        let audit = cost_audit(&[poisoned, finite.clone()]);
+        assert_eq!(
+            audit.stored_estimated_cost_usd, 1.0,
+            "one NaN row must not null the audit total"
+        );
+        assert_eq!(
+            audit.non_finite_stored_costs, 1,
+            "the poisoned session is disclosed, not silently dropped"
+        );
+        let poisoned_row = audit
+            .by_provider_model
+            .iter()
+            .find(|row| row.model == "claude-nan-carrier")
+            .expect("poisoned session keeps its audit row");
+        assert_eq!(poisoned_row.sessions, 1);
+        assert_eq!(
+            poisoned_row.stored_estimated_cost_usd, 0.0,
+            "row-level stored fold skips the non-finite cost"
+        );
+        // all-finite corpora stay byte-identical: the counter is
+        // skip-serialized at zero, so the serialized audit carries no
+        // new key and the folds sum the same values as before the guard.
+        let clean = cost_audit(&[finite]);
+        assert_eq!(clean.non_finite_stored_costs, 0);
+        assert_eq!(clean.stored_estimated_cost_usd, 1.0);
+        let clean_json = serde_json::to_string(&clean).expect("clean audit serializes");
+        assert!(
+            !clean_json.contains("non_finite_stored_costs"),
+            "zero counter must not serialize (byte-identity for finite corpora)"
+        );
     }
 
     #[test]

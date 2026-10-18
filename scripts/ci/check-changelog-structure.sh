@@ -81,4 +81,53 @@ if grep -q '^## Unreleased' "$changelog"; then
 		fail "Unreleased section is present but carries no entries (rm-1390): a header over zero bullets claims a landing lane that does not exist — land the entries, date the section, or drop the header"
 fi
 
-echo "check-changelog-structure: no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous)"
+# Pass 4 (rm-1996, run 754e0809 cycle 1): repeated contiguous entry
+# BLOCKS. Passes 1-3 police section KINDS, never entry content — a
+# 39-entry block duplicated verbatim inside one `### Added` passed this
+# gate rc0 (live-proven in this run's assess, 31a871e4), and
+# keep-a-changelog consumers rendering the section print the noise twice
+# while parsers that hash entries silently drop half the corpus claims.
+# Detection: within each `##` section, hash every window of WINDOW_LEN
+# consecutive non-blank lines; two identical windows = a repeated
+# contiguous block. Blank lines are skipped when forming windows — the
+# real-world duplication landed with DIFFERENT blank placement between
+# the copies (entries adjacent in one, blank-separated in the other),
+# and a blank-sensitive hash would have missed exactly the block that
+# motivated this pass. Windows never cross a `##` header; the same text
+# in two different version sections is legitimate history, not a dup.
+if ! dups="$(awk '
+	BEGIN { W = 6 }
+	{ line[NR] = $0 }
+	END {
+		for (i = 1; i <= NR; i++) {
+			if (line[i] ~ /^## /) { is_header[i] = 1; is_content[i] = 0; continue }
+			is_content[i] = (line[i] !~ /^[[:space:]]*$/)
+		}
+		for (i = 1; i <= NR; i++) {
+			if (!is_content[i]) continue
+			key = ""; c = 0; j = i; ok = 1; section = ""
+			# the section of a window is the section of its FIRST line:
+			# find it by looking back to the nearest header
+			for (b = i; b >= 1; b--) if (is_header[b]) { section = b; break }
+			while (c < W) {
+				if (j > NR) { ok = 0; break }
+				if (is_header[j]) { ok = 0; break }
+				if (is_content[j]) { key = key "\x1f" line[j]; c++ }
+				j++
+			}
+			if (!ok) continue
+			full = section "\x1e" key
+			if (full in seen) {
+				printf("  section starting at line %d repeats a %d-line entry block: first at line %d, again at line %d\n", section, W, seen[full], i)
+				bad = 1
+			} else {
+				seen[full] = i
+			}
+		}
+		exit bad ? 1 : 0
+	}
+' "$changelog")"; then
+	fail "repeated contiguous entry blocks in CHANGELOG.md (rm-1996):"$'\n'"$dups"
+fi
+
+echo "check-changelog-structure: no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous); no repeated entry blocks (>= 6 lines)"

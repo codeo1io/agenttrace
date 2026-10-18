@@ -905,6 +905,7 @@ pub fn data_health_scoped(
     opencode_fork_excluded: usize,
     future_excluded: usize,
     sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
+    cline_admission_rejected: usize,
 ) -> DataHealth {
     let parsed = sessions.len();
     let out_of_scope = discovered.saturating_sub(parsed + parse_failures);
@@ -928,6 +929,20 @@ pub fn data_health_scoped(
             .disclosures
             .get_mut("opencode_fork_excluded_sessions")
             .expect("just inserted") += opencode_fork_excluded;
+    }
+    // rm-1995: Cline CLI canonical-store admission rejections ride the
+    // same disclosure channel — a count the user can see instead of
+    // transcripts that vanish silently (manifest-less or
+    // basename-mismatched `.messages.json` under the canonical root).
+    if cline_admission_rejected > 0 {
+        health
+            .disclosures
+            .entry("cline_admission_rejected_sessions".to_string())
+            .or_insert(0);
+        *health
+            .disclosures
+            .get_mut("cline_admission_rejected_sessions")
+            .expect("just inserted") += cline_admission_rejected;
     }
     // rm-1534: sessions EXCLUDED by the future bound (activity
     // beyond now+grace, see `session_admitted_since`) ride the same

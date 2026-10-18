@@ -704,6 +704,8 @@ fn usage_overview(root: Option<&Path>, range: TimeRange) -> Result<Value, (i64, 
         // future-bound exclusion count flows through here too.
         report.future_excluded_sessions,
         report.sqlite.unreadable.clone(),
+        // rm-1995: keep MCP and CLI disclosures agreeing.
+        report.cline_admission_rejected,
     );
     let text = report_overview_json_with_context(
         &overview,

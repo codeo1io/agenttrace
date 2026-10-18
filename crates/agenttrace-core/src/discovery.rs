@@ -49,6 +49,14 @@ pub struct LoadReport {
     /// channel can report the exclusion instead of dropping sessions
     /// silently.
     pub opencode_fork_excluded: usize,
+    /// rm-1995: Cline CLI canonical-store admission rejections — files
+    /// under the canonical root that failed the `is_cline_cli_session_file`
+    /// content gates (manifest-less or basename-mismatched `.messages.json`
+    /// transcripts, `session.json` manifests, `hooks.jsonl` siblings).
+    /// Counted per walk and disclosed (loader data-health + `--doctor`),
+    /// never a silent drop; an explicit `--dir` keeps every file (same rule
+    /// as the fork exclusion, aggregation-only).
+    pub cline_admission_rejected: usize,
     /// rm-835 (minted campaign-locally as rm-695 by run f7f81aea, rebound
     /// at integration — the landed wall already holds an rm-695): how many
     /// discovered files failed to parse (the parse share of `skipped`,
@@ -466,7 +474,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // for org-less claude_code journals served from an override root.
     let override_root = std::env::var_os("CLAUDE_CONFIG_DIR").is_some();
     let mut sessions = Vec::new();
-    let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
+    let (files, json_fork_excluded, cline_admission_rejected) =
+        find_session_files_cached(dir, cache, true);
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
@@ -708,6 +717,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         cache_hits,
         sqlite: sqlite_ingest,
         opencode_fork_excluded,
+        cline_admission_rejected,
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
@@ -735,13 +745,24 @@ fn matches_filter(value: &str, filter: &str) -> bool {
 }
 
 pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
+    collect_session_files_counted(dir).0
+}
+
+/// rm-1995 twin of [`collect_session_files`] that also reports how many
+/// files under the Cline CLI canonical root were rejected by the
+/// admission gates (see `LoadReport::cline_admission_rejected`). The
+/// uncached walk feeds `find_session_files` (explicit `--dir`), which
+/// keeps every file by contract, so the count is informational there;
+/// the cached aggregation lane and the doctor carry the disclosure.
+fn collect_session_files_counted(dir: &Path) -> (Vec<PathBuf>, usize) {
     if is_cline_task_dir(dir) {
-        return vec![dir.to_path_buf()];
+        return (vec![dir.to_path_buf()], 0);
     }
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
     let mut visited = SymlinkTargets::new(dir);
     let mut file_targets = SessionFileTargets::new();
+    let mut cline_rejected = 0usize;
     walk_session_files(
         dir,
         0,
@@ -749,34 +770,41 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
         &mut items,
         &mut visited,
         &mut file_targets,
+        &mut cline_rejected,
     );
     items.sort_by_key(|item| Reverse(item.1));
-    items.into_iter().map(|item| item.0).collect()
+    (
+        items.into_iter().map(|item| item.0).collect(),
+        cline_rejected,
+    )
 }
 
 pub(crate) fn find_session_files_cached(
     dir: Option<&Path>,
     cache: &mut SessionCache,
     skip_sqlite_backed: bool,
-) -> (Vec<PathBuf>, usize) {
+) -> (Vec<PathBuf>, usize, usize) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return (vec![dir.to_path_buf()], 0);
+            return (vec![dir.to_path_buf()], 0, 0);
         }
         // rm-548: an explicitly requested directory keeps every file —
         // a forked copy loaded by explicit path still renders (the
         // exclusion is an aggregation rule, not a parse block).
-        return (collect_session_files_cached(dir, cache), 0);
+        let mut cline_rejected = 0usize;
+        let files = collect_session_files_cached(dir, cache, &mut cline_rejected);
+        return (files, 0, cline_rejected);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
+    let mut cline_rejected = 0usize;
     let mut seen = HashSet::new();
     let mut all = Vec::new();
     for dir in dirs {
         if skip_sqlite_backed && skip_sqlite_backed_file_dir(&dir) {
             continue;
         }
-        for path in collect_session_files_cached(&dir, cache) {
+        for path in collect_session_files_cached(&dir, cache, &mut cline_rejected) {
             // rm-338: dedup across roots by canonical identity (see
             // canonical_identity); listed paths are kept as-is.
             let identity = if cross_root {
@@ -809,7 +837,7 @@ pub(crate) fn find_session_files_cached(
     // rm-1881: the same session id in both the canonical CLI store and
     // the legacy VS Code tasks root renders one session (canonical wins).
     retain_single_cline_session_per_id(&mut all);
-    (sort_paths_by_cache(all, cache), opencode_fork_excluded)
+    (sort_paths_by_cache(all, cache), opencode_fork_excluded, cline_rejected)
 }
 
 /// rm-548: an opencode storage session doc (`.../storage/session/info/
@@ -873,7 +901,11 @@ pub(crate) fn opencode_session_fork_parent_cached(
     probed
 }
 
-fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<PathBuf> {
+fn collect_session_files_cached(
+    dir: &Path,
+    cache: &mut SessionCache,
+    cline_rejected: &mut usize,
+) -> Vec<PathBuf> {
     if is_cline_task_dir(dir) {
         return vec![dir.to_path_buf()];
     }
@@ -889,6 +921,7 @@ fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<Pat
         &mut items,
         &mut visited,
         &mut file_targets,
+        cline_rejected,
     );
     sort_paths_by_cache(items, cache)
 }
@@ -1011,6 +1044,7 @@ fn walk_session_files_cached(
     items: &mut Vec<PathBuf>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
+    cline_rejected: &mut usize,
 ) {
     if depth > max_depth {
         return;
@@ -1054,6 +1088,7 @@ fn walk_session_files_cached(
                     items,
                     visited,
                     file_targets,
+                    cline_rejected,
                 );
             }
         }
@@ -1112,8 +1147,25 @@ fn walk_session_files_cached(
         // `session.json` manifest and `hooks.jsonl` siblings stay out,
         // and the name alone never qualifies (content-shaped gates in
         // `is_cline_cli_session_file`).
-        if is_cline_cli_session_path(&path) && !is_cline_cli_session_file(&path) {
-            continue;
+        if is_cline_cli_session_path(&path) {
+            // rm-1995: transcript-shaped candidates that fail the admission
+            // gates are counted, not silent — a manifest-less or
+            // basename-mismatched `.messages.json` must surface in the
+            // loader's data-health disclosures and the doctor report, not
+            // vanish from discovery. Store furniture (session.json
+            // manifests, hooks.jsonl siblings) stays uncounted: it is
+            // expected structure, not a lost transcript.
+            if !is_cline_cli_session_file(&path)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".messages.json"))
+            {
+                *cline_rejected += 1;
+            }
+            if !is_cline_cli_session_file(&path) {
+                continue;
+            }
         }
         files.push(path);
     }
@@ -1134,6 +1186,7 @@ fn walk_session_files_cached(
             items,
             visited,
             file_targets,
+            cline_rejected,
         );
     }
 }
@@ -1145,6 +1198,7 @@ fn walk_session_files(
     items: &mut Vec<(PathBuf, SystemTime)>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
+    cline_rejected: &mut usize,
 ) {
     if depth > max_depth {
         return;
@@ -1177,7 +1231,15 @@ fn walk_session_files(
             if !visited.admit(&path) {
                 continue;
             }
-            walk_session_files(&path, depth + 1, max_depth, items, visited, file_targets);
+            walk_session_files(
+                &path,
+                depth + 1,
+                max_depth,
+                items,
+                visited,
+                file_targets,
+                cline_rejected,
+            );
             continue;
         }
         let name = entry.file_name();
@@ -1205,8 +1267,19 @@ fn walk_session_files(
         // `session.json` manifest and `hooks.jsonl` siblings stay out,
         // and the name alone never qualifies (content-shaped gates in
         // `is_cline_cli_session_file`).
-        if is_cline_cli_session_path(&path) && !is_cline_cli_session_file(&path) {
-            continue;
+        if is_cline_cli_session_path(&path) {
+            // rm-1995: counted, not silent — see the cached twin above.
+            if !is_cline_cli_session_file(&path)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".messages.json"))
+            {
+                *cline_rejected += 1;
+            }
+            if !is_cline_cli_session_file(&path) {
+                continue;
+            }
         }
         // rm-597: same-file admission — a symlink or hardlink alias of an
         // already-collected transcript is not a second session; admitted

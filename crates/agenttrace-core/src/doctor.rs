@@ -272,6 +272,7 @@ struct DoctorDiscovery {
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
     opencode_fork_excluded: usize,
+    cline_admission_rejected: usize,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -299,16 +300,17 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
+            cline_admission_rejected: 0,
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, opencode_fork_excluded) = if dir.is_none() {
+    let (files, opencode_fork_excluded, cline_admission_rejected) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
-        (find_session_files(dir), 0)
+        (find_session_files(dir), 0, 0)
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
@@ -351,6 +353,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        cline_admission_rejected,
     }
 }
 
@@ -372,6 +375,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        cline_admission_rejected,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -416,6 +420,17 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         disclosures.insert(
             "opencode_fork_excluded_sessions".to_string(),
             opencode_fork_excluded_total,
+        );
+    }
+    if cline_admission_rejected > 0 {
+        // rm-1995: same disclosure-key discipline as the fork exclusion —
+        // canonical-store admission rejections (manifest-less or
+        // basename-mismatched `.messages.json`) surface in `--doctor`
+        // instead of vanishing from discovery. The key mirrors the
+        // loader data-health lane so both agree.
+        disclosures.insert(
+            "cline_admission_rejected_sessions".to_string(),
+            cline_admission_rejected,
         );
     }
     let mut report = DoctorReport {
@@ -777,9 +792,10 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
+fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize, usize) {
     if dir.is_some() {
-        return (find_session_files(dir), 0);
+        let files = find_session_files(dir);
+        return (files, 0, 0);
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
     // inventory aggregates through the SAME loader primitive the CLI
@@ -795,12 +811,12 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, opencode_fork_excluded) =
+    let (files, opencode_fork_excluded, cline_admission_rejected) =
         crate::discovery::find_session_files_cached(None, &mut cache, true);
     // A cache write failure must never fail the doctor (the cache is
     // an optimization; the inventory answer is already correct).
     let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, opencode_fork_excluded)
+    (files, opencode_fork_excluded, cline_admission_rejected)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite

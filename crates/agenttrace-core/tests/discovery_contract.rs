@@ -3056,6 +3056,7 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
             all.opencode_fork_excluded,
             all.future_excluded_sessions,
             all.sqlite.unreadable.clone(),
+            all.cline_admission_rejected,
         );
         let health_day = data_health_scoped(
             &day.sessions,
@@ -3065,6 +3066,7 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
             day.opencode_fork_excluded,
             day.future_excluded_sessions,
             day.sqlite.unreadable.clone(),
+            day.cline_admission_rejected,
         );
         assert_eq!(health_all.parsed, 2);
         assert_eq!(
@@ -3150,6 +3152,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.opencode_fork_excluded,
             report.future_excluded_sessions,
             report.sqlite.unreadable.clone(),
+            report.cline_admission_rejected,
         );
         assert_eq!(health.non_finite_costs, 1, "non-finite cost is counted");
         assert_eq!(health.confidence, "low", "corrupted costs lower confidence");
@@ -3161,6 +3164,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.opencode_fork_excluded,
             report.future_excluded_sessions,
             report.sqlite.unreadable.clone(),
+            report.cline_admission_rejected,
         );
         assert_eq!(clean.non_finite_costs, 0);
     });
@@ -3910,6 +3914,7 @@ fn opencode_json_fork_copies_excluded_from_aggregation_and_disclosed() {
             report.opencode_fork_excluded,
             report.future_excluded_sessions,
             report.sqlite.unreadable.clone(),
+            report.cline_admission_rejected,
         );
         assert_eq!(
             health.disclosures.get("opencode_fork_excluded_sessions"),
@@ -4237,6 +4242,7 @@ fn corrupt_sqlite_lane_surfaces_in_load_report_data_health_and_doctor() {
             report.opencode_fork_excluded,
             report.future_excluded_sessions,
             report.sqlite.unreadable.clone(),
+            report.cline_admission_rejected,
         );
         assert_eq!(
             health.confidence, "low",
@@ -4256,6 +4262,7 @@ fn corrupt_sqlite_lane_surfaces_in_load_report_data_health_and_doctor() {
             0,
             0,
             Vec::new(),
+            report.cline_admission_rejected,
         );
         let clean_json = serde_json::to_string(&clean).expect("clean health json");
         assert!(
@@ -4976,6 +4983,73 @@ fn cline_cli_gates_hold_for_a_relative_env_store_root() {
         assert_eq!(cline.len(), 1, "exactly one cline session: {sessions:?}");
         assert_eq!(cline[0].metrics.tokens_input, 210);
         assert_eq!(cline[0].metrics.cost_estimated, 0.005);
+    });
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn cline_canonical_store_admission_rejections_are_counted_not_silent() {
+    // rm-1995: a manifest-less / basename-mismatched `.messages.json`
+    // transcript under the Cline CLI canonical root used to `continue`
+    // with no counter and no disclosure — silent data loss. The walk now
+    // counts it into `LoadReport::cline_admission_rejected` (loader
+    // data-health + `--doctor` disclose the same key), while the
+    // admitted transcript still loads exactly as before.
+    let home = std::env::temp_dir().join("agenttrace-rm1995-admission-home");
+    let cache = std::env::temp_dir().join("agenttrace-rm1995-admission-cache");
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cache);
+    let root = home.join(".cline").join("data").join("sessions");
+    seed_cline_cli_session(
+        &root,
+        "1784094124598_rruoq",
+        &cline_cli_envelope(1500, 900, 0, 0, 0.045),
+    );
+    // Manifest-less, basename-mismatched transcript: no `session.json`
+    // carries this id, so the admission gates reject it — counted now,
+    // not dropped.
+    fs::write(
+        root.join("1999999900000_zzzzq.messages.json"),
+        cline_cli_envelope(100, 50, 0, 0, 0.001).to_string(),
+    )
+    .expect("seed mismatched transcript");
+    // Store furniture under the same root: a bare manifest and a hooks
+    // sibling are expected structure, not lost transcripts — they must be
+    // skipped WITHOUT inflating the rejection counter.
+    fs::write(
+        root.join("session.json"),
+        r#"{"id":"1784094124599_none","created":"2026-06-01T00:00:00Z"}"#,
+    )
+    .expect("seed manifest without transcript");
+    fs::write(root.join("hooks.jsonl"), "{}\n").expect("seed hooks sibling");
+
+    with_home_and_cache(&home, &cache, || {
+        let report = load_sessions_with_options(None, &LoadOptions::default());
+        assert_eq!(
+            report.cline_admission_rejected, 1,
+            "mismatched transcript counted, furniture not (discovered {})",
+            report.discovered
+        );
+        assert_eq!(
+            report.discovered, 1,
+            "only the admitted canonical transcript is discovered"
+        );
+        assert!(
+            !report
+                .sessions
+                .iter()
+                .any(|session| std::path::Path::new(&session.path).file_name().and_then(|n| n.to_str())
+                    == Some("1999999900000_zzzzq.messages.json")),
+            "the rejected transcript stays unadmitted"
+        );
+        let cline: Vec<_> = report
+            .sessions
+            .iter()
+            .filter(|session| session.metrics.source_tool == "cline")
+            .collect();
+        assert_eq!(cline.len(), 1, "exactly the admitted session loads");
+        assert_eq!(cline[0].metrics.tokens_input, 1500);
     });
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cache);

@@ -1089,6 +1089,9 @@ fn run() -> anyhow::Result<()> {
                 // disclosed, never a silent drop.
                 report.future_excluded_sessions,
                 report.sqlite.unreadable.clone(),
+                // rm-1995: canonical-store admission rejections counted
+                // by the walk, not silently dropped.
+                report.cline_admission_rejected,
             ),
             None => data_health(&sessions, sessions.len(), 0),
         };
