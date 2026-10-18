@@ -206,6 +206,12 @@ pub struct DoctorDirReport {
     pub path: String,
     pub exists: bool,
     pub files: usize,
+    /// rm-992: admitted files whose names carry the `.jsonl.zst` migration
+    /// suffix (codex >= 0.162; decoded bounded by the parse lane). Doctor
+    /// discloses the compressed share so a migrated corpus presents as such
+    /// instead of looking like plain text.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub compressed: usize,
     pub parsed: usize,
     pub failed: usize,
     pub cache_hits: usize,
@@ -1133,6 +1139,10 @@ fn doctor_dir_report(
         path: path.to_string_lossy().to_string(),
         exists: path.is_dir(),
         files: files.len(),
+        compressed: files
+            .iter()
+            .filter(|f| f.to_string_lossy().to_lowercase().ends_with(".jsonl.zst"))
+            .count(),
         parsed,
         failed: files
             .len()
@@ -1218,6 +1228,8 @@ fn doctor_sqlite_directories(
             path: path.to_string_lossy().to_string(),
             exists,
             files: parsed + failed,
+            // SQLite lanes never carry the `.jsonl.zst` migration suffix.
+            compressed: 0,
             parsed,
             failed,
             cache_hits: 0,
@@ -1521,9 +1533,24 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
             Some(target) => format!(" (symlink -> {target})"),
             None => String::new(),
         };
+        // rm-992: the compressed share is appended only when non-zero so
+        // existing goldens stay byte-stable on uncompressed corpora.
+        let compressed = if dir.compressed > 0 {
+            format!("compressed={:<5} ", dir.compressed)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} {}{}\n",
-            dir.name, status, dir.files, dir.parsed, dir.failed, dir.cache_hits, dir.path, symlink
+            "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} {}{}{}\n",
+            dir.name,
+            status,
+            dir.files,
+            dir.parsed,
+            dir.failed,
+            dir.cache_hits,
+            compressed,
+            dir.path,
+            symlink
         ));
         for sample in &dir.failure_samples {
             out.push_str(&format!("    failed: {sample}\n"));

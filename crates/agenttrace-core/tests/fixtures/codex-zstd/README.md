@@ -10,6 +10,14 @@ rollouts by default is still feature-flagged upstream).
 - `rollout.jsonl` — single-frame compression of the golden plain twin
   `../codex-custom-tools/rollout.jsonl`. Pins decode parity: the
   compressed parse must equal the twin's parse.
+- `rollout-migrated.jsonl.zst` (rm-992) — the SAME zstd frame as
+  `rollout.jsonl` (byte-identical, md5 d41f59b81ae46c07ec4b8de57a2e351f)
+  under the migration NAME stable Codex writes when it compresses cold
+  rollouts (`rollout-*.jsonl.zst`). Before rm-992 the name gate admitted
+  only `.jsonl`, so the migrated twin was invisible to discovery while
+  the same bytes under a `.jsonl` name admitted — pins name-vs-content
+  orthogonality end-to-end (admission suite: identical parse totals,
+  doctor compressed-share, search decode-share).
 - `rollout-bomb.jsonl` — single frame claiming more than the 64 MiB
   decode cap (40 MiB of incompressible noise). Pins the per-frame
   over-cap refusal.

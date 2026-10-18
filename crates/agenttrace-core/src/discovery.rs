@@ -1250,7 +1250,12 @@ pub fn is_session_file_name(name: &str) -> bool {
     if name.ends_with(".lock") {
         return false;
     }
-    name.ends_with(".jsonl") || name.ends_with(".json")
+    // rm-992: codex >= 0.162 migrates `rollout-*.jsonl` to `rollout-*.jsonl.zst`
+    // in place; without this arm every migrated rollout is silently invisible
+    // to discovery end-to-end (--sessions, --doctor found=, --search). Content
+    // is still sniffed and decoded bounded by the parse lane either way; bare
+    // `.zst` (no `.jsonl` stem) stays unadmitted as no agent ships that shape.
+    name.ends_with(".jsonl") || name.ends_with(".json") || name.ends_with(".jsonl.zst")
 }
 
 fn max_session_dir_depth(dir: &Path) -> usize {

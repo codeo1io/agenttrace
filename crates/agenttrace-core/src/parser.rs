@@ -74,7 +74,7 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
 /// rollout cannot smuggle past it a frame at a time (rm-1516). A rollout
 /// past the cap is refused loudly; the operator can always decompress
 /// manually and re-run.
-const ZSTD_ROLLOUT_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const ZSTD_ROLLOUT_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// rm-1025: the over-cap refusal numeral is DERIVED from
 /// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`], never hand-written — a cap change
@@ -82,6 +82,22 @@ const ZSTD_ROLLOUT_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// discipline as `MCP_INPUT_MAX_BYTES` in the CLI transport lane).
 fn zstd_decode_cap_label() -> String {
     format!("{} MiB", ZSTD_ROLLOUT_DECODE_MAX_BYTES / (1024 * 1024))
+}
+
+/// zstd frame magic (RFC 8878), shared by every lane that sniffs session bytes.
+pub(crate) const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Passthrough decode for raw session bytes: if the payload carries the zstd
+/// frame magic, decode it bounded (same decoder and cap as the parse lane);
+/// otherwise return the bytes unchanged. Raw-byte scanning lanes (`search`)
+/// call this so compressed sessions are searched with the same truth the
+/// parse lane already has (rm-992 admission + rm-1872 residual arm).
+pub(crate) fn decode_session_bytes_if_zstd(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
+    if raw.starts_with(&ZSTD_FRAME_MAGIC) {
+        decode_zstd_rollout_bounded(raw, label)
+    } else {
+        Ok(raw)
+    }
 }
 
 /// Decode one zstd-compressed Codex rollout, bounded by

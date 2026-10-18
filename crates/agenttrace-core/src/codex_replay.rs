@@ -37,7 +37,10 @@
 //!
 //! Guarantees:
 //! * A corpus with no family (e.g. any single-file codex corpus) is
-//!   untouched — byte-identical output before/after.
+//!   untouched — byte-identical output before/after, except disclosure
+//!   counters (rm-451: an over-bound rollout the scan refuses to read
+//!   discloses `codex_replay_scan_refused_oversized` on its session —
+//!   disclosed is not "adjusted").
 //! * Sessions priced from upstream-recorded costs are never adjusted here
 //!   (their token-derived cost would not recompute); they are disclosed as
 //!   skipped instead.
@@ -69,6 +72,13 @@ use std::path::{Path, PathBuf};
 pub struct CodexReplayAdjustment {
     /// Replay families found (fingerprint groups with 2+ codex sessions).
     pub families: usize,
+    /// rm-451 residual arm: rollouts refused by the raw-read admission
+    /// bound of the scan (over
+    /// [`crate::parser::ZSTD_ROLLOUT_DECODE_MAX_BYTES`] on disk). Each
+    /// refusal is also disclosed on its session via the
+    /// `codex_replay_scan_refused_oversized` counter — a loud skip, never a
+    /// crash and never a fingerprint fabricated from a file this large.
+    pub scans_refused_oversized: usize,
     /// Child rollouts whose usage was rebased onto the parent's final snapshot.
     pub children_adjusted: usize,
     /// Family children left untouched because they carry upstream-recorded
@@ -135,6 +145,10 @@ struct OpeningFingerprint {
 /// Everything the reconciliation pass needs from one rollout file.
 struct RolloutScan {
     fingerprint: Option<OpeningFingerprint>,
+    /// rm-451: `Some(observed raw length)` when the file exceeded the
+    /// raw-read admission bound of the scan — a typed refusal; the caller
+    /// discloses it and no evidence is fabricated for the file.
+    over_cap: Option<u64>,
     /// Final cumulative `total_token_usage` snapshot (the file's last one).
     total: TotalSnapshot,
     /// First RFC3339 `timestamp` seen on any line of the file — the
@@ -154,23 +168,71 @@ struct RolloutScan {
 /// fingerprint and parse see the same file.
 ///
 /// zstd rollouts (Codex ≥ 0.152 writes the `.jsonl` file as a zstd frame,
-/// landed rm-992 after this run's base): the file is read whole, and a
-/// zstd-magic file goes through the SAME bounded decoder `parse_session_bytes`
-/// uses, so a session the parser accepted as first-class can never be
+/// landed rm-992 after this run's base): the raw read is bounded
+/// (rm-451 below), and a zstd-magic file goes through the SAME bounded
+/// decoder `parse_session_bytes` uses, so a session the parser accepted as first-class can never be
 /// invisible to family detection — the acceptance (replay counted once,
 /// attributed to the parent, disclosed) holds on the wire format Codex
 /// actually writes. A decode failure here yields no evidence, not an error:
 /// the parser has already failed loudly for that file at parse time, and
 /// reconciliation must never turn one parse-level refusal into a second one.
+
+/// rm-451 raw-read admission bound for this lane: the SAME numeral the
+/// decode lane caps decompressed output at
+/// ([`crate::parser::ZSTD_ROLLOUT_DECODE_MAX_BYTES`]) — one cap per lane,
+/// exported from `parser`, so the input side and the output side of the
+/// same decode path can never drift apart.
+const ROLLOUT_SCAN_MAX_RAW_BYTES: u64 = crate::parser::ZSTD_ROLLOUT_DECODE_MAX_BYTES as u64;
+
+/// Typed outcome of the bounded rollout read.
+enum RolloutRead {
+    /// The file raw bytes, at most [`ROLLOUT_SCAN_MAX_RAW_BYTES`].
+    Ok(Vec<u8>),
+    /// Over the admission bound; carries the observed raw length.
+    OverCap(u64),
+}
+
+/// rm-451 residual arm: read a rollout BOUNDED, never whole-file-blind.
+/// `scan_rollout` used to `std::fs::read` the rollout whole, so a
+/// pathological (or adversarial) rollout dominated resident memory before
+/// the decode cap ever engaged. Stat size is the advisory fast refusal —
+/// an over-bound file is not read at all — while the `take(cap + 1)` read
+/// is the authoritative bound for the stat-then-read race (rm-1871
+/// discipline: never trust stat as the last word on size).
+fn read_rollout_bounded(path: &Path) -> std::io::Result<RolloutRead> {
+    use std::io::Read;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_file() && meta.len() > ROLLOUT_SCAN_MAX_RAW_BYTES {
+            return Ok(RolloutRead::OverCap(meta.len()));
+        }
+    }
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(ROLLOUT_SCAN_MAX_RAW_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > ROLLOUT_SCAN_MAX_RAW_BYTES {
+        return Ok(RolloutRead::OverCap(bytes.len() as u64));
+    }
+    Ok(RolloutRead::Ok(bytes))
+}
+
 fn scan_rollout(path: &Path) -> RolloutScan {
     let mut scan = RolloutScan {
         fingerprint: None,
         total: TotalSnapshot::default(),
         first_timestamp: None,
         response_items: 0,
+        over_cap: None,
     };
-    let Ok(mut raw) = std::fs::read(path) else {
-        return scan;
+    let mut raw = match read_rollout_bounded(path) {
+        // Unreadable (missing, permissions, race): no evidence, not an
+        // error — the same contract the old bare `fs::read` carried.
+        Err(_) => return scan,
+        Ok(RolloutRead::OverCap(len)) => {
+            scan.over_cap = Some(len);
+            return scan;
+        }
+        Ok(RolloutRead::Ok(raw)) => raw,
     };
     // The zstd magic `28 B5 2F FD` — same probe as `parse_session_bytes`
     // (rm-992). Plain rollouts take the direct path byte-for-byte.
@@ -294,6 +356,9 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
         response_items: usize,
     }
     let mut families: HashMap<OpeningFingerprint, Vec<Evidence>> = HashMap::new();
+    // rm-451 residual arm: sessions whose rollout refused the raw-read
+    // admission bound — disclosed after the pass, never silently skipped.
+    let mut refused_over_cap: Vec<usize> = Vec::new();
     for (idx, session) in sessions.iter().enumerate() {
         if session.metrics.source_tool != "codex_cli" {
             continue;
@@ -302,6 +367,10 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
             continue;
         };
         let scan = scan_rollout(&path);
+        if scan.over_cap.is_some() {
+            refused_over_cap.push(idx);
+            continue;
+        }
         let Some(fingerprint) = scan.fingerprint else {
             continue;
         };
@@ -322,6 +391,21 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
             fingerprint_items: fingerprint.items,
             response_items: scan.response_items,
         });
+    }
+
+    // rm-451 residual arm: over-bound rollouts are a LOUD skip — one
+    // disclosure counter on the affected session (doctor folds
+    // `disclosure_counters` into its disclosed-facts lanes) and one stats
+    // count — so the refusal surfaces end-to-end instead of the file
+    // silently failing to join any family.
+    for idx in refused_over_cap {
+        sessions[idx]
+            .metrics
+            .disclosure_counters
+            .entry("codex_replay_scan_refused_oversized".to_string())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        stats.scans_refused_oversized += 1;
     }
 
     // Pass 2: per family, earliest start is the parent; rebase the rest.

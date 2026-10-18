@@ -27,6 +27,49 @@ fn cli_entrypoint_reads_generated_fixture() {
 }
 
 #[test]
+fn output_to_a_directory_refuses_with_the_truthful_cause() {
+    // rm-534 (run 7e61b07e cycle 3): the write guard checked
+    // fifo/socket/block-device but not directories, so `-o <dir>` fell
+    // through to the regular-file lane and rendered EISDIR as
+    // "Error: writing report output file: Permission denied (os error 13)"
+    // — wrong cause, wrong advice. The refusal must name the directory.
+    let dir = std::env::temp_dir().join("agenttrace-rm534-output-dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--sessions",
+            "--limit",
+            "1",
+            generated_fixture("detailed-tool-steps.jsonl")
+                .to_str()
+                .expect("fixture path is valid UTF-8"),
+            "-o",
+            dir.to_str().expect("temp dir path is valid UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI");
+
+    assert!(
+        !output.status.success(),
+        "-o <directory> must refuse loudly: {:?}",
+        output
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("it is a directory"),
+        "the refusal must name the truthful cause: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Permission denied"),
+        "the mislabeled EISDIR shape must be gone: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn project_filter_no_match_exits_loud() {
     // rm-779 review fix F2 (run 14954d7a independent_review): a
     // --project filter that matches nothing must be a loud rc!=0
