@@ -28,10 +28,6 @@ fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
     s.parse().expect("test timestamp parses")
 }
 
-fn ymd(t: chrono::DateTime<chrono::Utc>) -> String {
-    t.format("%Y-%m-%d").to_string()
-}
-
 #[test]
 fn history_rows_are_deduped_dated_and_evidence_backed() {
     let rows = rate_history_rows();
@@ -50,10 +46,16 @@ fn history_rows_are_deduped_dated_and_evidence_backed() {
     let mut last: Option<(&str, &str, f64, f64)> = None;
     for row in rows {
         assert_eq!(row.effective.len(), 10, "effective is YYYY-MM-DD");
-        assert!(row.observed.starts_with(row.effective), "observed on its effective date");
+        assert!(
+            row.observed.starts_with(row.effective),
+            "observed on its effective date"
+        );
         assert!(!row.note.is_empty(), "note carries provenance");
         assert!(row.input.is_finite() && row.input > 0.0, "sane input rate");
-        assert!(row.output.is_finite() && row.output > 0.0, "sane output rate");
+        assert!(
+            row.output.is_finite() && row.output > 0.0,
+            "sane output rate"
+        );
         if let Some((key, date, input, output)) = last {
             if key == row.key {
                 assert!(
@@ -127,8 +129,14 @@ fn bundled_row_is_a_state_on_the_same_ladder() {
     // every catalog-served key numerically identical whenever no edit
     // intervened.
     let priced = agenttrace_core::lookup_priced_at(KEY, None, Some(ts("2026-10-10T12:00:00Z")));
-    assert!((priced.price.input - 0.04).abs() < 1e-12, "bundled input 0.04/M");
-    assert!((priced.price.output - 0.64).abs() < 1e-12, "bundled output 0.64/M");
+    assert!(
+        (priced.price.input - 0.04).abs() < 1e-12,
+        "bundled input 0.04/M"
+    );
+    assert!(
+        (priced.price.output - 0.64).abs() < 1e-12,
+        "bundled output 0.64/M"
+    );
     assert_eq!(priced.basis.rate_date, "2026-10-08");
     assert_eq!(priced.basis.basis, agenttrace_core::RateBasisArm::AtSession);
     assert!(
@@ -176,11 +184,8 @@ fn raw_id_keys_not_in_the_catalog_price_from_history() {
 fn audit_lane_prices_at_newest_and_discloses_against_session() {
     // The cost-audit drift recompute prices at CURRENT rates by design;
     // rm-1965 keeps that but discloses the arm honestly.
-    let priced = agenttrace_core::rate_basis_against_session(
-        KEY,
-        None,
-        Some(ts("2026-10-10T12:00:00Z")),
-    );
+    let priced =
+        agenttrace_core::rate_basis_against_session(KEY, None, Some(ts("2026-10-10T12:00:00Z")));
     assert!((priced.price.output - 1.28).abs() < 1e-9, "newest state");
     assert_eq!(
         priced.basis.basis,
@@ -205,7 +210,11 @@ fn analyze_prices_at_session_time_and_serializes_the_basis() {
         ..Event::default()
     }];
     let metrics: Metrics = analyze(&events, KEY);
-    assert!((metrics.cost_estimated - 0.0007).abs() < 1e-9, "{}", metrics.cost_estimated);
+    assert!(
+        (metrics.cost_estimated - 0.0007).abs() < 1e-9,
+        "{}",
+        metrics.cost_estimated
+    );
     assert_eq!(metrics.rate_date.as_deref(), Some("2026-10-08"));
     assert_eq!(metrics.rate_basis.as_deref(), Some("at_session"));
     assert!(metrics.rate_source.as_deref().unwrap().contains("snapshot"));
@@ -224,17 +233,28 @@ fn analyze_prices_at_session_time_and_serializes_the_basis() {
         ..Event::default()
     }];
     let metrics: Metrics = analyze(&events, KEY);
-    assert!((metrics.cost_estimated - 0.0008).abs() < 1e-9, "{}", metrics.cost_estimated);
+    assert!(
+        (metrics.cost_estimated - 0.0008).abs() < 1e-9,
+        "{}",
+        metrics.cost_estimated
+    );
     assert_eq!(metrics.rate_date.as_deref(), Some("2026-10-12"));
     assert_eq!(metrics.rate_basis.as_deref(), Some("at_session"));
-    assert!(metrics.rate_source.as_deref().unwrap().starts_with("rate history"));
+    assert!(metrics
+        .rate_source
+        .as_deref()
+        .unwrap()
+        .starts_with("rate history"));
 
     // The disclosure serializes additively — `rate_date` first appears as
     // a serialized string on exactly the rm-1965 fields.
     let value = serde_json::to_value(&metrics).expect("Metrics serializes");
     assert_eq!(value["rate_date"], serde_json::json!("2026-10-12"));
     assert_eq!(value["rate_basis"], serde_json::json!("at_session"));
-    assert!(value["rate_source"].as_str().unwrap().starts_with("rate history"));
+    assert!(value["rate_source"]
+        .as_str()
+        .unwrap()
+        .starts_with("rate history"));
 }
 
 #[test]
@@ -242,12 +262,10 @@ fn keys_without_history_keep_the_snapshot_date_disclosure() {
     // gpt-5 is catalog-served with no recorded edit: rate_date is the
     // bundled snapshot date and the arm tells the truth about sessions
     // that predate it.
-    let priced =
-        agenttrace_core::lookup_priced_at("gpt-5", None, Some(ts("2026-10-15T00:00:00Z")));
+    let priced = agenttrace_core::lookup_priced_at("gpt-5", None, Some(ts("2026-10-15T00:00:00Z")));
     assert_eq!(priced.basis.rate_date, "2026-10-08");
     assert_eq!(priced.basis.basis, agenttrace_core::RateBasisArm::AtSession);
-    let priced =
-        agenttrace_core::lookup_priced_at("gpt-5", None, Some(ts("2026-09-01T00:00:00Z")));
+    let priced = agenttrace_core::lookup_priced_at("gpt-5", None, Some(ts("2026-09-01T00:00:00Z")));
     assert_eq!(
         priced.basis.basis,
         agenttrace_core::RateBasisArm::NewerThanSession
@@ -262,4 +280,3 @@ fn keys_without_history_keep_the_snapshot_date_disclosure() {
     assert_eq!(priced.basis.rate_date, "2026-10-08");
     assert_eq!(priced.basis.basis, agenttrace_core::RateBasisArm::AtSession);
 }
-

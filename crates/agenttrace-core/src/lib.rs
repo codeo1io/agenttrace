@@ -69,8 +69,8 @@ pub use pricing::{
     cache_rate_census, catalog_identity, has_specific_price, list_pricing, lookup_context_window,
     lookup_price, lookup_price_tiered, lookup_priced_at, pricing_cache_path, pricing_source,
     pricing_source_for, provider_for, rate_basis_against_session, rate_history_rows,
-    render_model_pricing_list,
-    render_test_match, update_pricing, CacheRateCensus, Price, PricedAt, RateBasis, RateBasisArm,
+    render_model_pricing_list, render_test_match, update_pricing, CacheRateCensus, Price, PricedAt,
+    RateBasis, RateBasisArm,
 };
 pub use reports::{
     add_baseline_comparison, guard_formula_json_leaves, report_compare, report_compare_json,
@@ -1625,7 +1625,10 @@ const IMPLAUSIBLE_TOKEN_MAGNITUDE: i64 = 1_000_000_000_000;
 pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // rm-1965: price the session at the rate live at session time — the
     // earliest event timestamp, never `now()` — and disclose the basis.
-    let session_ts = events.iter().filter_map(|event| parse_ts(&event.timestamp)).min();
+    let session_ts = events
+        .iter()
+        .filter_map(|event| parse_ts(&event.timestamp))
+        .min();
     let priced_at = pricing::lookup_priced_at(model, None, session_ts);
     let price = priced_at.price;
     let mut metrics = Metrics {

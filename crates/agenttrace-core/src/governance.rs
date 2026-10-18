@@ -956,15 +956,13 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         estimated_cost_usd,
         stored_estimated_cost_usd: round4(session.metrics.cost_estimated),
         rate_date: rate_basis.as_ref().map(|basis| basis.rate_date.clone()),
-        rate_basis: rate_basis
-            .as_ref()
-            .map(|basis| {
-                match basis.basis {
-                    pricing::RateBasisArm::AtSession => "at_session",
-                    pricing::RateBasisArm::NewerThanSession => "newer_than_session",
-                }
-                .to_string()
-            }),
+        rate_basis: rate_basis.as_ref().map(|basis| {
+            match basis.basis {
+                pricing::RateBasisArm::AtSession => "at_session",
+                pricing::RateBasisArm::NewerThanSession => "newer_than_session",
+            }
+            .to_string()
+        }),
         recorded_cost_usd: if recorded_basis {
             Some(round4(session.metrics.upstream_cost_usd))
         } else {

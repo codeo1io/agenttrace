@@ -19,9 +19,11 @@
 //! 4. a full-catalog sweep: every snapshot key bills at a real
 //!    snapshot row — no invented prices, no collateral collapse.
 
-use agenttrace_core::{lookup_context_window, lookup_price, pricing_source_for, provider_for};
+use agenttrace_core::{
+    lookup_context_window, lookup_price, pricing_source_for, provider_for, rate_history_rows,
+};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 fn snapshot_json() -> &'static Value {
@@ -331,6 +333,27 @@ fn unresolvable_window_is_none_not_a_twin() {
     );
 }
 
+/// rm-1965: newest observed state per rate-history key, in the sweep's
+/// cent-rounded units. Table order is date-ascending per key (pinned by
+/// rate_basis_contract), so the LAST row per key is its newest state —
+/// the rate a current-time (`at: None`) lookup bills.
+fn newest_observed_state() -> &'static HashMap<&'static str, (i64, i64)> {
+    static NEWEST: OnceLock<HashMap<&'static str, (i64, i64)>> = OnceLock::new();
+    NEWEST.get_or_init(|| {
+        let mut map = HashMap::new();
+        for row in rate_history_rows() {
+            map.insert(
+                row.key,
+                (
+                    (row.input * 1e2).round() as i64,
+                    (row.output * 1e2).round() as i64,
+                ),
+            );
+        }
+        map
+    })
+}
+
 #[test]
 fn bundled_catalog_sweep_bills_every_key_at_a_snapshot_row() {
     // Full-catalog sweep: every chat-priced snapshot key must bill at
@@ -395,6 +418,34 @@ fn bundled_catalog_sweep_bills_every_key_at_a_snapshot_row() {
             (price.input * 1e2).round() as i64,
             (price.output * 1e2).round() as i64,
         );
+        // rm-1965: a key with recorded rate history bills its NEWEST
+        // OBSERVED state at a current-time lookup — an evidence-backed
+        // supersession of the bundled row (models.dev edits rows in
+        // place; the snapshot is one state on a timeline), so the rate
+        // exists in no snapshot row BY DESIGN. Pin that arm explicitly
+        // and keep the no-invented-rates proof for every key without
+        // history.
+        if let Some(&observed) = newest_observed_state().get(key.as_str()) {
+            assert_eq!(
+                billed, observed,
+                "rm-1965: {key:?} must bill its newest observed state at a current-time lookup"
+            );
+            if is_qualified_key(key) {
+                qualified += 1;
+                let want_provider = row
+                    .get("litellm_provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert_eq!(
+                    provider_for(key).as_deref(),
+                    Some(want_provider),
+                    "qualified history key {key:?} still attributes to its own row's provider"
+                );
+            } else {
+                plain += 1;
+            }
+            continue;
+        }
         assert!(
             pairs.contains(&billed),
             "{key:?} bills ({:.2}/{:.2}) at a rate that exists in NO snapshot row",

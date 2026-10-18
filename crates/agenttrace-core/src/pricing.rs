@@ -636,12 +636,8 @@ pub fn lookup_priced_at(
             lookup_price_in(model, &catalog.aliases, &catalog.entries)
         }
     };
-    let (row, rate_date, arm, history_served) = rate_history_selection(
-        serving_key.as_deref(),
-        model,
-        snapshot_date,
-        at,
-    );
+    let (row, rate_date, arm, history_served) =
+        rate_history_selection(serving_key.as_deref(), model, snapshot_date, at);
     if let Some(row) = row {
         // rm-1965: the observed state supersedes the bundled standard
         // rates — a full-row supersession, because the cache rates ride
@@ -732,12 +728,7 @@ fn rate_history_selection(
     raw_model: &str,
     snapshot_date: &str,
     at: Option<chrono::DateTime<chrono::Utc>>,
-) -> (
-    Option<&'static RateHistoryRow>,
-    String,
-    RateBasisArm,
-    bool,
-) {
+) -> (Option<&'static RateHistoryRow>, String, RateBasisArm, bool) {
     // rm-196: an operator override is the operator's own truth — it
     // outranks every observed state, exactly as it outranks the bundled
     // row in the resolution ladder.
@@ -768,7 +759,7 @@ fn rate_history_selection(
         for candidate in &candidates {
             matched = RATE_HISTORY
                 .iter()
-                .filter(|row| &row.key == candidate)
+                .filter(|row| row.key == *candidate)
                 .collect();
             if !matched.is_empty() {
                 break;
@@ -837,10 +828,7 @@ fn rate_history_selection(
 
 /// ISO YYYY-MM-DD strings compare correctly as bytes, so the arm test is a
 /// plain string compare against the row's effective date.
-fn arm_against(
-    effective: &str,
-    at: Option<chrono::DateTime<chrono::Utc>>,
-) -> RateBasisArm {
+fn arm_against(effective: &str, at: Option<chrono::DateTime<chrono::Utc>>) -> RateBasisArm {
     match at.map(|t| t.format("%Y-%m-%d").to_string()) {
         None => RateBasisArm::AtSession,
         Some(ymd) => {
