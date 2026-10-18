@@ -17,7 +17,7 @@
 //! disclosures). Search rows (`--search`, rm-1415) carry the declared
 //! model because `SearchResult.model` reads the session attribution.
 
-use agenttrace_core::search::search_sessions;
+use agenttrace_core::search_sessions;
 
 fn scratch_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!(
@@ -38,11 +38,13 @@ fn write_envelope(dir: &std::path::Path, name: &str, messages: &str) -> std::pat
 
 const OPUS: &str = "claude-opus-4-1-20250805";
 
-const OPUS_ASSISTANT: &str = r#"{"role":"user","content":"razzmatazz brief me on the fix","timestamp":"2026-10-18T09:59:00Z"},
+fn opus_assistant() -> String {
+    r#"{"role":"user","content":"razzmatazz brief me on the fix","timestamp":"2026-10-18T09:59:00Z"},
 {"role":"assistant","content":"shipped the fix","timestamp":"2026-10-18T10:00:00Z",
  "modelInfo":{"id":"OPUS_ID","provider":"anthropic"},
  "metrics":{"tokensIn":1500,"tokensOut":900}}"#
-    .replace("OPUS_ID", OPUS);
+        .replace("OPUS_ID", OPUS)
+}
 
 /// The declaration prices the transcript on the DECLARED row, not the
 /// default fallback: 1500 in + 900 out at opus $15/$75 per M = 0.0225 +
@@ -50,9 +52,9 @@ const OPUS_ASSISTANT: &str = r#"{"role":"user","content":"razzmatazz brief me on
 #[test]
 fn declared_model_prices_on_the_declared_row_not_the_default_fallback() {
     let dir = scratch_dir("priced");
-    let path = write_envelope(&dir, "sess-a.messages.json", &OPUS_ASSISTANT);
+    let path = write_envelope(&dir, "sess-a.messages.json", &opus_assistant());
     let session = agenttrace_core::parse_file(&path).expect("envelope parses");
-    assert_eq!(session.model, OPUS, "modelInfo.id must win attribution");
+    assert_eq!(session.metrics.model_used, OPUS, "modelInfo.id must win attribution");
     assert!(
         (session.metrics.cost_estimated - 0.09).abs() < 1e-9,
         "opus row pricing expected, got {}",
@@ -92,7 +94,7 @@ fn envelope_without_modelinfo_keeps_the_fallback_shape_and_mints_no_counters() {
  "metrics":{"tokensIn":1500,"tokensOut":900}}"#;
     let path = write_envelope(&dir, "sess-b.messages.json", body);
     let session = agenttrace_core::parse_file(&path).expect("envelope parses");
-    assert_eq!(session.model, "default", "no declaration keeps the lane model");
+    assert_eq!(session.metrics.model_used, "default", "no declaration keeps the lane model");
     assert!(
         (session.metrics.cost_estimated - 0.018).abs() < 1e-9,
         "default-row pricing expected, got {}",
@@ -127,13 +129,13 @@ fn envelope_without_modelinfo_keeps_the_fallback_shape_and_mints_no_counters() {
 #[test]
 fn recorded_cost_wins_over_declared_row_pricing() {
     let dir = scratch_dir("recorded");
-    let body = OPUS_ASSISTANT.replace(
+    let body = opus_assistant().replace(
         "\"metrics\":{\"tokensIn\":1500,\"tokensOut\":900}",
         "\"metrics\":{\"tokensIn\":1500,\"tokensOut\":900,\"cost\":0.0123}",
     );
     let path = write_envelope(&dir, "sess-c.messages.json", &body);
     let session = agenttrace_core::parse_file(&path).expect("envelope parses");
-    assert_eq!(session.model, OPUS, "attribution is the declared id");
+    assert_eq!(session.metrics.model_used, OPUS, "attribution is the declared id");
     assert!(
         (session.metrics.cost_estimated - 0.0123).abs() < 1e-9,
         "recorded cost at face value expected, got {}",
@@ -148,11 +150,11 @@ fn recorded_cost_wins_over_declared_row_pricing() {
 fn unknown_declared_id_discloses_instead_of_folding_to_default() {
     let dir = scratch_dir("unknown");
     let unknown = "opaque-fleet-model-7";
-    let body = OPUS_ASSISTANT.replace(OPUS, unknown);
+    let body = opus_assistant().replace(OPUS, unknown);
     let path = write_envelope(&dir, "sess-d.messages.json", &body);
     let session = agenttrace_core::parse_file(&path).expect("envelope parses");
     assert_eq!(
-        session.model, unknown,
+        session.metrics.model_used, unknown,
         "unknown id keeps its identity instead of folding to default"
     );
     assert_eq!(
@@ -177,7 +179,7 @@ fn unknown_declared_id_discloses_instead_of_folding_to_default() {
 #[test]
 fn search_rows_carry_the_declared_model() {
     let dir = scratch_dir("search");
-    let path = write_envelope(&dir, "sess-e.messages.json", &OPUS_ASSISTANT);
+    let path = write_envelope(&dir, "sess-e.messages.json", &opus_assistant());
     let session = agenttrace_core::parse_file(&path).expect("envelope parses");
     let hits = search_sessions(std::slice::from_ref(&session), "razzmatazz", 10);
     assert!(!hits.is_empty(), "body hit must surface (rm-1415)");

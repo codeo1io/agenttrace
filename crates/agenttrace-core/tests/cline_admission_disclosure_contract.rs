@@ -142,7 +142,7 @@ fn manifest_less_transcript_is_counted_not_silently_dropped() {
             Some(&1),
             "the json disclosures map carries the loss class"
         );
-        let text = render_doctor_report(&report);
+        let text = render_doctor_report(None, false, "text").expect("render text");
         assert!(
             text.contains("admission-skipped: 1"),
             "plain report names the refusal count: {text}"
@@ -182,7 +182,7 @@ fn healthy_store_reports_zero_refusals_and_mints_no_key() {
             !report.disclosures.contains_key("cline_admission_skipped_sessions"),
             "0-count-clean: no disclosures key without a loss"
         );
-        let text = render_doctor_report(&report);
+        let text = render_doctor_report(None, false, "text").expect("render text");
         assert!(
             !text.contains("admission-skipped"),
             "no refusal line without a refusal: {text}"
@@ -208,7 +208,7 @@ fn all_refused_store_explains_the_admission_loss() {
         let report = build_doctor_report(None, false);
         assert_eq!(report.sessions, 0, "nothing was admitted");
         assert_eq!(report.cline_admission_skipped, 1);
-        let text = render_doctor_report(&report);
+        let text = render_doctor_report(None, false, "text").expect("render text");
         assert!(
             text.contains("cline session gate"),
             "empty-store explain names the gate: {text}"

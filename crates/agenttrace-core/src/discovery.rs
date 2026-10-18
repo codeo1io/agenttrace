@@ -1084,13 +1084,34 @@ fn walk_session_files_cached(
         // a fifo wedges with no message and no timeout. Cline task dirs
         // stay admissible — the cold walk admits them as session roots
         // ahead of the regular-file gate (see :862/:947 arms).
-        items.extend(
-            listing
-                .files
-                .into_iter()
-                .filter(|path| is_cline_task_dir(path) || path.is_file())
-                .filter(|path| file_targets.admit(path)),
-        );
+        // rm-1989: replay re-validates the cline admission gate on the
+        // (admission-raw) stored listing — counting refused
+        // transcript-shaped files exactly like the cold merge below, so
+        // a warm re-scan reports the same admission losses instead of
+        // silently dropping them (before this rung the listing was
+        // written post-gate, which is why it now stores gate-raw and
+        // DIR_LISTING_WALK_VERSION bumped 6 -> 7).
+        for path in listing.files {
+            if !(is_cline_task_dir(&path) || path.is_file()) {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if is_cline_cli_session_path(&path) && !is_cline_cli_session_file(&path) {
+                // Transcript-shaped bound: the deliberately-excluded
+                // `session.json`/`hooks.jsonl` siblings never ride the
+                // loss counter.
+                if name.ends_with(".messages.json") {
+                    *cline_admission_skipped += 1;
+                }
+                continue;
+            }
+            if file_targets.admit(&path) {
+                items.push(path);
+            }
+        }
         for child in listing.dirs {
             if visited.admit(&child) {
                 walk_session_files_cached(
@@ -1155,18 +1176,13 @@ fn walk_session_files_cached(
         if is_open_code_storage_path(&path) && !is_open_code_storage_session_file(&path) {
             continue;
         }
-        // rm-1881: under the Cline CLI canonical root only the
-        // `<id>.messages.json` transcript is admitted — the
-        // `session.json` manifest and `hooks.jsonl` siblings stay out,
-        // and the name alone never qualifies (content-shaped gates in
-        // `is_cline_cli_session_file`).
-        // rm-1989: a transcript-SHAPED file the gate still refuses is
-        // an admission-side loss — count it (cold arm) so it is
-        // disclosed, never silently dropped.
-        if is_cline_cli_session_path(&path) && !is_cline_cli_session_file(&path) {
-            *cline_admission_skipped += 1;
-            continue;
-        }
+        // rm-1881/rm-1989: under the Cline CLI canonical root the
+        // admission gate runs at MERGE time (below, after listing
+        // storage) so refused transcript names ride the stored listing
+        // and warm replays report the same losses as cold walks; the
+        // per-entry loop here stays admission-raw for the cline gate
+        // (every earlier gate — name/kind/special/gemini/opencode —
+        // still filters here, as before).
         files.push(path);
     }
     files.sort();
@@ -1174,9 +1190,34 @@ fn walk_session_files_cached(
     // rm-597: the stored listing is deliberately raw (undecidable at
     // per-directory scope); dedup happens as the list merges into the
     // walk output, keeping cached and uncached walks identical.
+    // rm-1989: "raw" now includes the cline admission gate — the gate
+    // evaluates at merge time (below) so the stored listing carries
+    // refused transcript names and warm replays report the same
+    // admission losses as cold walks.
     let _ = store_dir_listing(dir, &files, &dirs, cache);
 
-    items.extend(files.into_iter().filter(|path| file_targets.admit(path)));
+    // rm-1989 merge-time cline admission (mirrored on the warm replay
+    // arm above): a transcript-SHAPED file the gate refuses is an
+    // admission-side loss — count it, disclose it, never silently
+    // drop it. Transcript-shaped bound: only `.messages.json`
+    // refusals ride the counter (acceptance store of one admitted +
+    // one manifest-less session: files 2 / parsed 1 / skipped 1,
+    // never 3/1/2 with the manifest itself counted as a refusal).
+    for path in files {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if is_cline_cli_session_path(&path) && !is_cline_cli_session_file(&path) {
+            if name.ends_with(".messages.json") {
+                *cline_admission_skipped += 1;
+            }
+            continue;
+        }
+        if file_targets.admit(&path) {
+            items.push(path);
+        }
+    }
     for child in dirs {
         walk_session_files_cached(
             &child,
@@ -1268,9 +1309,19 @@ fn walk_session_files(
         // and the name alone never qualifies (content-shaped gates in
         // `is_cline_cli_session_file`).
         // rm-1989: same counting on the uncached walk (rm-1415-class
-        // parity with the cached arm above).
+        // parity with the cached arm above) — and the same
+        // transcript-shaped bound: manifest/hooks siblings stay
+        // uncounted deliberate exclusions, only `.messages.json`
+        // refusals ride the loss counter.
         if is_cline_cli_session_path(&path) && !is_cline_cli_session_file(&path) {
-            *cline_admission_skipped += 1;
+            // rm-1989 acceptance bound: only transcript-shaped refusals
+            // (`.messages.json`) are losses — the deliberately-excluded
+            // `session.json`/`hooks.jsonl` siblings never ride the
+            // counter (acceptance store: files 2 / parsed 1 / skipped 1,
+            // never 3/1/2 with the manifest itself counted).
+            if name.ends_with(".messages.json") {
+                *cline_admission_skipped += 1;
+            }
             continue;
         }
         // rm-597: same-file admission — a symlink or hardlink alias of an

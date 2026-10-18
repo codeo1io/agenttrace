@@ -7740,6 +7740,133 @@ fn path_slash(path: &Path) -> String {
         .join("/")
 }
 
+/// rm-1988: the envelope's per-assistant-message `modelInfo`
+/// declaration (id + provider) — the exact model that produced each
+/// assistant turn. Threading it into the events' `model_used` lets
+/// model attribution (and the pricing it drives) land on the declared
+/// row instead of collapsing to the 'default' alias: the assess F2 PoC
+/// — an envelope declaring `modelInfo.id: claude-opus-4-1-20250805`
+/// with 1.5k/900 tokens — rendered `model_used 'default'` and priced
+/// $0.018 against a $0.09 opus-row truth, a 5x understatement with
+/// zero disclosure. The census rides the SAME disclosure channels as
+/// the usage carriers (`cline_metrics_*`): an id with no specific
+/// catalog row is disclosed as unpriced, never silently folded into
+/// 'default'.
+#[derive(Default)]
+struct ClineModelDeclaration {
+    /// Assistant messages carrying a non-empty `modelInfo.id`.
+    messages: usize,
+    /// Distinct declared ids, first-seen order.
+    distinct: Vec<String>,
+    /// Last non-empty `modelInfo.provider` seen alongside a declared id.
+    provider: Option<String>,
+    /// Last declared id (the usage event's attribution basis — the
+    /// newest declaration is the freshest truth about the model that
+    /// produced the recorded tokens).
+    last_id: Option<String>,
+}
+
+impl ClineModelDeclaration {
+    fn declare(&mut self, id: &str, provider: Option<&str>) {
+        self.messages += 1;
+        if !self.distinct.iter().any(|seen| seen == id) {
+            self.distinct.push(id.to_string());
+        }
+        self.last_id = Some(id.to_string());
+        if let Some(provider) = provider.filter(|p| !p.is_empty()) {
+            self.provider = Some(provider.to_string());
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages == 0
+    }
+
+    /// The model the synthetic usage event carries: the newest declared
+    /// id, falling back to the lane model when no message declared one.
+    fn model_for_usage<'a>(&'a self, lane_model: &'a str) -> &'a str {
+        self.last_id.as_deref().unwrap_or(lane_model)
+    }
+
+    /// Fold the census into an event's disclosure surfaces — the usage
+    /// event when carriers exist, else the last declared-model text
+    /// event — so `--doctor` (json + plain) and every metrics fold pick
+    /// the declaration up through the existing channels.
+    fn attach(&self, event: &mut Event) {
+        event
+            .disclosure_counters
+            .insert("cline_modelinfo_messages".to_string(), self.messages as i64);
+        let unpriced: Vec<&String> = self
+            .distinct
+            .iter()
+            .filter(|id| !crate::pricing::has_specific_price(id))
+            .collect();
+        if !unpriced.is_empty() {
+            event.disclosure_counters.insert(
+                "cline_modelinfo_unpriced_ids".to_string(),
+                unpriced.len() as i64,
+            );
+            event.wire_metadata.insert(
+                "cline_modelinfo_unpriced".to_string(),
+                cline_bounded_id_list(&unpriced),
+            );
+        }
+        if self.distinct.len() > 1 {
+            event.disclosure_counters.insert(
+                "cline_modelinfo_distinct_models".to_string(),
+                self.distinct.len() as i64,
+            );
+        }
+        event.wire_metadata.insert(
+            "cline_modelinfo_models".to_string(),
+            cline_bounded_id_list(&self.distinct),
+        );
+        if let Some(provider) = &self.provider {
+            event
+                .wire_metadata
+                .insert("cline_modelinfo_provider".to_string(), provider.clone());
+        }
+    }
+}
+
+/// Bounded ", "-join for wire metadata — a hostile envelope declaring
+/// hundreds of ids must not mint an unbounded metadata string. The
+/// overflow suffix names what was elided.
+fn cline_bounded_id_list(ids: &[impl AsRef<str>]) -> String {
+    const JOIN_BYTE_BUDGET: usize = 120;
+    let mut joined = String::new();
+    let mut shown = 0usize;
+    for id in ids {
+        let id = id.as_ref();
+        let separator = if joined.is_empty() { 0 } else { 2 };
+        if joined.len() + separator + id.len() > JOIN_BYTE_BUDGET {
+            break;
+        }
+        if separator > 0 {
+            joined.push_str(", ");
+        }
+        joined.push_str(id);
+        shown += 1;
+    }
+    if shown < ids.len() {
+        joined.push_str(&format!(" (+{} more)", ids.len() - shown));
+    }
+    joined
+}
+
+/// Read one assistant message's `modelInfo.id` (+ provider) — the
+/// rm-1988 declaration lane. Empty/absent ids are `None`; a
+/// `modelInfo` that is not an object never qualifies.
+fn cline_declared_model(message: &JsonObject) -> Option<(String, Option<String>)> {
+    let info = message.get("modelInfo")?.as_object()?;
+    let id = string(info.get("id"))?.to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let provider = string(info.get("provider")).map(str::to_string);
+    Some((id, provider))
+}
+
 fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
     let messages = match value {
         Value::Array(items) => items.as_slice(),
@@ -7765,6 +7892,13 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
     // every absorbed carrier adds (saturating); nothing is overwritten
     // or dropped, and unknown additive fields are tolerated.
     let mut usage_state = ClineUsageState::default();
+    // rm-1988: per-assistant-message `modelInfo` census — see
+    // [`ClineModelDeclaration`]. The index tracks the last event pushed
+    // for a declared message so a carrier-free envelope still discloses
+    // through that event (the usage-event arm does not exist when
+    // carriers == 0).
+    let mut declared = ClineModelDeclaration::default();
+    let mut last_declared_event: Option<usize> = None;
     for message in messages {
         let Some(message) = message.as_object() else {
             continue;
@@ -7779,6 +7913,20 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
             first_value(message, &["timestamp", "ts", "createdAt", "created_at"])
                 .unwrap_or(&Value::Null),
         );
+        // rm-1988: the assistant declaration wins for the message that
+        // carries it; every other message keeps the lane model.
+        let role_is_assistant = role == "assistant";
+        let msg_model = if role_is_assistant {
+            match cline_declared_model(message) {
+                Some((id, provider)) => {
+                    declared.declare(&id, provider.as_deref());
+                    id
+                }
+                None => model.to_string(),
+            }
+        } else {
+            model.to_string()
+        };
         if let Some(carrier) = message.get("metrics").and_then(cline_carrier_from_object) {
             cline_absorb_carrier(&mut usage_state, carrier, &ts);
             // rm-1882: `carriers` counts entries-with-carriers, not
@@ -7788,7 +7936,7 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
         }
         let before = events.len();
         if let Some(content) = message.get("content") {
-            cline_content_events(&role, &ts, model, content, &mut events);
+            cline_content_events(&role, &ts, &msg_model, content, &mut events);
         }
         if events.len() == before {
             let text = string(message.get("text"))
@@ -7799,11 +7947,17 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
                     role,
                     content: text.to_string(),
                     timestamp: ts,
-                    model_used: model.to_string(),
+                    model_used: msg_model.clone(),
                     source_tool: "cline".to_string(),
                     ..Event::default()
                 });
             }
+        }
+        if role_is_assistant
+            && events.len() > before
+            && declared.last_id.as_deref() == Some(msg_model.as_str())
+        {
+            last_declared_event = Some(events.len() - 1);
         }
     }
     // Appended after the text stream (pi `recorded_cost_usd`
@@ -7812,8 +7966,22 @@ fn parse_cline_value(value: &Value, model: &str) -> Option<Vec<Event>> {
     // provenance flips to reported_by_agent downstream. A metrics-free
     // envelope takes none of this path (carriers == 0 gates the event)
     // and renders byte-identically to the pre-rm-1881 walk.
-    if let Some(event) = cline_usage_event(&usage_state, model) {
+    // rm-1988: the usage event carries the newest DECLARED model (falling
+    // back to the lane model), so reported tokens price and disclose on
+    // the row that actually produced them; recorded metrics.cost still
+    // wins through recorded_cost_usd below.
+    if let Some(mut event) = cline_usage_event(&usage_state, declared.model_for_usage(model)) {
+        if !declared.is_empty() {
+            declared.attach(&mut event);
+        }
         events.push(event);
+    } else if let Some(index) = last_declared_event {
+        // Carrier-free envelope: the census rides the last declared-model
+        // text event so the declaration still reaches the disclosure
+        // folds (usage event does not exist when carriers == 0).
+        if let Some(event) = events.get_mut(index) {
+            declared.attach(event);
+        }
     }
     non_empty(events)
 }
@@ -9316,6 +9484,12 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
     };
     let mut events = Vec::new();
     let mut usage_state = ClineUsageState::default();
+    // rm-1988: the same per-message `modelInfo` declaration the
+    // envelope lane threads — one object must fold to the same totals
+    // through either lane (the rm-1881 law), model attribution
+    // included.
+    let mut declared = ClineModelDeclaration::default();
+    let mut last_declared_event: Option<usize> = None;
     for message in messages {
         let Some(message) = message.as_object() else {
             continue;
@@ -9378,17 +9552,44 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
         if say == "tool" || ask == "tool" {
             role = "assistant";
         }
+        // rm-1988: an assistant entry's `modelInfo` declaration wins for
+        // that entry's event (see [`ClineModelDeclaration`]).
+        let msg_model = if role == "assistant" {
+            match cline_declared_model(message) {
+                Some((id, provider)) => {
+                    declared.declare(&id, provider.as_deref());
+                    id
+                }
+                None => model.to_string(),
+            }
+        } else {
+            model.to_string()
+        };
+        let before = events.len();
         events.push(Event {
             role: role.to_string(),
             content: text.to_string(),
             timestamp: ts,
-            model_used: model.to_string(),
+            model_used: msg_model.clone(),
             source_tool: "cline".to_string(),
             ..Event::default()
         });
+        if role == "assistant"
+            && events.len() > before
+            && declared.last_id.as_deref() == Some(msg_model.as_str())
+        {
+            last_declared_event = Some(events.len() - 1);
+        }
     }
-    if let Some(event) = cline_usage_event(&usage_state, model) {
+    if let Some(mut event) = cline_usage_event(&usage_state, declared.model_for_usage(model)) {
+        if !declared.is_empty() {
+            declared.attach(&mut event);
+        }
         events.push(event);
+    } else if let Some(index) = last_declared_event {
+        if let Some(event) = events.get_mut(index) {
+            declared.attach(event);
+        }
     }
     events
 }

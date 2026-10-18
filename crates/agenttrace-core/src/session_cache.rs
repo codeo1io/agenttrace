@@ -1177,7 +1177,15 @@ const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 /// manifest and `hooks.jsonl` siblings no longer are. A listing stored
 /// by a pre-rm-1881 walk of that root replays the old admission set,
 /// so the lane bumps once to retire every stored listing.
-const DIR_LISTING_WALK_VERSION: i64 = 6;
+///
+/// v7 (rm-1989, cycle 1 2026-10-18): the stored listing is now
+/// admission-RAW for the cline gate — the walk stores refused
+/// transcript names under the Cline CLI root too and evaluates the
+/// admission gate (with the rm-1989 loss counter) at merge time, so a
+/// warm replay reports the same admission losses as a cold walk.
+/// Listings written by a v6 walk are post-gate (refused transcripts
+/// absent), so every stored listing retires once and re-walks.
+const DIR_LISTING_WALK_VERSION: i64 = 7;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")

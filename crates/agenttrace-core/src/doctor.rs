@@ -3,7 +3,7 @@ use crate::sqlite_sessions::{
     load_sqlite_backed_sessions_reported_bounded, SqlitePartialDb, SqliteScanBudget,
 };
 use crate::{
-    cache_dir::user_cache_dir, cached_session, find_session_files, known_session_dirs,
+    cache_dir::user_cache_dir, cached_session, find_session_files_counted, known_session_dirs,
     load_session_cache, parse_file, save_session_cache, store_session, Session, SqliteIngestReport,
     VERSION,
 };
