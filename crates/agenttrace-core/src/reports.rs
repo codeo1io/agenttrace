@@ -516,7 +516,28 @@ pub fn report_overview_json_with_health(
     let ordered = canonical_sessions(sessions);
     let summary = overview_summary(overview, &ordered);
     let agents = group_items(&overview.by_agent, true);
-    let models = group_items(&overview.by_model, false);
+    let mut models = group_items(&overview.by_model, false);
+    // rm-1574: by_model is the money dimension — rows billed on the
+    // disclosed default carry `pricing_basis: "fallback"` (the
+    // default/unknown/multiple buckets "unknown"); exactly-priced
+    // rows keep the pre-change shape, so all-exact corpora render
+    // byte-identically to before. Review fix 9ce27e5c (F4): the key is
+    // `pricing_basis`, NOT `cost_basis` — that name is the loop-cost
+    // basis vocabulary (priced/synthetic, waste.rs / diagnostics.rs)
+    // and the mint itself reserved it; one key, one vocabulary.
+    for row in models.iter_mut() {
+        let Some(name) = row.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(basis) = pricing_basis_label(name) {
+            if let Value::Object(obj) = row {
+                obj.insert(
+                    "pricing_basis".to_string(),
+                    Value::String(basis.to_string()),
+                );
+            }
+        }
+    }
     let projects = group_items(&overview.by_project, false);
     let providers = group_items(&overview.by_provider, false);
     // rm-585 (spend-by-branch, first cut): same GroupOverview shape as
@@ -1614,18 +1635,41 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     }
 
     out.push_str("  ── By Agent ──\n");
-    push_text_group_family(&mut out, &overview.by_agent, 30, |name| {
-        tool_display_name(name)
-    });
+    push_text_group_family(
+        &mut out,
+        &overview.by_agent,
+        30,
+        |name| tool_display_name(name),
+        |_| "",
+    );
 
     out.push_str("  ── By Model ──\n");
-    push_text_group_family(&mut out, &overview.by_model, 25, |name| name.clone());
+    // rm-1574: visibly-defaulted money carries a marker on the text
+    // lane too — only on non-exact rows, so exact corpora stay
+    // byte-stable.
+    push_text_group_family(
+        &mut out,
+        &overview.by_model,
+        25,
+        |name| name.clone(),
+        |name| match pricing_basis_label(name) {
+            Some("fallback") => " (fallback pricing)",
+            Some(_) => " (pricing unknown)",
+            None => "",
+        },
+    );
 
     // rm-245: vendor and task-type dimensions beside by-model. Providers
     // come from the pricing catalog row that prices each model;
     // unresolvable models land in the explicit "unknown" bucket.
     out.push_str("  ── By Provider ──\n");
-    push_text_group_family(&mut out, &overview.by_provider, 25, |name| name.clone());
+    push_text_group_family(
+        &mut out,
+        &overview.by_provider,
+        25,
+        |name| name.clone(),
+        |_| "",
+    );
 
     // rm-585 (spend-by-branch, first cut): branch values come only
     // from the claude-code gitBranch envelope; missing, detached-HEAD
@@ -1642,14 +1686,20 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     // over-long refs at the 40-rune bound, so the lane stays bounded
     // and control-byte-safe.
     out.push_str("  ── By Branch ──\n");
-    push_text_group_family(&mut out, &overview.by_branch, 40, |name| name.clone());
+    push_text_group_family(
+        &mut out,
+        &overview.by_branch,
+        40,
+        |name| name.clone(),
+        |_| "",
+    );
 
     // rm-1405 reap (run 4f2af62e5b7e): By Org renders only when org
     // data exists (zero-noise facet — no "unknown" bucket).
     let org_groups = group_items(&overview.by_org, false);
     if !org_groups.is_empty() {
         out.push_str("  ── By Org ──\n");
-        push_text_group_family(&mut out, &overview.by_org, 40, |name| name.clone());
+        push_text_group_family(&mut out, &overview.by_org, 40, |name| name.clone(), |_| "");
     }
 
     out.push_str("  ── By Task Type ──\n");
@@ -2105,9 +2155,16 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
 
     w("<section><h2>By model</h2><table><thead><tr><th>Model</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
     for (model, group) in models.iter().take(GROUP_TAKE) {
+        // rm-1574: the HTML money rows carry the same visibly-defaulted
+        // marker as the text lane (exact rows stay unchanged).
+        let model_cell = match pricing_basis_label(model) {
+            Some("fallback") => format!("{} (fallback pricing)", html_escape(model)),
+            Some(_) => format!("{} (pricing unknown)", html_escape(model)),
+            None => html_escape(model),
+        };
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
-            html_escape(model),
+            model_cell,
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -2593,6 +2650,49 @@ fn overview_summary(overview: &Overview, sessions: &[Session]) -> Value {
             "counts": authority_counts,
         },
     })
+}
+
+/// rm-1574 (run fd0e91a2 cycle 3, basis disclosure): every reported
+/// dollar is either exactly right or visibly defaulted. This maps a
+/// by-model group key to its pricing basis, computed at render (never
+/// stored) from the same singleton catalog the cost math itself uses,
+/// so a label can never disagree with the price actually applied:
+/// `None` (exact — catalog-priced; rows stay byte-identical to before,
+/// zero-noise for all-exact corpora), `Some("fallback")` (billed on
+/// the disclosed $3/$15 default), `Some("unknown")` (the
+/// default/unknown/multiple buckets where no single model prices the
+/// row). Mirrors governance's cost-audit classification (the
+/// `Pricing: … exact= fallback= unknown=` aggregate line).
+fn pricing_basis_label(model: &str) -> Option<&'static str> {
+    if matches!(model, "default" | "unknown" | "multiple") {
+        return Some("unknown");
+    }
+    if crate::pricing::has_specific_price(model) {
+        None
+    } else {
+        Some("fallback")
+    }
+}
+
+/// rm-1574 review fix 9ce27e5c (run fd0e91a2 cycle 3, F1): the
+/// session-level arm of the basis disclosure. The `--diagnostics
+/// --inspect` JSON row previously exposed only the LOOP cost basis
+/// (`priced`/`synthetic`, diagnostics.rs), so a fallback-billed
+/// `zzz-unknown-xyz` session was indistinguishable from an
+/// exactly-priced one — the mint's named defect instance. This is the
+/// same ladder as the by-model rows, rendered as an always-present
+/// vocabulary (`exact` / `fallback` / `unknown`, matching the
+/// by-model key's values) computed at render from
+/// `metrics.model_used` — never stored — so the label can never
+/// disagree with the price the session actually paid.
+pub fn session_pricing_basis(model: &str) -> &'static str {
+    if model.is_empty() {
+        return "unknown";
+    }
+    match pricing_basis_label(model) {
+        Some(basis) => basis,
+        None => "exact",
+    }
 }
 
 fn group_items(groups: &BTreeMap<String, GroupOverview>, agent_display: bool) -> Vec<Value> {
@@ -3425,11 +3525,20 @@ fn push_text_group_family(
     groups: &BTreeMap<String, GroupOverview>,
     width: usize,
     display_name: impl Fn(&String) -> String,
+    marker: impl Fn(&String) -> &'static str,
 ) {
     for (name, group) in sorted_group_overview(groups).into_iter().take(GROUP_TAKE) {
+        // rm-1574: the basis marker is appended AFTER `text_cell` has
+        // run the sanitizer + rm-985 formula guard + numeric
+        // exemption on the bare name — it is a trusted constant
+        // suffix, so it can neither re-arm a neutralized formula nor
+        // strip a numeric-looking cell of its bare-for-value-import
+        // shape (the rm-985 exemption contract).
+        let mut cell = text_cell(&display_name(name), width);
+        cell.push_str(marker(name));
         out.push_str(&format!(
             "    {:<width$} {:>4} Sessions  {:>8}\n",
-            text_cell(&display_name(name), width),
+            cell,
             format_count(group.sessions),
             format_cost(group.cost),
             width = width
@@ -4261,5 +4370,85 @@ mod tests {
         assert!(cell.contains("workbuddy_input_basis:zeroed_suspected_mismatch=1"));
         assert!(cell.contains("upstream luoyuctl/agenttrace#310"));
         assert!(cell.contains("cache-inclusive"));
+    }
+
+    #[test]
+    fn by_model_rows_disclose_pricing_basis() {
+        // rm-1574 (run fd0e91a2 cycle 3, basis disclosure): every
+        // reported dollar is either exactly right or visibly
+        // defaulted. The money dimension's group rows carry their
+        // pricing basis, computed at render (never stored): rows
+        // billed on the disclosed $3/$15 default say
+        // `pricing_basis: "fallback"` (review fix 9ce27e5c renamed the
+        // key off the loop-cost `cost_basis` vocabulary), the no-model buckets say
+        // `"unknown"`, and exactly-priced rows stay byte-identical to
+        // before (no key, no marker — zero-noise for all-exact
+        // corpora). Mirrors governance's cost-audit classification, so
+        // the aggregate Pricing line and the per-row labels can never
+        // disagree.
+        let _env = crate::test_env::lock_env();
+        let basis_session = |name: &str, model: &str| crate::Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: name.to_string(),
+            path: format!("/tmp/{name}.jsonl"),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: crate::Metrics {
+                model_used: model.to_string(),
+                ..crate::Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let exact_model = "daybreak-red-latest"; // priced in the bundled snapshot
+        let sessions = vec![
+            basis_session("fb", "zzz-u"),
+            basis_session("ex", exact_model),
+        ];
+        let overview = crate::compute_overview(&sessions);
+        let json = report_overview_json(&overview, &sessions);
+        let payload: serde_json::Value = serde_json::from_str(&json).expect("overview JSON");
+        let rows = payload
+            .get("by_model")
+            .and_then(|value| value.as_array())
+            .expect("by_model rows");
+        let mut seen_fallback = false;
+        for row in rows {
+            match row.get("name").and_then(|value| value.as_str()) {
+                Some("zzz-u") => {
+                    assert_eq!(
+                        row.get("pricing_basis").and_then(|value| value.as_str()),
+                        Some("fallback"),
+                        "default-billed row is visibly defaulted"
+                    );
+                    seen_fallback = true;
+                }
+                Some(model) if model == exact_model => {
+                    assert!(
+                        row.get("pricing_basis").is_none()
+                            && row.get("cost_basis").is_none(),
+                        "exactly-priced rows keep the pre-change shape — and the loop-cost key never appears on a group row"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(seen_fallback, "fallback row present");
+        // Text lane: the fallback row is visibly marked, the exact
+        // row keeps its plain name (byte-stable).
+        let text = report_overview_text(&overview, &sessions);
+        assert_eq!(
+            text.matches("(fallback pricing)").count(),
+            1,
+            "exactly one visibly-defaulted marker"
+        );
+        assert!(text.contains("zzz-u (fallback pricing)"));
+        assert!(text.contains(exact_model));
+        // HTML lane carries the same marker.
+        let html = report_overview_html(&overview, &sessions);
+        assert!(html.contains("(fallback pricing)"));
     }
 }

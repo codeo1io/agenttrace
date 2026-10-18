@@ -626,9 +626,11 @@ pub fn update_pricing() -> anyhow::Result<usize> {
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
     // Same redirect parity as the initial catalog: a `--update-pricing`
     // refresh replaces the singleton, and the codex SKU coverage must
-    // survive it (rm-610) instead of silently reverting to fallback.
+    // survive it (rm-610) instead of silently reverting to fallback —
+    // the daybreak responses pins ride the same refresh parity (rm-1570).
     apply_codex_sku_entries(&mut catalog);
     apply_codex_sku_aliases(&mut catalog);
+    apply_daybreak_responses_entries(&mut catalog);
     let _ = PRICING_CATALOG.set(catalog);
     Ok(count)
 }
@@ -774,6 +776,7 @@ fn load_catalog_for_current_env() -> PricingCatalog {
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
     apply_codex_sku_entries(&mut catalog);
     apply_codex_sku_aliases(&mut catalog);
+    apply_daybreak_responses_entries(&mut catalog);
     catalog
 }
 
@@ -827,6 +830,48 @@ fn apply_codex_sku_entries(catalog: &mut PricingCatalog) {
         .providers
         .entry("gpt-5.3-codex".to_string())
         .or_insert_with(|| "openai".to_string());
+}
+
+/// rm-1570 (run fd0e91a2 cycle 3, money truth): the daybreak family
+/// is codex 0.163.0's DEFAULT model set, and LiteLLM publishes the
+/// `gpt-daybreak-*-latest` ids only under `mode: "responses"`, which
+/// the chat-mode catalog filter (update-snapshot.sh and
+/// `convert_litellm` alike) excludes — so the ids priced at the
+/// disclosed $3/$15 default instead of their own rates. Assess
+/// 2bdc99b3's live PoC measured the damage end to end: a
+/// `gpt-daybreak-red-latest` session billed $18.00 on fallback where
+/// the published rates put it at $87.50 — a ~4.86x UNDERSTATEMENT
+/// (the default rates are cheaper than red's published rates, so a
+/// fallback row is money the report silently under-bills, never a
+/// safe over-estimate). Rates are LiteLLM's
+/// own rows (live capture 2026-10-17), identical to the
+/// `daybreak-*-latest` chat twins already bundled: red 1.25e-5 in /
+/// 7.5e-5 out / 1.5625e-5 cache write / 1.25e-6 cache read per token,
+/// blue 4e-6 / 2e-5 / 5e-6 / 4e-7. `or_insert` retires each row the
+/// day upstream ships a chat-mode entry — the same
+/// drop-on-upstream-ship discipline as the aliases and the
+/// gpt-5.3-codex vend above — and a user override price for the id
+/// still wins (overrides merge first).
+fn apply_daybreak_responses_entries(catalog: &mut PricingCatalog) {
+    for (id, input, output, cw, cr) in [
+        ("gpt-daybreak-red-latest", 12.5, 75.0, 15.625, 1.25),
+        ("gpt-daybreak-blue-latest", 4.0, 20.0, 5.0, 0.4),
+    ] {
+        catalog
+            .entries
+            .entry(id.to_string())
+            .or_insert_with(|| Price {
+                input,
+                output,
+                cw,
+                cr,
+                ..Price::default()
+            });
+        catalog
+            .providers
+            .entry(id.to_string())
+            .or_insert_with(|| "openai".to_string());
+    }
 }
 
 fn fallback_catalog() -> PricingCatalog {
@@ -3723,6 +3768,86 @@ mod tests {
         assert_eq!(
             shipped.entries["gpt-5.3-codex"].input, 9.0,
             "a real upstream row must win over the vend"
+        );
+    }
+
+    #[test]
+    fn daybreak_responses_rows_are_pinned_exact() {
+        // rm-1570 (run fd0e91a2 cycle 3, money truth): codex 0.163.0's
+        // DEFAULT family billed against the disclosed $3/$15 default
+        // (~4.86x UNDERSTATEMENT on daybreak-red — assess 2bdc99b3's
+        // live PoC billed an $87.50 session $18.00) because
+        // LiteLLM publishes the gpt-daybreak family only under mode
+        // "responses", which the chat-mode snapshot filter excludes.
+        // The pin mirrors the published per-token rates exactly (live
+        // capture 2026-10-17: input 1.25e-5, output 7.5e-5, cache
+        // write 1.5625e-5, cache read 1.25e-6 red; input 4e-6, output
+        // 2e-5, cache write 5e-6, cache read 4e-7 blue — identical to
+        // the daybreak-*-latest chat twins already bundled) and
+        // retires per the rm-610 drop-on-upstream-ship discipline.
+        let _env = crate::test_env::lock_env();
+        let mut catalog = PricingCatalog {
+            entries: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: None,
+        };
+        catalog.entries.insert(
+            "already-shipped".to_string(),
+            Price {
+                input: 1.0,
+                output: 2.0,
+                ..Price::default()
+            },
+        );
+        apply_daybreak_responses_entries(&mut catalog);
+        for (id, input, output, cw, cr) in [
+            ("gpt-daybreak-red-latest", 12.5, 75.0, 15.625, 1.25),
+            ("gpt-daybreak-blue-latest", 4.0, 20.0, 5.0, 0.4),
+        ] {
+            let price = catalog
+                .entries
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} missing from pinned catalog"));
+            assert_eq!(price.input, input, "{id} input");
+            assert_eq!(price.output, output, "{id} output");
+            assert_eq!(price.cw, cw, "{id} cache write");
+            assert_eq!(price.cr, cr, "{id} cache read");
+            assert_eq!(catalog.providers[id], "openai", "{id} provider row");
+        }
+        assert!(
+            catalog
+                .entries
+                .get("already-shipped")
+                .is_some_and(|price| price.input == 1.0),
+            "or_insert: a snapshot-shipped row always wins over the pin"
+        );
+        // The shipped bundle carries the family too: both catalog
+        // build sites pin, so the codex default resolves exact through
+        // has_specific_price instead of the disclosed default (the
+        // assess PoC's fallback arm).
+        let shipped = load_catalog_for_current_env();
+        assert!(shipped.entries.contains_key("gpt-daybreak-red-latest"));
+        assert!(shipped.entries.contains_key("gpt-daybreak-blue-latest"));
+        assert!(has_specific_price("gpt-daybreak-red-latest"));
+        assert!(has_specific_price("gpt-daybreak-blue-latest"));
+        // Review fix 9ce27e5c (F5): the pin resolves a real token bill
+        // exactly — 1M in + 1M out is $87.50 red / $24.00 blue, against
+        // the $18.00 the disclosed $3/$15 default billed the SAME
+        // traffic (the PoC's measured ~4.86x understatement ratio).
+        assert_eq!(
+            token_cost(1_000_000, 1_000_000, 0, 0, "gpt-daybreak-red-latest", None),
+            87.5
+        );
+        assert_eq!(
+            token_cost(1_000_000, 1_000_000, 0, 0, "gpt-daybreak-blue-latest", None),
+            24.0
+        );
+        assert_eq!(
+            token_cost(1_000_000, 1_000_000, 0, 0, "zzz-unknown-xyz", None),
+            18.0,
+            "the fallback default's own 1M+1M bill — the understated side of the 4.86x ratio"
         );
     }
 

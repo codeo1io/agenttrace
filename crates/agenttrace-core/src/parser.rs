@@ -3018,6 +3018,26 @@ pub(crate) fn capped_disclosure_value(value: &str) -> String {
     format!("{prefix}…#{}", fnv1a_hex(&sanitized))
 }
 
+/// rm-1571 (run fd0e91a2 cycle 3, hostile-input bound): org identity
+/// values are journal-controlled strings, so they get the same
+/// rm-594/rm-880 wire-metadata treatment as the cwd cap — sanitize,
+/// then prefix+digest past the disclosure cap. A hostile 5 MiB
+/// `orgIdentifier` (assess 2bdc99b3 PoC) used to flow raw into
+/// `by_org` names, the JSON overview (a 5,250,754-byte report off one
+/// session) and the session-cache write (5,247,893 bytes). Returns
+/// `(capped, truncated)` so the capture site can mint the
+/// `org_identity_truncated` disclosure counter — the cwd cap's
+/// `(String, bool)` contract. Sane values round-trip byte-identically
+/// and the cap is idempotent (a capped value re-caps to itself), so
+/// the session cache applies the same cap at materialization without
+/// a schema-rung bump: warm entries either match what a fresh parse
+/// would produce or shrink.
+pub(crate) fn cap_org_identity_value(raw: &str) -> (String, bool) {
+    let sanitized = crate::statusline::sanitize_line_segment(raw);
+    let truncated = sanitized.chars().count() > DISCLOSURE_VALUE_CAP;
+    (capped_disclosure_value(raw), truncated)
+}
+
 fn oh_my_pi_message_events(
     message: &Map<String, Value>,
     entry_ts: &str,
@@ -5249,6 +5269,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // (first non-empty wins; see the carrier note at the lane tail).
     let mut org = String::new();
     let mut org_email = String::new();
+    let mut org_identity_truncated = false;
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
         if cwd.is_empty() {
@@ -5287,8 +5308,19 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         // the cwd gate above.
         if org.is_empty() {
             if let Some((captured_org, captured_email)) = claude_org_identity(obj) {
-                org = captured_org;
-                org_email = captured_email;
+                // rm-1571: the identity fields are journal-controlled
+                // strings — cap them through the disclosure-value
+                // discipline (sanitize, then prefix+digest past the
+                // cap) so a hostile-length orgIdentifier can never
+                // balloon the report or cache lanes. Sane orgs
+                // round-trip byte-identically; the truncation rides
+                // the `org_identity_truncated` counter beside the
+                // capture-basis counter at the carrier below.
+                let (capped_org, org_truncated) = cap_org_identity_value(&captured_org);
+                let (capped_email, email_truncated) = cap_org_identity_value(&captured_email);
+                org = capped_org;
+                org_email = capped_email;
+                org_identity_truncated = org_truncated || email_truncated;
             }
         }
         match typ {
@@ -5522,10 +5554,21 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     .disclosure_counters
                     .entry("claude_org_identity:transcript".to_string())
                     .or_insert(0) += 1;
+                if org_identity_truncated {
+                    // rm-1571: disclose the cap instead of silently
+                    // rewriting the record.
+                    *meta
+                        .disclosure_counters
+                        .entry("org_identity_truncated".to_string())
+                        .or_insert(0) += 1;
+                }
             }
             None => {
                 let mut counters = BTreeMap::new();
                 counters.insert("claude_org_identity:transcript".to_string(), 1);
+                if org_identity_truncated {
+                    counters.insert("org_identity_truncated".to_string(), 1);
+                }
                 events.insert(
                     0,
                     Event {

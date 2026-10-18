@@ -4,6 +4,59 @@
 
 ### Added
 
+- daybreak money truth + hostile-org bound + per-row pricing basis
+  (rm-1570 + rm-1571 + rm-1574, run fd0e91a2 cycle 3): the gpt-daybreak
+  family is codex 0.163.0's DEFAULT model set, and LiteLLM publishes the
+  `gpt-daybreak-*-latest` ids only under `mode: "responses"`, which the
+  chat-mode snapshot filter excludes — so those ids priced at the
+  disclosed $3/$15 default instead of their own rates (assess 2bdc99b3
+  PoC: a daybreak-red session billed $18.00 on fallback where the
+  published rates put it at $87.50 — a ~4.86x UNDERSTATEMENT. Review
+  fix 9ce27e5c corrected this line, the pricing.rs doc comment and
+  the test comment, which had all inverted the direction to a $3.70
+  overcharge: the default rates are CHEAPER than red's published
+  rates, so a fallback row silently under-bills. The ids are now hand-pinned
+  code-side (LiteLLM's own rates, live capture 2026-10-17, identical to
+  the daybreak chat twins) on both catalog build paths with
+  drop-on-upstream-ship `or_insert` discipline (rm-610 precedent); the
+  bundled card goldens' footer priced-model count moves 4441 → 4443
+  accordingly. Second, org identity is a journal-controlled string and
+  got no cap: a hostile 5 MiB `orgIdentifier` flowed raw into `by_org`
+  names, the JSON overview (a 5,250,754-byte report off one session)
+  and the session-cache write. Identity capture now applies the
+  repo's disclosure-cap discipline (sanitize, then prefix+digest past
+  the cap — the rm-594/rm-880 wire-metadata treatment), mints an
+  `org_identity_truncated` disclosure counter on the carrier, and the
+  session-cache materialization path applies the same idempotent cap so
+  stale warm entries from pre-fix builds can never balloon the output
+  lanes (sane orgs round-trip byte-identically; no schema-rung bump —
+  warm rows either match what a fresh parse produces or shrink).
+  Design deviation from the mint, recorded per review 9ce27e5c (F6):
+  the truncation discloses as the `org_identity_truncated` counter
+  plus the deterministic capped form (48-char visible prefix, U+2026,
+  `#`, 12-hex FNV-1a of the full sanitized value), NOT the original
+  length — the length itself is hostile-controlled signal, and the
+  digest already preserves distinguishability. Review 9ce27e5c also
+  pinned the spoofing-char arm the acceptance demanded (control,
+  bidi, BOM, joiner and newline chars in an orgIdentifier are
+  U+FFFD-replaced before the cap).
+  Third, per-row money truth: by-model group rows in the money
+  dimension now carry their pricing basis, computed at render from the
+  same catalog the cost math uses — `pricing_basis: "fallback"` in
+  the JSON lane for default-billed rows (`"unknown"` for the
+  default/unknown/multiple buckets) and a " (fallback pricing)" marker
+  on the text and HTML rows, appended after the sanitizers so the
+  rm-985 formula-guard/numeric-exemption contracts are untouched;
+  exactly-priced rows render byte-identically to before. Review fix
+  9ce27e5c (F4/F1/F5) renamed the JSON key off `cost_basis` (the
+  loop-cost vocabulary in waste.rs/diagnostics.rs that the mint
+  itself reserved) before the surface could pin the colliding name,
+  extended the disclosure to the `--diagnostics --inspect` JSON
+  session row as an always-present `pricing_basis` sibling key
+  (exact / fallback / unknown from `metrics.model_used` — the row's
+  only cost basis used to be the loop basis, so a fallback-billed
+  session looked exactly-priced), and pinned the 1M+1M token bills
+  the rates resolve to ($87.50 red / $24.00 blue / $18.00 fallback).
 - Claude org-dimension truth (rm-1405 reap, run 4f2af62e5b7e cycle 1):
   claude-code 2.1.29x+ journals carry an identity envelope
   (`$.session.identity.orgIdentifier` / `loginEmail`) that the parsers

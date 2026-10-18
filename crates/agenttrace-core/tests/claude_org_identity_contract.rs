@@ -137,3 +137,99 @@ fn cache_round_trip_preserves_org_dimension() {
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_dir(&dir);
 }
+
+#[test]
+fn org_identity_spoofing_characters_are_sanitized() {
+    // rm-1571 review fix 9ce27e5c (F7): the acceptance listed
+    // spoofing-char safety among the contract proofs but no arm
+    // pinned it. The cap sanitizes BEFORE bounding (the rm-594
+    // discipline), so a journal smuggling ANSI escapes, bidi
+    // overrides, BOMs or joiners into an orgIdentifier cannot reach
+    // the report lanes: every such char is replaced by U+FFFD,
+    // whether or not the value is long enough to hit the digest
+    // form. The ESC sequences ride the journal as JSON `\u001b`
+    // escapes (raw control bytes are not legal inside a JSON string —
+    // the parser unescapes them into the value, which is exactly the
+    // smuggling path); the non-ASCII format chars are legal raw.
+    // (U+2028 line-separator and ZWSP deliberately survive the
+    // sanitizer — the rm-594 lane rules treat them as safe-in-JSON /
+    // visible-in-text — so they are NOT asserted here.)
+    let spoofed = "ev\\u001b[31mall-good\\u001b[0m\u{202e}nig\u{200e}ma\u{feff}\u{200d}corp";
+    let journal = format!(
+        "{{\"sessionId\":\"spoof\",\"type\":\"user\",\"cwd\":\"/w\",\"session\":{{\"identity\":{{\"orgIdentifier\":\"{org}\",\"loginEmail\":\"ok@example.com\"}}}},\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n",
+        org = spoofed,
+    );
+    let parsed = parse_raw_session("spoof", "/work/projects/x/spoof.jsonl", &journal)
+        .expect("spoofing identity journal parses");
+    for control in [
+        '\u{1b}', '\u{202e}', '\u{200e}', '\u{feff}', '\u{200d}', '\n', '\r',
+    ] {
+        assert!(
+            !parsed.org.contains(control),
+            "spoofing control {control:?} must not survive into the org identity"
+        );
+    }
+    assert!(
+        parsed.org.contains('\u{FFFD}'),
+        "controls are replaced with a visible placeholder, not silently dropped"
+    );
+    assert!(
+        parsed.org.contains("all-good") && parsed.org.contains("corp"),
+        "the legitimate payload text survives the sanitize"
+    );
+}
+
+#[test]
+fn hostile_org_identifier_is_capped_and_disclosed() {
+    // rm-1571 (run fd0e91a2 cycle 3, hostile-input bound): the
+    // identity fields are journal-controlled strings, so a hostile
+    // 5 MiB `orgIdentifier` (assess 2bdc99b3 PoC) used to flow raw
+    // into `by_org` names, the JSON overview (a 5,250,754-byte report
+    // off one session) and the session-cache write. The capture site
+    // now applies the repo's disclosure-cap discipline (sanitize,
+    // then prefix+digest past the cap — the rm-594/rm-880
+    // wire-metadata treatment): the org stays bounded and
+    // distinguishable, the email rides the same cap, and the
+    // truncation discloses via `org_identity_truncated` instead of
+    // silently rewriting the record. Sane orgs round-trip
+    // byte-identically (the zero-noise contract above).
+    let hostile_org = "A".repeat(5 * 1024 * 1024);
+    let hostile_email = "b".repeat(4096);
+    let journal = format!(
+        "{{\"sessionId\":\"hostile\",\"type\":\"user\",\"cwd\":\"/w\",\"session\":{{\"identity\":{{\"orgIdentifier\":\"{org}\",\"loginEmail\":\"{email}\"}}}},\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n",
+        org = hostile_org,
+        email = hostile_email,
+    );
+    let hostile = parse_raw_session("hostile", "/work/projects/x/hostile.jsonl", &journal)
+        .expect("hostile identity journal parses");
+    assert!(hostile.org.chars().count() <= 96, "org is bounded");
+    assert!(hostile.org_email.chars().count() <= 96, "email is bounded");
+    assert!(
+        hostile.org.contains('\u{2026}') && hostile.org.contains('#'),
+        "digest form: bounded but still distinguishable from other hostile orgs"
+    );
+    assert_eq!(
+        hostile
+            .metrics
+            .disclosure_counters
+            .get("org_identity_truncated"),
+        Some(&1),
+        "truncation discloses instead of silently rewriting the record"
+    );
+    let overview = compute_overview(std::slice::from_ref(&hostile));
+    let json = report_overview_json(&overview, std::slice::from_ref(&hostile));
+    assert!(
+        json.len() < 100_000,
+        "the overview lane stays bounded (PoC measured 5,250,754 bytes)"
+    );
+    assert_eq!(overview.by_org.len(), 1);
+
+    // Sane identity stays byte-identical and counter-free.
+    let alpha = session("org-9f2a-example", ORG_ALPHA);
+    assert_eq!(alpha.org, "org-9f2a-example");
+    assert_eq!(alpha.org_email, "alpha@example.com");
+    assert!(!alpha
+        .metrics
+        .disclosure_counters
+        .contains_key("org_identity_truncated"));
+}
