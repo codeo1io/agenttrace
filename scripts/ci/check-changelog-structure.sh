@@ -81,4 +81,30 @@ if grep -q '^## Unreleased' "$changelog"; then
 		fail "Unreleased section is present but carries no entries (rm-1390): a header over zero bullets claims a landing lane that does not exist — land the entries, date the section, or drop the header"
 fi
 
-echo "check-changelog-structure: no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous)"
+# Pass 4 (rm-1987, run 2b30a694 cycle 3): exact-duplicate ENTRY detection.
+# The 2026-10-13 merge 52ddee62 pasted ~24 Unreleased entries twice (first
+# copy lines 426-465, second 500-540, md5-identical windows) and this gate
+# rc0'd on that tree: pass 2 counts visibility, pass 3 counts presence, and
+# neither fingerprints CONTENT. An exact-duplicate entry bullet inside one
+# `##` section is a mechanical paste error — every honest entry text is
+# unique per section. Wrapped continuation lines belong to the bullet above
+# them and are not independently fingerprinted.
+if ! entry_dups="$(awk '
+	/^## / { section = $0; sub(/^## +/, "", section); next }
+	/^- / {
+		entry = $0; sub(/^- +/, "", entry); gsub(/[[:space:]]+$/, "", entry)
+		if (entry == "") next
+		key = section "\t" entry
+		if (key in seen) {
+			printf("  section [%s] duplicates entry: first at line %d, again at line %d: %s...\n", section, seen[key], NR, substr(entry, 1, 60))
+			bad = 1
+		} else {
+			seen[key] = NR
+		}
+	}
+	END { exit bad ? 1 : 0 }
+' "$changelog")"; then
+	fail "duplicate entries in CHANGELOG.md:"$'\n'"$entry_dups"
+fi
+
+echo "check-changelog-structure: no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous); all section entries unique"
