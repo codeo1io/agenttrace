@@ -76,15 +76,34 @@ fn snapshot_derived_cost(model: &str, tokens: &Value) -> f64 {
         m => m,
     });
     let term = |key: &str| tokens[key].as_f64().unwrap_or(0.0) / 1_000_000.0;
-    // rm-1508: standard cache slots are Option — the conformance
-    // oracle prices only models whose bundle rows publish rates
-    // (explicit 0 included), so unwrap() fails loudly rather than
-    // silently repricing an absent-rate row at $0.
+    // rm-1508: standard cache slots are Option — absent ≠ published $0.
+    // The conformance oracle prices a cache class ONLY when the case
+    // exercises it with nonzero tokens and the bundle row publishes a
+    // rate for it (explicit 0 included): an absent rate on an
+    // exercised class fails loudly rather than silently repricing at
+    // $0, while a zero-token class contributes $0 exactly as the
+    // renderer bills it (no tokens, no cost, no fallback disclosure).
+    // The 2026-10-17 refresh (rm-176 fuse defusal) made this matter:
+    // glm-5.2's post-purge winner (first-party zai/glm-5.2) publishes
+    // no cache rates, and case 005 carries zero cache tokens.
+    let term_rate = |key: &str, rate: Option<f64>| -> f64 {
+        let count = tokens[key].as_f64().unwrap_or(0.0);
+        if count == 0.0 {
+            return 0.0;
+        }
+        count / 1_000_000.0
+            * rate.unwrap_or_else(|| {
+                panic!(
+                    "conformance oracle: model {model:?} publishes no rate for \
+                 {key} but the case exercises that class (rm-1508: absent ≠ $0)"
+                )
+            })
+    };
     round4(
         term("input") * price.input
             + term("output") * price.output
-            + term("cache_w") * price.cw.unwrap()
-            + term("cache_r") * price.cr.unwrap(),
+            + term_rate("cache_w", price.cw)
+            + term_rate("cache_r", price.cr),
     )
 }
 

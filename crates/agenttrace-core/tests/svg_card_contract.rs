@@ -174,11 +174,23 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
             .find(|l| l.contains("%Y") || l.contains("2026-"))
             .unwrap_or("<no date labels>")
     );
+    // The card must not leak the wall clock into the corpus-anchored
+    // axis — but the disclosure footer is a different lane (pricing
+    // catalog identity, rm-176): it legitimately carries the bundled
+    // snapshot's date, which on refresh day IS today. Strip the pricing
+    // footer line before the oracle or every same-day CI run after a
+    // snapshot refresh false-positives here (first observed 2026-10-17,
+    // the 466-key adjudication refresh, run 389e223a cycle 1).
+    let card_minus_pricing_footer = card
+        .lines()
+        .filter(|line| !line.contains("LiteLLM"))
+        .collect::<Vec<_>>()
+        .join("\n");
     // The demo corpus's fixed timestamps are far from today; if the card
     // were anchored to `Utc::now()` today's date would leak in.
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     assert!(
-        !card.contains(&today),
+        !card_minus_pricing_footer.contains(&today),
         "wall-clock date leaked into a corpus-anchored card"
     );
 }
