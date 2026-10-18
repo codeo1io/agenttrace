@@ -4,6 +4,33 @@
 
 ### Added
 
+- codex turn-boundary ledger + replay guardrail (rm-1949, run
+  e4bff731 cycle 1): codex 0.147+ journals turn boundaries as `event_msg`
+  payloads — `task_started`, `task_complete`, `user_message` (live census
+  2026-10-17: 29/29 fresh host rollouts carry the triple; previously these
+  lines vanished wholesale into `codex_ignorable_line` — 301 triple lines
+  across 100 host sessions, re-derived by grep over `~/.codex/sessions`:
+  task_started 101 / user_message 103 / task_complete 97). The triple is
+  now rescued from the noise filter and ledgered: per-journal counts on
+  the non-loss disclosure channel
+  (`codex_turns_started`, `codex_turns_completed`,
+  `codex_interactive_user_turns` — a whitespace-only `user_message` body does
+  not count) and first/last boundary timestamps on the wire channel
+  (`codex_turn_first_started`, `codex_turn_last_complete`), landed once per
+  journal on a terminal meta event. Journals without the triple (every
+  pre-0.147 rollout) parse byte-identically — no new counters, no new events
+  (pinned). The evidence doubles as a guardrail for the multiagent replay
+  reconcile (rm-402 surface): a family reconciles only when EVERY member's
+  journal carries `task_started` evidence, so pre-0.147 families — whose
+  content tie is uncorroborated — skip conservatively: usage stays fully
+  counted (over-billed, never erased), the would-be child discloses
+  `codex_multiagent_replay_family_no_task_started`, and a new
+  `families_skipped_no_task_started` stat names the skip
+  (`tests/codex_multiagent_replay.rs`). Fixtures: the three family fixture
+  sets were regenerated to carry one `task_started` boundary each, and a
+  `codex-multiagent-v2-no-turn-evidence` corpus (pre-edit byte-copy) pins
+  the guardrail's conservative path.
+
 - `--doctor` completes honestly on real homes (rm-367 stages (b)(c)(d), run
   ff5c1cd8 cycle 4): the doctor walk now runs under a per-root wall-clock
   budget (default 60s, `AGENTTRACE_DOCTOR_ROOT_BUDGET_MS`) with a per-root

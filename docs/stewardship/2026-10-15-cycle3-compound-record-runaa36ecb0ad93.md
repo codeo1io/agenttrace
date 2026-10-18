@@ -78,3 +78,24 @@ Residual (disclosed, not chased): the content-based family tie remains probabili
 - The worktree `ROADMAP.md` is untouched by compound (worktree porcelain = implement's 7-path batch + this record + the workflow-issues doc).
 - Done-flips for rm-402/rm-727/rm-558 ride the commit gate, AFTER the review-fix turn's corrections (review af521003: 9 findings fixed — see "Independent review outcome"; the regenerated compound chain's rider language notes the review-fix). The rm-727 CHANGELOG entry has landed (deviation 2 closed).
 - See `APPLY-SEAM.md` in the compound scratch for the exact land recipe.
+
+## Addendum (2026-10-17, run e4bff731 cycle 1, repository-maintenance 145b52fe)
+
+The residual note above ("≥384-byte + own-tail discriminators … cannot
+eliminate [the false-merge class] without replay markers on the wire") is now
+half-resolved from the wire side. The codex 0.147+ turn-boundary triple
+(`event_msg` `task_started`/`task_complete`/`user_message`, live census
+2026-10-17: 29/29 fresh host rollouts) is parsed and ledgered as turn evidence
+(rm-1949), and the family tie is now gated on it: a family reconciles only
+when every member journal carries `task_started` evidence. Two consequences
+for the mechanism described at the "first 4 response_items, payload-hash
+chain, ≥2 byte-identical" line: (1) pre-0.147 families (no boundary evidence)
+skip conservatively — over-billed, disclosed, never erased — instead of
+reconciling on the bare content tie; (2) the residual false-merge class is now
+confined to journals that carry turn evidence, which is the corroboration the
+note asked for. The short-parent structural gap (a ≤3-item parent can never
+fingerprint-match a 4-item-hashing child — the "≥2 byte-identical" arm is
+unreachable for real replay children) is rm-1946, deliberately NOT loosened
+this cycle: rm-1907's corroboration guards were unlanded at this base, and an
+unguarded loosening would trade conservative over-billing for false-merge
+under-billing. See ROADMAP rows rm-1946/rm-1949 for the follow-ups.

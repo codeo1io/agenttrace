@@ -78,6 +78,11 @@ pub struct CodexReplayAdjustment {
     /// exceeds theirs on some field (concurrent-spawn shape) — a saturating
     /// rebase would erase real usage (review af521003 F3).
     pub children_below_baseline: usize,
+    /// Families whose members do not ALL carry `task_started` turn
+    /// evidence (rm-1949 arm d): left fully counted — over-billed
+    /// rather than risked — with a per-child disclosure
+    /// (`codex_multiagent_replay_family_no_task_started`).
+    pub families_skipped_no_task_started: usize,
     /// Replayed tokens removed from children, per class.
     pub tokens_input_dropped: i64,
     pub tokens_cache_read_dropped: i64,
@@ -145,6 +150,13 @@ struct RolloutScan {
     /// Total `response_item` lines (not just fingerprinted ones) — a
     /// replay child by definition continues past the shared opening.
     response_items: usize,
+    /// rm-1949 arm d (run e4bff731 cycle 1): whether the journal carries
+    /// a codex 0.147+ `task_started` turn boundary — independent
+    /// evidence that the file is a turn-taking rollout rather than a
+    /// template whose opening bytes merely collide. Families missing it
+    /// on ANY member skip reconciliation: usage stays fully counted
+    /// (over-billed, never erased) and the skip is disclosed per child.
+    task_started_seen: bool,
 }
 
 /// Stream a rollout file once: hash the opening `response_item` payloads,
@@ -168,6 +180,7 @@ fn scan_rollout(path: &Path) -> RolloutScan {
         total: TotalSnapshot::default(),
         first_timestamp: None,
         response_items: 0,
+        task_started_seen: false,
     };
     let Ok(mut raw) = std::fs::read(path) else {
         return scan;
@@ -232,6 +245,10 @@ fn scan_rollout(path: &Path) -> RolloutScan {
                             };
                         }
                     }
+                } else if payload_type == Some("task_started") {
+                    // rm-1949 arm d: turn-boundary evidence for the
+                    // family guardrail (see RolloutScan::task_started_seen).
+                    scan.task_started_seen = true;
                 }
             }
             _ => {}
@@ -292,6 +309,7 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
         total: TotalSnapshot,
         fingerprint_items: usize,
         response_items: usize,
+        task_started_seen: bool,
     }
     let mut families: HashMap<OpeningFingerprint, Vec<Evidence>> = HashMap::new();
     for (idx, session) in sessions.iter().enumerate() {
@@ -321,6 +339,7 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
             total: scan.total,
             fingerprint_items: fingerprint.items,
             response_items: scan.response_items,
+            task_started_seen: scan.task_started_seen,
         });
     }
 
@@ -338,6 +357,25 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
                 .cmp(&b.started_at)
                 .then_with(|| a.path.cmp(&b.path))
         });
+        // rm-1949 arm d: the turn-boundary guardrail. A family
+        // reconciles only when EVERY member's journal carries codex
+        // 0.147+ `task_started` evidence — both files really are
+        // turn-taking rollouts, not templates whose opening bytes
+        // collide. Pre-0.147 corpora skip conservatively: usage stays
+        // fully counted (over-billed, never erased) and the skip is
+        // disclosed on each child.
+        if !members.iter().all(|member| member.task_started_seen) {
+            for member in &members[1..] {
+                sessions[member.session_idx]
+                    .metrics
+                    .disclosure_counters
+                    .entry("codex_multiagent_replay_family_no_task_started".to_string())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+            }
+            stats.families_skipped_no_task_started += 1;
+            continue;
+        }
         let parent_total = members[0].total;
         for child in &members[1..] {
             let session = &mut sessions[child.session_idx];

@@ -362,3 +362,102 @@ fn unrelated_short_opening_is_not_a_family() {
         );
     }
 }
+
+#[test]
+fn family_without_turn_evidence_skips_reconciliation() {
+    // rm-1949 arm d (run e4bff731 cycle 1): pre-0.147 codex journals
+    // carry no event_msg task_started turn evidence. The guardrail
+    // treats a missing turn boundary as uncorroborated and skips the
+    // family conservatively: naive totals stand, every member carries
+    // the named skip disclosure, and no replayed-token drop is
+    // recorded. (Fixture corpus: byte-copy of codex-multiagent-v2 with
+    // zero task_started lines — pinned by regen-fixtures.py.)
+    let mut sessions = vec![
+        load_dir("codex-multiagent-v2-no-turn-evidence", "child.jsonl"),
+        load_dir("codex-multiagent-v2-no-turn-evidence", "parent.jsonl"),
+    ];
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 1, "family still forms on shared opening");
+    assert_eq!(
+        stats.children_adjusted, 0,
+        "guardrail must block the rebase"
+    );
+    assert_eq!(
+        stats.families_skipped_no_task_started, 1,
+        "named stat must be observable"
+    );
+    let mut inputs: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    inputs.sort_unstable();
+    assert_eq!(
+        inputs,
+        vec![1_400, 1_700],
+        "naive totals must stand: the child keeps its un-rebased 1,700"
+    );
+    // The skip disclosure lands on the child (the would-be rebase
+    // target); the parent stays untouched.
+    let child = sessions
+        .iter()
+        .find(|s| s.metrics.tokens_input == 1_700)
+        .expect("child keeps naive total");
+    assert_eq!(
+        child
+            .metrics
+            .disclosure_counters
+            .get("codex_multiagent_replay_family_no_task_started")
+            .copied(),
+        Some(1),
+        "child must carry the named skip disclosure"
+    );
+    assert!(!child
+        .metrics
+        .disclosure_counters
+        .contains_key("codex_multiagent_replayed_tokens_dropped"));
+    let parent = sessions
+        .iter()
+        .find(|s| s.metrics.tokens_input == 1_400)
+        .expect("parent keeps total");
+    assert!(!parent
+        .metrics
+        .disclosure_counters
+        .contains_key("codex_multiagent_replay_family_no_task_started"));
+}
+
+#[test]
+fn family_fixture_journals_carry_turn_evidence() {
+    // rm-1949 arm e (run e4bff731 cycle 1): the three family fixture
+    // sets were regenerated so every member journal carries exactly one
+    // event_msg task_started boundary (recipes:
+    // regen-fixtures.py in the run's delegate spool). If this pin
+    // breaks, the other family tests are silently exercising the
+    // guardrail path instead of the rebase path.
+    for dir in ["codex-multiagent-v2", "codex-multiagent-v2-concurrent"] {
+        for role in ["parent.jsonl", "child.jsonl"] {
+            let session = load_dir(dir, role);
+            assert_eq!(
+                session
+                    .metrics
+                    .disclosure_counters
+                    .get("codex_turns_started")
+                    .copied(),
+                Some(1),
+                "{dir}/{role} must carry task_started turn evidence"
+            );
+        }
+    }
+    for role in ["parent", "child"] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex-multiagent-v2-zstd")
+            .join(format!("{role}.jsonl"));
+        let session =
+            agenttrace_core::parse_file(&path).unwrap_or_else(|e| panic!("parse zstd {role}: {e}"));
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("codex_turns_started")
+                .copied(),
+            Some(1),
+            "zstd fixture {role} must carry task_started turn evidence"
+        );
+    }
+}
