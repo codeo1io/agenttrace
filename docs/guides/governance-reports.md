@@ -505,7 +505,15 @@ advanced ceiling 71 — so this integration, conflict case
 f28c7946365b4f7382e5c59a73f8cfd4, re-bases it onto the advanced
 ceiling as 71 → 72 per the landed-rung-keeps-numeral convention,
 one invalidation either way; the SQLite snapshot stays 13 — no
-snapshot semantics moved)
+snapshot semantics moved;
+and the capture's bound tightened at the rm-1571 landing (run
+fd0e91a2 cycle 3, integrated at conflict case b0d213cb after rm-1553):
+the identity strings now take the disclosure-value cap — sanitize,
+then prefix+digest past the 96-char cap, subsuming the byte bound —
+with an `org_identity_truncated` counter beside the per-field
+`org_truncated:*` counters and an idempotent materialization cap in
+`GoSession::into_session`, so no further rung is required — rung 72
+already regenerates every pre-cap row)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

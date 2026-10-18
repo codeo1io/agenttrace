@@ -3306,8 +3306,18 @@ impl GoSession {
             },
             cwd: self.cwd,
             branch: self.branch,
-            org: self.org,
-            org_email: self.org_email,
+            // rm-1571 (run fd0e91a2 cycle 3, hostile-input bound),
+            // chokepoint 2: caches written by pre-fix builds can carry
+            // a raw hostile org name (assess 2bdc99b3 measured a
+            // 5,247,893-byte cache write). The parse lane caps at
+            // capture; this caps every row served back out of the
+            // cache, so a warm entry can never balloon the output
+            // lanes. Idempotent (a capped value re-caps to itself) and
+            // byte-identical for sane orgs, so no schema-rung bump:
+            // warm entries either match what a fresh parse would
+            // produce or shrink.
+            org: crate::parser::cap_org_identity_value(&self.org).0,
+            org_email: crate::parser::cap_org_identity_value(&self.org_email).0,
             metrics: self.metrics.into_metrics(),
             anomalies: self
                 .anomalies
@@ -6496,5 +6506,53 @@ mod tests {
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warm_hostile_org_rows_are_capped_at_materialization() {
+        // rm-1571 (run fd0e91a2 cycle 3, hostile-input bound),
+        // chokepoint 2: caches written by pre-fix builds can carry a
+        // raw hostile org name (assess 2bdc99b3 measured a 5,247,893-
+        // byte cache write). Every row served back through the
+        // session cache gets the same disclosure cap the parse lane
+        // applies — sanitize, then prefix+digest past the cap — so a
+        // warm entry can never balloon the output lanes again. The
+        // cap is idempotent (a capped value round-trips unchanged),
+        // and sane orgs stay byte-identical, so no schema-rung bump is
+        // required: warm entries either match what a fresh parse
+        // would produce or shrink.
+        let hostile = Session {
+            org: "A".repeat(5 * 1024 * 1024),
+            org_email: "b".repeat(4096),
+            name: "hostile".to_string(),
+            path: "/tmp/hostile.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let cached = GoSession::from_session(&hostile);
+        assert_eq!(
+            cached.org.len(),
+            5 * 1024 * 1024,
+            "pre-fix rows store the raw name"
+        );
+        let back = cached.into_session("/tmp/hostile.jsonl");
+        assert!(
+            back.org.chars().count() <= 96,
+            "materialization bounds the org for stale warm entries"
+        );
+        assert!(
+            back.org_email.chars().count() <= 96,
+            "materialization bounds the email for stale warm entries"
+        );
+        // Idempotent: capping an already-capped value is a no-op, so
+        // re-warms cannot churn.
+        let again = GoSession::from_session(&back);
+        assert_eq!(again.org, back.org);
+        assert_eq!(again.org_email, back.org_email);
     }
 }

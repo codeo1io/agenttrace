@@ -11,9 +11,9 @@ use agenttrace_core::{
     report_overview_json_with_context, report_overview_markdown_with_context,
     report_overview_svg_with_context, report_overview_text_with_context,
     report_search_json_detailed, report_search_text_detailed, report_text_with_language,
-    sanitize_line_segment, search_sessions_detailed, session_capability, session_start_cmp,
-    tool_fail_rate, total_tokens, update_pricing, waste_report_json, BaselineThresholds,
-    LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
+    sanitize_line_segment, search_sessions_detailed, session_capability, session_pricing_basis,
+    session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
+    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
     TRANSCRIPT_SCAN_FILE_BYTE_CAP, TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET, VERSION,
 };
 use anyhow::{bail, Context};
@@ -3047,6 +3047,13 @@ fn render_diagnostics(
     if format == "json" {
         return Ok(serde_json::to_string_pretty(&serde_json::json!({
             "session": session,
+            // rm-1574 review fix 9ce27e5c (run fd0e91a2 cycle 3, F1):
+            // the session row's only cost_basis is the LOOP basis
+            // (priced/synthetic, diagnostics.rs), so the pricing basis
+            // rides its own always-present sibling key — a
+            // fallback-billed session can never look exactly-priced
+            // here. Computed at render, never stored.
+            "pricing_basis": session_pricing_basis(&session.metrics.model_used),
             "cost_alert": alert,
             "fix_suggestions": fixes,
         }))?);
@@ -4421,6 +4428,10 @@ mod tests {
             .expect("diagnostics");
         assert!(diagnostics.contains("\"diagnostics\""));
         assert!(diagnostics.contains("\"cost_alert\""));
+        assert!(
+            diagnostics.contains("\"pricing_basis\""),
+            "rm-1574 review fix: the diagnostics JSON session row carries the pricing basis"
+        );
 
         args.cost = "expensive".to_string();
         assert!(prepare_cli_view(filtered, &args).is_err());

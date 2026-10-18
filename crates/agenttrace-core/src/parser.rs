@@ -419,6 +419,15 @@ pub(crate) const SESSION_IDENTITY_BYTE_CAP: usize = 4096;
 /// [`SESSION_IDENTITY_BYTE_CAP`] bytes (UTF-8 boundary safe).
 /// Returns the capped string and whether truncation happened, so
 /// call sites can mint the disclosure — mirror of [`cap_session_cwd`].
+///
+/// Composition note (rm-1553 + rm-1571, integration conflict case
+/// b0d213cb): the stored identity string is shaped by the STRONGER
+/// [`cap_org_identity_value`] (sanitize, then prefix+digest past the
+/// disclosure cap — subsumes this byte bound, since every digest
+/// form is <= 96 chars), so at the claude capture site this helper
+/// now supplies the per-field `org_truncated:*` disclosure flag for
+/// raw values past the byte cap; its capped-string arm remains the
+/// rm-1553 contract for any future caller.
 fn cap_session_identity(raw: &str) -> (String, bool) {
     if raw.len() <= SESSION_IDENTITY_BYTE_CAP {
         return (raw.to_string(), false);
@@ -3266,6 +3275,26 @@ pub(crate) fn capped_disclosure_value(value: &str) -> String {
     format!("{prefix}…#{}", fnv1a_hex(&sanitized))
 }
 
+/// rm-1571 (run fd0e91a2 cycle 3, hostile-input bound): org identity
+/// values are journal-controlled strings, so they get the same
+/// rm-594/rm-880 wire-metadata treatment as the cwd cap — sanitize,
+/// then prefix+digest past the disclosure cap. A hostile 5 MiB
+/// `orgIdentifier` (assess 2bdc99b3 PoC) used to flow raw into
+/// `by_org` names, the JSON overview (a 5,250,754-byte report off one
+/// session) and the session-cache write (5,247,893 bytes). Returns
+/// `(capped, truncated)` so the capture site can mint the
+/// `org_identity_truncated` disclosure counter — the cwd cap's
+/// `(String, bool)` contract. Sane values round-trip byte-identically
+/// and the cap is idempotent (a capped value re-caps to itself), so
+/// the session cache applies the same cap at materialization without
+/// a schema-rung bump: warm entries either match what a fresh parse
+/// would produce or shrink.
+pub(crate) fn cap_org_identity_value(raw: &str) -> (String, bool) {
+    let sanitized = crate::statusline::sanitize_line_segment(raw);
+    let truncated = sanitized.chars().count() > DISCLOSURE_VALUE_CAP;
+    (capped_disclosure_value(raw), truncated)
+}
+
 fn oh_my_pi_message_events(
     message: &Map<String, Value>,
     entry_ts: &str,
@@ -5514,6 +5543,11 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // actively un-truncate an already-truncated capture).
     let mut org_truncated_seen = false;
     let mut org_email_truncated_seen = false;
+    // rm-1571 (run fd0e91a2 cycle 3, landed after rm-1553 on this
+    // wall): the stronger disclosure-value cap mints its own single
+    // `org_identity_truncated` counter — composed with the per-field
+    // rm-1553 counters below, same first-wins monotone discipline.
+    let mut org_identity_truncated = false;
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
         if cwd.is_empty() {
@@ -5552,15 +5586,33 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         // the cwd gate above.
         if org.is_empty() {
             if let Some((captured_org, captured_email)) = claude_org_identity(obj) {
-                // rm-1553: cap the journal-derived identity at capture
-                // (assess d95bd222 F6) — Session.org, the session cache,
-                // and by_org keys stay bounded under hostile journals.
-                let (capped_org, org_truncated) = cap_session_identity(&captured_org);
-                let (capped_email, email_truncated) = cap_session_identity(&captured_email);
-                org_truncated_seen |= org_truncated;
-                org_email_truncated_seen |= email_truncated;
+                // rm-1553 + rm-1571 composition (this integration,
+                // conflict case b0d213cb): two sibling runs bounded
+                // this same capture in parallel — rm-1553 (run
+                // 4eeea891 cycle 2, landed first) truncated at
+                // SESSION_IDENTITY_BYTE_CAP with per-field counters;
+                // rm-1571 (run fd0e91a2 cycle 3, this landing) applies
+                // the repo's disclosure-value discipline (sanitize,
+                // then prefix+digest past the cap — the rm-594/rm-880
+                // wire-metadata treatment) so a hostile-length or
+                // spoofing-char orgIdentifier can never balloon the
+                // report or cache lanes, with the session cache
+                // applying the same idempotent cap at materialization.
+                // The digest cap SUBSUMES the byte bound (every
+                // capped form is <= 96 chars), so the STORED string
+                // takes the rm-1571 form (digest over the full
+                // sanitized value, exactly as reviewed) while the
+                // rm-1553 per-field counters keep their landed
+                // vocabulary for raw values past the byte cap — one
+                // pipeline, both disclosure contracts, sane orgs
+                // byte-identical either way.
+                let (capped_org, org_truncated) = cap_org_identity_value(&captured_org);
+                let (capped_email, email_truncated) = cap_org_identity_value(&captured_email);
+                org_truncated_seen |= cap_session_identity(&captured_org).1;
+                org_email_truncated_seen |= cap_session_identity(&captured_email).1;
                 org = capped_org;
                 org_email = capped_email;
+                org_identity_truncated |= org_truncated || email_truncated;
             }
         }
         match typ {
@@ -5820,11 +5872,23 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     .entry("claude_org_identity:transcript".to_string())
                     .or_insert(0) += 1;
                 seed_truncation_counters(&mut meta.disclosure_counters);
+                if org_identity_truncated {
+                    // rm-1571: disclose the digest cap beside the
+                    // per-field byte-cap counters instead of silently
+                    // rewriting the record.
+                    *meta
+                        .disclosure_counters
+                        .entry("org_identity_truncated".to_string())
+                        .or_insert(0) += 1;
+                }
             }
             None => {
                 let mut counters = BTreeMap::new();
                 counters.insert("claude_org_identity:transcript".to_string(), 1);
                 seed_truncation_counters(&mut counters);
+                if org_identity_truncated {
+                    counters.insert("org_identity_truncated".to_string(), 1);
+                }
                 events.insert(
                     0,
                     Event {

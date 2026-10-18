@@ -80,8 +80,8 @@ pub use reports::{
     report_overview_json_with_health, report_overview_markdown,
     report_overview_markdown_with_context, report_overview_svg, report_overview_svg_with_context,
     report_overview_text, report_overview_text_with_context, report_text,
-    report_text_with_language, BaselineBreaches, BaselineThresholds, ReportLanguage, SvgCardTheme,
-    GROUP_TAKE,
+    report_text_with_language, session_pricing_basis, BaselineBreaches, BaselineThresholds,
+    ReportLanguage, SvgCardTheme, GROUP_TAKE,
 };
 pub use runtime_config::{
     get as runtime_config_overrides, set as set_runtime_config, RuntimeConfigOverrides,
