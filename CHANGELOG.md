@@ -957,6 +957,49 @@
 
 ### Fixed
 
+- The vendored pricing catalog now matches the live LiteLLM catalog
+  instead of over-reporting 345 phantom costed models (rm-176
+  reconciliation, run 250c95d3 cycle 5): the 2026-10-20 refresh drops
+  the 466 keys LiteLLM's 2026-10 catalog restructure removed — 459
+  `openrouter/*` aggregator rows (zero remain live upstream), the
+  three `github_copilot` old-gen rows (upstream `deprecation_date`
+  2026-03-12; the copilot catalog was replaced by 49 new-gen keys),
+  the two legacy `palm/` rows, and two bedrock dot-keys — every drop
+  dated and reasoned in `scripts/pricing/snapshot-drops.txt`, and
+  carries the 122 new costed models (incl. `anthropic.claude-fable-5`,
+  `claude-opus-5-5` + bedrock variants, `DeepSeek-V4.1-Flash`, the
+  new-gen copilot family) plus upstream deprecation/context-window/
+  rate movements. `PRICING_SNAPSHOT_DATE` moves to 2026-10-20 in
+  lockstep with the `_snapshot` metadata, the removal guard
+  (`scripts/pricing/drift-check.sh`) reads clear against the same
+  live basis that red CI run 39246601177 flagged, and the
+  `pricing_snapshot_hygiene`/`cache_rate_truth_contract` census pins
+  moved consciously with the refresh (absent-vs-published-$0 cache
+  rates are now preserved from upstream rather than zero-filled —
+  the movement rm-1508 reserved for exactly this lane).
+- The OpenCode fork-parent probe no longer reads an unbounded file
+  after its size gate (rm-548 cap-honor twin, run 250c95d3 cycle 5):
+  `opencode_session_fork_parent` stat-gated the info doc
+  (`OPENCODE_INFO_DOC_READ_CAP_BYTES`) but then read it with
+  `fs::read_to_string` — a doc that satisfied the gate and grew
+  before the read escaped the cap family entirely (the same TOCTOU
+  window `read_session_file_bounded` closes for session journals).
+  The read now mirrors the parser twin: open, `take(cap+1)`, and a
+  post-read length re-check that refuses docs crossing the cap
+  between stat and read; boundary tests pin exact-cap parse and
+  cap+1 refusal alongside the existing equivalence tests.
+- The OTel exporter's semantic-convention pointer no longer cites a
+  dead upstream path (rm-546 repoint+restamp rider, run 250c95d3
+  cycle 5): the GenAI semconv moved to the dedicated
+  `open-telemetry/semantic-conventions-genai` repository (the old
+  `semantic-conventions` docs/gen-ai path is a tombstone page);
+  `otel.rs`'s module doc now points there, `SEMCONV_SNAPSHOT_DATE`
+  is restamped 2026-10-20 against the new home's registry (every
+  emitted `gen_ai.*` attribute name verified unchanged), and the
+  comment notes the newly available names (`reasoning.output_tokens`,
+  modality-scoped counters) stay future work until sources carry
+  them.
+
 - Statusline journal writers no longer hang forever behind a wedged journal
   lock (rm-686 production lock-wait arm, run c0a02f64 cycle 1):
   `open_locked_journal` called `File::lock` with no deadline — the retry

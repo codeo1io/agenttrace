@@ -2,7 +2,10 @@
 //!
 //! Emits an OTLP/HTTP-JSON `ExportTraceServiceRequest` document with one
 //! INTERNAL span per session carrying `gen_ai.*` attributes per the GenAI
-//! semantic conventions (open-telemetry/semantic-conventions docs/gen-ai,
+//! semantic conventions (after the 2026-10 reorganization these live in the
+//! dedicated repo, open-telemetry/semantic-conventions-genai, whose
+//! model/gen-ai/registry.yaml this pass re-verified against every emitted
+//! name; spans + mcp conventions remain Status: Development there —
 //! attribute names verified on [`SEMCONV_SNAPSHOT_DATE`]). The render is a
 //! file/stdout write only — there is no network transport in this module,
 //! honoring PRIVACY.md's offline-first posture.
@@ -35,7 +38,7 @@ use std::path::Path;
 /// verified against the `docs/gen-ai` tree. Golden tests pin this constant
 /// so a future semconv drift forces a conscious refresh of the attribute
 /// names rather than silent staleness.
-pub const SEMCONV_SNAPSHOT_DATE: &str = "2026-10-05";
+pub const SEMCONV_SNAPSHOT_DATE: &str = "2026-10-20";
 
 /// Recorded input-token basis of the emitted `gen_ai.usage.*` counters —
 /// see the module docs for the rationale. Emitted on every span so
@@ -468,7 +471,10 @@ mod tests {
 
     #[test]
     fn semconv_snapshot_date_is_pinned() {
-        assert_eq!(SEMCONV_SNAPSHOT_DATE, "2026-10-05");
+        // rm-546 restamp (run 250c95d3 cycle 5): re-verified against the
+        // dedicated semantic-conventions-genai repo's registry on
+        // 2026-10-20 — move only with a fresh re-verification.
+        assert_eq!(SEMCONV_SNAPSHOT_DATE, "2026-10-20");
     }
 
     #[test]

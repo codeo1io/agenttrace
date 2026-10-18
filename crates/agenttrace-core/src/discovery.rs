@@ -496,6 +496,54 @@ mod rm451_info_doc_cap_tests {
     }
 
     #[test]
+    fn probe_reads_doc_at_exactly_the_cap() {
+        // rm-548 boundary pin: take(cap+1) + strict `>` means a doc of
+        // EXACTLY cap bytes still parses — the cap is inclusive of the
+        // last legal byte, never an off-by-one refusal.
+        let dir = temp_dir_unique("probe-cap-exact");
+        let info = dir.join("storage").join("session").join("info");
+        fs::create_dir_all(&info).expect("info dir");
+        let doc = info.join("ses-fork.json");
+        let cap = super::OPENCODE_INFO_DOC_READ_CAP_BYTES as usize;
+        let mut exact = String::from("{\"id\":\"ses-fork\",\"parentID\":\"ses-parent\"}");
+        assert!(exact.len() < cap);
+        exact.push_str(&" ".repeat(cap - exact.len()));
+        assert_eq!(exact.len(), cap, "fixture must sit at exactly the cap");
+        fs::write(&doc, &exact).expect("write exact-cap doc");
+        assert_eq!(
+            opencode_session_fork_parent(&doc),
+            Some("ses-parent".to_string()),
+            "a doc of exactly cap bytes keeps its fork verdict"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_refuses_doc_one_byte_over_the_cap() {
+        // rm-548 boundary pin: one byte over cap — whether refused by
+        // the rm-451 stat gate or by the post-read re-check, the doc
+        // must never materialize. (The post-read branch is the TOCTOU
+        // twin: unreachable without a genuine stat/read race, so this
+        // pin fixes the arithmetic on the reachable side.)
+        let dir = temp_dir_unique("probe-cap-over");
+        let info = dir.join("storage").join("session").join("info");
+        fs::create_dir_all(&info).expect("info dir");
+        let doc = info.join("ses-fork.json");
+        let cap = super::OPENCODE_INFO_DOC_READ_CAP_BYTES as usize;
+        let mut over = String::from("{\"id\":\"ses-fork\",\"parentID\":\"ses-parent\"}");
+        assert!(over.len() < cap);
+        over.push_str(&" ".repeat(cap + 1 - over.len()));
+        assert_eq!(over.len(), cap + 1, "fixture must sit one byte over");
+        fs::write(&doc, &over).expect("write over-cap doc");
+        assert_eq!(
+            opencode_session_fork_parent(&doc),
+            None,
+            "one byte over cap yields no fork verdict"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn probe_still_reads_normal_doc() {
         let dir = temp_dir_unique("probe-ok");
         let info = dir.join("storage").join("session").join("info");
@@ -1192,7 +1240,26 @@ pub(crate) fn opencode_session_fork_parent(path: &Path) -> Option<String> {
     {
         return None;
     }
-    let raw = fs::read_to_string(path).ok()?;
+    // rm-548 cap-honor twin (2026-10-20, run 250c95d3 cycle 5): the
+    // rm-451 stat gate above is a fast-path skip, not a cap — a doc
+    // that satisfies it but grows before the read (the TOCTOU window)
+    // must not materialize unbounded. Mirror the parser's
+    // read_session_file_bounded (parser.rs:130-146): read at most
+    // cap+1 bytes and re-check the settled length, so an over-cap doc
+    // is skipped exactly like the stat-gate case.
+    let raw = {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .ok()?
+            .take(OPENCODE_INFO_DOC_READ_CAP_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > OPENCODE_INFO_DOC_READ_CAP_BYTES {
+            return None;
+        }
+        String::from_utf8(bytes).ok()?
+    };
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value
         .get("parentID")?

@@ -197,19 +197,22 @@ fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_publishe
     // The override rows merged into the bundled catalog, so absolute
     // totals are bundle-vintage-dependent (pricing_snapshot_hygiene.rs
     // pins those). What this binary pins: the classification itself —
-    // exactly the absent rows it contributes (the 2026-10-08 bundle
-    // zero-fills, so every bundled row classifies published), and the
+    // its own absent rows are present in the absent class, and the
     // per-class sum invariant absent + zero + nonzero == total.
+    // (rm-176 lane, 2026-10-20 refresh: the sanctioned refresh now
+    // preserves upstream absence instead of zero-filling, so the
+    // bundle itself contributes absent rows — exactly the conscious
+    // pin movement rm-1508 reserved for this lane.)
     let census: CacheRateCensus = cache_rate_census();
-    assert_eq!(
-        census.cache_read_absent, 1,
+    assert!(
+        census.cache_read_absent >= 1,
         "the absent-rate row must classify as absent: {census:?}"
     );
-    // rm-1508: the only absent rates in this process's catalog are
-    // the ones this test's override contributes — the 2026-10-08
-    // bundle zero-fills and upstream even publishes an explicit $0 on
-    // the gpt-5.3-codex rows, so the vend row is Some(0.0) too.
-    assert_eq!(census.cache_write_absent, 1);
+    // rm-1508: this test's override contributes an absent write row
+    // (the 2026-10-20 refresh preserves upstream cache-field absence,
+    // so bundled absent rows exist alongside it — hygiene pins the
+    // absolute totals).
+    assert!(census.cache_write_absent >= 1);
     assert_eq!(
         census.cache_read_absent + census.cache_read_zero + census.cache_read_published,
         census.models,
