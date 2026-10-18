@@ -155,13 +155,13 @@ agenttrace sessions.jsonl -f json    # -f is IGNORED (after the path)
 agenttrace -f json sessions.jsonl    # -f json works
 ```
 
-`--limit` caps list views only (for example the overview's `recent_sessions`);
-it never filters aggregates, audit totals, or recommendations. Bounded views
-disclose their bound: `--sessions` appends a `# showing N of M matching
-sessions` line in text and carries `total_matches` + `truncated` fields in
-JSON, and `--latest` says how many sessions the filters matched. Governance
-reports are unbounded by default — use `--sample N` for an explicitly
-disclosed bound.
+`--limit` caps list views only (for example the overview's `recent_sessions`,
+which never shows more than 10 entries); it never filters aggregates, audit
+totals, or recommendations. `--sessions` and `--latest` disclose their bound:
+`--sessions` appends a `# showing N of M matching sessions` line in text and
+carries `total_matches` + `truncated` fields in JSON, and `--latest` says how
+many sessions the filters matched. Governance reports are unbounded by
+default — use `--sample N` for an explicitly disclosed bound.
 
 ### Statusline capture
 
