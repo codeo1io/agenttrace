@@ -3,8 +3,8 @@ use agenttrace_core::{
     compute_waste_report, context_trends, cost_audit, data_health, data_health_scoped,
     delivery_evidence_with_git, demo_sessions, evaluate_overview_gate, filter_sessions,
     fix_suggestions, inspect_first, list_pricing, load_sessions_with_options, lookup_price,
-    matches_numeric_filter, mcp_governance, parse_file, parse_numeric_filter, parse_stdin_bytes,
-    predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
+    matches_numeric_filter, mcp_governance, parse_file_with_bound, parse_numeric_filter,
+    parse_stdin_bytes, predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
     render_doctor_report, render_model_pricing_list, render_test_match,
     render_waste_report_with_language, report_compare_json, report_json_with_language,
     report_overview_html_with_context, report_overview_json_with_context,
@@ -13,7 +13,7 @@ use agenttrace_core::{
     report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
     session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
     BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
-    VERSION,
+    DEFAULT_MAX_SESSION_FILE_BYTES, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -303,6 +303,14 @@ struct Args {
     /// lanes reject this flag loudly (rm-593).
     #[arg(long = "include-history")]
     include_history: bool,
+    /// Per-file admission bound in bytes for transcript parses
+    /// (default 268435456 = 256 MiB; rm-451). Files over the bound
+    /// are skipped whole, loudly — never read, never counted as parse
+    /// failures — with a stderr note and a doctor
+    /// "Admission-bound skips" row. Pass 0 to disable the bound
+    /// (admit every file).
+    #[arg(long = "max-session-file-bytes", value_name = "BYTES")]
+    max_session_file_bytes: Option<u64>,
 }
 
 fn main() {
@@ -1672,6 +1680,12 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--history-dir"
             | "--pricing-file"
             | "--weekly-budget"
+            // rm-451/cycle-4 review F-A: the admission bound takes a
+            // BYTES value; without this arm the shim treated the value
+            // as the positional session path and every placement of the
+            // documented space-separated form except absolute-last
+            // died with a misleading remediation (only =VALUE parsed).
+            | "--max-session-file-bytes"
     )
 }
 
@@ -1819,6 +1833,12 @@ fn validate_explicit_dir(dir_arg: Option<&str>) {
 }
 
 fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<LoadReport>)> {
+    // rm-451: the explicit-path lanes share the walk's per-file
+    // admission bound so a named over-bound file is refused the same
+    // way a discovered one is (0 disables the bound).
+    let admission_bound = args
+        .max_session_file_bytes
+        .unwrap_or(DEFAULT_MAX_SESSION_FILE_BYTES);
     if args.demo {
         // rm-735: the demo substitution must never silently swallow an
         // explicit session source (see reject_demo_source_conflict).
@@ -1845,14 +1865,20 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         let path = PathBuf::from(path);
         if path.is_file() {
             return Ok((
-                prepare_explicit_sessions(vec![parse_file(&path)?], args)?,
+                prepare_explicit_sessions(
+                    vec![parse_file_with_bound(&path, admission_bound)?],
+                    args,
+                )?,
                 None,
             ));
         }
         if path.is_dir() {
             if is_cline_task_dir(&path) {
                 return Ok((
-                    prepare_explicit_sessions(vec![parse_file(&path)?], args)?,
+                    prepare_explicit_sessions(
+                        vec![parse_file_with_bound(&path, admission_bound)?],
+                        args,
+                    )?,
                     None,
                 ));
             }
@@ -1892,6 +1918,7 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
             model: args.model_filter.clone(),
             include_history: args.include_history,
             preserve_history: args.preserve_history,
+            max_session_file_bytes: args.max_session_file_bytes,
         },
     );
     let sessions = report.sessions.clone();
@@ -1902,6 +1929,7 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // -f json) stays clean; exit codes are unchanged.
     disclose_sqlite_ingest(&report.sqlite);
     disclose_unlinked_subagents(report.unlinked_subagents);
+    disclose_admission_skips(&report);
     if sessions.is_empty() {
         if report.discovered == 0 {
             match args.dir.as_deref() {
@@ -1968,8 +1996,17 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // check (`-o <name>.jsonl` colliding with any journal a walk
     // admitted) — loud BEFORE any bytes are staged. rm-912: the walk
     // lane also contributes its attempted-but-unparseable journals —
-    // overwriting one would destroy the user's only copy.
-    ensure_output_is_not_an_input(args, &sessions, &report.parse_failure_paths)?;
+    // overwriting one would destroy the user's only copy. rm-451
+    // review fix (F1): admission-skipped journals join the same
+    // invariant through their own list — they are never read, but
+    // `--overview -d dir -o dir/huge.jsonl` used to replace the very
+    // oversized rollout the bound had protected.
+    ensure_output_is_not_an_input(
+        args,
+        &sessions,
+        &report.parse_failure_paths,
+        &report.admission_skip_paths,
+    )?;
     Ok((sessions, Some(report)))
 }
 
@@ -1984,6 +2021,24 @@ fn disclose_unlinked_subagents(count: usize) {
             "agenttrace: warning: {count} subagent transcript(s) have no parent session in the loaded corpus; they render as standalone rows and roll into no parent"
         );
     }
+}
+
+/// rm-451: admission-bound skips disclosed on stderr — a whole-file
+/// exclusion must not pass silently, and the note names the first
+/// skip and the flag that lifts the bound. Report output on stdout
+/// is unaffected.
+fn disclose_admission_skips(report: &LoadReport) {
+    if report.admission_skips == 0 {
+        return;
+    }
+    let first = report
+        .first_admission_skip
+        .as_deref()
+        .unwrap_or("(path unavailable)");
+    eprintln!(
+        "agenttrace: warning: {} session file(s) over the per-file admission bound were skipped whole without reading; first: {first}; raise or disable with --max-session-file-bytes BYTES (0 = unlimited)",
+        report.admission_skips
+    );
 }
 
 /// rm-753: one stderr line per SQLite-backed ingestion failure — a
@@ -2039,11 +2094,17 @@ fn parse_failure_advisory(report: &LoadReport) -> Option<String> {
 /// to this guard, so `--overview -d dir -o dir/bad.jsonl` exited 0 and
 /// silently overwrote the unfixable input (only a `.orig` twin left
 /// behind). Attempted-but-failed paths join the refusal set and the
-/// error names the transcript.
+/// error names the transcript. rm-451 review fix (F1):
+/// admission-skipped journals (over the per-file bound, skipped whole
+/// without reading) join the same refusal set through their own list
+/// — they are neither parsed nor attempted, but overwriting one
+/// destroys the exact oversized rollout the bound protects, so their
+/// refusal names the bound and the flag that lifts it.
 fn ensure_output_is_not_an_input(
     args: &Args,
     sessions: &[Session],
     attempted_parse_failures: &[PathBuf],
+    admission_skips: &[PathBuf],
 ) -> anyhow::Result<()> {
     let Some(output) = args.output.as_deref() else {
         return Ok(());
@@ -2065,6 +2126,22 @@ fn ensure_output_is_not_an_input(
             if source == resolved {
                 bail!(
                     "--output {} is an input session journal that failed to parse ({}); refusing to overwrite a transcript — convert or move the journal, or choose a different --output destination",
+                    output.display(),
+                    candidate.display()
+                );
+            }
+        }
+    }
+    // rm-451 review fix (F1): the admission-skipped arm. Skipped files
+    // are never read, so they can never appear above — without this
+    // loop, `--overview -d dir -o dir/huge.jsonl` overwrote the exact
+    // oversized rollout the bound just protected (review live PoC:
+    // rc 0, a 1 GiB input replaced by the 1,738-byte report).
+    for candidate in admission_skips {
+        if let Ok(source) = fs::canonicalize(candidate) {
+            if source == resolved {
+                bail!(
+                    "--output {} is an input session journal over the per-file admission bound ({}); refusing to overwrite a transcript — raise or disable the bound with --max-session-file-bytes BYTES (0 = unlimited), convert the journal, or choose a different --output destination",
                     output.display(),
                     candidate.display()
                 );
@@ -2115,10 +2192,13 @@ fn prepare_explicit_sessions(
     // rm-534: reject --output destinations that ARE an input journal
     // before any lane work (explicit positional file + demo paths).
     // rm-912: the explicit lane has no attempted-parse-failure set — an
-    // explicit positional file that fails to parse bails at `parse_file`
-    // (non-zero, before any write), so nothing attempted-and-failed
-    // can reach this guard.
-    ensure_output_is_not_an_input(args, &sessions, &[])?;
+    // explicit positional file that fails to parse bails at
+    // `parse_file_with_bound` (non-zero, before any write), so nothing
+    // attempted-and-failed can reach this guard. rm-451 review fix
+    // (F1): the admission arm is empty here for the same reason — an
+    // explicit over-bound positional is refused by the admission gate
+    // itself, before any write could stage.
+    ensure_output_is_not_an_input(args, &sessions, &[], &[])?;
     if args.preserve_history {
         agenttrace_core::preserve_derived_history(&sessions)?;
     }
@@ -3124,6 +3204,7 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
         clear_cache: false,
         preserve_history: false,
         include_history: false,
+        max_session_file_bytes: None,
     }
 }
 
@@ -4055,6 +4136,41 @@ mod tests {
     }
 
     #[test]
+    fn go_flag_shim_passes_admission_bound_value_mid_command() {
+        // Cycle-4 review F-A regression pin: --max-session-file-bytes
+        // is value-taking, so its documented space-separated form must
+        // survive the shim from ANY position. With the table arm
+        // missing, the shim swallowed BYTES as the positional session
+        // path and dropped every later flag with a misleading
+        // "place flags before the positional session path" remediation
+        // — only the =VALUE form and absolute-last placement parsed.
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--overview"),
+            OsString::from("--max-session-file-bytes"),
+            OsString::from("52428800"),
+            OsString::from("-d"),
+            OsString::from("corpus"),
+            OsString::from("-o"),
+            OsString::from("out.json"),
+        ])
+        .expect("space-separated mid-command form must survive");
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("agenttrace"),
+                OsString::from("--overview"),
+                OsString::from("--max-session-file-bytes"),
+                OsString::from("52428800"),
+                OsString::from("-d"),
+                OsString::from("corpus"),
+                OsString::from("-o"),
+                OsString::from("out.json"),
+            ]
+        );
+    }
+
+    #[test]
     fn go_flag_shim_keeps_boolean_no_baseline_gate_before_value_flags() {
         // A11-5 (cycle-4 review F2, found twice): --no-baseline-gate is a
         // boolean, but it sat in flag_takes_value, so the shim consumed
@@ -4200,15 +4316,22 @@ mod tests {
         // point moves — exactly the A11-5 failure mode. Derive the
         // expected set from the clap definition so drift fails here
         // instead of in production argv.
+        //
+        // Cycle-4 review F-B: this canary used to be inert. clap 4.6.7's
+        // Arg::get_num_args() returns None for every derive arg on an
+        // UNBUILT command, so the old .map(takes_values).unwrap_or(false)
+        // classified every argument non-value-taking and the test could
+        // never fail — exactly how F-A (the missing --max-session-file-
+        // bytes arm) shipped under a fully green suite. get_action() is
+        // populated at definition time and discriminates correctly
+        // unbuilt: Set/Append take a value, SetTrue/Count/Help/Version
+        // do not.
+        use clap::ArgAction;
         use clap::CommandFactory;
 
         let mut missing: Vec<String> = Vec::new();
         for arg in Args::command().get_arguments() {
-            let takes_values = arg
-                .get_num_args()
-                .map(|range| range.takes_values())
-                .unwrap_or(false);
-            if !takes_values {
+            if !matches!(arg.get_action(), ArgAction::Set | ArgAction::Append) {
                 continue;
             }
             if let Some(short) = arg.get_short() {

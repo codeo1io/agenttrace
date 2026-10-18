@@ -35,6 +35,24 @@ target/release/agenttrace --demo --doctor
 target/release/agenttrace --demo --overview -f json
 ```
 
+## CI and Dependency Automation
+
+`.github/dependabot.yml` declares weekly `cargo` and `github-actions`
+update groups, but on this fork that config is currently
+declared-but-dead: Dependabot has never opened a PR here (as of
+2026-10-13, `gh api search/issues -f q=repo:codeo1io/agenttrace+type:pr+author:app/dependabot`
+returns `total_count: 0`) while the upstream twin config keeps firing
+(luoyuctl/agenttrace PR #319). The most likely cause is the fork's
+repository-settings Dependabot toggle being off — enabling it is a
+GitHub-ops action (Settings → Code security → Dependabot version
+updates), not a change to any file in this tree. Verification path:
+after the toggle is flipped, confirm the first wave lands at the next
+weekly window (Mondays) with the search above returning PRs; until
+then, action-pin bumps land by hand, mirroring the upstream
+Dependabot PRs (they run green upstream) plus fork-only pins resolved
+from their tags (rm-1001; the 2026-10-13 wave mirrors upstream #319
+and bumps scorecard-action to v2.5.0).
+
 ## Translations
 
 All user-visible text lives in `crates/agenttrace-core/locales/en.yml` and

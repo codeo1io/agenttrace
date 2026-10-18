@@ -456,6 +456,59 @@ fn output_colliding_with_unparseable_walked_journal_is_rejected() {
 }
 
 #[test]
+fn output_colliding_with_admission_skipped_journal_is_rejected() {
+    // rm-451 review fix (F1, 2026-10-13): admission-skipped journals
+    // were invisible to the -o membership check — never read, so
+    // never attempted — and the review's live PoC had
+    // `--overview -d K -o K/…/huge.jsonl` exit 0 and replace the 1 GiB
+    // input with the 1,738-byte report. The guard must cover the
+    // class: refusal BEFORE any write, naming the bound and the flag
+    // that lifts it, with the oversized input left untouched.
+    let scratch = std::env::temp_dir().join(format!(
+        "agenttrace-rm451fix-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let sessions_dir = scratch.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions scratch");
+    std::fs::write(sessions_dir.join("good.jsonl"), claude_journal_lines())
+        .expect("write good journal");
+    // Sparse over-bound fixture: stat-visible 256 MiB + 1, ~zero disk.
+    let victim = sessions_dir.join("huge.jsonl");
+    std::fs::File::create(&victim)
+        .expect("create victim")
+        .set_len(256 * 1024 * 1024 + 1)
+        .expect("truncate victim sparse");
+    let before_len = std::fs::metadata(&victim).expect("stat victim").len();
+    let dir_arg = sessions_dir
+        .to_str()
+        .expect("utf-8 scratch path")
+        .to_string();
+    let victim_arg = victim.to_str().expect("utf-8 scratch path").to_string();
+
+    let (code, stdout, stderr) =
+        run_isolated(&["--overview", "-d", &dir_arg, "-o", &victim_arg], &scratch);
+    assert_ne!(
+        code, 0,
+        "-o at an admission-skipped input must refuse; stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("--output") && stderr.contains("admission bound"),
+        "refusal must name --output and the admission bound, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("huge.jsonl"),
+        "refusal must name the skipped transcript, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::metadata(&victim).expect("stat victim after").len(),
+        before_len,
+        "the admission-skipped input must stay untouched — no staging, no rename"
+    );
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
 fn all_unparseable_dir_with_colliding_output_keeps_the_parse_bail() {
     // rm-912 regression pin: when EVERY discovered journal fails to
     // parse, the rm-835 all-failed bail still fires FIRST — the run is

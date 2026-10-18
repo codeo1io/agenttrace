@@ -1,0 +1,2 @@
+agenttrace: session directory does not exist: k1
+- inspect: the -d/--dir value; drop -d to auto-discover agent homes

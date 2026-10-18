@@ -3,8 +3,8 @@ use crate::session_cache::{
     load_session_cache, save_session_cache, store_dir_listing, store_session, SessionCache,
 };
 use crate::{
-    merge_preserved_history, parse_file, preserve_derived_history, skip_sqlite_backed_file_dir,
-    Session,
+    file_over_admission_bound, merge_preserved_history, parse_file_with_bound,
+    preserve_derived_history, skip_sqlite_backed_file_dir, Session, DEFAULT_MAX_SESSION_FILE_BYTES,
 };
 use chrono::{DateTime, Utc};
 use std::cmp::Reverse;
@@ -27,6 +27,13 @@ pub struct LoadOptions {
     pub model: String,
     pub include_history: bool,
     pub preserve_history: bool,
+    /// rm-451: per-file admission bound in bytes for the transcript
+    /// walk. `None` uses `DEFAULT_MAX_SESSION_FILE_BYTES`; `Some(0)`
+    /// disables the bound (the `--max-session-file-bytes` escape
+    /// hatch). Files over the bound are skipped whole — never read,
+    /// never a parse failure — and counted on the report's
+    /// `admission_skips`.
+    pub max_session_file_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,6 +73,23 @@ pub struct LoadReport {
     /// `--overview -d dir -o dir/bad.jsonl` silently overwrites the
     /// unparseable input (a `.orig` twin is not a recovery path).
     pub parse_failure_paths: Vec<PathBuf>,
+    /// rm-451: discovered files rejected by the per-file admission
+    /// bound — skipped whole (never read), so they are neither parse
+    /// failures nor corpus members; disclosed loudly on stderr and in
+    /// doctor, never silently dropped.
+    pub admission_skips: usize,
+    /// rm-451: the first admission skip as a ready-to-print sentence
+    /// (path, size, bound) in discovery order, so the CLI's stderr
+    /// note can name it like `first_parse_failure` does for parses.
+    pub first_admission_skip: Option<String>,
+    /// rm-451 review fix (F1, 2026-10-13): every admission-skipped
+    /// path in discovery order, the sibling of `parse_failure_paths`
+    /// — skipped files are never read, so they can never join the
+    /// rm-912 attempted-parse set, but the CLI's `-o` no-clobber
+    /// guard must still cover them or `--overview -d dir -o
+    /// dir/huge.jsonl` silently replaces the oversized rollout the
+    /// bound just protected (review live PoC: a 1 GiB input, rc 0).
+    pub admission_skip_paths: Vec<PathBuf>,
     /// rm-799: subagent transcripts whose parent session is NOT part
     /// of the loaded corpus (orphaned children — moved transcripts,
     /// partial copies). They still render as standalone rows, but the
@@ -366,7 +390,39 @@ pub fn load_sessions_with_progress_from_cache_mode(
     type Slot = Option<(Option<Session>, Option<String>, bool)>;
     let mut slots: Vec<Slot> = Vec::with_capacity(files.len());
     let mut misses = Vec::new();
+    // rm-451: the admission bound filters BEFORE the cache and the
+    // parse queue — an over-bound file is not corpus (admission, not
+    // memory management), so even a warm cache entry cannot
+    // resurrect it, and the parse workers are never handed it. The
+    // slot is pre-filled so the in-order drain does not stall on a
+    // never-claimed index, and the index is recorded so the drain
+    // classifies it as an admission skip, never a parse failure (it
+    // never joins the rm-912 attempted-parse set — the loader never
+    // ATTEMPTED it; the `-o` no-clobber coverage it needs flows
+    // through its own `admission_skip_paths` list, review F1).
+    let admission_bound = options
+        .max_session_file_bytes
+        .unwrap_or(DEFAULT_MAX_SESSION_FILE_BYTES);
+    let mut admission_skips = 0usize;
+    let mut first_admission_skip: Option<String> = None;
+    let mut admission_skip_paths: Vec<PathBuf> = Vec::new();
+    let mut admission_skip_indexes: HashSet<usize> = HashSet::new();
     for (index, path) in files.iter().enumerate() {
+        if let Some(len) = file_over_admission_bound(path, admission_bound) {
+            slots.push(Some((None, None, false)));
+            admission_skip_indexes.insert(index);
+            admission_skips += 1;
+            admission_skip_paths.push(path.clone());
+            if first_admission_skip.is_none() {
+                first_admission_skip = Some(format!(
+                    "{} ({} bytes, over the {}-byte admission bound)",
+                    path.display(),
+                    len,
+                    admission_bound
+                ));
+            }
+            continue;
+        }
         match cached_session(path, cache) {
             Some(session) => slots.push(Some((Some(session), None, true))),
             None => {
@@ -405,7 +461,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
                 while let Some(&index) =
                     misses.get(next_miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
-                    let parsed = parse_file(&files[index]);
+                    let parsed = parse_file_with_bound(&files[index], admission_bound);
                     let failure = parsed.as_ref().err().map(|error| format!("{error:#}"));
                     if tx.send((index, parsed.ok(), failure)).is_err() {
                         break;
@@ -427,16 +483,25 @@ pub fn load_sessions_with_progress_from_cache_mode(
                     }
                     (None, _) => {
                         skipped += 1;
-                        // rm-835: keep the first failure's parser message
-                        // (discovery order) for the LoadReport.
-                        if first_parse_failure.is_none() {
-                            first_parse_failure = failure;
+                        // rm-451: whole-file admission skip — counted
+                        // in the pre-pass, named by
+                        // `first_admission_skip`, and listed in
+                        // `admission_skip_paths` (review F1) for the
+                        // CLI's -o guard; never a parse failure. The
+                        // slot falls through to progress accounting so
+                        // the count stays in file order.
+                        if !admission_skip_indexes.contains(&next) {
+                            // rm-835: keep the first failure's parser message
+                            // (discovery order) for the LoadReport.
+                            if first_parse_failure.is_none() {
+                                first_parse_failure = failure;
+                            }
+                            // rm-912: the loader ATTEMPTED this path — it
+                            // joins the -o refusal set even though no
+                            // session was produced from it.
+                            parse_failure_paths.push(files[next].clone());
+                            parse_failures += 1;
                         }
-                        // rm-912: the loader ATTEMPTED this path — it
-                        // joins the -o refusal set even though no
-                        // session was produced from it.
-                        parse_failure_paths.push(files[next].clone());
-                        parse_failures += 1;
                     }
                 }
                 report_load_progress(
@@ -538,6 +603,9 @@ pub fn load_sessions_with_progress_from_cache_mode(
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
+        admission_skips,
+        first_admission_skip,
+        admission_skip_paths,
         unlinked_subagents,
     }
 }

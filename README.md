@@ -452,6 +452,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--clear-cache` |  | Delete the session cache before running, forcing a full re-parse |
 | `--preserve-history` |  | Persist derived metrics to the history ledger so later `--include-history` runs can see them; the interactive and utility lanes reject the flag loudly |
 | `--include-history` |  | Merge preserved-history sessions into the view (offline or retained-history analysis); the interactive and utility lanes reject the flag loudly |
+| `--max-session-file-bytes <BYTES>` | `268435456` | Per-file admission bound in bytes for transcript parses (rm-451): files over the bound are skipped whole — never read, never counted as parse failures — disclosed on stderr and as `--doctor`'s "Admission-bound skips" row; `0` disables the bound |
 | `-h, --help` |  | Print help |
 
 ## What you get
