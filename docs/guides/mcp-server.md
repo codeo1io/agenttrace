@@ -72,14 +72,24 @@ error naming the cap, and the messages after it still answer.
 
 | Method | Answers |
 | --- | --- |
-| `initialize` | `serverInfo`, `capabilities.tools`, and the newest **mutually supported** `protocolVersion` of `2026-07-28`, `2025-11-25`, `2025-06-18` — negotiated, never echoed; an unknown or absent client version falls back to the server's newest with a one-line stderr disclosure (rm-780) |
+| `initialize` | `serverInfo`, `capabilities.tools`, and the newest **mutually supported** `protocolVersion` of `2026-07-28`, `2025-11-25`, `2025-06-18` — negotiated, never echoed; an unknown version answers the typed `UnsupportedProtocolVersionError` `-32022` (`data {requested, supported}`, message `Unsupported version`), an absent one falls back to the server's newest with a one-line stderr disclosure (rm-780, rm-455) |
+| `server/discover` | the 2026-07-28 revision's one mandatory server RPC, stateless — `supportedVersions`, `capabilities.tools` (`listChanged: false`), the cache-hint pair (`ttlMs`/`cacheScope: public`) the revision's cacheable-result rule requires, and the reserved `_meta` server-info key; `resultType` rides the central seam like every result (rm-455) |
 | `notifications/initialized` | silence (notifications are never answered) |
 | `ping` | `{}` |
 | `tools/list` | the two tools below |
 | `tools/call` | tool result or `isError` result |
 
 JSON-RPC batching is rejected (`-32600`), matching the current MCP
-spec revision. Malformed JSON answers `-32700`; unknown methods answer
+spec revision. Version negotiation is also inline and stateless
+(rm-455): every request may carry its protocol version under the
+reserved canonical `_meta` key
+`io.modelcontextprotocol/protocolVersion`, honored on ANY method — a
+supported inline version is served, an unknown one answers the same
+typed `-32022` error with `data {requested, supported}`. The explicit
+`protocolVersion` member takes precedence over `_meta`, and a bare
+`protocolVersion` `_meta` member (no reserved prefix) is client-chosen
+data, not a negotiation signal, and is ignored. Malformed JSON answers
+`-32700`; unknown methods answer
 `-32601`; invalid tool parameters answer `-32602`. The wire reader is
 disciplined (rm-782): a non-UTF-8 line answers `-32700` and the
 server keeps serving (the byte-level lane never dies on undecodable

@@ -4,6 +4,32 @@
 
 ### Added
 
+- The MCP server speaks the 2026-07-28 revision's wire truth
+  end to end (rm-455, run f62ee197 cycle 4): `server/discover` — the
+  revision's ONE mandatory server RPC, whose schema description reads
+  "Servers MUST implement `server/discover`" — is implemented and
+  stateless (no `initialize` needed first), answering `supportedVersions`,
+  `capabilities` (two read-only tools, `listChanged: false`), the
+  required cache-hint pair (`ttlMs`, `cacheScope: public`), and the
+  reserved `_meta` server-info key; `resultType` rides the existing
+  central seam. Per-request version negotiation under the reserved
+  canonical `_meta` key `io.modelcontextprotocol/protocolVersion` is
+  honored on every method (previously silently ignored — the server
+  answered with its newest revision regardless), with the explicit
+  `protocolVersion` member taking precedence and non-reserved bare
+  spellings ignored. An unsupported requested version — member or
+  `_meta`, any method — now answers the schema's typed
+  `UnsupportedProtocolVersionError` (`-32022`, message
+  `Unsupported version`, `data {requested, supported}`) instead of the
+  success-with-newest fallback that claimed a session in a dialect
+  neither side speaks (first-party demand: the claude-code 2.1.303
+  changelog fixes servers over this exact 2026-07-28 negotiation
+  surface). An absent version keeps the rm-780 fallback with its
+  stderr disclosure for legacy clients. Pinned by
+  `server_discover_answers_the_mandatory_rpc_statelessly` and
+  `per_request_meta_version_negotiates_statelessly_and_typed`, with the
+  unknown-version arm of `protocol_version_is_negotiated_never_echoed`
+  flipped to the typed contract.
 - Compressed codex rollouts (`.jsonl.zst`) are admitted by discovery and
   decoded (rm-992, run e4209f0c cycle 5): upstream codex `migrate_rollouts`
   compresses rollouts to `<name>.jsonl.zst` (compression stable-adjacent
