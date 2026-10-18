@@ -188,6 +188,13 @@ pub struct DoctorReport {
     /// database reads cleanly.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
+    /// rm-1989: transcript-shaped files the rm-1881 cline session gate
+    /// refused under the Cline CLI canonical root (admission-side
+    /// loss). Zero stays out of the JSON so clean corpora render
+    /// byte-identically — same `skip_serializing_if` law as the
+    /// rm-1534 future-timestamp census.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cline_admission_skipped: usize,
     pub recommendations: Vec<String>,
 }
 
@@ -221,6 +228,14 @@ pub struct DoctorDirReport {
     /// parsed bytes crossed the size cap (count-sampled pass).
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub skipped_size: usize,
+    /// rm-1989: transcript-shaped files under this root the rm-1881
+    /// cline session gate refused BEFORE the parse lane (a
+    /// `.messages.json` without its `session.json` manifest sibling,
+    /// or a basename the content-shaped gate rejects). Counted on
+    /// both walk arms, folded into `files` so the row shows found
+    /// transcripts — never admitted silently minus the loss.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub admission_skipped: usize,
     /// Present when the provider directory is itself a symlink, so the
     /// doctor names the link it follows instead of implying a plain
     /// directory (cycle 7, Codex `#42135`).
@@ -272,6 +287,11 @@ struct DoctorDiscovery {
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
     opencode_fork_excluded: usize,
+    /// rm-1989: transcripts the rm-1881 cline session gate refused
+    /// under the Cline CLI canonical root — rides the same disclosure
+    /// channel as the fork exclusion so the per-root row and the
+    /// report-level field can name the admission-side loss.
+    cline_admission_skipped: usize,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -299,16 +319,18 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
+            cline_admission_skipped: 0,
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, opencode_fork_excluded) = if dir.is_none() {
+    let (files, opencode_fork_excluded, cline_admission_skipped) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
-        (find_session_files(dir), 0)
+        let (files, cline_admission_skipped) = find_session_files_counted(dir);
+        (files, 0, cline_admission_skipped)
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
@@ -351,6 +373,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        cline_admission_skipped,
     }
 }
 
@@ -372,6 +395,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        cline_admission_skipped,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -391,7 +415,15 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     // disclosures — see the `dropped_lines` field; the scan state
     // carries the mutable reports through the directory walk.
     let mut scan = DoctorScanState::default();
-    let directories = doctor_directories(dir, demo, &files, &sessions, &sqlite_ingest, &mut scan);
+    let directories = doctor_directories(
+        dir,
+        demo,
+        &files,
+        &sessions,
+        &sqlite_ingest,
+        &mut scan,
+        cline_admission_skipped,
+    );
     let DoctorScanState {
         mut project_decode,
         zero_usage,
@@ -418,6 +450,14 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             opencode_fork_excluded_total,
         );
     }
+    // rm-1989: the cline admission refusals ride the same disclosure
+    // channel — a counted, named loss class, never a silent drop.
+    if cline_admission_skipped > 0 {
+        disclosures.insert(
+            "cline_admission_skipped_sessions".to_string(),
+            cline_admission_skipped,
+        );
+    }
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -438,6 +478,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions: files.len() + sessions.len(),
         session_files: files.len(),
         sqlite_duplicate_dbs: sqlite_ingest.duplicate_dbs,
+        cline_admission_skipped,
         scan_partial: {
             // rm-367(b)/(d): honest-truncation disclosure — present
             // exactly when a bound truncated work, so a complete scan
@@ -777,9 +818,10 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
+fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize, usize) {
     if dir.is_some() {
-        return (find_session_files(dir), 0);
+        let (files, cline_admission_skipped) = find_session_files_counted(dir);
+        return (files, 0, cline_admission_skipped);
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
     // inventory aggregates through the SAME loader primitive the CLI
@@ -795,12 +837,12 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, opencode_fork_excluded) =
+    let (files, opencode_fork_excluded, cline_admission_skipped) =
         crate::discovery::find_session_files_cached(None, &mut cache, true);
     // A cache write failure must never fail the doctor (the cache is
     // an optimization; the inventory answer is already correct).
     let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, opencode_fork_excluded)
+    (files, opencode_fork_excluded, cline_admission_skipped)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite
@@ -877,6 +919,7 @@ fn doctor_directories(
     sessions: &[Session],
     sqlite_ingest: &SqliteIngestReport,
     scan: &mut DoctorScanState,
+    cline_admission_skipped: usize,
 ) -> Vec<DoctorDirReport> {
     if demo {
         // rm-596 demo gate: enumerate no real root — both
@@ -967,7 +1010,7 @@ fn doctor_directories(
                 .filter(|file| is_under(file, &candidate.path))
                 .cloned()
                 .collect::<Vec<_>>();
-            dirs.push(doctor_dir_report(
+            let mut row = doctor_dir_report(
                 &candidate.name,
                 &candidate.path,
                 &matching,
@@ -977,7 +1020,20 @@ fn doctor_directories(
                 &mut scan.project_decode,
                 &mut scan.zero_usage,
                 &mut scan.disclosure_fold,
-            ));
+            );
+            // rm-1989: the Cline CLI root is the one root whose walk
+            // can refuse transcript-shaped files BEFORE the parse lane
+            // (rm-1881 gate: no `session.json` manifest sibling, or a
+            // content-mismatched basename). Fold the walk's refusal
+            // count into the row so `files` counts found transcripts
+            // and the loss carries its own field — the assess c954461c
+            // PoC had it invisible (files 1 / parsed 1 with a second
+            // dropped transcript on disk).
+            if candidate.name.contains("Cline") && cline_admission_skipped > 0 {
+                row.files += cline_admission_skipped;
+                row.admission_skipped = cline_admission_skipped;
+            }
+            dirs.push(row);
         }
     }
     // rm-367 stage (a): persist fresh parses so an immediate --doctor
@@ -1169,6 +1225,7 @@ fn doctor_dir_report(
         symlink_target: symlink_target_of(path),
         failure_samples,
         read_cap_refused,
+        admission_skipped: 0,
     }
 }
 
@@ -1253,6 +1310,7 @@ fn doctor_sqlite_directories(
             symlink_target: symlink_target_of(&path),
             failure_samples,
             read_cap_refused: 0,
+            admission_skipped: 0,
         });
     }
     dirs
@@ -1292,12 +1350,27 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
                 "No sessions found in this directory. Check `-d <dir>` or point it at a session JSON/JSONL directory."
                     .to_string(),
             ];
+            // rm-1989: the empty-store explain covers the admission-side
+            // loss class too — a store that lost every transcript to the
+            // cline session gate must say so instead of "point HOME".
+            if report.cline_admission_skipped > 0 {
+                out.push(format!(
+                    "{} cline transcript(s) were found but refused by the cline session gate (no session.json manifest sibling or basename mismatch) — restore the session.json manifests next to them and re-run",
+                    report.cline_admission_skipped
+                ));
+            }
             out.extend(sqlite_repairs);
             return out;
         }
         let mut out = vec![
             "No sessions found. Run `agenttrace --demo` to try the TUI immediately.".to_string(),
         ];
+        if report.cline_admission_skipped > 0 {
+            out.push(format!(
+                "{} cline transcript(s) were found but refused by the cline session gate (no session.json manifest sibling or basename mismatch) — restore the session.json manifests next to them and re-run",
+                report.cline_admission_skipped
+            ));
+        }
         out.extend(sqlite_repairs);
         return out;
     }
@@ -1331,6 +1404,17 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
             "{} session(s) carry activity timestamps beyond now+{}h (future_timestamp): ranged views exclude them; check the recording machine's clock and the journal's timestamps at the source.",
             report.future_timestamp_sessions,
             crate::insights::FUTURE_ADMISSION_GRACE_SECS / 3600
+        ));
+    }
+    // rm-1989: admission-side loss gets a repair pointer in the
+    // non-empty arm too — the corpus renders, but the operator should
+    // learn the cline root's gate refused transcripts (the usual cause:
+    // the `session.json` manifest was moved or never written next to
+    // the `.messages.json`).
+    if report.cline_admission_skipped > 0 {
+        recommendations.push(format!(
+            "{} cline transcript(s) under the Cline CLI root were refused by the cline session gate (no session.json manifest sibling or basename mismatch) and are NOT counted; restore the manifests next to them or rename the transcript to its recorded session id to recover their spend.",
+            report.cline_admission_skipped
         ));
     }
     // rm-607: sibling sqlite databases suppressed as duplicates are
@@ -1563,6 +1647,15 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
             out.push_str(&format!(
                 "    read-cap refused: {} file(s) past the AGENTTRACE_FILE_CAP_BYTES admission bound\n",
                 dir.read_cap_refused
+            ));
+        }
+        // rm-1989: admission-side loss named at the row level — the
+        // cline session gate refused these transcripts before the
+        // parse lane (JSON arm carries the same counter as a field).
+        if dir.admission_skipped > 0 {
+            out.push_str(&format!(
+                "    admission-skipped: {} transcript(s) refused by the cline session gate (no session.json manifest sibling or basename mismatch) — spend NOT counted\n",
+                dir.admission_skipped
             ));
         }
     }
@@ -2067,6 +2160,7 @@ mod tests {
             &[session],
             &SqliteIngestReport::default(),
             &mut scan,
+            0,
         );
         assert!(dirs.is_empty(), "demo enumerates no real root: {dirs:?}");
         assert_eq!(
