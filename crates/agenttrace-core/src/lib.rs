@@ -65,7 +65,8 @@ pub use insights::{
 };
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 pub use parser::{
-    parse_file, parse_raw_session, parse_stdin_bytes, ReadCapRefused, FILE_READ_CAP_BYTES,
+    cap_model_identity, parse_file, parse_raw_session, parse_stdin_bytes, ReadCapRefused,
+    FILE_READ_CAP_BYTES,
 };
 pub use pricing::{
     cache_rate_census, catalog_identity, effort_tier_of, has_specific_price, list_pricing,
@@ -1342,6 +1343,29 @@ pub fn session_from_events(
             }
         }
     }
+    // rm-1958 (run 0e63a73c cycle 1): the model dimension gets the
+    // same choke-point treatment as the cwd backstop above — parser
+    // lanes cap at read time, so their events pass through untouched;
+    // deserialized journals and any uncapped lane are bounded HERE so
+    // no journal string rides raw into `model_used`, the
+    // by_model/model_attribution keys or the session-cache write. The
+    // cap is idempotent, so warm cache rows re-cap to themselves
+    // without a schema-rung bump.
+    for event in &mut events {
+        let (capped, truncated) = crate::parser::cap_model_identity(&event.model_used);
+        if truncated {
+            let lane = if event.source_tool.is_empty() {
+                "generic"
+            } else {
+                event.source_tool.as_str()
+            };
+            event.model_used = capped;
+            *event
+                .disclosure_counters
+                .entry(format!("model_identity_truncated:{lane}"))
+                .or_insert(0) += 1;
+        }
+    }
     let mut model = "default".to_string();
     let mut cwd = String::new();
     let mut branch = String::new();
@@ -1615,7 +1639,12 @@ pub(crate) const PER_BLOCK_PRICING_MARKER: &str = "priced per usage block";
 const IMPLAUSIBLE_TOKEN_MAGNITUDE: i64 = 1_000_000_000_000;
 
 pub fn analyze(events: &[Event], model: &str) -> Metrics {
-    let price = pricing::lookup_price(model);
+    // rm-1958: the model label is journal-controlled; bound it at the
+    // analyze choke point too so even uncapped lanes (deserialized
+    // journals, MCP generic events) can't plant a raw multi-MiB key.
+    let model_capped = crate::parser::cap_model_identity(model).0;
+    let model: &str = model_capped.as_str();
+    let price = pricing::lookup_price(&model);
     let mut metrics = Metrics {
         model_used: model.to_string(),
         tool_usage: BTreeMap::new(),
@@ -2188,7 +2217,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             let block_model = if event.model_used.is_empty() || event.model_used == "unknown" {
                 model.to_string()
             } else {
-                event.model_used.clone()
+                // rm-1958: attribution keys are report/cache surfaces
+                // — bound any uncapped producer here too.
+                crate::parser::cap_model_identity(&event.model_used).0
             };
             let entry = model_attribution.entry(block_model).or_default();
             entry.input_tokens = entry
@@ -3086,6 +3117,10 @@ struct QuotaWindow {
     end: DateTime<Utc>,
     spend_usd: f64,
     sessions_contributing: usize,
+    /// rm-1957: true when `cutoff - span` falls below the
+    /// representable floor and the start saturated there instead of
+    /// panicking — disclosed on both output lanes.
+    start_saturated: bool,
 }
 
 /// The corpus cutoff: the newest instant any loaded session can place
@@ -3188,7 +3223,16 @@ fn quota_window(
     cutoff: DateTime<Utc>,
     span: chrono::Duration,
 ) -> QuotaWindow {
-    let start = cutoff - span;
+    // rm-1957: a corpus anchored near the representable floor (a
+    // hostile `-262143-01-01T00:00:00` event) makes `cutoff - span`
+    // overflow DateTime - TimeDelta and used to panic the whole
+    // `--quota` lane. Saturate the start at the floor instead; the
+    // saturation is disclosed via `window_start_saturated` and the
+    // cutoff-basis note (composing the rm-1402 future-skew guard).
+    let (start, start_saturated) = match cutoff.checked_sub_signed(span) {
+        Some(start) => (start, false),
+        None => (DateTime::<Utc>::MIN_UTC, true),
+    };
     let mut spend_usd = 0.0;
     let mut sessions_contributing = 0;
     for session in sessions {
@@ -3208,6 +3252,7 @@ fn quota_window(
         end: cutoff,
         spend_usd: round4(spend_usd),
         sessions_contributing,
+        start_saturated,
     }
 }
 
@@ -3240,6 +3285,9 @@ fn quota_ts(ts: &DateTime<Utc>) -> String {
 fn quota_window_json(window: &QuotaWindow, span: chrono::Duration) -> serde_json::Value {
     serde_json::json!({
         "window_start_utc": quota_ts(&window.start),
+        // rm-1957: true when the cutoff sits below `now - span`'s
+        // representable floor and the start saturated at MIN_UTC.
+        "window_start_saturated": window.start_saturated,
         "window_end_utc": quota_ts(&window.end),
         "spend_usd": window.spend_usd,
         "sessions_contributing": window.sessions_contributing,
@@ -3282,7 +3330,7 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
                 "corpus": {
                     "sessions": sessions.len(),
                     "cutoff_utc": serde_json::Value::Null,
-                    "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); null when no session carries placeable time; rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant",
+                    "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); null when no session carries placeable time; rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant; rm-1957: a cutoff older than the window span saturates the window start at the representable floor instead of panicking",
                     "future_discarded_sessions": future_discarded,
                     "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
                     "attribution": {
@@ -3307,7 +3355,7 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
         "corpus": {
             "sessions": sessions.len(),
             "cutoff_utc": quota_ts(&five_hour.end),
-            "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant",
+            "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant; rm-1957: a cutoff older than the window span saturates the window start at the representable floor instead of panicking",
             "future_discarded_sessions": future_discarded,
             "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
             "attribution": {
@@ -3351,14 +3399,21 @@ fn render_quota_text(report: &serde_json::Value) -> String {
             ));
             for (label, key) in [("5h window", "five_hour"), ("7d window", "weekly")] {
                 match report[key].as_object() {
-                    Some(window) => out.push_str(&format!(
+                    Some(window) => {
+                        out.push_str(&format!(
                         "  {label}      {} → {}  spend ${:.4} across {} session(s); ages out fully {}\n",
                         window["window_start_utc"].as_str().unwrap_or("?"),
                         window["window_end_utc"].as_str().unwrap_or("?"),
                         window["spend_usd"].as_f64().unwrap_or(0.0),
                         window["sessions_contributing"],
                         window["resets_at_utc"].as_str().unwrap_or("?"),
-                    )),
+                    ));
+                    if window["window_start_saturated"].as_bool() == Some(true) {
+                        out.push_str(
+                            "      note         window start saturated at the representable floor (rm-1957): the cutoff predates the span by more than the calendar range\n",
+                        );
+                    }
+                    }
                     None => out.push_str(&format!("  {label}      undefined (no cutoff)\n")),
                 }
             }
@@ -5295,6 +5350,7 @@ mod quota_tests {
         }
         for key in [
             "window_start_utc",
+            "window_start_saturated",
             "window_end_utc",
             "spend_usd",
             "sessions_contributing",
@@ -5381,6 +5437,75 @@ mod quota_tests {
         assert_eq!(
             report["weekly"]["sessions_contributing"], 1,
             "only the plausible session contributes"
+        );
+    }
+
+    #[test]
+    fn quota_past_extreme_cutoff_saturates_window_start() {
+        // rm-1957: the assess PoC — a 94-byte journal whose only
+        // timestamp is the representable floor. Pre-fix this
+        // panicked at `cutoff - span` ('DateTime - TimeDelta
+        // overflowed') and took the whole --quota lane down; now the
+        // window start saturates at the floor and both lanes say so.
+        let sessions = vec![quota_session(
+            "floor",
+            &["-262143-01-01T00:00:00"],
+            0.0105,
+        )];
+        let report = quota_report(&sessions);
+        for key in ["five_hour", "weekly"] {
+            assert_eq!(
+                report[key]["window_start_saturated"], true,
+                "{key} window discloses the saturated start"
+            );
+            assert_eq!(
+                report[key]["window_start_utc"], "-262143-01-01T00:00:00Z",
+                "{key} start sits at the representable floor"
+            );
+        }
+        assert_eq!(
+            report["corpus"]["future_discarded_sessions"], 0,
+            "the past extreme is not a clock-skew discard — it anchors honestly"
+        );
+        assert_eq!(
+            report["weekly"]["spend_usd"], 0.0105,
+            "the floor-anchored session's own cost still counts inside the saturated window"
+        );
+        assert!(
+            report["corpus"]["cutoff_basis"]
+                .as_str()
+                .expect("basis string")
+                .contains("rm-1957"),
+            "the cutoff basis names the saturation policy"
+        );
+        let text = render_quota_view("text", &sessions).expect("text lane renders");
+        assert!(
+            text.contains("saturated at the representable floor"),
+            "text lane discloses the saturation: {text}"
+        );
+    }
+
+    #[test]
+    fn quota_both_extremes_compose_future_clamp_and_floor_saturation() {
+        // rm-1402 (future skew) + rm-1957 (past extreme) in one
+        // corpus: the clamp discards the 2099 line, the floor line
+        // anchors, and the window start saturates without a panic.
+        let sessions = vec![
+            quota_session("skew", &["2099-01-01T00:00:00Z"], 1.0),
+            quota_session("floor", &["-262143-01-01T00:00:00"], 0.0200),
+        ];
+        let report = quota_report(&sessions);
+        assert_eq!(
+            report["corpus"]["future_discarded_sessions"], 1,
+            "the future extreme hits the rm-1402 clamp"
+        );
+        assert_eq!(
+            report["weekly"]["window_start_saturated"], true,
+            "the surviving floor anchor saturates the window start"
+        );
+        assert_eq!(
+            report["weekly"]["spend_usd"], 0.0200,
+            "only the floor session bills; the skewed line stays discarded"
         );
     }
 

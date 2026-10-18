@@ -283,3 +283,117 @@ fn hostile_org_identifier_is_capped_and_disclosed() {
         .disclosure_counters
         .contains_key("org_identity_truncated"));
 }
+
+#[test]
+fn hostile_model_string_is_capped_at_capture_and_backstop() {
+    // rm-1958 (run 0e63a73c cycle 1): the model dimension of the
+    // rm-1571 class. A journal-controlled 5 MiB `model` used to ride
+    // raw into by_model/attribution keys, JSON overviews and the
+    // session-cache write. Bounded at the claude capture lane AND at
+    // the session_from_events backstop, with the
+    // `model_identity_truncated:<lane>` counter disclosing the cap.
+    let hostile_model = "M".repeat(5 * 1024 * 1024);
+    let journal = format!(
+        "{{\"timestamp\":\"2026-10-18T10:00:00Z\",\"type\":\"assistant\",\"message\":{{\"id\":\"msg_1\",\"model\":\"{hostile_model}\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":5}}}}}}"
+    );
+    let session = parse_raw_session(
+        "hostile-model",
+        "/work/projects/shared/hostile-model.jsonl",
+        &journal,
+    )
+    .expect("hostile-model journal parses");
+
+    let model = &session.metrics.model_used;
+    assert!(
+        model.chars().count() <= 96 + 20,
+        "model label bounded, got {} chars",
+        model.chars().count()
+    );
+    assert!(
+        model.contains('…') && model.contains('#'),
+        "capped form is prefix + … + # + digest"
+    );
+    let capped_counter = session
+        .metrics
+        .disclosure_counters
+        .iter()
+        .find(|(key, _)| key.starts_with("model_identity_truncated:"))
+        .expect("model cap discloses via counter");
+    assert!(
+        capped_counter.0.ends_with("claude_code"),
+        "counter names the lane: {}",
+        capped_counter.0
+    );
+
+    // The amplification vector is closed end-to-end: by_model keys and
+    // the JSON overview stay bounded off ONE hostile session.
+    let overview = compute_overview(std::slice::from_ref(&session));
+    for key in overview.by_model.keys() {
+        assert!(
+            key.chars().count() <= 120,
+            "by_model key bounded, got {} chars",
+            key.chars().count()
+        );
+    }
+    let json = report_overview_json(&overview, std::slice::from_ref(&session));
+    assert!(
+        json.len() < 100_000,
+        "the overview lane stays bounded off a 5 MiB model string"
+    );
+
+    // The cap is idempotent: a capped value re-caps to itself, so
+    // warm cache rows and re-analysis never double-cap or drift.
+    let (recapped, truncated_again) =
+        agenttrace_core::parser::cap_model_identity(model);
+    assert_eq!(recapped, *model);
+    assert!(!truncated_again, "capped form is already within the cap");
+}
+
+#[test]
+fn sane_model_ids_stay_byte_identical_and_catalog_safe() {
+    // rm-1958 real-id safety: every model id in the vendored pricing
+    // bundle is far below the 96-char disclosure cap, so real journals
+    // price unchanged and no catalog id is ever rewritten.
+    let snapshot: serde_json::Value =
+        serde_json::from_str(include_str!("../src/pricing_snapshot.json"))
+            .expect("vendored pricing snapshot parses");
+    let mut max_len = 0usize;
+    let mut max_id = String::new();
+    for key in snapshot
+        .as_object()
+        .expect("snapshot is a map")
+        .keys()
+    {
+        if key.chars().count() > max_len {
+            max_len = key.chars().count();
+            max_id = key.clone();
+        }
+    }
+    assert!(
+        max_len < 96,
+        "longest vendored catalog id ({max_id}, {max_len} chars) must sit below the 96-char cap"
+    );
+
+    for sane in [
+        "claude-sonnet-4-5-20250929",
+        "gpt-5.2",
+        "gemini-3.1-pro",
+        "unknown",
+        "",
+    ] {
+        let (capped, truncated) = agenttrace_core::parser::cap_model_identity(sane);
+        assert_eq!(capped, sane, "sane ids round-trip byte-identically");
+        assert!(!truncated);
+    }
+
+    let alpha = session("org-9f2a-example", ORG_ALPHA);
+    assert!(!session("org-9f2a-example", ORG_ALPHA)
+        .metrics
+        .disclosure_counters
+        .iter()
+        .any(|(key, _)| key.starts_with("model_identity_truncated:")));
+    assert!(
+        !alpha.metrics.model_used.contains('…'),
+        "real fixture model untouched"
+    );
+}

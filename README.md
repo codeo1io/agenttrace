@@ -459,6 +459,15 @@ still carries, and a corpus with no plausible instant renders undefined
 windows with the discard count rather than a future-anchored zero-spend
 masquerade.
 
+The mirror-image extreme is equally hostile: a journal anchored at the
+representable floor (a `-262143-01-01T00:00:00` event) makes `cutoff −
+span` overflow and used to panic the whole view. The window start now
+saturates at the floor instead — never a panic — and the saturation is
+disclosed on both lanes: `window_start_saturated` in each window object
+(rm-1957) and a note line on the text lane. The corpus still bills
+honestly: the floor-anchored session's own cost counts inside the
+saturated window and the `cutoff_basis` text names the policy.
+
 `-f json` emits the stable `agenttrace.quota/1` schema; the default text
 lane summarizes the same numbers. The view is corpus-scope: `--range`,
 `--sample`, and the history flags do not apply to it and are refused

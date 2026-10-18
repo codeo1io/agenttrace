@@ -64,6 +64,20 @@ pub struct SessionCsvRow {
     pub parent_session: String,
 }
 
+/// rm-1500 residual (cycle 1, run 0e63a73c): the csv surface is a
+/// MACHINE surface — a bare `NaN`/`inf` cell breaks numeric parsing
+/// downstream, so non-finite costs render as `n/a` while the row
+/// stays listed (skip-while-counting parity with the lib.rs and
+/// governance folds; the session is already counted by
+/// `overview.non_finite_costs`).
+fn cost_cell(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.4}")
+    } else {
+        "n/a".to_string()
+    }
+}
+
 pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
     let mut out = table(
         "sessions",
@@ -90,13 +104,13 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             &row.data,
             &row.source,
             &row.model,
-            &format!("{:.4}", row.cost),
+            &cost_cell(row.cost),
             &row.tokens.to_string(),
             &row.fail.to_string(),
             &row.anomalies.to_string(),
             &row.zero_usage_events.to_string(),
             &row.subagents.to_string(),
-            &format!("{:.4}", row.subagent_cost),
+            &cost_cell(row.subagent_cost),
             &row.parent_session,
         ]));
     }
@@ -132,7 +146,7 @@ pub fn overview_csv(overview: &Overview) -> String {
         &overview.healthy.to_string(),
         &overview.warning.to_string(),
         &overview.critical.to_string(),
-        &format!("{:.4}", overview.total_cost),
+        &cost_cell(overview.total_cost),
     ]));
     for (name, rows) in [
         // rm-895 policy: the csv surface is a MACHINE surface — these
@@ -154,7 +168,7 @@ pub fn overview_csv(overview: &Overview) -> String {
             out.push_str(&csv_row(&[
                 group,
                 &entry.sessions.to_string(),
-                &format!("{:.4}", entry.cost),
+                &cost_cell(entry.cost),
             ]));
         }
     }
@@ -167,7 +181,7 @@ pub fn overview_csv(overview: &Overview) -> String {
             out.push_str(&csv_row(&[
                 task_type,
                 &entry.sessions.to_string(),
-                &format!("{:.4}", entry.cost),
+                &cost_cell(entry.cost),
                 &entry.tokens_input.to_string(),
                 &entry.tokens_output.to_string(),
             ]));
@@ -532,6 +546,56 @@ mod tests {
         assert!(
             !out.contains("more not shown"),
             "csv must not claim a cut; it renders the full set"
+        );
+    }
+
+    #[test]
+    fn non_finite_costs_render_na_never_nan_cells() {
+        // rm-1500 residual (run 0e63a73c cycle 1): the csv surface is a
+        // machine surface — a hostile journal poisons a session's
+        // cost_estimated with NaN and a subagent rollup with inf; the
+        // cells must render `n/a` (numeric parsers reject `NaN`/
+        // `inf` strings), the ROW must stay listed (skip-while-counting
+        // parity — overview.non_finite_costs already counts the
+        // session), and no bare NaN/inf may appear anywhere in the file.
+        let row = SessionCsvRow {
+            session: "poisoned".to_string(),
+            health: 50,
+            data: "ok".to_string(),
+            source: "claude-code".to_string(),
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            cost: f64::NAN,
+            tokens: 10,
+            fail: 0,
+            anomalies: 0,
+            zero_usage_events: 0,
+            subagents: 2,
+            subagent_cost: f64::INFINITY,
+            parent_session: String::new(),
+        };
+        let out = sessions_csv(&[row]);
+        assert!(out.contains("poisoned"), "the poisoned session stays listed");
+        assert!(
+            out.contains(",n/a,") && !out.contains("NaN") && !out.contains("inf"),
+            "cost cells render n/a, never NaN/inf: {out}"
+        );
+
+        use agenttrace_core::{GroupOverview, Overview};
+        use std::collections::BTreeMap;
+        let mut by_model = BTreeMap::new();
+        by_model.insert(
+            "claude-3-5-haiku-20241022".to_string(),
+            GroupOverview { sessions: 1, cost: f64::NAN },
+        );
+        let overview = Overview {
+            total_cost: f64::INFINITY,
+            by_model,
+            ..Overview::default()
+        };
+        let summary = overview_csv(&overview);
+        assert!(
+            summary.contains("n/a") && !summary.contains("NaN") && !summary.contains("inf"),
+            "summary/group cost cells render n/a too: {summary}"
         );
     }
 }

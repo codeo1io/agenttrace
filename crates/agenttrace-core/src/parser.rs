@@ -3295,6 +3295,25 @@ pub(crate) fn cap_org_identity_value(raw: &str) -> (String, bool) {
     (capped_disclosure_value(raw), truncated)
 }
 
+/// rm-1958 (run 0e63a73c cycle 1, hostile-input bound): the model
+/// dimension of the rm-1571 class. `model` is a journal-controlled
+/// string on every export/message lane, and a hostile multi-MiB
+/// `model` used to ride raw into `by_model`/`model_attribution`
+/// keys, JSON overviews and the session-cache write. Same contract
+/// as [`cap_org_identity_value`]: sanitize, then the
+/// prefix+digest form past the disclosure cap, returning
+/// `(capped, truncated)` for the capture-site counter. Idempotent
+/// (a capped value re-caps to itself), so the
+/// [`crate::session_from_events`] backstop can re-cap without a
+/// schema-rung bump; every real catalog id in the vendored bundle
+/// is far below the cap (pinned by test), so pricing lookups are
+/// unaffected for real journals.
+pub fn cap_model_identity(raw: &str) -> (String, bool) {
+    let sanitized = crate::statusline::sanitize_line_segment(raw);
+    let truncated = sanitized.chars().count() > DISCLOSURE_VALUE_CAP;
+    (capped_disclosure_value(raw), truncated)
+}
+
 fn oh_my_pi_message_events(
     message: &Map<String, Value>,
     entry_ts: &str,
@@ -5633,7 +5652,9 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 if model == "unknown" {
                     if let Some(next_model) = string(message.get("model")).filter(|m| !m.is_empty())
                     {
-                        model = next_model.to_string();
+                        // rm-1958: journal-controlled model string —
+                        // bound it at capture like the org/cwd caps.
+                        model = cap_model_identity(&next_model).0;
                     }
                 }
                 if let Some(usage) = message.get("usage").and_then(usage_from_value) {
@@ -6190,7 +6211,8 @@ fn parse_kimi_value(value: &Value) -> Option<Vec<Event>> {
     if !doc.contains_key("messages") || !doc.contains_key("model") {
         return None;
     }
-    let model = string(doc.get("model")).unwrap_or("unknown").to_string();
+    // rm-1958: journal-controlled export model — bounded at capture.
+    let model = cap_model_identity(&string(doc.get("model")).unwrap_or("unknown")).0;
     let mut events = Vec::new();
     // rm-616 (upstream #312 port): exports that carry BOTH a top-level
     // `usage` and `metadata.usage` mirror the same counters — counting
@@ -6222,7 +6244,8 @@ fn parse_kimi_value(value: &Value) -> Option<Vec<Event>> {
 fn parse_messages_value(value: &Value, source_tool: &str) -> Option<Vec<Event>> {
     let doc = value.as_object()?;
     let messages = doc.get("messages")?.as_array()?;
-    let model = string(doc.get("model")).unwrap_or("unknown").to_string();
+    // rm-1958: journal-controlled export model — bounded at capture.
+    let model = cap_model_identity(&string(doc.get("model")).unwrap_or("unknown")).0;
     let mut events = Vec::new();
     for message in messages {
         if let Some(mut event) = event_from_message(message, &model) {

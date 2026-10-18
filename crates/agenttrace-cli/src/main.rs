@@ -9,7 +9,7 @@ use agenttrace_core::{
     render_test_match, render_waste_report_with_language, report_compare_json,
     report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
-    report_overview_svg_with_context, report_overview_text_with_context,
+    report_overview_svg_with_context, report_overview_text_with_context, round4,
     report_search_json_detailed, report_search_text_detailed, report_text_with_language,
     sanitize_line_segment, search_sessions_detailed, session_capability, session_pricing_basis,
     session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
@@ -2961,12 +2961,45 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
     let matched = sessions.len();
     let sessions = sessions.iter().take(limit).collect::<Vec<_>>();
     if format == "json" {
+        // rm-795 rider (run 0e63a73c cycle 1): `storedCost` beside the
+        // row — the source-recorded USD total (rm-436 `upstream_cost_usd`)
+        // under the cross-tool parity name, null-never-0.0 so absence
+        // stays distinguishable from a genuine $0.00 recording, with the
+        // basis string naming the semantics. The serde field itself
+        // stays untouched (cache schema stability); the augmentation
+        // happens at this render seam only.
+        let rows: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|session| {
+                let mut row = serde_json::to_value(session).expect("session serializes");
+                if let Some(object) = row.as_object_mut() {
+                    let recorded = session.metrics.upstream_cost_usd;
+                    object.insert(
+                        "storedCost".to_string(),
+                        if recorded > 0.0 && recorded.is_finite() {
+                            serde_json::json!(round4(recorded))
+                        } else {
+                            serde_json::Value::Null
+                        },
+                    );
+                    if recorded > 0.0 && recorded.is_finite() {
+                        object.insert(
+                            "storedCostBasis".to_string(),
+                            serde_json::json!(
+                                "sum of usage costs the source journal itself recorded (rm-436); those tokens are excluded from the catalog estimate beside it"
+                            ),
+                        );
+                    }
+                }
+                row
+            })
+            .collect();
         return serde_json::to_string_pretty(&serde_json::json!({
             "matched_sessions": matched,
             "returned_sessions": sessions.len(),
             "truncated": sessions.len() < matched,
             "limit": limit,
-            "sessions": sessions,
+            "sessions": rows,
         }))
         .expect("sessions serialize");
     }
@@ -3624,6 +3657,61 @@ mod tests {
     use super::*;
     use agenttrace_core::Metrics;
     use std::io::Write;
+
+    #[test]
+    fn session_list_json_exposes_stored_cost_beside_cost() {
+        // rm-795 rider (run 0e63a73c cycle 1): the sessions machine lane
+        // carries `storedCost` beside `cost` — the source-recorded USD
+        // total (rm-436 `upstream_cost_usd`) under the cross-tool parity
+        // name. Null-never-0.0: a journal that recorded nothing must stay
+        // distinguishable from a genuine $0.00 recording, so absence is
+        // null (and carries no basis string), presence is round4'd with
+        // the provenance basis. Non-finite recorded sums render null too
+        // (the rm-1500 null discipline — the accumulation gate upstream
+        // already drops them, this keeps the render seam honest if that
+        // ever regresses).
+        fn session_with(upstream_cost_usd: f64) -> Session {
+            Session {
+                id: "test-session".to_string(),
+                metrics: Metrics {
+                    upstream_cost_usd,
+                    ..Metrics::default()
+                },
+                ..Session::default()
+            }
+        }
+        let out = render_session_list(
+            &[session_with(0.01234), session_with(0.0)],
+            "json",
+            10,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("sessions lane is json");
+        let rows = parsed["sessions"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2, "both sessions listed");
+        assert_eq!(
+            rows[0]["storedCost"].as_f64(),
+            Some(0.0123),
+            "recorded cost exposed under the parity name, round4'd"
+        );
+        assert_eq!(
+            rows[0]["storedCostBasis"].as_str().unwrap_or(""),
+            "sum of usage costs the source journal itself recorded (rm-436); those tokens are excluded from the catalog estimate beside it",
+            "provenance basis named when storedCost is present"
+        );
+        assert!(
+            rows[0].get("cost").is_some(),
+            "storedCost lands beside cost, never replacing it"
+        );
+        assert_eq!(
+            rows[1]["storedCost"],
+            serde_json::Value::Null,
+            "no recorded cost stays null, never 0.0"
+        );
+        assert!(
+            rows[1].get("storedCostBasis").is_none(),
+            "no basis string when nothing was recorded"
+        );
+    }
 
     #[test]
     fn has_followup_action_covers_every_action_arm_for_both_side_effect_exits() {
