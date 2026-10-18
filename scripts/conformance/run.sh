@@ -17,7 +17,7 @@
 #
 # Fully offline: no network, no writes outside a mktemp scratch dir.
 # Usage: AGENTTRACE_BIN=<path> scripts/conformance/run.sh
-#   (defaults to target/release, then target/debug, then fails).
+#   (defaults to $CARGO_TARGET_DIR or target/{release,debug}, then fails).
 set -euo pipefail
 
 fail() { echo "conformance: $*" >&2; exit 1; }
@@ -26,14 +26,22 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 manifest="$repo_root/testdata/conformance/manifest.json"
 [ -f "$manifest" ] || fail "missing pack manifest at $manifest"
 
+# rm-241 repo-side arm (run ce9309d9 cycle 1, batch "battery-truth
+# hygiene"): resolve the probe binary from the target dir cargo
+# actually used — the explicitly exported CARGO_TARGET_DIR when the
+# fleet set one (the repo ./target would be a stale stranger in that
+# layout), the repo default otherwise. This runner builds nothing, so
+# it takes no namespaced default of its own; explicit AGENTTRACE_BIN
+# still wins (CI passes it).
+at_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 if [ -n "${AGENTTRACE_BIN:-}" ]; then
   bin="$AGENTTRACE_BIN"
-elif [ -x "$repo_root/target/release/agenttrace" ]; then
-  bin="$repo_root/target/release/agenttrace"
-elif [ -x "$repo_root/target/debug/agenttrace" ]; then
-  bin="$repo_root/target/debug/agenttrace"
+elif [ -x "$at_target_dir/release/agenttrace" ]; then
+  bin="$at_target_dir/release/agenttrace"
+elif [ -x "$at_target_dir/debug/agenttrace" ]; then
+  bin="$at_target_dir/debug/agenttrace"
 else
-  fail "no agenttrace binary found; build one (cargo build -p agenttrace) or set AGENTTRACE_BIN"
+  fail "no agenttrace binary found under $at_target_dir; build one (cargo build -p agenttrace) or set AGENTTRACE_BIN"
 fi
 [ -x "$bin" ] || fail "AGENTTRACE_BIN=$bin is not executable"
 echo "conformance: binary $bin"

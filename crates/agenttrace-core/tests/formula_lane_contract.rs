@@ -513,13 +513,102 @@ fn scratch_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{stem}-{}-{seq}{ext}", std::process::id()))
 }
 
+/// rm-1955 (run ce9309d9 cycle 1, batch "battery-truth hygiene"):
+/// teardown-on-drop handle around the rm-1882 unique scratch path.
+/// rm-1882 made the PATH unique; this makes the artifact EPHEMERAL —
+/// the file/dir is removed when the test ends, success or panic, so
+/// repeat battery runs accumulate nothing under TMPDIR. The two
+/// at-doc-guard call sites below used to leak their scratch dirs on
+/// every run (no teardown at all); the dead pre-uniqueness `rm -rf`
+/// prologues (a pid+seq path can never pre-exist) fold into the
+/// guard's Drop.
+struct Scratch {
+    path: std::path::PathBuf,
+}
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        Self {
+            path: scratch_path(name),
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for Scratch {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // symlink_metadata: never follow — a symlinked scratch unlinks
+        // the link itself, not its target.
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.is_dir() => {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+            Ok(_) => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+fn scratch(name: &str) -> Scratch {
+    Scratch::new(name)
+}
+
+#[test]
+fn scratch_sandboxes_tear_down_and_never_accumulate() {
+    // rm-1955 zero-accumulation repeat-run check: two live handles
+    // never share a path (rm-1882 uniqueness, re-pinned here), and
+    // dropping a handle removes its artifact whether it ended up a
+    // file or a directory — run twice to prove repeat runs leave
+    // nothing behind.
+    for round in 0..2 {
+        let dir = scratch("at-rm1955-residue-dir");
+        let file = scratch("at-rm1955-residue-file.jsonl");
+        let dir_path = dir.path().to_path_buf();
+        let file_path = file.path().to_path_buf();
+        assert_ne!(
+            dir_path, file_path,
+            "live scratch paths must stay unique (rm-1882)"
+        );
+        std::fs::create_dir_all(&dir_path).expect("mkdir scratch dir");
+        std::fs::write(&file_path, b"probe").expect("seed scratch file");
+        drop(dir);
+        drop(file);
+        assert!(
+            !dir_path.exists(),
+            "round {round}: scratch dir must be gone at drop"
+        );
+        assert!(
+            !file_path.exists(),
+            "round {round}: scratch file must be gone at drop"
+        );
+    }
+}
+
 #[test]
 fn doctor_zero_usage_sample_lane_gets_formula_guard() {
-    let tmp = scratch_path("at-doc-guard-zero");
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = scratch("at-doc-guard-zero");
     std::fs::create_dir_all(&tmp).expect("mkdir zero-usage corpus");
     copy_fixture_to(
-        &tmp,
+        tmp.path(),
         "tests/fixtures/formula-lane/=2+5_zero_usage.jsonl",
         "session.jsonl",
     );
@@ -581,11 +670,10 @@ fn doctor_duplicate_db_lane_gets_formula_guard_and_json_stays_raw() {
 
     // Contrast: the same hostile session flows through the JSON surface with
     // NO marker — machine lanes stay byte-lossless BY DESIGN.
-    let tmp = scratch_path("at-doc-guard-json");
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = scratch("at-doc-guard-json");
     std::fs::create_dir_all(&tmp).expect("mkdir json corpus");
     copy_fixture_to(
-        &tmp,
+        tmp.path(),
         "tests/fixtures/formula-lane/=2+5_zero_usage.jsonl",
         "session.jsonl",
     );

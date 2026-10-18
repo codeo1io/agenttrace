@@ -18,6 +18,20 @@
 //!    behavior (the collapse still serves plain session ids);
 //! 4. a full-catalog sweep: every snapshot key bills at a real
 //!    snapshot row — no invented prices, no collateral collapse.
+//!
+//! rm-1954 (run ce9309d9 cycle 1, batch "battery-truth hygiene"):
+//! every catalog-lane assertion below runs inside
+//! `support::with_isolated_pricing_env`. The public lane PREFERS a
+//! machine pricing cache (`$AGENTTRACE_SESSION_CACHE_DIR/pricing.json`
+//! or the default user-cache location) over the bundled snapshot, and
+//! the catalog initializes once per process — so without the guard,
+//! ambient host state silently re-points the census (assess f4cb5f63
+//! F2 PoC: a mutated cache flipped the window sweep, `Some(524345)`
+//! vs `Some(512000)`, on a pristine tree; the red was re-confirmed on
+//! this tree pre-patch). The mutated-cache fixture at the bottom of
+//! this file keeps that PoC standing.
+
+mod support;
 
 use agenttrace_core::{lookup_context_window, lookup_price, pricing_source_for, provider_for};
 use serde_json::Value;
@@ -102,6 +116,10 @@ fn is_chat_priced(key: &str) -> bool {
 
 #[test]
 fn regional_twin_families_bill_at_their_own_rows() {
+    support::with_isolated_pricing_env(regional_twin_families_body);
+}
+
+fn regional_twin_families_body() {
     // The assess 53af6c9e $ table, one probe per regional prefix
     // family present in the bundled snapshot. Each probe must resolve
     // to ITS OWN snapshot row — pre-fix, every probe collapsed onto
@@ -181,6 +199,10 @@ fn regional_twin_families_bill_at_their_own_rows() {
 
 #[test]
 fn regional_provider_attribution_rides_the_rate_row() {
+    support::with_isolated_pricing_env(regional_provider_attribution_body);
+}
+
+fn regional_provider_attribution_body() {
     // rm-1053's core invariant: provider and pricing-source lookups
     // derive from the SAME resolved row the rate came from. Pre-fix,
     // the provider path double-normalized (normalize of a normalize),
@@ -213,6 +235,10 @@ fn regional_provider_attribution_rides_the_rate_row() {
 
 #[test]
 fn base_model_pricing_is_unchanged_by_the_regional_split() {
+    support::with_isolated_pricing_env(base_model_pricing_body);
+}
+
+fn base_model_pricing_body() {
     // The collapse keeps serving plain session ids exactly as before:
     // the undated base row for the sonnet-4-5 family is the plain
     // `claude-sonnet-4-5` key ($3.00/$15.00), and unrelated models are
@@ -253,6 +279,10 @@ fn snapshot_window(key: &str) -> Option<u64> {
 
 #[test]
 fn window_pins_regional_twins_resolve_to_their_own_rows() {
+    support::with_isolated_pricing_env(window_pins_body);
+}
+
+fn window_pins_body() {
     // rm-1881: the window lane must resolve through the same rm-1053
     // raw-first ladder the rate lane uses. Pre-fix it was the one
     // resolver still on the plain matcher, so a mixed-case deployment
@@ -291,6 +321,10 @@ fn window_pins_regional_twins_resolve_to_their_own_rows() {
 
 #[test]
 fn bundled_catalog_window_sweep_serves_own_rows() {
+    support::with_isolated_pricing_env(bundled_catalog_window_sweep_body);
+}
+
+fn bundled_catalog_window_sweep_body() {
     // rm-1881 full-catalog sweep, mirroring the rate sweep: every
     // chat-priced qualified key that carries a window must resolve its
     // window to its OWN row's value through the public lane.
@@ -320,6 +354,10 @@ fn bundled_catalog_window_sweep_serves_own_rows() {
 
 #[test]
 fn unresolvable_window_is_none_not_a_twin() {
+    support::with_isolated_pricing_env(unresolvable_window_body);
+}
+
+fn unresolvable_window_body() {
     // None is the honest answer for an unresolvable id: the
     // diagnostics caller then labels the utilization a fallback
     // estimate. The window lane must never reach for a base-twin
@@ -333,6 +371,10 @@ fn unresolvable_window_is_none_not_a_twin() {
 
 #[test]
 fn bundled_catalog_sweep_bills_every_key_at_a_snapshot_row() {
+    support::with_isolated_pricing_env(bundled_catalog_sweep_bills_body);
+}
+
+fn bundled_catalog_sweep_bills_body() {
     // Full-catalog sweep: every chat-priced snapshot key must bill at
     // a REAL snapshot row (its own row when the key is
     // region/vendor-qualified; some same-collapse row otherwise) and,
@@ -429,4 +471,102 @@ fn bundled_catalog_sweep_bills_every_key_at_a_snapshot_row() {
         "expected the regional/vendor-qualified population to survive the conversion, got {qualified}"
     );
     assert!(plain > 100, "plain keys still populate the base collapse");
+}
+
+// rm-1954 standing fixture: the assess f4cb5f63 F2 PoC, kept alive.
+// The mutation delta mirrors the original (+12345 on a 512000 window).
+const POISON_KEY: &str = "fireworks_ai/minimax-m3";
+const BUNDLED_WINDOW: u64 = 512_000;
+const MUTATED_WINDOW: u64 = 524_345;
+
+#[test]
+fn mutated_machine_cache_does_not_flip_the_census() {
+    // Red-first (banked at assess f4cb5f63 F2, re-confirmed on this
+    // tree pre-patch): a machine pricing cache whose `POISON_KEY`
+    // window was mutated flips the census through the public lane's
+    // cache preference. The suite's isolation makes that impossible;
+    // this fixture keeps the proof standing by spawning the probe
+    // BOTH ways:
+    //
+    //   guarded   — poison seeded at every default machine-cache
+    //               location under a scratch HOME, session cache
+    //               relocated to a fresh scratch: the probe passes
+    //               (the bundled snapshot serves the census).
+    //   unguarded — the same poisoned HOME, no relocation: the probe
+    //               FAILS (cache preference is real product behavior;
+    //               load_pricing_cache beats the bundled fallback). If
+    //               this leg ever turns green the threat model
+    //               changed — re-adjudicate the fixture, don't delete
+    //               the isolation guard.
+    let tmp = std::env::temp_dir();
+    let poison_home = tmp.join(format!("at-rm1954-poison-home-{}", std::process::id()));
+    let clean_session = tmp.join(format!("at-rm1954-clean-session-{}", std::process::id()));
+    for dir in [&poison_home, &clean_session] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    let mut snapshot: Value = serde_json::from_str(include_str!("../src/pricing_snapshot.json"))
+        .expect("bundled snapshot parses");
+    snapshot
+        .get_mut(POISON_KEY)
+        .expect("poison key exists in the bundle")["max_input_tokens"] =
+        Value::from(MUTATED_WINDOW);
+    let poisoned_raw = serde_json::to_string(&snapshot).expect("re-serialize poison");
+    // Seed every platform default machine-cache location under the
+    // scratch HOME (the cache lane resolves ~/.cache on Linux,
+    // ~/Library/Caches on macOS — seed both so the fixture is
+    // portable either way).
+    for rel in [".cache/agenttrace", "Library/Caches/agenttrace"] {
+        let dir = poison_home.join(rel);
+        std::fs::create_dir_all(&dir).expect("poison cache dir");
+        std::fs::write(dir.join("pricing.json"), &poisoned_raw).expect("seed poison");
+    }
+    std::fs::create_dir_all(&clean_session).expect("clean session scratch");
+
+    let run_probe = |session_cache_dir: Option<&std::path::Path>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        cmd.arg("--exact")
+            .arg("pricing_poison_probe")
+            .env("AGENTTRACE_TEST_PRICING_PROBE", "1")
+            .env("HOME", &poison_home)
+            .env_remove("XDG_CACHE_HOME");
+        match session_cache_dir {
+            Some(dir) => cmd.env("AGENTTRACE_SESSION_CACHE_DIR", dir),
+            None => cmd.env_remove("AGENTTRACE_SESSION_CACHE_DIR"),
+        };
+        cmd.output().expect("spawn probe")
+    };
+
+    let guarded = run_probe(Some(&clean_session));
+    assert!(
+        guarded.status.success(),
+        "guarded census must ignore a poisoned default machine cache:\n{}",
+        String::from_utf8_lossy(&guarded.stderr)
+    );
+
+    let unguarded = run_probe(None);
+    assert!(
+        !unguarded.status.success(),
+        "the poison mechanism must stay real: the unguarded probe passed, so the \
+         cache-preference contract changed — re-adjudicate this fixture"
+    );
+
+    let _ = std::fs::remove_dir_all(&poison_home);
+    let _ = std::fs::remove_dir_all(&clean_session);
+}
+
+// Spawned probe for the fixture above. Inert during a normal suite
+// run (sentinel absent): the wrapped census arms carry the guarded
+// coverage; only the fixture's child runs execute the body.
+#[test]
+fn pricing_poison_probe() {
+    if std::env::var_os("AGENTTRACE_TEST_PRICING_PROBE").is_none() {
+        return;
+    }
+    assert_eq!(
+        lookup_context_window(POISON_KEY),
+        Some(BUNDLED_WINDOW),
+        "census must serve the bundled window, not a machine cache's {}",
+        MUTATED_WINDOW
+    );
 }

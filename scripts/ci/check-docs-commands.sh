@@ -12,7 +12,13 @@ fail() {
 # AGENTTRACE_BIN still overrides for A/B against a pinned build.
 repo_root="$(git rev-parse --show-toplevel)" \
   || fail "must run inside the agenttrace repository (or set AGENTTRACE_BIN)"
-bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
+# rm-241 (cycle 4, run ce9309d9): derive the default from the target
+# dir cargo actually used — the explicitly exported CARGO_TARGET_DIR
+# when the fleet set one (repo ./target would be a stale stranger in
+# that layout), the repo default otherwise (CI builds there with no
+# env set, so this stays byte-identical to the pre-change behavior in
+# CI). AGENTTRACE_BIN still wins for A/B against a pinned build.
+bin="${AGENTTRACE_BIN:-${CARGO_TARGET_DIR:-$repo_root/target}/release/agenttrace}"
 out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 
 # rm-241 (cycle 3): split "not built yet" from "built but not

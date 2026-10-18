@@ -33,6 +33,39 @@ set -euo pipefail
 # Exit codes: 0 environmental|flaky (adjudicated non-defect), 1 defect,
 # 2 usage/internal error.
 
+# rm-241 repo-side arm (composition fix, conflict case
+# 0c4406e6bb7744fe8f99e17bb2636bb0, independent review of run
+# ce9309d9's "battery-truth hygiene" landing): this gate postdates
+# the batch that armed the other cargo runners (run a1f6c1f8 landed
+# it after base 6cd11e0, outside that batch's 9-script census) and
+# ran cargo under whatever ambient CARGO_TARGET_DIR it inherited —
+# the exact shared-layout hazard the arm exists for, sharpened by
+# this tool's purpose: a stale sibling test binary here does not
+# merely mis-test, it BANKS A FALSE VERDICT (a pre-fix binary
+# passing every isolated re-run classifies a real defect as
+# "environmental" and the commit gate banks the standing-red).
+# Default — only when CARGO_TARGET_DIR is UNSET — to the same
+# repo-root+HEAD-namespaced dir under the user cache the landed
+# gates use; an explicitly exported CARGO_TARGET_DIR always wins,
+# with the shared-layout note.
+if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
+	at_repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+	at_head="$(git rev-parse HEAD 2>/dev/null || true)"
+	at_cache_home="${XDG_CACHE_HOME:-${HOME:-}/.cache}"
+	if [[ -n "$at_repo" && -n "$at_head" && -n "${HOME:-}" && -d "$at_cache_home" ]]; then
+		# git hash-object for portability (sha256sum is absent on macOS runners)
+		at_ns="$(printf '%s:%s' "$at_repo" "$at_head" | git hash-object --stdin | cut -c1-16)"
+		export CARGO_TARGET_DIR="$at_cache_home/agenttrace-dev/target/at-$at_ns"
+	fi
+else
+	case "$CARGO_TARGET_DIR" in
+	*/agenttrace-dev/target/at-*) ;;
+	*)
+		echo "check-battery-adjudicate: note: ambient CARGO_TARGET_DIR=$CARGO_TARGET_DIR looks like shared layout — it can serve stale sibling artifacts and bank a false verdict (rm-241); unset it to use the per-worktree namespaced default" >&2
+		;;
+	esac
+fi
+
 fail() {
 	echo "check-battery-adjudicate: $*" >&2
 	exit 2
