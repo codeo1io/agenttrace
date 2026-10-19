@@ -210,6 +210,26 @@ fn cost_audit_excludes_non_finite_costs_with_a_named_census() {
         "the poisoned session must be censused, not silently dropped"
     );
 
+    // rm-1996 seam sweep: the per-provider-model ROWS roll their
+    // `stored_estimated_cost_usd` from the same sessions — they must
+    // sit on the same exclude-and-census basis as the top total, or a
+    // poisoned session would null its row through serde and the rows
+    // would no longer sum to the disclosed document total.
+    let row_total: f64 = audit
+        .by_provider_model
+        .iter()
+        .map(|row| row.stored_estimated_cost_usd)
+        .sum();
+    assert!(
+        row_total.is_finite(),
+        "no row may fold the poisoned cost (got {row_total})"
+    );
+    assert!(
+        (row_total - audit.stored_estimated_cost_usd).abs() < 1e-6,
+        "rows and top total must share one basis: rows say {row_total}, total says {}",
+        audit.stored_estimated_cost_usd
+    );
+
     // The document must carry no null totals and must carry the census.
     let json = serde_json::to_value(&audit).expect("audit serializes");
     assert!(

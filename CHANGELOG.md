@@ -4,6 +4,37 @@
 
 ### Added
 
+- Pricing-attribution and bounded-I/O honesty land as one unit
+  (rm-1993 + rm-1994 + rm-1996, run 948382c1 cycle 1). **rm-1994:**
+  antigravity numeric ids resolve through ccusage's full map of record
+  (27 entries — PR #1905's 1417|1418|1419 → gemini-4-argon effort
+  collapse and PR #1902's 1050 → gemini-3.1-flash-lite subagent-step
+  billing included; 1277 stays deliberately unmapped per ccusage
+  #1897) plus the `model_placeholder_m41x` effort spellings,
+  identity-only as before, so a mapped id whose model is absent from
+  the catalog still degrades through the disclosed unknown-model path.
+  Bare display names price through the provider-qualified twins'
+  rm-1053 base collapse: the minted qualified-probe arm was proven
+  unreachable (every qualified family already votes its top-level base
+  row in during `convert_litellm`) and was replaced by a structural
+  snapshot invariant that fails loudly if a refresh ever ships a
+  qualified family without its base row — the shape in which a bare
+  name would silently reprice at fallback. **rm-1993:** a transcript
+  whose READ length exceeds the stat length that gated its admission
+  (procfs entries claiming `st_size` 0 with real content, or a live
+  journal appended between the metadata call and the read) now
+  saturates the scan's byte budget at zero and skips with disclosure
+  through the budget-skip family — where it previously panicked in
+  debug builds and silently unbounded the remaining scan in release
+  builds, breaking the rm-1415 bounded-I/O contract. **rm-1996:**
+  `cost_audit` excludes non-finite stored cost estimates from its
+  totals and censuses them in a named `non_finite_cost_sessions`
+  counter (mirroring the overview lane's rm-600 posture), with the
+  per-provider rows on the same basis so visible rows always sum to
+  the disclosed total and the text audit names the excluded sessions
+  — where a single NaN-poisoned session previously nulled
+  `total_estimated_cost`/`stored_estimated_cost_usd` through serde
+  with no disclosure key at all.
 - Cline CLI envelope intake works on every production path, and its
   canonical store is auto-discovered (rm-1881 + rm-1882, run e30a8801
   cycle 1): the Cline CLI `.messages.json` envelope carries usage as

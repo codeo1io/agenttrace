@@ -54,7 +54,10 @@ impl TranscriptScanSummary {
 
     /// Human sentence for the text report tail; "none considered" renders
     /// nothing (the blank-query guard returns before any file is touched).
-    fn describe(&self) -> Option<String> {
+    /// rm-1993: public because it IS the disclosure surface — the
+    /// transcript-scan contract tests pin the skip families' exact
+    /// wording through it.
+    pub fn describe(&self) -> Option<String> {
         if self.files_considered == 0 {
             return None;
         }

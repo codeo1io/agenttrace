@@ -10811,8 +10811,8 @@ mod tests {
         ] {
             let mut obj = Map::new();
             obj.insert("model".into(), serde_json::json!(spelling));
-            let resolved = antigravity_model_id(&obj)
-                .unwrap_or_else(|| panic!("{spelling} must resolve"));
+            let resolved =
+                antigravity_model_id(&obj).unwrap_or_else(|| panic!("{spelling} must resolve"));
             assert_eq!(resolved.display, "gemini-4-argon", "{spelling}");
             assert!(!resolved.numeric);
         }

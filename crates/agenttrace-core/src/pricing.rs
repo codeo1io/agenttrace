@@ -1525,60 +1525,23 @@ fn matching_catalog_key_for(model: &str, catalog: &PricingCatalog) -> Option<Str
         // the unqualified first hit (rm-196), while later non-override
         // variants never displace it (rm-1053 ladder order).
     }
-    if first_hit.is_none() {
-        // rm-1994: the ladder missed entirely — a bare display name
-        // the catalog only knows as provider-QUALIFIED rows (e.g.
-        // `gemini-4-argon`, which exists only as `gemini/`,
-        // `vertex_ai/` and `github_copilot/` rows) used to fall all
-        // the way through to fallback pricing. Probe the qualified
-        // arms instead. The probe can never override a top-level hit:
-        // it only runs when the ladder found nothing at all, so the
-        // precedence contracts (rm-1053/rm-196/rm-1532) are untouched.
-        return qualified_base_probe(model, catalog);
-    }
+    // rm-1994 adjudication (2026-10-18, this batch): the qualified-probe
+    // arm originally minted for this row was removed as unreachable —
+    // every provider-qualified twin (`gemini/gemini-4-argon`, …) votes
+    // its normalized base into `convert_litellm`'s base collapse
+    // (rm-1053's own design), so by the time this ladder runs, a bare
+    // display name the catalog knows in ANY qualified form already
+    // has its top-level row and resolves through `first_hit` above.
+    // Verified against the live LiteLLM catalog: `gemini-4-argon`,
+    // `gemini-4-argon-cyber-permissive` and `gemini-3.1-flash-lite`
+    // all serve exact first-party rates through the collapse with no
+    // probe. First-party preference and deterministic tie-breaks are
+    // the collapse's own `provider_priority` + sort-stable voting,
+    // pinned by the rm-1994 tests below; a bare name still unknown in
+    // every form (the bundled snapshot predates the argon family —
+    // the refresh the weekly cron owns closes it) keeps falling
+    // through to the disclosed fallback path.
     first_hit
-}
-
-/// rm-1994: provider-qualified probe arm for bare display names. When
-/// the raw-first ladder finds nothing, look for catalog rows whose
-/// `normalize_model` base identity equals the query's — i.e. the
-/// qualified twins (`gemini/…`, `vertex_ai/…`, reseller paths) of the
-/// same model — and serve the best one. Selection is deterministic and
-/// snapshot-derived (no vendored rows, so a refresh can only change it
-/// by genuinely changing the catalog): first-party provider rows win,
-/// ties break lexicographically. The probe invents no names and never
-/// mutates the query — it answers with an existing catalog key or
-/// stays silent, and a first-party top-level row (if one appears in a
-/// later snapshot) automatically outranks the probe because the
-/// ladder itself wins first.
-fn qualified_base_probe(model: &str, catalog: &PricingCatalog) -> Option<String> {
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let target = normalize_model(trimmed);
-    if target.is_empty() || target == "default" || target == "unknown" {
-        return None;
-    }
-    let mut best: Option<(bool, String)> = None; // (is_reseller, key)
-    for key in catalog.entries.keys() {
-        if !key.contains('/') {
-            // Top-level rows are the ladder's jurisdiction; indexing
-            // them here could only ever shadow real hits.
-            continue;
-        }
-        if normalize_model(key) != target {
-            continue;
-        }
-        let is_reseller = !is_first_party_provider(
-            catalog.providers.get(key).map(String::as_str).unwrap_or(""),
-        );
-        let candidate = (is_reseller, key.clone());
-        if best.as_ref().is_none_or(|current| candidate < *current) {
-            best = Some(candidate);
-        }
-    }
-    best.map(|(_, key)| key)
 }
 
 /// rm-1053: the catalog id a region/vendor-qualified LiteLLM key must
@@ -3744,7 +3707,7 @@ mod tests {
         let twin = "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0";
         // Pre-override: the twin already bills its own retained row
         // (the landed rm-1053 mechanics this lane composes onto).
-        let before = lookup_price_in(twin, catalog);
+        let before = lookup_price_in(twin, &catalog);
         assert!((before.input - 3.6).abs() < 1e-9);
 
         let root = std::env::temp_dir().join(format!(
@@ -3776,7 +3739,7 @@ mod tests {
 
         // The twin's own row carries the user's rates, provider, and
         // source — all three surfaces cite one row.
-        let price = lookup_price_in(twin, catalog);
+        let price = lookup_price_in(twin, &catalog);
         assert_eq!((price.input, price.output), (4.0, 20.0));
         assert_eq!(provider_for_in(twin, &catalog), Some("bedrock".to_string()));
         assert_eq!(
@@ -3790,7 +3753,7 @@ mod tests {
         let slot = "anthropic.claude-sonnet-4-5";
         let slot_price = catalog.entries.get(slot).expect("shared slot row");
         assert!((slot_price.input - 3.0).abs() < 1e-9);
-        let base = lookup_price_in(slot, catalog);
+        let base = lookup_price_in(slot, &catalog);
         assert!((base.input - 3.0).abs() < 1e-9);
     }
 
@@ -3856,7 +3819,7 @@ mod tests {
             // Resolve exactly like the production rate path — one
             // raw-first ladder call — so the pin cannot pass through a
             // different resolution chain than a real session does.
-            let price = lookup_price_in(model, catalog);
+            let price = lookup_price_in(model, &catalog);
             assert!(
                 (price.input - input).abs() < 1e-9 && (price.output - output).abs() < 1e-9,
                 "{model} priced from the wrong row: got ({}, {}), expected ({input}, {output})",
@@ -3871,8 +3834,7 @@ mod tests {
             // The single-row invariant: the rate path and the provider
             // path resolve the SAME catalog key — the model's own raw
             // id for qualified rows, its normalized winner otherwise.
-            let key = matching_catalog_key_for(model, catalog)
-                .expect("row key resolves");
+            let key = matching_catalog_key_for(model, &catalog).expect("row key resolves");
             assert_eq!(
                 catalog.providers.get(&key).map(String::as_str),
                 Some(provider),
@@ -3884,6 +3846,273 @@ mod tests {
                 "resolved row {key} must carry the rate billed for {model}"
             );
         }
+    }
+
+    #[test]
+    fn bare_display_name_prices_through_its_qualified_twins() {
+        // rm-1994: the live LiteLLM catalog carries the antigravity
+        // flagship ONLY as provider-qualified rows (`gemini/`,
+        // `github_copilot/`, `vertex_ai/` twins — zero top-level rows,
+        // pass-13 research census, re-verified against live bytes this
+        // batch). rm-1533 maps ids 1417|1418|1419 → `gemini-4-argon`;
+        // this test pins that the bare display name then prices
+        // EXACTLY through those twins — via the rm-1053 base collapse
+        // (`convert_litellm`: every qualified twin votes its normalized
+        // base, `provider_priority` picks the winner), the mechanism a
+        // snapshot refresh rides. The original mint sketched a
+        // ladder-side probe arm; it was unreachable (any twin it could
+        // find had already voted the base row in) and was removed —
+        // see the note in `matching_catalog_key_for`. Synthetic catalog
+        // mirrors the live shape (the bundled snapshot predates the
+        // argon family — that is the refresh gap rm-1994 tracks; the
+        // weekly cron owns closing it).
+        let fixture = serde_json::json!({
+            "gemini/gemini-4-argon": {
+                "input_cost_per_token": 0.00000125, "output_cost_per_token": 0.00001,
+                "mode": "chat", "litellm_provider": "gemini"
+            },
+            "github_copilot/gemini-4-argon": {
+                "input_cost_per_token": 0.000002, "output_cost_per_token": 0.000016,
+                "mode": "chat", "litellm_provider": "github_copilot"
+            },
+            "vertex_ai/gemini-4-argon@default": {
+                "input_cost_per_token": 0.0000015, "output_cost_per_token": 0.000012,
+                "mode": "chat", "litellm_provider": "vertex_ai"
+            }
+        });
+        let converted = convert_litellm(
+            serde_json::to_vec(&fixture)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        let catalog = PricingCatalog {
+            entries: converted.entries,
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: converted.providers,
+            reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
+        };
+        // The collapse serves the bare display name from the
+        // first-party twin's own row (provider_priority: gemini 10 >
+        // github_copilot 6 > vertex_ai 5) — an EXISTING top-level
+        // entry, the collapsed base the twins voted in.
+        assert_eq!(
+            matching_catalog_key_for("gemini-4-argon", &catalog).as_deref(),
+            Some("gemini-4-argon")
+        );
+        let price = lookup_price_in("gemini-4-argon", &catalog);
+        assert!((price.input - 1.25).abs() < 1e-9 && (price.output - 10.0).abs() < 1e-9);
+        // One-row invariant, same as every other resolution: the rate
+        // path and the provider path cite the same catalog row.
+        assert_eq!(
+            provider_for_in("gemini-4-argon", &catalog),
+            Some("gemini".to_string())
+        );
+        // And the qualified spellings keep their OWN rows (rm-1053
+        // supremacy): naming the deployment id bills the deployment
+        // row, never the collapsed base.
+        assert_eq!(
+            matching_catalog_key_for("github_copilot/gemini-4-argon", &catalog).as_deref(),
+            Some("github_copilot/gemini-4-argon")
+        );
+        let twin = lookup_price_in("github_copilot/gemini-4-argon", &catalog);
+        assert!((twin.input - 2.0).abs() < 1e-9 && (twin.output - 16.0).abs() < 1e-9);
+        assert_eq!(
+            provider_for_in("github_copilot/gemini-4-argon", &catalog),
+            Some("github_copilot".to_string())
+        );
+    }
+
+    #[test]
+    fn qualified_twins_collapse_first_party_first_and_break_ties_deterministically() {
+        // rm-1994 refresh-stability: selection is a pure function of
+        // the catalog — `provider_priority` ranks first-party rows
+        // above resellers, and equal-priority voters resolve to the
+        // first in the source's sort order — so a snapshot refresh can
+        // only move the answer by genuinely moving rows.
+        let fixture = serde_json::json!({
+            "anthropic/claude-zed-9": {
+                "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015,
+                "mode": "chat", "litellm_provider": "anthropic"
+            },
+            "aaa/claude-zed-9": {
+                "input_cost_per_token": 0.000009, "output_cost_per_token": 0.000045,
+                "mode": "chat", "litellm_provider": "aihubmix"
+            },
+            "zzz/claude-zed-9": {
+                "input_cost_per_token": 0.000008, "output_cost_per_token": 0.000040,
+                "mode": "chat", "litellm_provider": "aihubmix"
+            },
+            "aaa/zed-only": {
+                "input_cost_per_token": 0.0000022, "output_cost_per_token": 0.000011,
+                "mode": "chat", "litellm_provider": "aihubmix"
+            },
+            "bbb/zed-only": {
+                "input_cost_per_token": 0.000002, "output_cost_per_token": 0.000010,
+                "mode": "chat", "litellm_provider": "aihubmix"
+            }
+        });
+        let converted = convert_litellm(
+            serde_json::to_vec(&fixture)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        let catalog = PricingCatalog {
+            entries: converted.entries,
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: converted.providers,
+            reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
+        };
+        // First-party twin wins the base vote even though resellers
+        // sort first — and the served rates are the winner's own row.
+        assert_eq!(
+            matching_catalog_key_for("claude-zed-9", &catalog).as_deref(),
+            Some("claude-zed-9")
+        );
+        let price = lookup_price_in("claude-zed-9", &catalog);
+        assert!((price.input - 3.0).abs() < 1e-9 && (price.output - 15.0).abs() < 1e-9);
+        assert_eq!(
+            provider_for_in("claude-zed-9", &catalog),
+            Some("anthropic".to_string())
+        );
+        // Reseller-only family: equal priorities keep the FIRST voter
+        // in the source's iteration order (aaa listed before bbb —
+        // textual order under `preserve_order`, sorted order without)
+        // — deterministic, never the last writer.
+        assert_eq!(
+            matching_catalog_key_for("zed-only", &catalog).as_deref(),
+            Some("zed-only")
+        );
+        let reseller = lookup_price_in("zed-only", &catalog);
+        assert!((reseller.input - 2.2).abs() < 1e-9 && (reseller.output - 11.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_top_level_hit_is_never_displaced_by_a_same_priority_twin() {
+        // rm-1994 precedence guard. The real precedence rule is the
+        // collapse's own: `provider_priority` ranks the voters, and a
+        // later equal-priority voter never displaces the incumbent
+        // (`existing >= priority` keeps the first in the source's sort
+        // order — and a bare id sorts before its `provider/` twin).
+        // So a later snapshot adding a top-level row of the SAME
+        // provider class automatically outranks the qualified twin,
+        // while a genuinely higher-priority twin still wins — the
+        // live `gemini-3.1-flash-lite` shape (top-level
+        // `vertex_ai-language-models` row at priority 5, first-party
+        // `gemini/` twin at 10, both $0.25/$1.50 live — the twin
+        // serves). Both arms pinned here; the rm-1053/rm-196/rm-1532
+        // contracts are untouched.
+        let fixture = serde_json::json!({
+            "gemini-4-argon": {
+                "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015,
+                "mode": "chat", "litellm_provider": "gemini"
+            },
+            "gemini/gemini-4-argon": {
+                "input_cost_per_token": 0.00000125, "output_cost_per_token": 0.00001,
+                "mode": "chat", "litellm_provider": "gemini"
+            }
+        });
+        let converted = convert_litellm(
+            serde_json::to_vec(&fixture)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        let catalog = PricingCatalog {
+            entries: converted.entries,
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: converted.providers,
+            reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
+        };
+        assert_eq!(
+            matching_catalog_key_for("gemini-4-argon", &catalog).as_deref(),
+            Some("gemini-4-argon")
+        );
+        let price = lookup_price_in("gemini-4-argon", &catalog);
+        assert!((price.input - 3.0).abs() < 1e-9 && (price.output - 15.0).abs() < 1e-9);
+        // The qualified spelling keeps its own row either way.
+        assert_eq!(
+            matching_catalog_key_for("gemini/gemini-4-argon", &catalog).as_deref(),
+            Some("gemini/gemini-4-argon")
+        );
+
+        // The live flash-lite shape: a first-party twin outranks a
+        // lower-priority top-level row — priority is the arbiter,
+        // not position.
+        let live_shape = serde_json::json!({
+            "gemini-3.1-flash-lite": {
+                "input_cost_per_token": 0.000005, "output_cost_per_token": 0.000025,
+                "mode": "chat", "litellm_provider": "vertex_ai-language-models"
+            },
+            "gemini/gemini-3.1-flash-lite": {
+                "input_cost_per_token": 0.0000025, "output_cost_per_token": 0.0000125,
+                "mode": "chat", "litellm_provider": "gemini"
+            }
+        });
+        let converted = convert_litellm(
+            serde_json::to_vec(&live_shape)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        let catalog = PricingCatalog {
+            entries: converted.entries,
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: converted.providers,
+            reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
+        };
+        let twin_wins = lookup_price_in("gemini-3.1-flash-lite", &catalog);
+        assert!(
+            (twin_wins.input - 2.5).abs() < 1e-9 && (twin_wins.output - 12.5).abs() < 1e-9,
+            "the higher-priority twin must serve, got {}/{}",
+            twin_wins.input,
+            twin_wins.output
+        );
+        assert_eq!(
+            provider_for_in("gemini-3.1-flash-lite", &catalog),
+            Some("gemini".to_string())
+        );
+    }
+
+    #[test]
+    fn bundled_snapshot_collapse_serves_every_qualified_identity_base() {
+        // rm-1994 structural pin, against the REAL bundled snapshot:
+        // bare-display-name pricing rides the rm-1053 base collapse —
+        // every provider-qualified row (`gemini/…`, `vertex_ai/…`,
+        // reseller paths) must have its normalized base sitting in the
+        // catalog as a top-level row. The salvage-era draft of this
+        // test hunted for qualified-ONLY identities (bases with NO
+        // top-level row) and found zero — the collapse creates them
+        // all — which is exactly why the minted probe arm was
+        // unreachable and was removed. The invariant below is the
+        // refresh-stable guard that matters: if a refresh ever ships a
+        // catalog shape where a qualified family's base row goes
+        // missing, bare display names would silently reprice at
+        // fallback — this fails loudly instead.
+        let catalog = fallback_catalog();
+        assert!(
+            catalog.entries.len() > 2_000,
+            "bundled snapshot must be loaded (got {} entries)",
+            catalog.entries.len()
+        );
+        let mut swept = 0usize;
+        for key in catalog.entries.keys() {
+            if !key.contains('/') {
+                continue;
+            }
+            swept += 1;
+            let base = normalize_model(key);
+            assert!(
+                catalog.entries.contains_key(&base),
+                "qualified row {key} has no top-level base row {base} \
+                 — the collapse invariant broke"
+            );
+        }
+        assert!(
+            swept > 1_000,
+            "snapshot must carry a meaningful qualified-row census (swept {swept})"
+        );
     }
 
     /// rm-404: PRIVACY.md must enumerate the pricing download URL, derived

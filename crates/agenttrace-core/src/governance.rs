@@ -506,7 +506,14 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .cache_read
             .saturating_add(session.metrics.tokens_cache_r);
         row.tokens.total = row.tokens.total.saturating_add(total_tokens(session));
-        row.cost += session.metrics.cost_estimated;
+        // rm-1996: rows share the top fold's basis — a non-finite
+        // session cost is excluded here too (censused once at the
+        // document level) so no row's `stored_estimated_cost_usd` can
+        // null through serde and the visible rows always sum to the
+        // disclosed top total.
+        if session.metrics.cost_estimated.is_finite() {
+            row.cost += session.metrics.cost_estimated;
+        }
         // rm-520: carry each session's rm-436 recorded-cost basis into
         // the row so the drift comparison prices recorded classes
         // exactly once instead of re-estimating them at catalog rates.

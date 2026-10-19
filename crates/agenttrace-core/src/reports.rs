@@ -699,6 +699,16 @@ pub fn report_overview_text_with_context(
         audit.pricing_coverage.fallback_priced_sessions,
         audit.pricing_coverage.unpriced_or_unknown_sessions
     ));
+    // rm-1996: same exclude-and-census posture as the overview lane
+    // (rm-1500) — the audit text must name the sessions it excluded
+    // from its totals instead of implying clean arithmetic. Zero
+    // keeps every existing report byte-identical.
+    if audit.non_finite_cost_sessions > 0 {
+        out.push_str(&format!(
+            "  ⚠️  Non-finite stored costs:  {} (excluded from audit totals — run --diagnostics)\n",
+            audit.non_finite_cost_sessions
+        ));
+    }
     render_recommendations_text(&mut out, &recommendations(sessions));
     out
 }
