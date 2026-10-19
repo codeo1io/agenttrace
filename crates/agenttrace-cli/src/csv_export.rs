@@ -64,6 +64,18 @@ pub struct SessionCsvRow {
     pub parent_session: String,
 }
 
+/// rm-1500 residual (run e40a66d3 cycle 6): money cells render `n/a`
+/// for non-finite values — a bare `NaN`/`inf` token inside a machine
+/// CSV column breaks downstream numeric parsers. Healthy values keep
+/// their exact four-decimal rendering, byte-for-byte.
+fn money_cell(value: f64) -> String {
+    if value.is_finite() {
+        format!("{:.4}", value)
+    } else {
+        "n/a".to_string()
+    }
+}
+
 pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
     let mut out = table(
         "sessions",
@@ -90,13 +102,13 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             &row.data,
             &row.source,
             &row.model,
-            &format!("{:.4}", row.cost),
+            &money_cell(row.cost),
             &row.tokens.to_string(),
             &row.fail.to_string(),
             &row.anomalies.to_string(),
             &row.zero_usage_events.to_string(),
             &row.subagents.to_string(),
-            &format!("{:.4}", row.subagent_cost),
+            &money_cell(row.subagent_cost),
             &row.parent_session,
         ]));
     }
@@ -132,7 +144,7 @@ pub fn overview_csv(overview: &Overview) -> String {
         &overview.healthy.to_string(),
         &overview.warning.to_string(),
         &overview.critical.to_string(),
-        &format!("{:.4}", overview.total_cost),
+        &money_cell(overview.total_cost),
     ]));
     for (name, rows) in [
         // rm-895 policy: the csv surface is a MACHINE surface — these
@@ -154,7 +166,7 @@ pub fn overview_csv(overview: &Overview) -> String {
             out.push_str(&csv_row(&[
                 group,
                 &entry.sessions.to_string(),
-                &format!("{:.4}", entry.cost),
+                &money_cell(entry.cost),
             ]));
         }
     }
@@ -167,7 +179,7 @@ pub fn overview_csv(overview: &Overview) -> String {
             out.push_str(&csv_row(&[
                 task_type,
                 &entry.sessions.to_string(),
-                &format!("{:.4}", entry.cost),
+                &money_cell(entry.cost),
                 &entry.tokens_input.to_string(),
                 &entry.tokens_output.to_string(),
             ]));
@@ -281,6 +293,44 @@ fn is_formula_introducer(first: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn money_cell_renders_finite_and_marks_non_finite() {
+        // rm-1500 residual (run e40a66d3 cycle 6, assess 3483a6c6 F5):
+        // money columns must never emit a bare NaN/inf token —
+        // downstream numeric parsers choke on it. `n/a` is the
+        // established non-finite marker; healthy values keep their
+        // exact four-decimal bytes.
+        assert_eq!(money_cell(1.25), "1.2500");
+        assert_eq!(money_cell(0.0), "0.0000");
+        assert_eq!(money_cell(f64::NAN), "n/a");
+        assert_eq!(money_cell(f64::INFINITY), "n/a");
+        assert_eq!(money_cell(f64::NEG_INFINITY), "n/a");
+    }
+
+    #[test]
+    fn sessions_csv_poisoned_cost_renders_na_not_bare_nan() {
+        let out = sessions_csv(&[SessionCsvRow {
+            session: "poisoned".to_string(),
+            health: 98,
+            data: "green".to_string(),
+            source: "claude_code".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            cost: f64::NAN,
+            tokens: 900,
+            fail: 0,
+            anomalies: 0,
+            zero_usage_events: 2,
+            subagents: 1,
+            subagent_cost: f64::INFINITY,
+            parent_session: "/p/proj/abc.jsonl".to_string(),
+        }]);
+        assert!(
+            !out.contains("NaN") && !out.contains("inf"),
+            "no bare non-finite token in the machine CSV: {out}"
+        );
+        assert_eq!(out.matches("n/a").count(), 2);
+    }
 
     #[test]
     fn quotes_embedded_commas_quotes_and_newlines() {

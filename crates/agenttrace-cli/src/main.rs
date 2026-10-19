@@ -2313,7 +2313,13 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // rm-402: reconcile codex multi-agent replay families on the assembled
     // corpus — discovery lanes see parent and child rollouts together, and a
     // replayed prefix billed inside both would double the family's usage.
-    agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
+    // rm-1956 residual (run e40a66d3 cycle 6): the aggregate outcome is
+    // disclosed on stderr — zero when the corpus reconciled cleanly, so
+    // healthy output bytes stay exactly as they were.
+    let replay_adjustment = agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
+    if let Some(line) = replay_adjustment.disclosure_line() {
+        eprintln!("agenttrace: warning: {line}");
+    }
     ensure_output_is_not_an_input(args, &sessions, &report.parse_failure_paths)?;
     Ok((sessions, Some(report)))
 }
@@ -2483,7 +2489,12 @@ fn prepare_explicit_sessions(
     // rm-402: codex MultiAgent V2 replay families must be reconciled
     // wherever a full corpus assembles — the explicit lane can load a
     // parent/child pair via repeated positional files.
-    agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
+    // rm-1956 residual (run e40a66d3 cycle 6): ditto the disclosure
+    // line above — the explicit lane skips-and-discloses too.
+    let replay_adjustment = agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
+    if let Some(line) = replay_adjustment.disclosure_line() {
+        eprintln!("agenttrace: warning: {line}");
+    }
     filter_cli_sessions(sessions, args)
 }
 

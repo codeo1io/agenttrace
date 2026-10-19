@@ -561,6 +561,70 @@ fn unreadable_rollout_discloses_reconciliation_skip() {
 }
 
 #[test]
+fn over_cap_rollout_discloses_reconcile_skip_without_reading_it() {
+    // rm-451 residual (run e40a66d3 cycle 6): scan_rollout used to
+    // fs::read the whole rollout at reconcile time — an over-cap
+    // rollout was slurped into memory just to be refused later at
+    // parse. The metadata fast-path now refuses it before any read:
+    // the session keeps its inline turns and discloses
+    // `codex_multiagent_reconcile_skipped_over_read_cap`.
+    let dir = std::env::temp_dir().join(format!("agenttrace-rm451cap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-multiagent-v2");
+    let parent_text = std::fs::read_to_string(base.join("parent.jsonl")).unwrap();
+    let child_text = std::fs::read_to_string(base.join("child.jsonl")).unwrap();
+    let parent_path = dir.join("parent.jsonl");
+    let child_path = dir.join("child.jsonl");
+    std::fs::write(&parent_path, &parent_text).unwrap();
+    std::fs::write(&child_path, &child_text).unwrap();
+    // Parse both while the files are honest-size, then sparsely grow
+    // the child past the cap (set_len writes no bytes) — the corpus
+    // shape where the file on disk changed after caching.
+    let parent = agenttrace_core::parse_file(&parent_path).unwrap();
+    let child = agenttrace_core::parse_file(&child_path).unwrap();
+    let mut sessions = vec![parent, child];
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&child_path)
+        .unwrap();
+    file.set_len(agenttrace_core::FILE_READ_CAP_BYTES + 1)
+        .expect("sparse grow past the read cap");
+    drop(file);
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 0, "a refused member cannot form a family");
+    assert_eq!(stats.children_adjusted, 0);
+    assert_eq!(stats.rollouts_unreadable, 0);
+    assert_eq!(
+        stats.rollouts_over_cap, 1,
+        "the over-cap rollout is counted"
+    );
+    // The refused child keeps its full inline usage (conservative,
+    // over-billed never erased) ...
+    let counts: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    assert_eq!(counts, vec![1_400, 1_700], "usage must not be destroyed");
+    // ... and discloses the skip; the in-cap parent stays silent.
+    assert_eq!(
+        sessions[1]
+            .metrics
+            .disclosure_counters
+            .get("codex_multiagent_reconcile_skipped_over_read_cap"),
+        Some(&1),
+        "the over-cap rollout must disclose the skip"
+    );
+    assert!(
+        !sessions[0]
+            .metrics
+            .disclosure_counters
+            .contains_key("codex_multiagent_reconcile_skipped_over_read_cap"),
+        "in-cap rollouts carry no skip disclosure"
+    );
+    // The corpus-level stderr line names the class (rm-1956 residual).
+    let line = stats.disclosure_line().expect("skips are disclosed");
+    assert!(line.contains("1 rollout over the read cap"), "{line}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn family_without_turn_evidence_skips_reconciliation() {
     // rm-1949 arm d (run e4bff731 cycle 1): pre-0.147 codex journals
     // carry no event_msg task_started turn evidence. The guardrail
