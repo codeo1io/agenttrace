@@ -12,7 +12,8 @@ use agenttrace_core::{
     report_overview_svg_with_context, report_overview_text_with_context,
     report_search_json_detailed, report_search_text_detailed, report_text_with_language,
     sanitize_line_segment, search_sessions_detailed, session_capability, session_pricing_basis,
-    session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
+    session_start_cmp, tool_fail_rate, total_tokens, unpriced_model_census, update_pricing,
+    waste_report_json,
     BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
     TRANSCRIPT_SCAN_FILE_BYTE_CAP, TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET, VERSION,
 };
@@ -3044,8 +3045,16 @@ fn render_diagnostics(
 ) -> anyhow::Result<String> {
     let alert = predict_cost_anomaly(history, session);
     let fixes = fix_suggestions(session);
+    // rm-2041 (run f5db7fd4 cycle 1, assess a53de7ec M4): the
+    // unpriced-model census over the loaded corpus — every DISTINCT
+    // model id observed but priced nowhere (no catalog row, alias,
+    // override, or embedded extract), with session and token mass.
+    // Omitted entirely when empty: an all-exactly-priced corpus keeps
+    // its byte-identical diagnostics output (zero-noise discipline,
+    // same as rm-1574's by-model zero-noise choice).
+    let unpriced = unpriced_model_census(history);
     if format == "json" {
-        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+        let mut doc = serde_json::json!({
             "session": session,
             // rm-1574 review fix 9ce27e5c (run fd0e91a2 cycle 3, F1):
             // the session row's only cost_basis is the LOOP basis
@@ -3056,12 +3065,41 @@ fn render_diagnostics(
             "pricing_basis": session_pricing_basis(&session.metrics.model_used),
             "cost_alert": alert,
             "fix_suggestions": fixes,
-        }))?);
+        });
+        if !unpriced.is_empty() {
+            doc.as_object_mut()
+                .expect("the diagnostics document is a JSON object")
+                .insert(
+                    "unpriced_models".to_string(),
+                    serde_json::to_value(&unpriced)?,
+                );
+        }
+        return Ok(serde_json::to_string_pretty(&doc)?);
     }
     let mut out = report_text_with_language(session, language);
     out.push_str("\nDiagnostics\n-----------\n");
     let guarded = guard_formula_json_leaves(&serde_json::to_value(&session.diagnostics)?);
     out.push_str(&serde_json::to_string_pretty(&guarded)?);
+    if !unpriced.is_empty() {
+        // rm-2041: the text-lane rendering of the census. The costs
+        // are the DISCLOSED default, never exact — the line says what
+        // the money actually is, so a $0-usage unpriced session stops
+        // looking healthy by omission.
+        out.push_str(
+            "\nUnpriced models — priced by no catalog row, alias, override, or embedded extract; costs are the disclosed fallback default, never exact:\n",
+        );
+        for row in &unpriced {
+            out.push_str(&format!(
+                "  {}  {} session(s), {} in / {} out tokens\n",
+                row.model, row.sessions, row.tokens_input, row.tokens_output
+            ));
+            if let Some(base) = &row.priced_base_hint {
+                out.push_str(&format!(
+                    "    hint: exact base '{base}' is in the catalog — an override or alias could price this id\n"
+                ));
+            }
+        }
+    }
     if alert.triggered {
         out.push_str(&format!(
             "\nCost alert [{}]: {}",

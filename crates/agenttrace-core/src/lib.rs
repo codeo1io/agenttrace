@@ -29,9 +29,9 @@ pub use demo::{demo_sessions, DEMO_REPORT_EPOCH};
 pub use diagnostics::{
     attention_priority, attention_rank, fix_suggestions, inspect_first, inspect_reason,
     loop_waste_percent, needs_attention, predict_cost_anomaly, session_findings,
-    ContextUtilization, CostAlert, Diagnostics, FindingEvidence, FixSuggestion, InspectFirst,
-    LargeParam, LoopCost, LoopCostBasis, LoopFingerprint, SessionFinding, StuckPattern,
-    ToolLatency, TraceStep, UnusedTool,
+    unpriced_model_census, ContextUtilization, CostAlert, Diagnostics, FindingEvidence,
+    FixSuggestion, InspectFirst, LargeParam, LoopCost, LoopCostBasis, LoopFingerprint,
+    SessionFinding, StuckPattern, ToolLatency, TraceStep, UnusedTool, UnpricedModelRow,
 };
 pub use filters::{
     matches_numeric_filter, parse_finite_f64, parse_numeric_filter, parse_numeric_filter_i32,
@@ -1154,6 +1154,11 @@ fn counts_toward_disclosure_cap(key: &str) -> bool {
         || key.starts_with("usage_alias_unmapped:")
         || key.starts_with("usage_unconsumed_location:")
         || key.starts_with("kimi_usage_alias:")
+        // rm-2045: the salvage's field-qualified keys are wire-controlled
+        // cardinality (the enclosing JSON key names the hostile journal);
+        // the bare class names stay uncapped — they are fixed vocabulary.
+        || key.starts_with("number_out_of_range:")
+        || key.starts_with("number_not_finite:")
 }
 
 /// Mint one disclosure key (with its occurrence count) into a
@@ -1201,23 +1206,45 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         if line.is_empty() {
             continue;
         }
-        let Some(mut value) = parser::parse_jsonl_value_lenient(line) else {
-            count_skip("unparseable_line", &mut line_skips);
-            // rm-616: a rejected line that itself carries model identity
-            // or a usage block is not just a lost message — it is lost
-            // ACCOUNTING. Count it separately so the drop is disclosed,
-            // never silent. Unparseable lines get a conservative
-            // substring check (quoted key forms for usage to avoid
-            // `tool_usage`-shaped false positives).
-            if line.contains("model_used")
-                || line.contains("ModelUsed")
-                || line.contains("\"usage\"")
-                || line.contains("\"Usage\"")
-            {
-                count_skip("model_or_usage_dropped", &mut line_skips);
+        // rm-2045 (run f5db7fd4 cycle 1, assess a53de7ec M2): mirror of
+        // `jsonl_objects_counted`'s salvage — a line the lenient parse
+        // rejects may carry only a poison number literal (1e400, bare
+        // NaN/Infinity); rescue it here too so the generic-JSONL
+        // fallback keeps the event and discloses the field-level drop
+        // instead of losing the whole line to `unparseable_line`.
+        let (mut value, salvaged_drops) = match parser::parse_jsonl_value_lenient(line) {
+            Some(value) => (value, None),
+            None => {
+                match parser::salvage_out_of_range_numbers(line).and_then(
+                    |(repaired, drops)| {
+                        parser::parse_jsonl_value_lenient(&repaired)
+                            .map(|value| (value, drops))
+                    },
+                ) {
+                    Some((value, drops)) => (value, Some(drops)),
+                    None => {
+                        count_skip("unparseable_line", &mut line_skips);
+                        // rm-616: a rejected line that itself carries model identity
+                        // or a usage block is not just a lost message — it is lost
+                        // ACCOUNTING. Count it separately so the drop is disclosed,
+                        // never silent. Unparseable lines get a conservative
+                        // substring check (quoted key forms for usage to avoid
+                        // `tool_usage`-shaped false positives).
+                        if line.contains("model_used")
+                            || line.contains("ModelUsed")
+                            || line.contains("\"usage\"")
+                            || line.contains("\"Usage\"")
+                        {
+                            count_skip("model_or_usage_dropped", &mut line_skips);
+                        }
+                        continue;
+                    }
+                }
             }
-            continue;
         };
+        for (name, occurrences) in salvaged_drops.unwrap_or_default() {
+            mint_disclosure(&mut line_skips, name, occurrences);
+        }
         if line_objects.len() < 20 {
             if let Some(object) = value.as_object() {
                 line_objects.push(object.clone());
@@ -3105,11 +3132,14 @@ struct QuotaWindow {
 /// carries (an earlier event timestamp, or a warm-cache
 /// `session_start`), and sessions with no plausible instant are
 /// counted as discarded, never silently dropped. Returns
-/// `(cutoff, future_discarded_sessions)`.
-fn quota_cutoff(sessions: &[Session]) -> (Option<DateTime<Utc>>, usize) {
+/// `(cutoff, future_discarded_sessions, past_discarded_sessions)`.
+fn quota_cutoff(sessions: &[Session]) -> (Option<DateTime<Utc>>, usize, usize) {
     let now = Utc::now();
+    let floor = past_anchor_floor();
+    let plausible = |ts: DateTime<Utc>| ts >= floor && ts <= now;
     let mut cutoff: Option<DateTime<Utc>> = None;
     let mut future_discarded = 0usize;
+    let mut past_discarded = 0usize;
     for session in sessions {
         let anchor = match session
             .metrics
@@ -3121,24 +3151,71 @@ fn quota_cutoff(sessions: &[Session]) -> (Option<DateTime<Utc>>, usize) {
             Some(ts) => ts,
             None => continue,
         };
-        if anchor <= now {
+        if anchor <= now && anchor >= floor {
             cutoff = Some(cutoff.map_or(anchor, |c: DateTime<Utc>| c.max(anchor)));
             continue;
         }
-        future_discarded += 1;
+        if anchor > now {
+            // rm-1402: the clock-skew guard — a future-dated journal
+            // line must not anchor the rolling windows past now.
+            future_discarded += 1;
+            let rescued = session
+                .metrics
+                .timestamps
+                .iter()
+                .rev()
+                // rm-2040: rescued instants must be plausible on BOTH
+                // sides — a hostile journal can carry a pre-epoch
+                // session_start that would otherwise re-enter the
+                // cutoff and still overflow the window subtraction.
+                .find(|ts| plausible(**ts))
+                .copied()
+                .or_else(|| {
+                    parse_ts(&session.metrics.session_start).filter(|ts| plausible(*ts))
+                });
+            if let Some(ts) = rescued {
+                cutoff = Some(cutoff.map_or(ts, |c: DateTime<Utc>| c.max(ts)));
+            }
+            continue;
+        }
+        // rm-2040: the past-side mirror of the clock-skew guard. A
+        // pre-epoch anchor can only be meter corruption (hostile or
+        // torn journal data — none of the tools this corpus models
+        // recorded anything before 1970), and letting it through does
+        // not merely misreport: `quota_window` subtracts multi-day
+        // spans from the cutoff, and a cutoff sitting at chrono's
+        // minimum representable instant OVERFLOWS that subtraction and
+        // panics the whole report (the assess PoC: a 94-byte journal
+        // stamped -262143-01-01 crashed `--quota` at lib.rs's window
+        // subtraction and `--overview -f svg` at the day-series
+        // arithmetic). Discard the anchor at a disclosed guard,
+        // rescue to the oldest at-or-after-floor instant the session
+        // still carries, and count it in
+        // `corpus.past_discarded_sessions`.
+        past_discarded += 1;
         let rescued = session
             .metrics
             .timestamps
             .iter()
-            .rev()
-            .find(|ts| **ts <= now)
+            .find(|ts| plausible(**ts))
             .copied()
-            .or_else(|| parse_ts(&session.metrics.session_start).filter(|ts| *ts <= now));
+            .or_else(|| parse_ts(&session.metrics.session_start).filter(|ts| plausible(*ts)));
         if let Some(ts) = rescued {
             cutoff = Some(cutoff.map_or(ts, |c: DateTime<Utc>| c.max(ts)));
         }
     }
-    (cutoff, future_discarded)
+    (cutoff, future_discarded, past_discarded)
+}
+
+/// rm-2040: the hostile past-stamp floor — the Unix epoch. Every
+/// instant that enters the quota cutoff is at-or-after this floor and
+/// at-or-before now (see [`quota_cutoff`]), so the rolling-window
+/// subtraction in `quota_window` and the full-decay horizon arithmetic
+/// can never overflow on a hostile journal, and the windows can never
+/// anchor before recorded time. Returned by a function rather than a
+/// const because `DateTime::from_timestamp` is not const-callable.
+fn past_anchor_floor() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("the Unix epoch is representable")
 }
 
 /// The share of a session's cost that sits inside `[start, end]`.
@@ -3262,7 +3339,7 @@ fn quota_window_json(window: &QuotaWindow, span: chrono::Duration) -> serde_json
 /// masquerade as a live quota. Schema `agenttrace.quota/1` is stable:
 /// the README "Quota view" section documents every key.
 pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
-    let (cutoff, future_discarded) = quota_cutoff(sessions);
+    let (cutoff, future_discarded, past_discarded) = quota_cutoff(sessions);
     let (event_basis, span_basis, unplaced) = quota_attribution_census(sessions);
     let (five_hour, weekly) = match cutoff {
         Some(cutoff) => (
@@ -3282,8 +3359,9 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
                 "corpus": {
                     "sessions": sessions.len(),
                     "cutoff_utc": serde_json::Value::Null,
-                    "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); null when no session carries placeable time; rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant",
+                    "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); null when no session carries placeable time; rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant; rm-2040: timestamps before 1970-01-01T00:00:00Z are discarded at a hostile-stamp guard (pre-epoch stamps are meter corruption, not calendar truth), so window arithmetic can never overflow on a past-extreme stamp",
                     "future_discarded_sessions": future_discarded,
+                    "past_discarded_sessions": past_discarded,
                     "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
                     "attribution": {
                         "event_timestamps": event_basis,
@@ -3307,8 +3385,9 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
         "corpus": {
             "sessions": sessions.len(),
             "cutoff_utc": quota_ts(&five_hour.end),
-            "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant",
+            "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant; rm-2040: timestamps before 1970-01-01T00:00:00Z are discarded at a hostile-stamp guard (pre-epoch stamps are meter corruption, not calendar truth), so window arithmetic can never overflow on a past-extreme stamp",
             "future_discarded_sessions": future_discarded,
+            "past_discarded_sessions": past_discarded,
             "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
             "attribution": {
                 "event_timestamps": event_basis,
@@ -3380,6 +3459,16 @@ fn render_quota_text(report: &serde_json::Value) -> String {
         if discarded > 0 {
             out.push_str(&format!(
                 "  clock skew       {discarded} session(s) carry timestamps after now — discarded; the cutoff is the newest at-or-before-now instant\n"
+            ));
+        }
+    }
+    // rm-2040: the past-side mirror — a discarded pre-epoch stamp is
+    // a disclosure too, and names the floor the windows can never
+    // cross.
+    if let Some(discarded) = corpus["past_discarded_sessions"].as_u64() {
+        if discarded > 0 {
+            out.push_str(&format!(
+                "  hostile stamps    {discarded} session(s) carry timestamps before 1970-01-01 UTC — discarded; pre-epoch stamps are meter corruption, not calendar truth\n"
             ));
         }
     }
@@ -4146,6 +4235,40 @@ mod tests {
             BTreeMap::from([("unparseable_line".to_string(), 1)])
         );
         assert_eq!(session.metrics.tokens_input, 7);
+    }
+
+    #[test]
+    fn parse_jsonl_session_salvages_out_of_range_numbers_by_field() {
+        // rm-2045, generic-lane mirror (run f5db7fd4 cycle 1, assess
+        // a53de7ec M2): a line whose only pathology is a number the
+        // f64 realm cannot carry — or a bare JS/Python non-finite
+        // spelling — is repaired, disclosed BY FIELD, and keeps its
+        // well-formed siblings; only a genuinely torn line still
+        // lands in `unparseable_line`.
+        let raw = concat!(
+            "{\"role\":\"user\",\"content\":\"clean\",\"junk_metric\":1e400}\n",
+            "{\"role\":\"user\",\"content\":\"also clean\",\"py_metric\":NaN}\n",
+            "{\"role\":\"user\",\"content\":\"broken \\uzzzz }\n",
+        );
+        let session = parse_jsonl_session("salvage-generic", "salvage-generic.jsonl", raw)
+            .expect("generic fallback parses");
+        assert_eq!(
+            session.metrics.user_messages, 2,
+            "both salvageable lines recover"
+        );
+        assert_eq!(
+            session.metrics.line_skips.get("number_out_of_range:junk_metric"),
+            Some(&1)
+        );
+        assert_eq!(
+            session.metrics.line_skips.get("number_not_finite:py_metric"),
+            Some(&1)
+        );
+        assert_eq!(
+            session.metrics.line_skips.get("unparseable_line"),
+            Some(&1),
+            "the genuinely torn line still drops whole"
+        );
     }
 
     #[test]
@@ -5381,6 +5504,130 @@ mod quota_tests {
         assert_eq!(
             report["weekly"]["sessions_contributing"], 1,
             "only the plausible session contributes"
+        );
+    }
+
+    #[test]
+    fn quota_past_extreme_timestamps_discard_and_disclose_instead_of_panicking() {
+        // rm-2040 (run f5db7fd4 cycle 1, assess a53de7ec M3): the
+        // past-side mirror of the rm-1402 clock-skew guard. A journal
+        // line stamped before the epoch (chrono's minimum
+        // representable instant, -262143-01-01) used to anchor the
+        // cutoff there, and `quota_window`'s `cutoff - span`
+        // subtraction OVERFLOWED — a 94-byte journal PANICKED
+        // `--quota` (exit 101 at the window subtraction, and the svg
+        // lane at its day-series arithmetic). Pre-epoch stamps are
+        // meter corruption, not calendar truth: the anchor is
+        // discarded at a disclosed hostile-stamp guard, the session
+        // is counted in `corpus.past_discarded_sessions`, and the
+        // honest spend is restored.
+        let sessions = vec![
+            quota_session(
+                "real",
+                &["2026-10-12T10:00:00Z", "2026-10-12T10:30:00Z"],
+                1.52,
+            ),
+            quota_session(
+                "hostile-past",
+                &["-262143-01-01T00:00:00"],
+                9.99,
+            ),
+        ];
+        let report = quota_report(&sessions);
+        assert_eq!(
+            report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z",
+            "the hostile pre-epoch stamp must not anchor the cutoff (pre-fix: panic)"
+        );
+        assert_eq!(
+            report["corpus"]["past_discarded_sessions"], 1,
+            "the hostile-stamp guard firing is disclosed in the corpus block"
+        );
+        assert_eq!(
+            report["corpus"]["future_discarded_sessions"], 0,
+            "the future guard stays quiet — this is a past-side PoC"
+        );
+        assert!(
+            report["corpus"]["cutoff_basis"]
+                .as_str()
+                .expect("cutoff basis string")
+                .contains("rm-2040"),
+            "the basis names the hostile-stamp guard"
+        );
+        assert_eq!(
+            report["five_hour"]["spend_usd"], 1.52,
+            "the honest 5h number survives the hostile session"
+        );
+        assert_eq!(
+            report["weekly"]["spend_usd"], 1.52,
+            "the honest weekly number survives (pre-fix: panic before render)"
+        );
+    }
+
+    #[test]
+    fn quota_past_extreme_only_corpus_discloses_null_cutoff() {
+        // Every session pre-epoch: the guard discards them all, the
+        // corpus carries NO plausible cutoff, and the report renders
+        // undefined windows with a discard count — the past-side twin
+        // of `quota_future_only_corpus_discloses_null_cutoff`, and the
+        // exact shape of the assess PoC corpus floor.jsonl (whose
+        // pre-fix fate was a panic, rc101).
+        let sessions = vec![quota_session(
+            "floor",
+            &["-262143-01-01T00:00:00"],
+            5.0,
+        )];
+        let report = quota_report(&sessions);
+        assert!(
+            report["corpus"]["cutoff_utc"].is_null(),
+            "no plausible cutoff survives the guard"
+        );
+        assert_eq!(report["corpus"]["past_discarded_sessions"], 1);
+        assert!(report["five_hour"].is_null() && report["weekly"].is_null());
+    }
+
+    #[test]
+    fn quota_past_extreme_session_with_real_stamp_rescues_forward() {
+        // The past-side rescue: a session carrying BOTH a pre-epoch
+        // stamp and a plausible one keeps its plausible instant — the
+        // guard discards the ANCHOR, not the session — and a future-
+        // heavy session whose session_start itself is pre-epoch can no
+        // longer smuggle a hostile instant back into the cutoff
+        // through the rescue path.
+        let sessions = vec![quota_session(
+            "mixed",
+            &["2026-10-12T09:00:00Z", "-262143-01-01T00:00:00"],
+            3.0,
+        )];
+        let report = quota_report(&sessions);
+        assert_eq!(
+            report["corpus"]["cutoff_utc"], "2026-10-12T09:00:00Z",
+            "the rescue keeps the plausible instant"
+        );
+        assert_eq!(report["corpus"]["past_discarded_sessions"], 1);
+
+        // Smuggle: the newest stamp is future (2099) and the
+        // session_start is pre-epoch. Pre-rm-2040 the future-side
+        // rescue accepted ANY <= now session_start, including this
+        // one — re-anchoring the cutoff at -262143 and panicking the
+        // window subtraction anyway.
+        let smuggle = vec![quota_span_session(
+            "smuggle",
+            "-262143-01-01T00:00:00",
+            "2099-06-01T00:00:00Z",
+            8.0,
+        )];
+        let report = quota_report(&smuggle);
+        assert!(
+            report["corpus"]["cutoff_utc"].is_null(),
+            "the future-side rescue must now refuse pre-epoch session_start values"
+        );
+        assert_eq!(
+            report["corpus"]["future_discarded_sessions"], 1,
+            "the anchor was future-side; that guard fired"
+        );
+        assert_eq!(
+            report["corpus"]["past_discarded_sessions"], 0,
+            "the pre-epoch value was a rescue candidate, not an anchor"
         );
     }
 

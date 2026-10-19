@@ -1472,11 +1472,20 @@ struct AntigravityModelId {
 /// rm-1864: numeric model ids observed in the wild and their proven
 /// model names. 1417 → gemini-4-argon is ccusage v20.0.34's first-party
 /// mapping (PR #1894, 2026-10-15); further ids arrive weekly (ccusage
-/// #1897 reports 1277/1050 unmapped). The map fixes IDENTITY only —
+/// #1897 reports 1277/1050 unmapped). rm-2042 arm 1 (run f5db7fd4
+/// cycle 1, research afa6bd50): ccusage v20.0.36 shipped the second
+/// proven mapping — 1050 → gemini-3.1-flash-lite (PR #1902, 2026-10-18)
+/// — and unlike 1417 the fork's own bundled catalog PRICES that model
+/// (gemini-3.1-flash-lite), so a 1050 journal stopped degrading through
+/// the disclosed unknown-model path and bills exactly. 1277 stays
+/// unmapped (ccusage #1897 tracks it). The map fixes IDENTITY only —
 /// pricing still rides the catalog's normal lookup, so a mapped id whose
 /// model is absent from the catalog degrades through the disclosed
 /// unknown-model path rather than this table inventing a price.
-const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[(1417, "gemini-4-argon")];
+const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
+    (1417, "gemini-4-argon"),
+    (1050, "gemini-3.1-flash-lite"),
+];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
 /// number, but the float spelling stringifies as `"1417.0"` — the
@@ -8975,7 +8984,42 @@ fn jsonl_objects_counted(raw: &str) -> (Vec<Map<String, Value>>, BTreeMap<String
         match parse_jsonl_value_lenient(line) {
             Some(Value::Object(obj)) => objs.push(obj),
             Some(_) => *skips.entry("non_object_line".to_string()).or_insert(0) += 1,
-            None => *skips.entry("unparseable_line".to_string()).or_insert(0) += 1,
+            None => {
+                // rm-2045 (run f5db7fd4 cycle 1, assess a53de7ec M2):
+                // a line that fails even the lenient parse is not
+                // necessarily torn — it can carry a number literal no
+                // `f64` can represent (`1e400`) or a bare JS non-finite
+                // token (`NaN`/`Infinity`, which JSON forbids). That
+                // used to drop the whole event into `unparseable_line`:
+                // model, timestamps, and every WELL-FORMED usage
+                // counter beside the poison value went with it, and the
+                // session reported model `default`, cost $0.0000, and
+                // health 100 with only a buried one-line skip as the
+                // trace. Salvage first (see
+                // [`salvage_out_of_range_numbers`]): neutralize the
+                // offending literals to `null` — a missing value the
+                // usage extractor already treats as absent — disclose
+                // the drop by FIELD with a reason class, and keep the
+                // rest of the event. Only when the salvage itself fails
+                // does the line fall to `unparseable_line` as before.
+                let salvaged = salvage_out_of_range_numbers(line).and_then(|(repaired, drops)| {
+                    parse_jsonl_value_lenient(&repaired).map(|value| (value, drops))
+                });
+                match salvaged {
+                    Some((Value::Object(obj), drops)) => {
+                        objs.push(obj);
+                        for (name, occurrences) in drops {
+                            crate::mint_disclosure(&mut skips, name, occurrences);
+                        }
+                    }
+                    Some(_) => {
+                        *skips.entry("non_object_line".to_string()).or_insert(0) += 1;
+                    }
+                    None => {
+                        *skips.entry("unparseable_line".to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
         }
     }
     (objs, skips)
@@ -8989,6 +9033,177 @@ pub(crate) fn parse_jsonl_value_lenient(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(line)
         .ok()
         .or_else(|| repair_lone_surrogates(line).and_then(|line| serde_json::from_str(&line).ok()))
+}
+
+/// rm-2045: append `null` for a neutralized literal and count the
+/// drop under its reason class, qualified by the enclosing JSON key
+/// when the scanner knows one (`number_out_of_range:input_tokens`);
+/// the bare class name stands when the literal sits at no key.
+fn push_salvage_null(
+    out: &mut Vec<u8>,
+    drops: &mut Vec<(String, usize)>,
+    key: Option<&str>,
+    class: &str,
+) {
+    out.extend_from_slice(b"null");
+    let name = match key {
+        Some(key) if !key.is_empty() => format!("{class}:{key}"),
+        _ => class.to_string(),
+    };
+    match drops.iter_mut().find(|(existing, _)| *existing == name) {
+        Some((_, count)) => *count += 1,
+        None => drops.push((name, 1)),
+    }
+}
+
+/// rm-2045 (run f5db7fd4 cycle 1, assess a53de7ec M2): rescue a JSONL
+/// line whose strict/lenient parse failed ONLY because of a number the
+/// `f64` realm cannot carry — an out-of-range literal (`1e400`, a
+/// >308-digit integer, anything that parses to ±∞) or a bare
+/// non-finite token JavaScript emits and JSON forbids (`NaN`,
+/// `Infinity`, `-Infinity`, plus the Python-flavored `inf`/`-inf`).
+/// Walks the line with a string-aware byte scanner (string contents
+/// are copied verbatim — the tokens only count OUTSIDE strings),
+/// replaces each offending literal with `null`, and returns the
+/// repaired line plus per-reason drop counters naming the enclosing
+/// JSON key. Returns `None` when no such token exists, so an ordinary
+/// torn tail keeps its `unparseable_line` fate — and the caller is
+/// expected to re-parse the repaired line and discard BOTH the repair
+/// and the counters if it still fails, so the counters can never name
+/// a drop that did not actually happen. The distinct-key cap of
+/// rm-594 applies at the mint site.
+pub(crate) fn salvage_out_of_range_numbers(
+    line: &str,
+) -> Option<(String, Vec<(String, usize)>)> {
+    let bytes = line.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut drops: Vec<(String, usize)> = Vec::new();
+    let mut i = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    // Byte index of the opening quote of the string currently being
+    // copied, so its content can be sliced as a key candidate at close.
+    let mut string_open: Option<usize> = None;
+    // The most recently CLOSED string, waiting to learn whether a `:`
+    // follows (key) or not (value).
+    let mut pending_key: Option<String> = None;
+    // The key the NEXT value belongs to, if the line carries one.
+    let mut last_key: Option<String> = None;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_string {
+            out.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+                pending_key = string_open.map(|open| line[open + 1..i].to_string());
+                string_open = None;
+            }
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'"' => {
+                string_open = Some(i);
+                in_string = true;
+                out.push(byte);
+                i += 1;
+            }
+            b':' => {
+                if let Some(key) = pending_key.take() {
+                    last_key = Some(key);
+                }
+                out.push(byte);
+                i += 1;
+            }
+            b',' | b'{' | b'[' | b'}' | b']' => {
+                // A string just closed against a value position: it
+                // was a value, not a key.
+                pending_key = None;
+                out.push(byte);
+                i += 1;
+            }
+            // Whitespace keeps the pending key alive (`"a"\t:\t1`).
+            b' ' | b'\t' | b'\r' => {
+                out.push(byte);
+                i += 1;
+            }
+            b'N' if line[i..].starts_with("NaN") => {
+                push_salvage_null(&mut out, &mut drops, last_key.as_deref(), "number_not_finite");
+                pending_key = None;
+                i += 3;
+            }
+            b'I' if line[i..].starts_with("Infinity") => {
+                push_salvage_null(&mut out, &mut drops, last_key.as_deref(), "number_not_finite");
+                pending_key = None;
+                i += 8;
+            }
+            b'i' if line[i..].starts_with("inf") => {
+                push_salvage_null(&mut out, &mut drops, last_key.as_deref(), "number_not_finite");
+                pending_key = None;
+                i += 3;
+            }
+            b'-' if line[i..].starts_with("-Infinity") || line[i..].starts_with("-inf") => {
+                let width = if line[i..].starts_with("-Infinity") { 9 } else { 4 };
+                push_salvage_null(&mut out, &mut drops, last_key.as_deref(), "number_not_finite");
+                pending_key = None;
+                i += width;
+            }
+            b'-' | b'0'..=b'9' => {
+                // One JSON number literal, scanned by the grammar so
+                // the token boundaries are exact.
+                let start = i;
+                if bytes[i] == b'-' {
+                    i += 1;
+                }
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'.' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+                    i += 1;
+                    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                        i += 1;
+                    }
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                let token = &line[start..i];
+                match token.parse::<f64>() {
+                    Ok(value) if value.is_finite() => out.extend_from_slice(token.as_bytes()),
+                    // Rust's `f64` FromStr yields ±∞ (not an error) for
+                    // overflowing literals — exactly the class serde
+                    // rejects as `number out of range`.
+                    _ => push_salvage_null(
+                        &mut out,
+                        &mut drops,
+                        last_key.as_deref(),
+                        "number_out_of_range",
+                    ),
+                }
+                pending_key = None;
+            }
+            _ => {
+                // `true`/`false`/`null` letters and anything else a
+                // failed line may carry: copy through untouched.
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    if drops.is_empty() {
+        return None;
+    }
+    Some((String::from_utf8(out).ok()?, drops))
 }
 
 /// Parses the four bytes of a `\uXXXX` escape. Reading hex from **bytes**
@@ -11093,6 +11308,56 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_numeric_1050_maps_to_bundle_priced_flash_lite() {
+        // rm-2042 (arm 1, run f5db7fd4 cycle 1, research afa6bd50 C2/
+        // upstream radar #236): ccusage v20.0.36 also maps antigravity
+        // 1050 to gemini-3.1-flash-lite. Unlike 1417 — whose
+        // gemini-4-argon target the vendored bundle cannot price
+        // (zero argon rows, the research dossier's headline) — 1050's
+        // target IS a priced row in our snapshot, so the mapping must
+        // both fix identity AND land on exact money: a numeric-only
+        // antigravity corpus stops being default-rate-billed.
+        let raw = serde_json::json!({
+            "trajectoryId": "33333333-4444-5555-6666-777777777777",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-15T15:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Flash-lite generation.",
+                        "usageStats": { "inputTokens": 120, "outputTokens": 80 },
+                        "modelConfigId": 1050
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("flash-lite-1050", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "gemini-3.1-flash-lite",
+            "the proven 1050 mapping attributes the bundle-priced target"
+        );
+        assert!(
+            crate::pricing::has_specific_price(&session.metrics.model_used),
+            "gemini-3.1-flash-lite must resolve to an exact catalog row — the point of arm 1"
+        );
+        assert!(
+            session.metrics.cost_estimated > 0.0,
+            "a priced target bills exact money, not the pre-fix $0/default mis-attribution"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+            "the 1050 sighting is still disclosed as numeric"
+        );
+    }
+
+    #[test]
     fn antigravity_numeric_model_ids_stringify_map_and_disclose() {
         // rm-1864 red-first: with the string-only decode, a corpus whose
         // modelConfigId values are JSON numbers folded every model id to
@@ -11881,6 +12146,109 @@ mod tests {
         assert_eq!(
             repair_lone_surrogates(r#"{"prompt":"lone \udc00 low half"}"#).as_deref(),
             Some(r#"{"prompt":"lone \ufffd low half"}"#)
+        );
+    }
+
+    #[test]
+    fn salvage_neutralizes_out_of_range_and_non_finite_numbers_by_field() {
+        // rm-2045 unit core (run f5db7fd4 cycle 1, assess a53de7ec
+        // M2): an out-of-range literal becomes null and the drop
+        // counter names the enclosing JSON key; the JS/Python
+        // non-finite spellings get their own reason class; string
+        // contents are copied verbatim so the forbidden tokens only
+        // count OUTSIDE strings, and in-realm numbers are left
+        // untouched (a clean line needs no repair at all).
+        let (repaired, drops) =
+            salvage_out_of_range_numbers(r#"{"input_tokens":1e400,"output_tokens":7}"#)
+                .expect("out-of-range line is repairable");
+        assert_eq!(repaired, r#"{"input_tokens":null,"output_tokens":7}"#);
+        assert_eq!(
+            drops,
+            vec![("number_out_of_range:input_tokens".to_string(), 1)]
+        );
+
+        let (repaired, drops) = salvage_out_of_range_numbers(
+            r#"{"a":NaN,"b":Infinity,"c":-Infinity,"d":inf,"e":-inf}"#,
+        )
+        .expect("non-finite spellings are repairable");
+        assert_eq!(
+            repaired,
+            r#"{"a":null,"b":null,"c":null,"d":null,"e":null}"#
+        );
+        assert_eq!(
+            drops,
+            vec![
+                ("number_not_finite:a".to_string(), 1),
+                ("number_not_finite:b".to_string(), 1),
+                ("number_not_finite:c".to_string(), 1),
+                ("number_not_finite:d".to_string(), 1),
+                ("number_not_finite:e".to_string(), 1),
+            ]
+        );
+
+        assert!(salvage_out_of_range_numbers(
+            r#"{"note":"NaN 1e400 Infinity -inf","tokens":1e308}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn salvage_tracks_key_depth_and_does_not_validate_the_tail() {
+        // rm-2045: the key tracker follows the CURRENT object depth —
+        // the same field name in sibling objects attributes to each,
+        // an array element inherits its enclosing key — and the repair
+        // never retro-validates a torn line: only the caller's
+        // re-parse can decide that.
+        let (repaired, drops) = salvage_out_of_range_numbers(
+            r#"{"outer":{"deep":1e400},"outer2":{"deep":2},"list":[1e999]}"#,
+        )
+        .expect("nested repair");
+        assert_eq!(
+            repaired,
+            r#"{"outer":{"deep":null},"outer2":{"deep":2},"list":[null]}"#
+        );
+        assert_eq!(
+            drops,
+            vec![
+                ("number_out_of_range:deep".to_string(), 1),
+                ("number_out_of_range:list".to_string(), 1),
+            ]
+        );
+        let (repaired, _drops) =
+            salvage_out_of_range_numbers(r#"{"a":1e400, "broken"#).expect("still replaces");
+        assert_eq!(repaired, r#"{"a":null, "broken"#);
+    }
+
+    #[test]
+    fn counted_lane_salvages_out_of_range_usage_and_discloses_by_field() {
+        // rm-2045 e2e on the counted lane (assess M2's exact shape):
+        // serde_json itself rejects `1e400` with "number out of
+        // range", so the whole assistant event used to vanish as
+        // `unparseable_line` — model identity, the well-formed
+        // sibling fields, everything. The salvage recovers the
+        // object and the disclosure names the FIELD, not the line;
+        // a genuinely torn tail keeps its whole-line fate.
+        let raw = concat!(
+            "{\"role\":\"user\",\"content\":\"q\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"a\",\"model\":\"m-x\",",
+            "\"usage\":{\"input_tokens\":1e400,\"output_tokens\":7}}\n",
+            "{\"role\":\"user\",\"content\":\"torn \\uzzzz tail\"}\n",
+        );
+        let (objects, skips) = jsonl_objects_counted(raw);
+        assert_eq!(objects.len(), 2, "the salvaged line parses as an object");
+        assert_eq!(
+            skips.get("number_out_of_range:input_tokens"),
+            Some(&1),
+            "the disclosure names the offending field"
+        );
+        assert_eq!(
+            skips.get("unparseable_line"),
+            Some(&1),
+            "the torn line still drops whole"
+        );
+        assert!(
+            !skips.contains_key("number_out_of_range:output_tokens"),
+            "the well-formed sibling is not dropped"
         );
     }
 

@@ -1196,6 +1196,81 @@ fn hash(value: &str) -> u32 {
     })
 }
 
+/// rm-2041 (run f5db7fd4 cycle 1, assess a53de7ec M4 / research
+/// afa6bd50 C1): one row of the `--diagnostics` unpriced-model
+/// census. A session whose model no catalog row, alias, override, or
+/// embedded extract prices bills at the built-in default ($3 in /
+/// $15 out); `pricing_basis: "fallback"` names that fact per session,
+/// but the corpus lane had NO aggregation — an unpriceable model with
+/// zero usage rendered cost $0.0000 / model `default` / health 100,
+/// indistinguishable from a healthy free session, and the per-session
+/// basis string never rolled up into a by-name list an operator could
+/// act on (the fork's own bundled catalog prices ZERO argon rows while
+/// parser.rs maps antigravity 1417 to gemini-4-argon). The census
+/// names every DISTINCT model id observed but priced nowhere, with
+/// session and token mass, so the fact is disclosed by name.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UnpricedModelRow {
+    /// The raw `model_used` identity exactly as the journal carried it.
+    pub model: String,
+    /// Sessions attributed to this model id.
+    pub sessions: usize,
+    /// Summed input tokens across those sessions (the mass that would
+    /// mis-bill at the default rate).
+    pub tokens_input: i64,
+    /// Summed output tokens across those sessions.
+    pub tokens_output: i64,
+    /// rm-1511 tie-in: the exact in-catalog base hiding under one
+    /// unrecognized trailing token, when one exists — an override or
+    /// alias could price this id exactly instead of at the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priced_base_hint: Option<String>,
+}
+
+/// rm-2041: the census itself. Zero-false-positive discipline: only
+/// real model identities are listed — the identity-less buckets
+/// (`default`, `unknown`, `multiple`, empty) never appear, and a model
+/// the ladder prices (exact row, normalization, alias, override, or
+/// variant collapse) never appears either. Sorted by session mass,
+/// then token mass, then name — heaviest exposure first, and a
+/// deterministic order for pinned renders.
+pub fn unpriced_model_census(sessions: &[Session]) -> Vec<UnpricedModelRow> {
+    // Identity-less buckets are not unpriced MODELS — they are the
+    // absence of attribution, disclosed elsewhere.
+    const UNATTRIBUTED: [&str; 3] = ["default", "unknown", "multiple"];
+    let mut rows: BTreeMap<&str, (usize, i64, i64)> = BTreeMap::new();
+    for session in sessions {
+        let model = session.metrics.model_used.trim();
+        if model.is_empty() || UNATTRIBUTED.contains(&model) {
+            continue;
+        }
+        if crate::pricing::has_specific_price(model) {
+            continue;
+        }
+        let entry = rows.entry(model).or_insert((0, 0, 0));
+        entry.0 += 1;
+        entry.1 += session.metrics.tokens_input;
+        entry.2 += session.metrics.tokens_output;
+    }
+    let mut census: Vec<UnpricedModelRow> = rows
+        .into_iter()
+        .map(|(model, (sessions, tokens_input, tokens_output))| UnpricedModelRow {
+            model: model.to_string(),
+            sessions,
+            tokens_input,
+            tokens_output,
+            priced_base_hint: crate::pricing::specific_base_for_unpriced(model),
+        })
+        .collect();
+    census.sort_by(|a, b| {
+        b.sessions
+            .cmp(&a.sessions)
+            .then((b.tokens_input + b.tokens_output).cmp(&(a.tokens_input + a.tokens_output)))
+            .then(a.model.cmp(&b.model))
+    });
+    census
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2085,6 +2160,88 @@ mod tests {
                 .iter()
                 .any(|fix| fix.category == "data_quality" && fix.title.contains("token counts")),
             "implausible_magnitude must carry a fix suggestion: {fixes:?}"
+        );
+    }
+
+    fn census_row(model: &str, input: i64) -> Session {
+        Session {
+            name: model.to_string(),
+            path: format!("/tmp/{model}.jsonl"),
+            metrics: Metrics {
+                model_used: model.to_string(),
+                tokens_input: input,
+                tokens_output: 4,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+        }
+    }
+
+    #[test]
+    fn unpriced_model_census_lists_only_real_unpriced_identities() {
+        // rm-2041 (run f5db7fd4 cycle 1, assess a53de7ec): zero-false-
+        // positive discipline. The census lists a real model id the
+        // ladder cannot price — gemini-4-argon: priced by models.dev
+        // TODAY but absent from the vendored snapshot (the research
+        // dossier's headline) — with session and token mass, and
+        // ONLY that. Identity-less buckets (empty/unknown/default/
+        // multiple) never appear; a priced id never appears.
+        let sessions = vec![
+            census_row("gemini-4-argon", 100),
+            census_row("gemini-4-argon", 50),
+            census_row("claude-haiku-5-5", 1000),
+            census_row("default", 100),
+            census_row("unknown", 100),
+            census_row("multiple", 100),
+            census_row("", 100),
+        ];
+        let census = unpriced_model_census(&sessions);
+        assert_eq!(census.len(), 1, "exactly one row: {census:?}");
+        assert_eq!(census[0].model, "gemini-4-argon");
+        assert_eq!(census[0].sessions, 2);
+        assert_eq!(census[0].tokens_input, 150);
+        assert_eq!(census[0].tokens_output, 8);
+        assert!(
+            census[0].priced_base_hint.is_none(),
+            "no in-catalog base hides under a trailing token of gemini-4-argon"
+        );
+    }
+
+    #[test]
+    fn unpriced_model_census_sorts_heaviest_first_and_hints_derivable_bases() {
+        // rm-2041 + rm-1511 tie-in: an unpriced id that differs from
+        // an in-catalog base by one unrecognized trailing token
+        // carries the hint — the census tells the operator the exact
+        // override that would price the id — and the ordering
+        // (sessions desc, tokens desc, name asc) is deterministic so
+        // renders are pinned.
+        let sessions = vec![
+            census_row("claude-haiku-5-5-turbo", 100),
+            census_row("zz-unmapped-heavy", 100),
+            census_row("zz-unmapped-heavy", 100),
+        ];
+        let census = unpriced_model_census(&sessions);
+        assert_eq!(census.len(), 2);
+        assert_eq!(
+            census[0].model, "zz-unmapped-heavy",
+            "heavier session mass first"
+        );
+        assert_eq!(census[0].sessions, 2);
+        assert_eq!(
+            census[1].model, "claude-haiku-5-5-turbo",
+            "the lighter id is listed, never silently dropped"
+        );
+        assert_eq!(
+            census[1].priced_base_hint.as_deref(),
+            Some("claude-haiku-5-5"),
+            "the hint names the in-catalog base an override could extend"
         );
     }
 }
