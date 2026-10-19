@@ -1643,6 +1643,15 @@ fn lock_sibling(path: &Path) -> PathBuf {
 ///   writer. Content-first matters for liveness too: an inert file on
 ///   the lock name must not wedge every future save behind the full
 ///   wait budget;
+/// - rm-2016: "the process no longer exists" is answered by the OS on
+///   every unix — the procfs entry on /proc-bearing platforms (Linux),
+///   `kill(pid, 0)` on the rest of the unix family (macOS, first-class
+///   via the homebrew/ install, and the BSDs). The former /proc-only
+///   probe read every LIVE holder dead on /proc-less unixes, so
+///   "stolen only after CACHE_LOCK_STALE_AFTER" was void there — locks
+///   were stolen instantly, mid-write. Where the OS answer is
+///   unavailable the holder is presumed live and staleness rides the
+///   age lane (`CACHE_LOCK_STALE_AFTER`);
 /// - a stolen victim fences its own write (`still_ours` re-reads the
 ///   token before the rename in `save_session_cache`), so a writer
 ///   whose lock was stolen mid-flight aborts and re-serializes
@@ -1762,6 +1771,10 @@ fn lock_decision(text: &str, age: std::time::Duration) -> bool {
     if text.is_empty() {
         return age > CACHE_LOCK_EMPTY_GRACE;
     }
+    // rm-2016: the liveness behind this match CONSULTS THE OS (procfs
+    // entry on Linux, kill(pid,0) elsewhere on the unix family) — a
+    // dead holder is stolen at any age, and an inconclusive probe
+    // reads ALIVE so the age lane stays the only other steal path.
     match lock_token_pid(text) {
         Some(pid) if lock_pid_is_alive(pid) => age > CACHE_LOCK_STALE_AFTER,
         // Not a recognizable token: a stray file parked on the
@@ -1784,14 +1797,56 @@ fn lock_token_pid(text: &str) -> Option<u32> {
 
 #[cfg(unix)]
 fn lock_pid_is_alive(pid: u32) -> bool {
-    // /proc is the std-only liveness probe on the unix family this
-    // tool ships on; where it is absent the age lane still catches
-    // the crash.
-    Path::new("/proc").join(pid.to_string()).exists()
+    lock_pid_is_alive_at(Path::new("/proc"), pid)
+}
+
+/// rm-2016: OS-consulting pid liveness with an injectable procfs root,
+/// so the half of the unix family without /proc (macOS — first-class
+/// via the homebrew/ install — and the BSDs) is actually probed
+/// instead of read dead. Platforms that mount procfs keep the entry
+/// fast path (Linux behavior identical to the old probe);
+/// /proc-less platforms fall through to kill(pid, 0), the POSIX
+/// existence check: 0 = alive, EPERM = alive (the process exists but
+/// belongs to another user), ESRCH = dead. Anything else — unknown
+/// errno, or a pid beyond pid_t range — reads ALIVE, because the only
+/// safe degradation for an inconclusive probe is the age lane
+/// (CACHE_LOCK_STALE_AFTER), never the instant steal the /proc-only
+/// probe forced on macOS (a LIVE holder's lock was stolen mid-write
+/// the moment a competitor looked). The injectable root exists for
+/// the tests: a path with no procfs behind it exercises the
+/// kill(pid,0) lane on a /proc-bearing dev box.
+#[cfg(unix)]
+fn lock_pid_is_alive_at(proc_root: &Path, pid: u32) -> bool {
+    if proc_root.is_dir() {
+        return proc_root.join(pid.to_string()).exists();
+    }
+    if pid > i32::MAX as u32 {
+        // Not addressable by kill(): presume live; the age lane
+        // carries staleness.
+        return true;
+    }
+    // SAFETY: kill(2) with signal 0 is the pure existence query — no
+    // signal is ever delivered. Declared inline rather than through
+    // the libc crate to keep the std-only dependency posture (MSRV
+    // 1.80); libc is linked by std on every unix target.
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    if unsafe { kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    // 3 = ESRCH (no such process) on every unix this tool ships on;
+    // 1 = EPERM means the process exists but is not ours — alive.
+    !matches!(errno, 3)
 }
 
 #[cfg(not(unix))]
 fn lock_pid_is_alive(_pid: u32) -> bool {
+    // Same unified rm-2016 contract as the unix arms above: when the
+    // platform offers no std-only OS probe, the holder is presumed
+    // live and staleness rides the age lane (CACHE_LOCK_STALE_AFTER)
+    // — never an instant steal.
     true
 }
 
@@ -5753,6 +5808,129 @@ mod tests {
             std::time::Duration::from_millis(10)
         ));
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lock_liveness_probe_consults_the_os_beyond_procfs() {
+        // rm-2016 red-first: the /proc-only probe read every LIVE
+        // holder dead on /proc-less unixes (macOS — first-class via
+        // homebrew/ — and the BSDs), so `lock_decision` stole the
+        // lock at ANY age and the "live holder stolen only after
+        // STALE_AFTER" contract was void. The probe now consults the
+        // OS: a root with no procfs behind it (the macOS stand-in)
+        // must still see a live pid alive via kill(pid,0), a reaped
+        // child must read dead on BOTH lanes, and an inconclusive
+        // probe (pid beyond pid_t range) must degrade to ALIVE so
+        // staleness rides the age lane instead of an instant steal.
+        let no_proc_root = std::env::temp_dir().join(format!(
+            "agenttrace-rm2016-no-proc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        assert!(
+            !no_proc_root.is_dir(),
+            "fixture path must not exist: no procfs behind it"
+        );
+        assert!(
+            lock_pid_is_alive_at(&no_proc_root, std::process::id()),
+            "a live pid must read alive without /proc (the macOS lane)"
+        );
+        assert!(
+            lock_pid_is_alive_at(Path::new("/proc"), std::process::id()),
+            "a live pid reads alive through the real procfs root too"
+        );
+        // A pid no kernel will hand out reads dead on both lanes
+        // (kill(pid,0) -> ESRCH; no procfs entry can exist).
+        assert!(
+            !lock_pid_is_alive_at(&no_proc_root, 999_999_999),
+            "an unallocated pid reads dead through kill(pid,0)"
+        );
+        assert!(
+            !lock_pid_is_alive_at(Path::new("/proc"), 999_999_999),
+            "an unallocated pid reads dead through the procfs lane"
+        );
+        // Beyond pid_t range kill() cannot address the pid at all;
+        // the conservative read is ALIVE (age lane), never dead.
+        assert!(
+            lock_pid_is_alive_at(&no_proc_root, u32::MAX),
+            "an unaddressable pid reads alive — the conservative default"
+        );
+        // A REAL process lifecycle, both lanes: spawn → live, reap →
+        // dead.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a short-lived child");
+        let child_pid = child.id();
+        assert!(lock_pid_is_alive_at(&no_proc_root, child_pid));
+        assert!(lock_pid_is_alive_at(Path::new("/proc"), child_pid));
+        child.wait().expect("reap the child");
+        assert!(
+            !lock_pid_is_alive_at(&no_proc_root, child_pid),
+            "a reaped child reads dead through kill(pid,0)"
+        );
+        assert!(
+            !lock_pid_is_alive_at(Path::new("/proc"), child_pid),
+            "a reaped child reads dead through the procfs lane"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_child_lock_holder_is_not_stolen_at_fresh_age() {
+        // rm-2016 acceptance leg: a REAL live process holds the lock
+        // with its own pid token. Under the /proc-only probe on a
+        // /proc-less platform that holder read dead and the lock was
+        // stolen instantly, mid-write. It must be unstealable at
+        // fresh age while alive — with the wedged-but-alive clause
+        // (age > STALE_AFTER) still handing it over as documented —
+        // and stealable at once the holder is reaped.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm2016-holder-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let lock_path = lock_sibling(&root.join("sessions.json"));
+        fs::create_dir_all(lock_path.parent().expect("parent")).expect("create cache dir");
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn the lock holder");
+        let token = format!("{}-rm2016-holder", child.id());
+        assert_eq!(
+            lock_token_pid(&token),
+            Some(child.id()),
+            "sanity: the token names the live child"
+        );
+        fs::write(&lock_path, &token).expect("write the holder's lock");
+        assert!(
+            !lock_stealable(&lock_path),
+            "a live holder's fresh lock must not be stolen"
+        );
+        assert!(
+            !lock_decision(&token, std::time::Duration::from_millis(1)),
+            "live holder at fresh age: not stealable (synthetic-age pin)"
+        );
+        assert!(
+            lock_decision(
+                &token,
+                CACHE_LOCK_STALE_AFTER + std::time::Duration::from_millis(1)
+            ),
+            "the wedged-but-alive clause still hands the lock over past \
+             STALE_AFTER — that is the documented contract, not a bug"
+        );
+        child.kill().expect("kill the holder");
+        child.wait().expect("reap the holder");
+        assert!(
+            lock_stealable(&lock_path),
+            "the reaped holder's lock is stealable at once, at any age"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
