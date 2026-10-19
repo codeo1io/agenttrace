@@ -995,6 +995,14 @@ fn run() -> anyhow::Result<()> {
                 );
             }
             let out = render_session_list(&sessions, &args.format, args.limit);
+            // rm-2059: same disclosure block on the --sessions JSON —
+            // append-only, and only for the json format (text lanes
+            // stay exactly as rendered).
+            let out = if args.format == "json" {
+                json_with_admission_disclosures(out, &load_report, &sessions)
+            } else {
+                out
+            };
             let out = dispatch_sanitize(&args.format, out);
             write_output(&args.output, &(out.clone() + "\n"))?;
             write_stdout(&out)?;
@@ -1116,17 +1124,26 @@ fn run() -> anyhow::Result<()> {
             // valid (non-zero) span id; see agenttrace_core::otel for
             // the recorded input-token basis and snapshot date.
             "otel" => agenttrace_core::report_otel_export(&sessions),
-            "json" => report_overview_json_with_context(
-                &overview,
-                &sessions,
-                Some(&health),
-                range,
-                args.include_history,
-                // Pinned epoch keeps --demo JSON byte-deterministic (CI
-                // determinism check); real runs stamp the wall clock.
-                args.demo.then_some(agenttrace_core::DEMO_REPORT_EPOCH),
-                args.limit,
-            ),
+            "json" => {
+                // rm-2059: the overview JSON carries the admission
+                // disclosure block — same keys, same absent-when-zero
+                // convention as the doctor/audit lanes, appended to
+                // the rendered object without rewriting any existing
+                // field.
+                let rendered = report_overview_json_with_context(
+                    &overview,
+                    &sessions,
+                    Some(&health),
+                    range,
+                    args.include_history,
+                    // Pinned epoch keeps --demo JSON byte-deterministic
+                    // (CI determinism check); real runs stamp the wall
+                    // clock.
+                    args.demo.then_some(agenttrace_core::DEMO_REPORT_EPOCH),
+                    args.limit,
+                );
+                json_with_admission_disclosures(rendered, &load_report, &sessions)
+            }
             "markdown" | "md" => report_overview_markdown_with_context(
                 &overview,
                 &sessions,
@@ -1579,6 +1596,15 @@ fn attach_admission_disclosures(
                 .collect::<Vec<_>>()),
         );
     }
+    // rm-2058: the empty class rides the same disclosure block so
+    // every surface that carries admission counters carries all of
+    // them.
+    if report.empty_session_files > 0 {
+        map.insert(
+            "empty_session_files".to_string(),
+            serde_json::json!(report.empty_session_files),
+        );
+    }
     let negative_rejected: usize = sessions
         .iter()
         .filter_map(|session| {
@@ -1595,6 +1621,30 @@ fn attach_admission_disclosures(
             serde_json::json!(negative_rejected),
         );
     }
+}
+
+/// rm-2059 (run c361e67f cycle 1, "admission truth"): post-process a
+/// rendered JSON report so the admission disclosure block rides every
+/// surface, not just doctor/audit. Append-never-rewrite: the rendered
+/// object is parsed and keys are ADDED (absent when zero); if the
+/// renderer's output is not a JSON object for any reason the raw text
+/// is returned untouched rather than mangled.
+fn json_with_admission_disclosures(
+    rendered: String,
+    report: &Option<LoadReport>,
+    sessions: &[Session],
+) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&rendered) else {
+        return rendered;
+    };
+    let keys_before = value.as_object().map(|map| map.len());
+    attach_admission_disclosures(&mut value, report, sessions);
+    // Nothing appended (clean corpus, absent-when-zero): return the
+    // renderer's own bytes untouched so determinism pins hold.
+    if value.as_object().map(|map| map.len()) == keys_before {
+        return rendered;
+    }
+    serde_json::to_string_pretty(&value).unwrap_or(rendered)
 }
 
 fn attach_audit_coverage(

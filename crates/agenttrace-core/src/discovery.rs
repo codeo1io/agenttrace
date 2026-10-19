@@ -64,6 +64,12 @@ pub struct LoadReport {
     /// capped at five, naming the paths so an operator can tell a
     /// copy from a coincidence.
     pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-2058 (run c361e67f, assess F2): zero-byte session files —
+    /// disclosed admission class, NOT suppressions (they are kept,
+    /// parsed, and honestly counted); carried here so every report
+    /// surface can say "N empty session files" instead of folding
+    /// placeholders into the duplicate ledger.
+    pub empty_session_files: usize,
     /// rm-835 (minted campaign-locally as rm-695 by run f7f81aea, rebound
     /// at integration — the landed wall already holds an rm-695): how many
     /// discovered files failed to parse (the parse share of `skipped`,
@@ -376,12 +382,29 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     // content dedup so an id-level duplicate resolves by the canonical
     // store rather than first-seen path order, matching the cached walk.
     retain_single_cline_session_per_id(&mut all);
-    let mut signatures: HashSet<(i64, u64)> = HashSet::new();
+    let mut signatures: HashMap<(i64, u64), PathBuf> = HashMap::new();
     all.retain(|path| {
         // Unreadable: keep (the parse lane owns and discloses those).
-        content_signature(path)
-            .map(|signature| signatures.insert(signature))
-            .unwrap_or(true)
+        // rm-2058: zero-byte placeholders never enter the duplicate
+        // class, and hash equality alone never suppresses — the
+        // candidate must be PROVEN byte-identical to the first-seen
+        // survivor of that signature. This uncached lane has no
+        // disclosure channel, so it only guarantees the truth rules.
+        let Some((signature, _)) = content_signature(path) else {
+            return true;
+        };
+        if signature.0 == 0 {
+            return true;
+        }
+        match signatures.entry(signature) {
+            std::collections::hash_map::Entry::Occupied(survivor) => {
+                files_byte_identical(survivor.get(), path)
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(path.clone());
+                true
+            }
+        }
     });
     sort_paths_by_mod_time(all)
 }
@@ -657,6 +680,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
     let subagent_artifact_files = suppressed.subagent_artifact_files;
     let duplicate_session_files = suppressed.duplicate_session_files;
     let duplicate_session_file_pairs = suppressed.duplicate_session_file_pairs;
+    let empty_session_files = suppressed.empty_session_files;
     if dir.is_none() {
         let (sqlite_sessions, ingest) =
             crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
@@ -745,6 +769,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         subagent_artifact_files,
         duplicate_session_files,
         duplicate_session_file_pairs,
+        empty_session_files,
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
@@ -818,6 +843,14 @@ pub struct SuppressedSessions {
     /// capped at [`MAX_DUPLICATE_PAIR_SAMPLES`]; the full count rides
     /// `duplicate_session_files`.
     pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-2058 (run c361e67f, assess F2): zero-byte session files —
+    /// an admission class of their own, NOT suppressions. Every empty
+    /// `.jsonl` carries the same (0, fnv("")) content signature, so
+    /// leaving them in the duplicate class manufactured N-1 false
+    /// "byte-identical copy" disclosures out of tool-created
+    /// placeholders. Counted here so the disclosure channel can say
+    /// "N empty session files" instead of lying about copies.
+    pub empty_session_files: usize,
 }
 
 /// rm-1886: cap on the named duplicate pairs carried for disclosure —
@@ -862,12 +895,28 @@ pub(crate) fn is_subagent_artifact_path(path: &Path) -> bool {
 /// leaving them to the parse lane; `take(cap + 1)` mirrors the
 /// metadata-lie guard so a file that grows between stat and read
 /// still cannot allocate past one byte over the cap.
-fn content_signature(path: &Path) -> Option<(i64, u64)> {
+fn content_signature(path: &Path) -> Option<((i64, u64), i64)> {
     use std::io::Read;
     let cap = crate::parser::file_read_cap_bytes();
-    if fs::metadata(path).ok()?.len() > cap {
+    let before = fs::metadata(path).ok()?;
+    if before.len() > cap {
         return None;
     }
+    // rm-2058: the fingerprint that vouches for this hash is captured
+    // BEFORE the read and re-checked AFTER it. A file rewritten under
+    // the read would otherwise pair a fresh stat with a torn hash —
+    // a memo entry that poisons every warm run keyed to it. A
+    // mismatch tears the signature: the file stays KEPT (unsiged),
+    // and nothing is persisted.
+    let fingerprint_before = (
+        before
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or_default(),
+        before.len(),
+    );
     let mut bytes = Vec::new();
     fs::File::open(path)
         .ok()?
@@ -877,7 +926,66 @@ fn content_signature(path: &Path) -> Option<(i64, u64)> {
     if bytes.len() as u64 > cap {
         return None;
     }
-    Some((bytes.len() as i64, fnv1a64(&bytes)))
+    let after = fs::metadata(path).ok()?;
+    let fingerprint_after = (
+        after
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or_default(),
+        after.len(),
+    );
+    if fingerprint_before != fingerprint_after {
+        return None;
+    }
+    Some(((bytes.len() as i64, fnv1a64(&bytes)), fingerprint_before.0))
+}
+
+/// rm-2058: byte-level proof that two paths hold the same bytes —
+/// the ONLY grounds for suppressing a file as a duplicate. Sizes are
+/// compared from metadata first (cheap reject), then the files are
+/// read in fixed 64-KiB chunks, both bounded by
+/// [`crate::parser::file_read_cap_bytes`]: a file past the cap (or
+/// unreadable) is NOT verifiable, and an unverifiable file is KEPT —
+/// the same stance the signature lane takes for over-cap journals,
+/// because admission dedup must never become the unbounded read the
+/// cap family closed.
+fn files_byte_identical(left: &Path, right: &Path) -> bool {
+    use std::io::Read;
+    let cap = crate::parser::file_read_cap_bytes();
+    let (meta_left, meta_right) = match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(l), Ok(r)) => (l, r),
+        _ => return false,
+    };
+    if meta_left.len() != meta_right.len() {
+        return false;
+    }
+    if meta_left.len() > cap || meta_right.len() > cap {
+        return false;
+    }
+    let Ok(mut handle_left) = fs::File::open(left) else {
+        return false;
+    };
+    let Ok(mut handle_right) = fs::File::open(right) else {
+        return false;
+    };
+    let mut left_chunk = vec![0u8; 64 * 1024];
+    let mut right_chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read_left = handle_left.read(&mut left_chunk);
+        let read_right = handle_right.read(&mut right_chunk);
+        let (n_left, n_right) = match (read_left, read_right) {
+            (Ok(l), Ok(r)) => (l, r),
+            _ => return false,
+        };
+        if n_left != n_right || left_chunk[..n_left] != right_chunk[..n_right] {
+            return false;
+        }
+        if n_left == 0 {
+            return true;
+        }
+    }
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -900,8 +1008,18 @@ fn content_signature_cached(path: &Path, cache: &mut SessionCache) -> Option<(i6
     if let Some(signature) = crate::session_cache::cached_content_signature(path, cache) {
         return Some(signature);
     }
-    let signature = content_signature(path)?;
-    crate::session_cache::store_content_signature(path, signature.0, signature.1, cache);
+    let (signature, verified_mtime_ns) = content_signature(path)?;
+    // rm-2058: the memo persists the mtime captured BEFORE the read
+    // (re-verified after it), never a fresh post-hash stat — the
+    // T0-hash/T2-stat pairing could key a rewritten file's fingerprint
+    // to the pre-rewrite hash and poison every warm run after it.
+    crate::session_cache::store_content_signature(
+        path,
+        signature.0,
+        signature.1,
+        verified_mtime_ns,
+        cache,
+    );
     Some(signature)
 }
 
@@ -996,13 +1114,39 @@ pub(crate) fn find_session_files_cached(
             deduped.push(path);
             continue;
         };
+        // rm-2058 (assess F2): zero-byte placeholders are their own
+        // admission class — every empty .jsonl carries the same
+        // (0, fnv("")) signature, so the duplicate class would
+        // otherwise manufacture N-1 false "byte-identical copy"
+        // disclosures out of tool-created placeholders. They are
+        // counted and disclosed, never deduped, never suppressed.
+        if signature.0 == 0 {
+            suppressed.empty_session_files += 1;
+            deduped.push(path);
+            continue;
+        }
         match signatures.entry(signature) {
             std::collections::hash_map::Entry::Occupied(survivor) => {
-                suppressed.duplicate_session_files += 1;
-                if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
-                    suppressed
-                        .duplicate_session_file_pairs
-                        .push((survivor.get().clone(), path));
+                // rm-2058 (assess F1): hash equality is a CANDIDATE
+                // match, never proof — the memo vouches for a
+                // (mtime_ns, size) fingerprint that a same-size,
+                // mtime-preserving rewrite keeps stale, and fnv1a64
+                // is not collision-resistant. Suppress only on
+                // bytewise proof; a failed proof keeps the candidate
+                // (its spend was silently lost at base) and leaves
+                // the first survivor owning the signature, so a
+                // third same-signature file still verifies against
+                // the survivor, not the disproven candidate.
+                let survivor_path = survivor.get().clone();
+                if files_byte_identical(&survivor_path, &path) {
+                    suppressed.duplicate_session_files += 1;
+                    if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
+                        suppressed
+                            .duplicate_session_file_pairs
+                            .push((survivor_path, path));
+                    }
+                } else {
+                    deduped.push(path);
                 }
             }
             std::collections::hash_map::Entry::Vacant(slot) => {

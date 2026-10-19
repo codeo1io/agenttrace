@@ -2614,11 +2614,21 @@ pub(crate) fn cached_content_signature(path: &Path, cache: &SessionCache) -> Opt
 /// cached listing (see [`cached_content_signature`]). When the parent
 /// directory has no cached listing the result is simply not persisted
 /// — the signature is still correct for this run.
-pub(crate) fn store_content_signature(path: &Path, size: i64, sig: u64, cache: &mut SessionCache) {
+///
+/// rm-2058: the fingerprint's `mod_time` is handed in by the caller —
+/// captured BEFORE the content read and re-verified after it (see
+/// `discovery::content_signature`) — instead of a fresh stat here.
+/// Statting now could pair a post-read fingerprint with a pre-rewrite
+/// hash (a torn read), persisting a memo entry that poisons every
+/// warm run keyed to that fingerprint.
+pub(crate) fn store_content_signature(
+    path: &Path,
+    size: i64,
+    sig: u64,
+    verified_mod_time_ns: i64,
+    cache: &mut SessionCache,
+) {
     let Some(dir) = path.parent() else {
-        return;
-    };
-    let Ok(metadata) = fs::metadata(path) else {
         return;
     };
     let Some(entry) = cache.dirs.get_mut(&cache_key(dir)) else {
@@ -2628,7 +2638,7 @@ pub(crate) fn store_content_signature(path: &Path, size: i64, sig: u64, cache: &
         cache_key(path),
         (
             FileFingerprint {
-                mod_time: file_mod_time_nanos(&metadata),
+                mod_time: verified_mod_time_ns,
                 size,
             },
             sig,

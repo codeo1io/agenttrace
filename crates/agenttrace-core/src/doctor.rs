@@ -219,6 +219,14 @@ pub struct DoctorReport {
     /// byte-identical copies were found.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub duplicate_session_file_pairs: Vec<String>,
+    /// rm-2058 (run c361e67f cycle 1, "admission truth"): zero-byte
+    /// session files disclosed in their own admission class — KEPT
+    /// files that never enter the duplicate class (an empty journal is
+    /// a placeholder, not a copy of its sibling). Counting them here
+    /// keeps the duplicate ledger free of placeholder noise; zero
+    /// stays out of the JSON so clean corpora render unchanged.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub empty_session_files: usize,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
     /// `agenttrace statusline` has been configured as the statusLine
@@ -327,6 +335,9 @@ struct DoctorDiscovery {
     subagent_artifact_files: usize,
     duplicate_session_files: usize,
     duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-2058: zero-byte session files kept and disclosed in their
+    /// own admission class (never duplicates).
+    empty_session_files: usize,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -357,6 +368,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             subagent_artifact_files: 0,
             duplicate_session_files: 0,
             duplicate_session_file_pairs: Vec::new(),
+            empty_session_files: 0,
         };
     }
     let cache = load_session_cache_report();
@@ -415,6 +427,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         subagent_artifact_files: suppressed.subagent_artifact_files,
         duplicate_session_files: suppressed.duplicate_session_files,
         duplicate_session_file_pairs: suppressed.duplicate_session_file_pairs,
+        empty_session_files: suppressed.empty_session_files,
     }
 }
 
@@ -442,6 +455,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         subagent_artifact_files,
         duplicate_session_files,
         duplicate_session_file_pairs,
+        empty_session_files,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -506,6 +520,12 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             duplicate_session_files,
         );
     }
+    // rm-2058: zero-byte placeholders are disclosed in their own
+    // admission class — kept files, never duplicates — so a pile of
+    // empty .jsonl sidecars cannot masquerade as a duplicate ledger.
+    if empty_session_files > 0 {
+        disclosures.insert("empty_session_files".to_string(), empty_session_files);
+    }
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -568,6 +588,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
                 format!("{} <- {}", survivor.display(), suppressed.display())
             })
             .collect(),
+        empty_session_files,
         project_decode,
         zero_usage,
         future_timestamp_sessions,
@@ -1477,6 +1498,15 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
         if count > 0 {
             recommendations.push(format!(
                 "{} byte-identical session file copy/copies were counted once (content signature match); keep ONE canonical copy per journal so tooling that ignores content identity stays honest.",
+                count
+            ));
+        }
+    }
+    // rm-2058: zero-byte session files disclosed in their own class.
+    if let Some(&count) = report.disclosures.get("empty_session_files") {
+        if count > 0 {
+            recommendations.push(format!(
+                "{} zero-byte session file(s) were disclosed as empty (kept and never deduplicated against each other); they bank no events — safe to delete if they are stale placeholders.",
                 count
             ));
         }

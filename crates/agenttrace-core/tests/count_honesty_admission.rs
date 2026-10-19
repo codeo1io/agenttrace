@@ -679,3 +679,167 @@ fn doctor_and_audit_disclose_the_admission_ledger() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+// ------------------------------------------------------------------
+// rm-2058 (run c361e67f cycle 1, assess F1/F2): the content-dedup
+// ledger must never suppress a file it has not PROVEN byte-identical.
+// Three truth routes, all pinned on pocA/pocB shapes:
+//   1. stale memo — (mtime_ns, size) fingerprint serves an old hash
+//      after a size-preserving, mtime-preserving mutation;
+//   2. torn-read memo poison — stat/hash/stat mismatch discards the
+//      memo entry instead of persisting a fingerprint/hash mismatch;
+//   3. zero-byte placeholders — empty files are their own admission
+//      class (disclosed, never deduped against each other).
+// ------------------------------------------------------------------
+
+fn same_length_mutated_journal() -> (String, String) {
+    // "0.0038" -> "0.0098": same byte length, different content.
+    let left = pi_journal_with_cost("0.0038");
+    let right = pi_journal_with_cost("0.0098");
+    assert_eq!(left.len(), right.len(), "fixture must stay same-size");
+    assert_ne!(left, right);
+    (left, right)
+}
+
+#[test]
+fn stale_memo_must_not_suppress_a_mutated_twin() {
+    // Red-first flip of assess F1 (pocA): after a cold load populates
+    // the content-signature memo, mutating one twin in place — same
+    // size, mtime restored to the nanosecond — must NOT keep the
+    // mutated journal suppressed as a "byte-identical copy". Its
+    // spend was silently lost at base; both sessions bank and no
+    // duplicate is disclosed.
+    let home = temp_home("stale-memo");
+    let (left, right) = same_length_mutated_journal();
+    let alpha = write(&home.join(".pi/agent/sessions/alpha/a.jsonl"), &left);
+    let beta = write(&home.join(".pi/agent/sessions/beta/b.jsonl"), &left);
+    with_pinned_home(&home, || {
+        // Cold pass: identical copies, one suppression, memo stored.
+        let cold = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(cold.sessions.len(), 1);
+        assert_eq!(cold.duplicate_session_files, 1);
+
+        // Mutate beta in place; restore the exact mtime so the
+        // fingerprint the memo vouches for is unchanged.
+        let preserved = fs::metadata(&beta)
+            .expect("stat beta")
+            .modified()
+            .expect("mtime");
+        fs::write(&beta, &right).expect("mutate beta");
+        let handle = fs::File::options()
+            .write(true)
+            .open(&beta)
+            .expect("reopen beta");
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(preserved))
+            .expect("restore mtime");
+        drop(handle);
+        let after = fs::metadata(&beta).expect("re-stat beta");
+        assert_eq!(
+            after.modified().expect("mtime after"),
+            preserved,
+            "fixture: mtime must round-trip exactly for the memo to be in play"
+        );
+        assert_eq!(after.len() as usize, right.len());
+
+        // Warm pass through the memo: the mutated twin must survive.
+        let warm = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            warm.sessions.len(),
+            2,
+            "mutated twin banks alongside the survivor: got {}",
+            warm.sessions.len()
+        );
+        assert_eq!(
+            warm.duplicate_session_files, 0,
+            "no duplicate disclosure for genuinely distinct content"
+        );
+        let total: f64 = warm
+            .sessions
+            .iter()
+            .map(|s| s.metrics.upstream_cost_usd)
+            .sum();
+        assert!(
+            (total - 0.0136).abs() < 1e-9,
+            "both recorded costs bank (0.0038 + 0.0098), none lost: got {total}"
+        );
+        let paths: Vec<&str> = warm
+            .sessions
+            .iter()
+            .map(|s| Path::new(&s.path).file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"a.jsonl") && paths.contains(&"b.jsonl"));
+        let _ = alpha;
+    });
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn mutated_twin_with_fresh_fingerprint_stays_distinct() {
+    // Control for the stale-memo route: same mutation but a 1ns mtime
+    // bump — the memo misses, the honest re-hash runs, and both files
+    // bank. Green before AND after rm-2058; pins that the fix never
+    // regressed the plain re-hash lane.
+    let home = temp_home("fresh-fp");
+    let (left, right) = same_length_mutated_journal();
+    let beta = write(&home.join(".pi/agent/sessions/alpha/a.jsonl"), &left);
+    write(&home.join(".pi/agent/sessions/beta/b.jsonl"), &left);
+    with_pinned_home(&home, || {
+        let cold = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(cold.duplicate_session_files, 1);
+        fs::write(&beta, &right).expect("mutate beta");
+        let preserved = fs::metadata(&beta)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        let bumped = preserved + std::time::Duration::from_nanos(1);
+        let handle = fs::File::options().write(true).open(&beta).expect("reopen");
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(bumped))
+            .expect("bump mtime");
+        drop(handle);
+        let warm = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(warm.sessions.len(), 2);
+        assert_eq!(warm.duplicate_session_files, 0);
+    });
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn zero_byte_files_are_not_duplicates() {
+    // Red-first flip of assess F2 (pocB): five empty .jsonl
+    // placeholders plus one real journal must not manufacture four
+    // "byte-identical copy" disclosures. Empty files are their own
+    // admission class — disclosed by count, never deduped.
+    let home = temp_home("empty-class");
+    let journal = pi_journal_with_cost("0.0038");
+    write(&home.join(".pi/agent/sessions/alpha/a.jsonl"), &journal);
+    for n in 1..=5 {
+        write(
+            &home.join(format!(".pi/agent/sessions/empty/e{n}.jsonl")),
+            "",
+        );
+    }
+    with_pinned_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.duplicate_session_files, 0,
+            "empty placeholders never enter the duplicate class"
+        );
+        assert_eq!(
+            report.empty_session_files, 5,
+            "each zero-byte file is disclosed in its own class"
+        );
+        assert_eq!(
+            report.duplicate_session_file_pairs.len(),
+            0,
+            "no survivor <- suppressed pairs for empty files"
+        );
+        assert!(!report.sessions.is_empty(), "the real journal still banks");
+        assert!(
+            (report.sessions[0].metrics.upstream_cost_usd - 0.0038).abs() < 1e-12,
+            "the real journal's cost is untouched by the empty class"
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+}

@@ -3566,3 +3566,132 @@ fn count_honesty_disclosures_in_cli_lanes() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn admission_disclosures_ride_overview_and_sessions_json() {
+    // rm-2059 (run c361e67f cycle 1, "admission truth"): the admission
+    // disclosure block is a property of the AGGREGATE, not of the
+    // doctor/audit renderers — `--overview -f json` and `--sessions
+    // -f json` carry the same keys with the same absent-when-zero
+    // convention (the count-honesty arc at 4/4 surfaces). Pinned end
+    // to end through the real binary; env is scoped to the subprocess
+    // so the host corpus and the shared fleet session cache are never
+    // read or written.
+    let home =
+        std::env::temp_dir().join(format!("agenttrace-admission-cli-{}", std::process::id()));
+    let sessions = home.join(".pi/agent/sessions");
+    let pi_journal = |total: &str| {
+        format!(
+            concat!(
+                r#"{{"id": "00000000-0000-4000-8000-000000000001", "timestamp": "2026-10-04T07:16:46.634Z", "type": "session", "version": 3, "cwd": "/redacted/project"}}"#,
+                "\n",
+                r#"{{"id": "00000000-0000-4000-8000-000000000002", "parentId": "00000000-0000-4000-8000-000000000001", "timestamp": "2026-10-04T07:16:46.700Z", "type": "session_info", "name": "redacted-session"}}"#,
+                "\n",
+                r#"{{"id": "00000000-0000-4000-8000-000000000003", "timestamp": "2026-10-04T07:16:47.000Z", "message": {{"role": "user", "content": [{{"type": "text", "text": "hello"}}], "timestamp": "2026-10-04T07:16:47.000Z"}}, "type": "message"}}"#,
+                "\n",
+                r#"{{"id": "00000000-0000-4000-8000-000000000004", "timestamp": "2026-10-04T07:16:48.000Z", "message": {{"role": "assistant", "content": [{{"type": "text", "text": "hi there"}}], "timestamp": "2026-10-04T07:16:48.000Z", "usage": {{"input": 500, "output": 1000, "cacheRead": 25000, "cacheWrite": 5000, "totalTokens": 31500, "cost": {{"input": 0.0015, "output": 0.006, "cacheRead": 0.0, "cacheWrite": 0.0, "total": {0}}}}}}}, "model": "claude-sonnet-4-20250514", "type": "message"}}"#,
+                "\n"
+            ),
+            total
+        )
+    };
+    let write = |rel: &str, contents: &str| {
+        let path = sessions.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(&path, contents).expect("write fixture");
+        path
+    };
+    // One real journal banked twice (alpha survives, beta is the copy)
+    // plus a zero-byte placeholder: the duplicate ledger and the empty
+    // class both disclose.
+    let journal = pi_journal("0.0038");
+    write("alpha/a.jsonl", &journal);
+    write("beta/b.jsonl", &journal);
+    write("empty/e.jsonl", "");
+
+    let run_json = |args: &[&str]| -> serde_json::Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args(args)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("AGENTTRACE_SESSION_CACHE_DIR", home.join("session-cache"))
+            .output()
+            .expect("run agenttrace");
+        assert!(
+            output.status.success(),
+            "{args:?} must succeed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("lane output is JSON")
+    };
+
+    let overview = run_json(&["--overview", "-f", "json", "--range", "all"]);
+    assert_eq!(
+        overview["duplicate_session_files"], 1,
+        "the suppressed copy is disclosed on the overview JSON"
+    );
+    assert!(
+        overview["duplicate_session_file_pairs"]
+            .as_array()
+            .expect("named pairs ride the overview disclosure")
+            .len()
+            == 1,
+        "one survivor <- suppressed pair"
+    );
+    assert_eq!(
+        overview["empty_session_files"], 1,
+        "the zero-byte placeholder is disclosed in its own class"
+    );
+    assert_eq!(
+        overview["summary"]["total_sessions"], 1,
+        "one session banks: survivor only, the copy suppressed, the placeholder banks nothing"
+    );
+
+    let list = run_json(&["--sessions", "-f", "json"]);
+    assert_eq!(
+        list["duplicate_session_files"], 1,
+        "the sessions lane carries the same duplicate disclosure"
+    );
+    assert_eq!(
+        list["empty_session_files"], 1,
+        "the sessions lane carries the same empty-class disclosure"
+    );
+
+    // Absent-when-zero on the same lanes: a clean corpus renders with
+    // NONE of the admission keys present.
+    let clean_home =
+        std::env::temp_dir().join(format!("agenttrace-admission-clean-{}", std::process::id()));
+    let clean_sessions = clean_home.join(".pi/agent/sessions");
+    std::fs::create_dir_all(clean_sessions.join("solo")).expect("create clean home");
+    std::fs::write(clean_sessions.join("solo/s.jsonl"), &journal).expect("write clean journal");
+    let clean = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--overview", "-f", "json", "--range", "all"])
+        .env("HOME", &clean_home)
+        .env("XDG_CONFIG_HOME", clean_home.join(".config"))
+        .env("XDG_CACHE_HOME", clean_home.join(".cache"))
+        .env("XDG_DATA_HOME", clean_home.join(".local/share"))
+        .env(
+            "AGENTTRACE_SESSION_CACHE_DIR",
+            clean_home.join("session-cache"),
+        )
+        .output()
+        .expect("run clean overview");
+    assert!(clean.status.success());
+    let clean_stdout = String::from_utf8_lossy(&clean.stdout);
+    for key in [
+        "duplicate_session_files",
+        "duplicate_session_file_pairs",
+        "empty_session_files",
+        "subagent_artifact_files",
+    ] {
+        assert!(
+            !clean_stdout.contains(key),
+            "absent-when-zero: {key} must not ride a clean corpus"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&clean_home);
+}
