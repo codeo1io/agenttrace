@@ -28,6 +28,11 @@ implement `e4098c47` after fold-rejected `4d602419`):
    pins toolchain actions, runs `UPDATE_CARD_GOLDEN=1 cargo test -p agenttrace-core
    --test svg_card_contract` in the regen step, re-runs the byte-pin assertion, and
    stages the three goldens beside bundle+const; PR body carries the no-CI disclosure.
+   *(Extended 2026-10-18 by review fix 00e01125 F1: the same step now also verifies the
+   four consumer suites — `pricing_snapshot_hygiene`, `cache_rate_truth_contract`,
+   `first_party_pricing_extract_contract`, `token_conformance` — against the refreshed
+   bundle and refuses to open the PR on red, so a moved census pin is a loud workflow
+   failure and a manual-sweep signal, never a red master at the GITHUB_TOKEN merge.)*
 4. **Ledger** — CHANGELOG entry + the rm-176 riders (deadline/acceptance-closure/
    executed-refresh) landed with the salvage.
 
@@ -44,10 +49,19 @@ implement `e4098c47` after fold-rejected `4d602419`):
 | targeted_tests | `015247bc` | focused battery green; digest `validation:v1:4936e116…` reproduced pre+post |
 | full_tests | `f9892823` (provider-dead; delta salvaged as `5cc1b95f`)→`53f1c679` | ci.yml-verbatim workspace suite 1298/0/81, 02:01:56Z→02:08:19Z |
 
-Six of eight first attempts were provider deaths (~30s, `session_reaped`, zero output —
-implement's true first attempt `347d99e4` included; census corrected 2026-10-18 by review
-d77fa453 F2, which caught it omitted and `f9892823` double-counted); the redo-from-scratch-
-on-census-match rule carried the run — see the 2026-10-18 Addendum
+Six of eight first attempts were provider deaths (identity: absent `delegate/<attempt>.json`,
+event log ending `session_reaped` exit_reason=failed; implement's true first attempt `347d99e4`
+included; census identity corrected 2026-10-18 by review d77fa453 F2, which caught it omitted
+and `f9892823` double-counted). Characterization corrected 2026-10-18 by review 00e01125 F2 —
+this record's earlier "~30s, zero output" wording was wrong: durations re-derived from the
+event logs are 28s (`d8e8aec4`) and 31s (`9ea1516e`) but 218s (`f9892823`), 531s (`110abe8f`),
+2524s (`347d99e4`), and 3122s (`1ffff93d`), and durable output was NOT uniformly zero —
+`347d99e4` left a quarantine scratch (`gen_drops.py`, `refresh-run.log`,
+`removal-analysis.txt` under `quarantine/scratches/20261017T193835Z/`) whose delta the
+implement redo adopted, and `f9892823`'s delta was salvaged as landing `5cc1b95f`. Reap
+triage must census duration AND scratch/envelope state per attempt, never assume zero-durable
+from the reaper exit alone. The redo-from-scratch-on-census-match rule carried the run — see
+the 2026-10-18 Addendum
 on `docs/solutions/workflow-issues/provider-reaped-delegate-attempts-redo-from-scratch-on-census-match.md`.
 
 ## 3. Lessons & prevention rules (reusable)
@@ -79,9 +93,15 @@ on `docs/solutions/workflow-issues/provider-reaped-delegate-attempts-redo-from-s
 
 ## 4. Context for the next maintenance cycle
 
-- **LIVE PROOF POINT — Monday 2026-10-19 06:00 UTC**: first scheduled run of the defused
-  lane. Expect drift-check rc0, removal_guard clear, and an auto-PR that stages goldens.
-  Anything else reopens rm-176. Check `gh run list --workflow pricing-drift.yml`.
+- **LIVE PROOF POINT — Monday 2026-10-19 06:00 UTC**: first scheduled run of the lane.
+  BOTH outcomes are acceptable (reworded 2026-10-18 by review 00e01125 F3 — the original
+  "rc0 + auto-PR" conjunction was unsatisfiable: rc0 ⇒ mode=clean ⇒ no PR): (a) gate rc0,
+  removal_guard clear, mode=clean, no PR; or (b) gate rc1 actionable with guard+desync clear
+  → bump arm regenerates bundle+const+goldens, post-regen gate rc0 + consumer suites green
+  in-run, PR opens with the goldens staged. Reopen rm-176 only on rc2, removal_guard SET,
+  desync, post-regen gate ≠ rc0, or a red master after a merge; a red consumer suite in the
+  workflow is the manual census-sweep signal (review 00e01125 F1), not a lane defect.
+  Check `gh run list --workflow pricing-drift.yml`.
 - **Queued candidates** (prioritize d9e79fe5, in value order): by_org/by_branch
   cost-finite guard (assess F2 — governance/reports folds, small); insights relative-cwd
   attribution (F4); models.dev `cost.tiers` second pricing source (RC3; bundled snapshot

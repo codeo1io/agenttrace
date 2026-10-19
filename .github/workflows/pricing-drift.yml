@@ -15,8 +15,8 @@ name: pricing-drift
 #             no auto-PR, a human reconciles. Catalog growth stays additive: no silent price
 #             removals.
 # Note: PRs authored by the default GITHUB_TOKEN do not trigger CI workflows (GitHub limitation).
-# The drift gate's own post-regeneration verification below is the review artifact; the PR body
-# says so explicitly.
+# The drift gate's own post-regeneration verification below — gate rerun, SVG-golden byte-pin,
+# AND the consumer-suite sweep — is the review artifact; the PR body says so explicitly.
 
 on:
   schedule:
@@ -141,6 +141,42 @@ jobs:
           UPDATE_CARD_GOLDEN=1 cargo test --locked -p agenttrace-core --test svg_card_contract
           cargo test --locked -p agenttrace-core --test svg_card_contract
 
+          # Consumer-suite verification (review 00e01125 F1): the refresh
+          # contracts pin bundle-census literals and other world literals in
+          # four consumer suites (pricing_snapshot_hygiene: cache_read_absent
+          # 2,226 / cache_write_absent 3,344; cache_rate_truth_contract: the
+          # same bundle census + its own override delta;
+          # first_party_pricing_extract_contract's reseller pin;
+          # token_conformance's manifest case 005). A bump that admits keys
+          # lacking cache pricing MOVES those pins — and GITHUB_TOKEN PRs run
+          # no CI, so a red consumer here would otherwise redden master only
+          # at the merge, undetected until then. Refuse to open the PR: the
+          # census pins are world-census literals that ride the manual
+          # consumer sweep (rm-176 rider); this step makes that sweep's
+          # necessity loud instead of silent.
+          rc=0
+          cargo test --locked -p agenttrace-core \
+            --test pricing_snapshot_hygiene --test cache_rate_truth_contract \
+            --test first_party_pricing_extract_contract --test token_conformance \
+            > consumer-sweep.txt 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo "## pricing refresh blocked: consumer sweep red (rc=$rc)"
+              echo "The refreshed bundle moved a pinned census/contract literal. No auto-PR was opened. Run the manual consumer sweep — re-pin the moved literals consciously per the refresh contracts — and rerun this workflow."
+              echo '```'
+              tail -n 40 consumer-sweep.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::consumer sweep red (rc=$rc) — census/contract pins moved with the refreshed bundle; manual consumer sweep required (details in the step summary)"
+            exit 1
+          fi
+          {
+            echo "## consumer sweep green on the refreshed bundle"
+            echo '```'
+            grep -E '^test result:' consumer-sweep.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
           git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs crates/agenttrace-core/tests/fixtures/svg-card/*.svg
           git commit -m "chore(pricing): refresh bundled snapshot to $new_date (pricing-drift gate)"
 
@@ -156,9 +192,9 @@ jobs:
             echo '```'
             cat refresh-check.txt
             echo '```'
-            echo "Snapshot date: **$new_date**. $counts SVG card goldens regenerated and byte-pin-verified in-run."
+            echo "Snapshot date: **$new_date**. $counts SVG card goldens regenerated and byte-pin-verified in-run; consumer suites (pricing_snapshot_hygiene, cache_rate_truth_contract, first_party_pricing_extract_contract, token_conformance) verified green in-run on the refreshed bundle."
             echo
-            echo "Note: PRs authored by the default GITHUB_TOKEN do not trigger CI workflows (GitHub limitation); the post-regeneration gate run above is the validation artifact. Removal guard and desync paths never reach this step — they fail the workflow instead."
+            echo "Note: PRs authored by the default GITHUB_TOKEN do not trigger CI workflows (GitHub limitation); the validation artifacts are IN THIS RUN — the post-regeneration gate rerun above (rc 0) plus the in-run verification: svg_card_contract golden regen + byte-pin, and the four-suite consumer sweep. Removal guard, desync, and any red consumer suite never reach this step — they fail the workflow instead of opening a PR (a moved census pin means the manual consumer sweep was needed, not that a PR is ready)."
           } > pr-body.md
 
           git push origin "$branch"
