@@ -3,6 +3,18 @@ set -eu
 
 # agenttrace — single binary install (Rust + ratatui)
 # Usage: curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
+#
+# Environment contract (rm-2014) — all optional:
+#   AGENTTRACE_VERSION=TAG    install that release tag instead of the
+#                             newest release. A tag that does not exist
+#                             fails closed; this script never silently
+#                             falls back to latest.
+#   AGENTTRACE_INSTALL_DIR=DIR   install into DIR (default ~/.local/bin).
+#   AGENTTRACE_NO_MODIFY_PATH=1  this script never edits your shell
+#                             profile; the flag silences the PATH hint.
+#   AGENTTRACE_DOWNLOAD_URL=URL override the binary download URL
+#                             entirely (offline CI tests; wins over
+#                             AGENTTRACE_VERSION).
 
 REPO="luoyuctl/agenttrace"
 # Pinned ref for the build-from-source fallback (rm-051): the fallback
@@ -16,6 +28,10 @@ REF="${AGENTTRACE_SOURCE_REF:-v0.10.1}"
 INSTALL_RECEIPT="${AGENTTRACE_INSTALL_RECEIPT:-${XDG_DATA_HOME:-$HOME/.local/share}/agenttrace/install-receipt}"
 BIN="agenttrace"
 INSTALL_DIR="${AGENTTRACE_INSTALL_DIR:-}"
+# rm-2014: release-tag pin ("latest" or unset keeps the moving
+# newest-release URL). A pinned-but-missing tag 404s below and the
+# script exits — never a silent fallback.
+VERSION="${AGENTTRACE_VERSION:-latest}"
 
 # — detect platform —
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -46,11 +62,18 @@ fi
 mkdir -p "$INSTALL_DIR"
 DEST="${INSTALL_DIR}/${BIN}"
 
-# — resolve latest release asset —
-echo "🔍 Fetching latest release..."
+# — resolve release asset —
+echo "🔍 Fetching release (${VERSION})..."
 ASSET="${BIN}-${OS}-${ARCH}"
-# AGENTTRACE_DOWNLOAD_URL overrides the release URL (used by offline CI tests).
-RELEASE_URL="${AGENTTRACE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download/${ASSET}}"
+# AGENTTRACE_DOWNLOAD_URL overrides the release URL (used by offline CI tests);
+# AGENTTRACE_VERSION (rm-2014) retargets it at a named release tag.
+if [ -n "${AGENTTRACE_DOWNLOAD_URL:-}" ]; then
+  RELEASE_URL="${AGENTTRACE_DOWNLOAD_URL}"
+elif [ "${VERSION}" = "latest" ]; then
+  RELEASE_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+else
+  RELEASE_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
+fi
 # AGENTTRACE_SOURCE_URL overrides the source-build clone/fetch URL (offline CI tests).
 SRC_URL="${AGENTTRACE_SOURCE_URL:-https://github.com/${REPO}.git}"
 
@@ -60,6 +83,9 @@ TMP=$(mktemp)
 if ! curl -fsSL -o "$TMP" "$RELEASE_URL"; then
   rm -f "$TMP"
   echo "❌ No binary found for ${OS}/${ARCH}"
+  if [ "${VERSION}" != "latest" ]; then
+    echo "   (pinned via AGENTTRACE_VERSION=${VERSION} — unset it to track the newest release)"
+  fi
   echo "   Build from source: git clone https://github.com/${REPO}.git && cd agenttrace && cargo build --release -p agenttrace"
   exit 1
 fi
@@ -226,8 +252,10 @@ echo "   $(head -n 1 "$VERIFY_LOG")"
 rm -f "$VERIFY_LOG"
 echo "✅ Installed to ${DEST}"
 
-# — PATH hint —
-if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
+# — PATH hint (rm-2014: this script never edits your shell profile —
+# it only prints how to add the install directory; the env flag
+# silences the hint for scripted installs) —
+if [ "${AGENTTRACE_NO_MODIFY_PATH:-0}" != "1" ] && ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
   echo ""
   echo "⚠️  ${INSTALL_DIR} is not in your PATH."
   echo "   Add this to your shell profile:"

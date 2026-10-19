@@ -4,6 +4,62 @@
 
 ### Added
 
+- installer release pinning + hostile-timestamp no-panic + CSV/TUI
+  pricing basis (rm-2014 + rm-2013 + rm-1574 extension, run 91066ba0
+  cycle 2): `install.ps1`'s `-Version` parameter was unreachable under
+  its own documented `iex` one-liner — Windows had NO way to pin a
+  release. Both installers now honor the same environment contract
+  (`AGENTTRACE_VERSION`, `AGENTTRACE_INSTALL_DIR`, and
+  `AGENTTRACE_NO_MODIFY_PATH`, documented in README.md and
+  README.zh-CN.md): a pinned-but-missing tag fails closed and the
+  installer never silently falls back to latest; the README's claim
+  that installers "add the install directory to your PATH" is
+  corrected to the truth (they print the addition — they never edit
+  shell profiles). Separately, a journal carrying a hostile
+  naive-profile timestamp (chrono 0.4.45 parses `-262143-01-01T00:00:00`;
+  the hole is one-sided — `+262143-…` is rejected) panicked the
+  process in `--quota` (`DateTime - TimeDelta overflowed` at
+  `quota_window`'s window bound) and in the governance commit window;
+  `parse_ts` now accepts only 4-digit years, so expanded-year rows are
+  disclosed unplaced by the corpus census instead of aborting the run.
+  Finally the CSV by-model export carries a new additive
+  `pricing_basis` column and the TUI top-model row the same
+  ` (fallback pricing)` / ` (pricing unknown)` markers as the text
+  lane — fallback-priced totals are no longer indistinguishable from
+  exact-priced ones on the machine and human surfaces.
+
+  Integration seam (2026-10-19, conflict case 8bb3b4d5, landing onto a
+  wall that had since integrated runs e4bff731 / e4209f0c / the
+  c0a02f64 salvage above this run's base fd0e91a2): the only textual
+  conflict was this changelog row itself — both sides had prepended
+  to the Unreleased Added list — and the row lands atop the list as
+  the newest landing commit. The mechanics compose unchanged with the
+  advanced wall: rm-2013's guard sits at the one `parse_ts_form` seam
+  the wall never touched (its later parser work was the rm-1978
+  carrier construction and the rm-1949 turn-boundary rescue, never
+  timestamp parsing), so both arithmetic co-victims (`quota_window`,
+  the governance commit window) stay closed by construction;
+  rm-1574's extension reuses fd0e91a2's own `pricing_basis_label`
+  (now `pub` and re-exported from the core crate) for the additive
+  CSV column and the TUI top-model marker, so the machine and human
+  surfaces cannot drift from the text lane's vocabulary; and no
+  session-cache or dir-listing rung rides the batch, so nothing
+  collides with the wall's advanced ceilings (the schema rungs and
+  the rm-992 `DIR_LISTING_WALK_VERSION` 6 → 7 stay as the wall
+  landed them).
+
+  Independent-review seam (2026-10-20, conflict case 75c75c00, the
+  568cee6e timeout redone): review verdict APPROVED as staged, and
+  the round closes the one seam the code landing could not — the
+  run's roadmap band (mints rm-2013/rm-2014/rm-2015, 10 dated
+  riders, the cycle-2 stewardship record) never applied to the wall
+  and lands re-anchored in ROADMAP.md plus
+  docs/stewardship/2026-10-19-cycle2-compound-record-run91066ba0.md
+  at this round; rider drift adjudicated in the landing banner (the
+  rm-548 F7 "uncapped" claim is superseded-in-part by the landed
+  info-doc read cap; the rm-451 F6 and rm-992 coordinates moved
+  with landed code and stand).
+
 - Compressed codex rollouts (`.jsonl.zst`) are admitted by discovery and
   decoded (rm-992, run e4209f0c cycle 5): upstream codex `migrate_rollouts`
   compresses rollouts to `<name>.jsonl.zst` (compression stable-adjacent

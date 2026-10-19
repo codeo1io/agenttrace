@@ -88,11 +88,31 @@ Windows CMD：
 curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
-安装脚本会下载对应平台的发布版程序，按发布的校验和验证 SHA-256，并把安装目录
-（`~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\agenttrace`）加入 PATH。
-Shell 安装脚本始终获取最新发布版（源码构建回退可用
-`AGENTTRACE_SOURCE_REF=v0.10.1` 固定）；Windows 上用 `-Version v0.10.1`
-（PowerShell）固定版本。
+安装脚本会下载对应平台的发布版程序，并在安装前按发布的校验和验证
+SHA-256。脚本从不修改你的 shell 配置文件——只会打印加入 PATH 的方法
+（`~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\agenttrace`）。
+
+安装指定版本（rm-2014）——两个安装脚本遵守同一套环境变量；
+通过管道一行命令安装时，环境变量是唯一的固定版本方式
+（PowerShell 的 `iex` 管道无法传参，`-Version` 在那里从来不可用）：
+
+| 变量 | 含义 |
+| --- | --- |
+| `AGENTTRACE_VERSION` | 要安装的发布标签（默认最新）。标签不存在则直接失败退出——安装脚本绝不悄悄回退到最新版。 |
+| `AGENTTRACE_INSTALL_DIR` | 覆盖安装目录。 |
+| `AGENTTRACE_NO_MODIFY_PATH` | 设为 `1` 时为脚本化安装静默 PATH 提示。 |
+| `AGENTTRACE_SOURCE_REF` | 固定 shell 安装脚本的源码构建回退（默认 `v0.10.1`）。 |
+| `AGENTTRACE_DOWNLOAD_URL` | 完全覆盖二进制下载地址（离线 CI 测试用）。 |
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh \
+  | AGENTTRACE_VERSION=v0.10.1 sh
+```
+
+```powershell
+$env:AGENTTRACE_VERSION = "v0.10.1"
+irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+```
 
 包管理器：
 

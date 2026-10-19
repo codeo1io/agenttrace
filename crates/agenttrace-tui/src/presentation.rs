@@ -3435,12 +3435,25 @@ pub(super) fn top_group(
         })
 }
 
+/// rm-1574 extension: TUI-lane pricing-basis marker, same vocabulary
+/// as the text lane (reports.rs `pricing_basis_label`). Exact-priced
+/// models render no marker; fallback-priced ones must not read as
+/// exact-priced on this surface either.
+pub(super) fn pricing_basis_marker(model: &str) -> &'static str {
+    match agenttrace_core::pricing_basis_label(model) {
+        Some("fallback") => " (fallback pricing)",
+        Some(_) => " (pricing unknown)",
+        None => "",
+    }
+}
+
 pub(super) fn top_model_line(app: &App) -> String {
     if let Some((model, group)) = top_group(&app.overview.by_model) {
         format!(
-            "{} {}  {} {}  {} {}",
+            "{} {}{}  {} {}  {} {}",
             app.t("top model", "最高频模型"),
             short(model, 24),
+            pricing_basis_marker(model),
             app.t("sessions", "会话"),
             format_count(group.sessions as i64),
             app.t("cost", "成本"),
@@ -4020,6 +4033,35 @@ pub(super) fn format_duration(seconds: f64) -> String {
         return format!("{:.1}y", seconds / (365.0 * 86_400.0));
     }
     format!("{:.1}d", seconds / 86_400.0)
+}
+
+#[cfg(test)]
+mod pricing_basis_marker_tests {
+    use super::pricing_basis_marker;
+
+    // rm-1574 extension: the TUI top-model row must carry the same
+    // basis vocabulary as the text lane. `gpt-4o` has exact snapshot
+    // pricing; `zzz-unpriced-9` does not.
+    #[test]
+    fn exact_priced_model_has_no_marker() {
+        assert_eq!(pricing_basis_marker("gpt-4o"), "");
+    }
+
+    #[test]
+    fn fallback_priced_model_is_marked() {
+        assert_eq!(
+            pricing_basis_marker("zzz-unpriced-9"),
+            " (fallback pricing)"
+        );
+    }
+
+    #[test]
+    fn unknown_bucket_models_get_unknown_marker() {
+        // rm-1574 vocabulary: the default/unknown/multiple buckets
+        // carry the " (pricing unknown)" marker, not "fallback".
+        assert_eq!(pricing_basis_marker("default"), " (pricing unknown)");
+        assert_eq!(pricing_basis_marker("unknown"), " (pricing unknown)");
+    }
 }
 
 #[cfg(test)]

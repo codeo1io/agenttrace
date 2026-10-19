@@ -2682,7 +2682,7 @@ fn overview_summary(overview: &Overview, sessions: &[Session]) -> Value {
 /// default/unknown/multiple buckets where no single model prices the
 /// row). Mirrors governance's cost-audit classification (the
 /// `Pricing: … exact= fallback= unknown=` aggregate line).
-fn pricing_basis_label(model: &str) -> Option<&'static str> {
+pub fn pricing_basis_label(model: &str) -> Option<&'static str> {
     if matches!(model, "default" | "unknown" | "multiple") {
         return Some("unknown");
     }

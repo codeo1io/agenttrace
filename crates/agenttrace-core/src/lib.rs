@@ -20,7 +20,7 @@ mod statusline;
 mod subagents;
 mod waste;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,10 +74,10 @@ pub use pricing::{
     specific_base_for_unpriced, update_pricing, CacheRateCensus, Price,
 };
 pub use reports::{
-    add_baseline_comparison, guard_formula_json_leaves, report_compare, report_compare_json,
-    report_compare_with_language, report_json, report_json_with_language, report_overview_html,
-    report_overview_html_with_context, report_overview_json, report_overview_json_with_context,
-    report_overview_json_with_health, report_overview_markdown,
+    add_baseline_comparison, guard_formula_json_leaves, pricing_basis_label, report_compare,
+    report_compare_json, report_compare_with_language, report_json, report_json_with_language,
+    report_overview_html, report_overview_html_with_context, report_overview_json,
+    report_overview_json_with_context, report_overview_json_with_health, report_overview_markdown,
     report_overview_markdown_with_context, report_overview_svg, report_overview_svg_with_context,
     report_overview_text, report_overview_text_with_context, report_text,
     report_text_with_language, session_pricing_basis, BaselineBreaches, BaselineThresholds,
@@ -3609,13 +3609,29 @@ fn parse_ts_form(value: &str) -> Option<(DateTime<Utc>, TimestampForm)> {
         return None;
     }
     let normalized = value.replace('Z', "+00:00");
-    if let Ok(ts) = DateTime::parse_from_rfc3339(&normalized) {
-        return Some((ts.with_timezone(&Utc), TimestampForm::Rfc3339));
+    let parsed = if let Ok(ts) = DateTime::parse_from_rfc3339(&normalized) {
+        Some((ts.with_timezone(&Utc), TimestampForm::Rfc3339))
+    } else {
+        NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f")
+            .or_else(|_| NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S"))
+            .ok()
+            .map(|ts| (ts.and_utc(), TimestampForm::NaiveUtc))
+    };
+    // rm-2013 (run 91066ba0 cycle 2): chrono 0.4.45 parses
+    // expanded-year strings on both arms — the RFC-3339 arm accepts
+    // signed forms (`+262143-12-31T23:59:59+00:00`), and the naive
+    // `%Y` arm accepts the negative one (`-262143-01-01T00:00:00`, a
+    // one-sided hole). Those edges overflow the window arithmetic
+    // downstream (`quota_window`'s `cutoff - span`, governance's
+    // commit-window bounds) and panicked the process. Real journals
+    // emit 4-digit ISO-profile years, so anything outside
+    // `0..=9999` is unplaceable: None here flows to the existing
+    // disclosure counters (quota attribution census `unplaced`),
+    // never to arithmetic.
+    match parsed {
+        Some((ts, form)) if (0..=9999).contains(&ts.year()) => Some((ts, form)),
+        _ => None,
     }
-    NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f")
-        .or_else(|_| NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S"))
-        .ok()
-        .map(|ts| (ts.and_utc(), TimestampForm::NaiveUtc))
 }
 
 pub(crate) fn percentile(sorted: &[f64], p: f64) -> f64 {
