@@ -1644,7 +1644,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // journals, MCP generic events) can't plant a raw multi-MiB key.
     let model_capped = crate::parser::cap_model_identity(model).0;
     let model: &str = model_capped.as_str();
-    let price = pricing::lookup_price(&model);
+    let price = pricing::lookup_price(model);
     let mut metrics = Metrics {
         model_used: model.to_string(),
         tool_usage: BTreeMap::new(),
@@ -5447,11 +5447,7 @@ mod quota_tests {
         // panicked at `cutoff - span` ('DateTime - TimeDelta
         // overflowed') and took the whole --quota lane down; now the
         // window start saturates at the floor and both lanes say so.
-        let sessions = vec![quota_session(
-            "floor",
-            &["-262143-01-01T00:00:00"],
-            0.0105,
-        )];
+        let sessions = vec![quota_session("floor", &["-262143-01-01T00:00:00"], 0.0105)];
         let report = quota_report(&sessions);
         for key in ["five_hour", "weekly"] {
             assert_eq!(

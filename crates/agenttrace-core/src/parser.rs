@@ -3309,9 +3309,21 @@ pub(crate) fn cap_org_identity_value(raw: &str) -> (String, bool) {
 /// is far below the cap (pinned by test), so pricing lookups are
 /// unaffected for real journals.
 pub fn cap_model_identity(raw: &str) -> (String, bool) {
-    let sanitized = crate::statusline::sanitize_line_segment(raw);
-    let truncated = sanitized.chars().count() > DISCLOSURE_VALUE_CAP;
-    (capped_disclosure_value(raw), truncated)
+    // rm-1958: bounds LENGTH only — deliberately NO sanitize pass.
+    // The landed rm-1918 contract neutralizes Cf/bidi spoofing
+    // characters at the serialization boundary (escape_spoofing_json
+    // and the sanitize_line_segment-derived document pass); a hostile
+    // model id must still carry its raw bytes to that boundary so the
+    // wire shows the escaped form (parity with the MCP lane). The
+    // cap's job is the hostile-amplification dimension: bound how many
+    // bytes a journal-controlled model string can push into every
+    // group/rollup key, and disclose the truncation.
+    let truncated = raw.chars().count() > DISCLOSURE_VALUE_CAP;
+    if !truncated {
+        return (raw.to_string(), false);
+    }
+    let prefix: String = raw.chars().take(DISCLOSURE_VALUE_PREFIX).collect();
+    (format!("{prefix}…#{}", fnv1a_hex(raw)), truncated)
 }
 
 fn oh_my_pi_message_events(
@@ -5567,6 +5579,11 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // `org_identity_truncated` counter — composed with the per-field
     // rm-1553 counters below, same first-wins monotone discipline.
     let mut org_identity_truncated = false;
+    // rm-1958: same single-counter discipline for the model cap — the
+    // capture site below sets the flag; the meta mint below discloses
+    // it (the session_from_events backstop only ever sees the
+    // already-capped value, so the capture site owns the disclosure).
+    let mut model_identity_truncated = false;
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
         if cwd.is_empty() {
@@ -5653,8 +5670,12 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     if let Some(next_model) = string(message.get("model")).filter(|m| !m.is_empty())
                     {
                         // rm-1958: journal-controlled model string —
-                        // bound it at capture like the org/cwd caps.
-                        model = cap_model_identity(&next_model).0;
+                        // bound it at capture like the org/cwd caps,
+                        // keeping the truncation flag for the lane
+                        // disclosure mint below.
+                        let (capped_model, model_truncated) = cap_model_identity(next_model);
+                        model = capped_model;
+                        model_identity_truncated |= model_truncated;
                     }
                 }
                 if let Some(usage) = message.get("usage").and_then(usage_from_value) {
@@ -5867,6 +5888,10 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // refold counters below. Sessions whose journals carry no
     // identity get NO carrier — the by_org facet leaves them out
     // entirely rather than bucketing an invented "unknown".
+    // rm-1958: capture org emptiness before the carrier block below
+    // moves `org` — the model-cap disclosure at the tail mints on the
+    // first event for org-less journals instead of the org carrier.
+    let org_empty = org.is_empty();
     if !org.is_empty() {
         let carrier = events.iter_mut().find(|event| event.role == "session_meta");
         // rm-1553: the cap disclosure rides the same carrier — an
@@ -5902,6 +5927,14 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         .entry("org_identity_truncated".to_string())
                         .or_insert(0) += 1;
                 }
+                if model_identity_truncated {
+                    // rm-1958: disclose the model cap under the lane
+                    // key the session_from_events backstop uses.
+                    *meta
+                        .disclosure_counters
+                        .entry("model_identity_truncated:claude_code".to_string())
+                        .or_insert(0) += 1;
+                }
             }
             None => {
                 let mut counters = BTreeMap::new();
@@ -5909,6 +5942,9 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 seed_truncation_counters(&mut counters);
                 if org_identity_truncated {
                     counters.insert("org_identity_truncated".to_string(), 1);
+                }
+                if model_identity_truncated {
+                    counters.insert("model_identity_truncated:claude_code".to_string(), 1);
                 }
                 events.insert(
                     0,
@@ -5922,6 +5958,18 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     },
                 );
             }
+        }
+    }
+    // rm-1958: the model-cap disclosure must not depend on an org
+    // identity being present — org-less journals (the common case)
+    // mint the counter on the first event instead, same
+    // once-per-session discipline as the export lanes.
+    if model_identity_truncated && org_empty {
+        if let Some(first) = events.first_mut() {
+            *first
+                .disclosure_counters
+                .entry("model_identity_truncated:claude_code".to_string())
+                .or_insert(0) += 1;
         }
     }
 
@@ -6211,8 +6259,12 @@ fn parse_kimi_value(value: &Value) -> Option<Vec<Event>> {
     if !doc.contains_key("messages") || !doc.contains_key("model") {
         return None;
     }
-    // rm-1958: journal-controlled export model — bounded at capture.
-    let model = cap_model_identity(&string(doc.get("model")).unwrap_or("unknown")).0;
+    // rm-1958: journal-controlled export model — bounded at capture,
+    // with the truncation flag riding the meta event below (the
+    // session_from_events backstop only ever sees the already-capped
+    // value, so the capture site owns the disclosure).
+    let (model, model_truncated) =
+        cap_model_identity(string(doc.get("model")).unwrap_or("unknown"));
     let mut events = Vec::new();
     // rm-616 (upstream #312 port): exports that carry BOTH a top-level
     // `usage` and `metadata.usage` mirror the same counters — counting
@@ -6224,13 +6276,20 @@ fn parse_kimi_value(value: &Value) -> Option<Vec<Event>> {
             .and_then(|metadata| metadata.get("usage"))
             .and_then(usage_from_value)
     }) {
-        events.push(Event {
+        let mut meta = Event {
             role: "meta".to_string(),
             usage,
             model_used: model.clone(),
             source_tool: "kimi_cli".to_string(),
             ..Event::default()
-        });
+        };
+        if model_truncated {
+            *meta
+                .disclosure_counters
+                .entry("model_identity_truncated:kimi_cli".to_string())
+                .or_insert(0) += 1;
+        }
+        events.push(meta);
     }
     for message in doc.get("messages")?.as_array()? {
         let Some(message) = message.as_object() else {
@@ -6244,13 +6303,24 @@ fn parse_kimi_value(value: &Value) -> Option<Vec<Event>> {
 fn parse_messages_value(value: &Value, source_tool: &str) -> Option<Vec<Event>> {
     let doc = value.as_object()?;
     let messages = doc.get("messages")?.as_array()?;
-    // rm-1958: journal-controlled export model — bounded at capture.
-    let model = cap_model_identity(&string(doc.get("model")).unwrap_or("unknown")).0;
+    // rm-1958: journal-controlled export model — bounded at capture;
+    // the truncation flag is disclosed on the first event under the
+    // lane key the session_from_events backstop uses.
+    let (model, model_truncated) =
+        cap_model_identity(string(doc.get("model")).unwrap_or("unknown"));
     let mut events = Vec::new();
     for message in messages {
         if let Some(mut event) = event_from_message(message, &model) {
             event.source_tool = source_tool.to_string();
             events.push(event);
+        }
+    }
+    if model_truncated {
+        if let Some(first) = events.first_mut() {
+            *first
+                .disclosure_counters
+                .entry(format!("model_identity_truncated:{source_tool}"))
+                .or_insert(0) += 1;
         }
     }
     non_empty(events)
@@ -12758,6 +12828,74 @@ mod tests {
             .clone();
         assert_eq!(usage["input_tokens"], 7);
         assert_eq!(usage["output_tokens"], 3);
+    }
+
+    #[test]
+    fn kimi_export_hostile_model_is_capped_and_disclosed() {
+        // rm-1958 (run 0e63a73c cycle 1): the kimi export lane caps the
+        // journal-controlled `model` at capture and discloses it under
+        // the lane key the session_from_events backstop would use.
+        // Pinned directly for the same dispatch-order reason as the
+        // rm-616 test above (the gemini value probe runs first in the
+        // full dispatcher).
+        let hostile = "K".repeat(200 * 1024);
+        let value = serde_json::json!({
+            "model": hostile,
+            "messages": [{"role": "user", "content": "hi", "timestamp": "2026-10-01T10:00:00Z"}],
+            "usage": {"input_other": 100, "output": 40}
+        });
+        let events = parse_kimi_value(&value).expect("kimi session value recognized");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "meta")
+            .expect("usage meta event");
+        assert!(
+            meta.model_used.chars().count() <= 96 + 20,
+            "model label bounded, got {} chars",
+            meta.model_used.chars().count()
+        );
+        assert!(
+            meta.model_used.contains('…') && meta.model_used.contains('#'),
+            "capped form is prefix + … + # + digest"
+        );
+        assert_eq!(
+            meta.disclosure_counters
+                .get("model_identity_truncated:kimi_cli"),
+            Some(&1),
+            "the cap is disclosed under the kimi lane key, once per session"
+        );
+    }
+
+    #[test]
+    fn messages_export_hostile_model_is_capped_and_disclosed() {
+        // rm-1958: the generic messages-export lane (codex_cli et al.)
+        // caps at capture and discloses on the first event under the
+        // lane key it was dispatched with.
+        let hostile = "C".repeat(200 * 1024);
+        let value = serde_json::json!({
+            "model": hostile,
+            "messages": [
+                {"role": "user", "content": "hi", "timestamp": "2026-10-01T10:00:00Z"}
+            ]
+        });
+        let events = parse_messages_value(&value, "codex_cli").expect("messages export recognized");
+        let first = events.first().expect("at least one message event");
+        assert!(
+            first.model_used.chars().count() <= 96 + 20,
+            "model label bounded, got {} chars",
+            first.model_used.chars().count()
+        );
+        assert!(
+            first.model_used.contains('…') && first.model_used.contains('#'),
+            "capped form is prefix + … + # + digest"
+        );
+        assert_eq!(
+            first
+                .disclosure_counters
+                .get("model_identity_truncated:codex_cli"),
+            Some(&1),
+            "the cap is disclosed under the dispatched lane key"
+        );
     }
 
     #[test]

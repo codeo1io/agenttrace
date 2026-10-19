@@ -343,8 +343,7 @@ fn hostile_model_string_is_capped_at_capture_and_backstop() {
 
     // The cap is idempotent: a capped value re-caps to itself, so
     // warm cache rows and re-analysis never double-cap or drift.
-    let (recapped, truncated_again) =
-        agenttrace_core::parser::cap_model_identity(model);
+    let (recapped, truncated_again) = agenttrace_core::cap_model_identity(model);
     assert_eq!(recapped, *model);
     assert!(!truncated_again, "capped form is already within the cap");
 }
@@ -359,11 +358,7 @@ fn sane_model_ids_stay_byte_identical_and_catalog_safe() {
             .expect("vendored pricing snapshot parses");
     let mut max_len = 0usize;
     let mut max_id = String::new();
-    for key in snapshot
-        .as_object()
-        .expect("snapshot is a map")
-        .keys()
-    {
+    for key in snapshot.as_object().expect("snapshot is a map").keys() {
         if key.chars().count() > max_len {
             max_len = key.chars().count();
             max_id = key.clone();
@@ -381,7 +376,7 @@ fn sane_model_ids_stay_byte_identical_and_catalog_safe() {
         "unknown",
         "",
     ] {
-        let (capped, truncated) = agenttrace_core::parser::cap_model_identity(sane);
+        let (capped, truncated) = agenttrace_core::cap_model_identity(sane);
         assert_eq!(capped, sane, "sane ids round-trip byte-identically");
         assert!(!truncated);
     }

@@ -9,8 +9,8 @@ use agenttrace_core::{
     render_test_match, render_waste_report_with_language, report_compare_json,
     report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
-    report_overview_svg_with_context, report_overview_text_with_context, round4,
-    report_search_json_detailed, report_search_text_detailed, report_text_with_language,
+    report_overview_svg_with_context, report_overview_text_with_context,
+    report_search_json_detailed, report_search_text_detailed, report_text_with_language, round4,
     sanitize_line_segment, search_sessions_detailed, session_capability, session_pricing_basis,
     session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
     BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
@@ -2989,6 +2989,22 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
                                 "sum of usage costs the source journal itself recorded (rm-436); those tokens are excluded from the catalog estimate beside it"
                             ),
                         );
+                        // rm-795 divergence arm: the recorded total and the
+                        // catalog estimate measure different token sets,
+                        // so they legitimately differ — but a material
+                        // gap (> $0.005) is machine-relevant and gets its
+                        // own disclosed delta rather than silently
+                        // coexisting with the `cost` field.
+                        let estimated = session.metrics.cost_estimated;
+                        if estimated.is_finite() && (recorded - estimated).abs() > 0.005 {
+                            object.insert(
+                                "storedCostDivergence".to_string(),
+                                serde_json::json!({
+                                    "delta_usd": round4(recorded - estimated),
+                                    "note": "recorded cost differs from the catalog estimate beside it by more than $0.005 (rm-795); the two measure different token sets",
+                                }),
+                            );
+                        }
                     }
                 }
                 row
@@ -3670,24 +3686,37 @@ mod tests {
         // (the rm-1500 null discipline — the accumulation gate upstream
         // already drops them, this keeps the render seam honest if that
         // ever regresses).
-        fn session_with(upstream_cost_usd: f64) -> Session {
+        fn session_with(upstream_cost_usd: f64, cost_estimated: f64) -> Session {
             Session {
-                id: "test-session".to_string(),
+                name: "test-session".to_string(),
+                path: "/tmp/test-session.jsonl".to_string(),
+                cwd: String::new(),
+                branch: String::new(),
+                org: String::new(),
+                org_email: String::new(),
                 metrics: Metrics {
                     upstream_cost_usd,
+                    cost_estimated,
                     ..Metrics::default()
                 },
-                ..Session::default()
+                anomalies: Vec::new(),
+                health: 100,
+                tool_warnings: Vec::new(),
+                diagnostics: agenttrace_core::Diagnostics::default(),
             }
         }
         let out = render_session_list(
-            &[session_with(0.01234), session_with(0.0)],
+            &[
+                session_with(0.01234, 0.0),
+                session_with(0.0, 0.0),
+                session_with(0.0100, 0.0102),
+            ],
             "json",
             10,
         );
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("sessions lane is json");
         let rows = parsed["sessions"].as_array().expect("rows");
-        assert_eq!(rows.len(), 2, "both sessions listed");
+        assert_eq!(rows.len(), 3, "all sessions listed");
         assert_eq!(
             rows[0]["storedCost"].as_f64(),
             Some(0.0123),
@@ -3699,8 +3728,8 @@ mod tests {
             "provenance basis named when storedCost is present"
         );
         assert!(
-            rows[0].get("cost").is_some(),
-            "storedCost lands beside cost, never replacing it"
+            rows[0]["metrics"]["cost_estimated"].is_number(),
+            "storedCost lands beside the catalog estimate (metrics.cost_estimated), never replacing it"
         );
         assert_eq!(
             rows[1]["storedCost"],
@@ -3710,6 +3739,31 @@ mod tests {
         assert!(
             rows[1].get("storedCostBasis").is_none(),
             "no basis string when nothing was recorded"
+        );
+        assert_eq!(
+            rows[0]["storedCostDivergence"]["delta_usd"].as_f64(),
+            Some(0.0123),
+            "material gap (> $0.005) between recorded and estimated cost is disclosed with a signed, round4'd delta"
+        );
+        assert!(
+            rows[0]["storedCostDivergence"]["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rm-795"),
+            "divergence note carries the rm-795 tag"
+        );
+        assert!(
+            rows[1].get("storedCostDivergence").is_none(),
+            "no recorded cost means no divergence arm"
+        );
+        assert!(
+            rows[2].get("storedCostDivergence").is_none(),
+            "sub-threshold divergence (<= $0.005) stays silent"
+        );
+        assert_eq!(
+            rows[2]["storedCost"].as_f64(),
+            Some(0.01),
+            "parity-close recorded cost still exposes storedCost"
         );
     }
 

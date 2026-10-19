@@ -574,7 +574,10 @@ mod tests {
             parent_session: String::new(),
         };
         let out = sessions_csv(&[row]);
-        assert!(out.contains("poisoned"), "the poisoned session stays listed");
+        assert!(
+            out.contains("poisoned"),
+            "the poisoned session stays listed"
+        );
         assert!(
             out.contains(",n/a,") && !out.contains("NaN") && !out.contains("inf"),
             "cost cells render n/a, never NaN/inf: {out}"
@@ -585,7 +588,10 @@ mod tests {
         let mut by_model = BTreeMap::new();
         by_model.insert(
             "claude-3-5-haiku-20241022".to_string(),
-            GroupOverview { sessions: 1, cost: f64::NAN },
+            GroupOverview {
+                sessions: 1,
+                cost: f64::NAN,
+            },
         );
         let overview = Overview {
             total_cost: f64::INFINITY,
