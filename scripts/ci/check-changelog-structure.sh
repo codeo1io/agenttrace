@@ -81,4 +81,30 @@ if grep -q '^## Unreleased' "$changelog"; then
 		fail "Unreleased section is present but carries no entries (rm-1390): a header over zero bullets claims a landing lane that does not exist — land the entries, date the section, or drop the header"
 fi
 
-echo "check-changelog-structure: no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous)"
+# Pass 4 (rm-1992, run e8524e5a cycle 1, batch "deadline + cline truth +
+# ledger hygiene"): the entry-level twin of pass 1. The 2026-10-18 tree
+# passed every pass above while 39 Unreleased Added entries sat VERBATIM
+# TWICE (an order-preserving copy-paste accident INSIDE the single Added
+# block — the `###` kind headings stayed unique, so both the kind lens and
+# the first-per-kind entry lens were structurally satisfied by a section
+# that was full-but-duplicated). Per `## ` section, no two entries may
+# share a first line: a verbatim duplicated block is an accident a human
+# must heal, never a state to carry (release notes read twice are still
+# wrong twice).
+if ! entry_dups="$(awk '
+	/^## / { section = $0; sub(/^## +/, "", section); next }
+	/^- / {
+		key = section "\t" $0
+		if (seen[key]) {
+			printf("  section [%s] entry first at line %d appears again at line %d: %s\n", section, seen[key], NR, substr($0, 1, 72))
+			bad = 1
+		} else {
+			seen[key] = NR
+		}
+	}
+	END { exit bad ? 1 : 0 }
+' "$changelog")"; then
+	fail "duplicate CHANGELOG entries (same first line twice in one section, rm-1992):"$'\n'"$entry_dups"
+fi
+
+echo "check-changelog-structure: no duplicate section kinds; no duplicate entries within any section; first-per-kind Unreleased parse sees all $total entries (non-vacuous)"

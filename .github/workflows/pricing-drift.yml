@@ -75,6 +75,15 @@ jobs:
             echo "mode=bump" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install Rust toolchain (usage-card golden regeneration)
+        if: steps.gate.outputs.mode == 'bump'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          # Same pinned action SHA and toolchain as ci.yml (rm-405 full-SHA
+          # discipline; rust-toolchain.toml agrees), so the golden regeneration
+          # below builds the same shapes CI builds.
+          toolchain: "1.98.1"
+
       - name: Regenerate bundle, bump const, open PR
         if: steps.gate.outputs.mode == 'bump'
         env:
@@ -114,6 +123,26 @@ jobs:
             exit 1
           fi
 
+          # Golden arms (rm-176, run e8524e5a cycle 1, batch "deadline + cline
+          # truth + ledger hygiene"): the three usage-card goldens under
+          # tests/fixtures/svg-card/ byte-pin catalog-derived footer bytes —
+          # `LiteLLM snapshot <date> (bundled); N of M priced models past
+          # vendor deprecation` (svg_card_contract.rs) — so a refresh PR that
+          # staged only the pricing pair would land master's svg_card_contract
+          # suite RED after merge (assess c954461c F2: this workflow had zero
+          # UPDATE_CARD_GOLDEN references). Regenerate the goldens from the
+          # refreshed bundle with the suite's self-regen env and stage whatever
+          # moved; the regen run doubles as verification (golden == card
+          # asserts green immediately after the write), and any build failure
+          # here fails the PR loudly — a stale-golden refresh never merges.
+          UPDATE_CARD_GOLDEN=1 cargo test --locked -p agenttrace-core --test svg_card_contract
+          if git diff --quiet -- crates/agenttrace-core/tests/fixtures/svg-card; then
+            goldens="usage-card goldens unchanged by this refresh (catalog-derived footer bytes did not move)"
+          else
+            git add crates/agenttrace-core/tests/fixtures/svg-card
+            goldens="usage-card goldens regenerated with the refresh (catalog-derived footer bytes moved; UPDATE_CARD_GOLDEN=1)"
+          fi
+
           git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs
           git commit -m "chore(pricing): refresh bundled snapshot to $new_date (pricing-drift gate)"
 
@@ -130,6 +159,7 @@ jobs:
             cat refresh-check.txt
             echo '```'
             echo "Snapshot date: **$new_date**. $counts"
+            echo "$goldens."
             echo
             echo "Note: PRs authored by the default GITHUB_TOKEN do not trigger CI workflows (GitHub limitation); the post-regeneration gate run above is the validation artifact. Removal guard and desync paths never reach this step — they fail the workflow instead."
           } > pr-body.md
