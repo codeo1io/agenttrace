@@ -1989,6 +1989,11 @@ fn parse_claude_transcript_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     content: jsonish(entry.get("tool_output")),
                     timestamp,
                     tool_call_id,
+                    // rm-1958: the flat-claude arm dropped `is_error`, so a
+                    // failing tool result counted as `tool_calls_ok` while
+                    // the nested arm honored the same flag — mirror it so
+                    // both shapes feed the failure fold identically.
+                    is_error: boolish(entry.get("is_error")),
                     source_tool: "claude_code".to_string(),
                     ..Event::default()
                 });
@@ -9690,10 +9695,15 @@ fn apply_cline_metadata_timestamps(events: &mut [Event], metadata: &Map<String, 
 }
 
 fn session_name(path: &Path) -> String {
-    path.file_stem()
+    // rm-1959: `.jsonl.zst` is a compound extension — `file_stem` strips
+    // only the final dot-segment, so `a.jsonl.zst` was named `a.jsonl`.
+    // Strip the documented suffix chain so the session name is the true
+    // stem for both the plain and the zstd-compressed admission shapes.
+    let stem = path
+        .file_stem()
         .and_then(|name| name.to_str())
-        .unwrap_or("session")
-        .to_string()
+        .unwrap_or("session");
+    stem.strip_suffix(".jsonl").unwrap_or(stem).to_string()
 }
 
 #[cfg(test)]
@@ -10607,6 +10617,55 @@ mod tests {
         let usage = meta[0].usage.clone();
         assert_eq!(usage["input_tokens"], 40);
         assert_eq!(usage["output_tokens"], 35);
+    }
+
+    #[test]
+    fn claude_flat_tool_result_honors_is_error() {
+        // rm-1958 (run 0750744d cycle 2, assess 9538968d F3): the flat arm
+        // dropped `is_error`, so a FAILING flat tool result counted as
+        // `tool_calls_ok` while the nested arm honored the same flag. Both
+        // admission shapes must feed the failure fold identically.
+        let flat = concat!(
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"tool_name\":\"Bash\",\"tool_use_id\":\"tu-1\"}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"tool_name\":\"Bash\",\"tool_output\":\"boom\",\"tool_use_id\":\"tu-1\",\"is_error\":true}\n"
+        );
+        let events = parse_claude_transcript_jsonl(&jsonl_objects(flat).collect::<Vec<_>>())
+            .expect("flat claude transcript detected");
+        let results: Vec<&Event> = events.iter().filter(|e| e.role == "tool").collect();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].is_error,
+            "a failing flat tool result carries is_error (pre-fix: counted ok)"
+        );
+
+        // Nested twin of the same failing call — the honored shape.
+        let nested = "{\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu-1\",\"is_error\":true,\"content\":\"boom\"}]}}";
+        let events = parse_claude_code_jsonl(&jsonl_objects(nested).collect::<Vec<_>>())
+            .expect("nested claude rows recognized");
+        let results: Vec<&Event> = events.iter().filter(|e| e.role == "tool").collect();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].is_error,
+            "the nested arm keeps honoring the flag"
+        );
+    }
+
+    #[test]
+    fn session_name_strips_the_compound_zst_suffix() {
+        // rm-1959: `file_stem` strips only the final dot-segment, so
+        // `a.jsonl.zst` was named `a.jsonl`. The name is the true stem for
+        // both admission shapes (plain `.jsonl` unchanged).
+        assert_eq!(
+            session_name(std::path::Path::new(
+                "rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"
+            )),
+            "rollout-2026-10-15-10-00-00-3f2a1b2c"
+        );
+        assert_eq!(
+            session_name(std::path::Path::new("plain-20261015.jsonl")),
+            "plain-20261015"
+        );
+        assert_eq!(session_name(std::path::Path::new("edge.zst")), "edge");
     }
 
     #[test]

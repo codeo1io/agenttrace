@@ -32,6 +32,16 @@ pub struct TranscriptScanSummary {
     pub skipped_oversized: usize,
     pub skipped_non_file: usize,
     pub skipped_budget: usize,
+    /// rm-1872 (residual arm): admitted `.jsonl.zst` rollouts that were
+    /// zstd-decoded and grepped like any plain journal.
+    pub zstd_decoded_files: usize,
+    /// rm-1872 (residual arm): decompressed bytes actually searched for
+    /// zstd rollouts. `scanned_bytes` counts these DECODED bytes for
+    /// compressed files (the budget still charges disk bytes).
+    pub zstd_decoded_bytes: u64,
+    /// rm-1872 (residual arm): zstd frames that failed bounded decode and
+    /// were skipped with a per-row disclosure (never fatal to the scan).
+    pub skipped_decode: usize,
     pub file_byte_cap: u64,
     pub total_byte_budget: u64,
 }
@@ -47,6 +57,9 @@ impl TranscriptScanSummary {
             skipped_oversized: 0,
             skipped_non_file: 0,
             skipped_budget: 0,
+            zstd_decoded_files: 0,
+            zstd_decoded_bytes: 0,
+            skipped_decode: 0,
             file_byte_cap,
             total_byte_budget,
         }
@@ -68,10 +81,17 @@ impl TranscriptScanSummary {
             ("over byte cap", self.skipped_oversized),
             ("non-file", self.skipped_non_file),
             ("read budget exhausted", self.skipped_budget),
+            ("zstd decode failed", self.skipped_decode),
         ] {
             if count > 0 {
                 parts.push(format!("{count} skipped: {label}"));
             }
+        }
+        if self.zstd_decoded_files > 0 {
+            parts.push(format!(
+                "{} zstd-decoded ({} decoded bytes; budget charged on disk bytes)",
+                self.zstd_decoded_files, self.zstd_decoded_bytes
+            ));
         }
         Some(format!(
             "Transcript scan: {}; caps: {} bytes/file, {} bytes total.",
@@ -350,6 +370,9 @@ fn write_transcript_summary_json(out: &mut String, scan: &TranscriptScanSummary)
         ("skipped_oversized", scan.skipped_oversized.to_string()),
         ("skipped_non_file", scan.skipped_non_file.to_string()),
         ("skipped_budget", scan.skipped_budget.to_string()),
+        ("zstd_decoded_files", scan.zstd_decoded_files.to_string()),
+        ("zstd_decoded_bytes", scan.zstd_decoded_bytes.to_string()),
+        ("skipped_decode", scan.skipped_decode.to_string()),
         ("file_byte_cap", scan.file_byte_cap.to_string()),
         ("total_byte_budget", scan.total_byte_budget.to_string()),
     ];
@@ -556,10 +579,54 @@ fn transcript_evidence(
     let read = bytes.len() as u64;
     *budget_left -= read;
     scan.scanned_files += 1;
-    scan.scanned_bytes += read;
+
+    // rm-1872 (residual arm): admitted `.jsonl.zst` rollouts are zstd
+    // frames — grepping the raw bytes certified a scan that could never
+    // match, because the needle lives inside the compressed stream. Sniff
+    // the frame magic and ride the SAME bounded decoder as the parser lane
+    // (one cap, one refusal wording). The budget charges disk bytes
+    // (compressed); `scanned_bytes` certifies DECODED bytes, which is what
+    // was actually searched. A frame that fails bounded decode is skipped
+    // with a per-row disclosure — never fatal, the metadata lanes stand.
+    let search_bytes: &[u8] = if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        match crate::parser::decode_zstd_rollout_bounded(bytes, path) {
+            Ok(decoded) => {
+                let decoded_len = decoded.len() as u64;
+                scan.scanned_bytes += decoded_len;
+                scan.zstd_decoded_files += 1;
+                scan.zstd_decoded_bytes += decoded_len;
+                let footer =
+                    format!("scanned ({decoded_len} bytes decoded from {read} compressed)");
+                // Lossy decode mirrors the plain arm: a torn multibyte
+                // tail must not abort the scan.
+                let content = String::from_utf8_lossy(&decoded);
+                return (collect_snippets(&content, query), footer);
+            }
+            Err(decode_error) => {
+                scan.skipped_decode += 1;
+                return (
+                    Vec::new(),
+                    format!("skipped: zstd decode failed ({decode_error})"),
+                );
+            }
+        }
+    } else {
+        scan.scanned_bytes += read;
+        &bytes
+    };
 
     // Lossy decode: a torn multibyte tail must not abort the scan.
-    let content = String::from_utf8_lossy(&bytes);
+    let content = String::from_utf8_lossy(search_bytes);
+    (
+        collect_snippets(&content, query),
+        format!("scanned ({read} bytes)"),
+    )
+}
+
+/// Line scanner shared by the plain and zstd-decoded arms: up to
+/// `TRANSCRIPT_MATCHES_PER_SESSION` `…window…` snippets around the first
+/// case-insensitive hits of `query`.
+fn collect_snippets(content: &str, query: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in content.lines() {
         if out.len() >= TRANSCRIPT_MATCHES_PER_SESSION {
@@ -569,7 +636,7 @@ fn transcript_evidence(
             out.push(format!("transcript: {snippet}"));
         }
     }
-    (out, format!("scanned ({read} bytes)"))
+    out
 }
 
 /// A `…window…` snippet centered on the first case-insensitive hit of
@@ -603,6 +670,107 @@ fn snippet_around(line: &str, query: &str, width: usize) -> Option<String> {
 mod tests {
     use super::*;
     use crate::{Metrics, Session};
+
+    #[test]
+    fn transcript_scan_searches_inside_zstd_rollouts() {
+        // rm-1872 residual arm (run 0750744d cycle 2, assess 9538968d F1):
+        // admission (rm-992) let `.jsonl.zst` rollouts into the corpus, but
+        // the scan grepped RAW bytes — a needle inside the compressed
+        // stream returned zero matches while the footer still certified
+        // the file scanned, charging COMPRESSED bytes. The scan now rides
+        // the same bounded decoder as the parser lane: matches inside the
+        // decoded content, `scanned_bytes` counted DECODED, the footer
+        // disclosing the decode, and the budget charging disk bytes.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst");
+        let compressed_len = std::fs::metadata(&path).unwrap().len();
+        let mut scan = TranscriptScanSummary::new(64 * 1024 * 1024, 256 * 1024 * 1024);
+        let mut budget = 256u64 * 1024 * 1024;
+        let (hits, footer) = transcript_evidence(
+            &path.to_string_lossy(),
+            "parser regression",
+            64 * 1024 * 1024,
+            &mut budget,
+            &mut scan,
+        );
+        assert!(
+            !hits.is_empty(),
+            "the needle lives inside the compressed stream"
+        );
+        assert!(
+            footer.contains("bytes decoded from"),
+            "footer discloses the decode: {footer}"
+        );
+        assert_eq!(scan.zstd_decoded_files, 1);
+        assert!(scan.zstd_decoded_bytes > compressed_len);
+        assert_eq!(
+            scan.scanned_bytes, scan.zstd_decoded_bytes,
+            "scanned_bytes certifies DECODED bytes for compressed rollouts"
+        );
+        assert_eq!(scan.skipped_decode, 0);
+        assert_eq!(
+            budget,
+            256 * 1024 * 1024 - compressed_len,
+            "the budget charges DISK (compressed) bytes"
+        );
+    }
+
+    #[test]
+    fn transcript_scan_discloses_zstd_decode_failures() {
+        // rm-1872 residual arm: a zstd frame that fails bounded decode is
+        // skipped with a per-row disclosure and a `skipped_decode` counter
+        // — never fatal to the scan (the metadata lanes stand).
+        let dir = std::env::temp_dir().join("agenttrace-search-zst-broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("broken-rollout.jsonl.zst");
+        let mut frame = vec![0x28u8, 0xB5, 0x2F, 0xFD];
+        frame.extend_from_slice(b"not a real frame body");
+        std::fs::write(&path, &frame).unwrap();
+        let mut scan = TranscriptScanSummary::new(64 * 1024 * 1024, 256 * 1024 * 1024);
+        let mut budget = 256u64 * 1024 * 1024;
+        let (hits, footer) = transcript_evidence(
+            &path.to_string_lossy(),
+            "needle",
+            64 * 1024 * 1024,
+            &mut budget,
+            &mut scan,
+        );
+        assert!(hits.is_empty());
+        assert!(
+            footer.starts_with("skipped: zstd decode failed"),
+            "per-row disclosure: {footer}"
+        );
+        assert_eq!(scan.skipped_decode, 1);
+        assert_eq!(scan.zstd_decoded_files, 0);
+        assert_eq!(scan.scanned_files, 1, "the file was opened and charged");
+    }
+
+    #[test]
+    fn transcript_scan_plain_files_keep_raw_byte_accounting() {
+        // Plain journals are pinned byte-for-byte against the rm-1872 arm:
+        // unchanged footer wording, raw-byte accounting, zero zstd
+        // counters.
+        let dir = std::env::temp_dir().join("agenttrace-search-plain");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plain-session.jsonl");
+        let body = "{\"type\":\"user\",\"content\":\"find the PLAINNEEDLE here\"}\n";
+        std::fs::write(&path, body).unwrap();
+        let mut scan = TranscriptScanSummary::new(64 * 1024 * 1024, 256 * 1024 * 1024);
+        let mut budget = 256u64 * 1024 * 1024;
+        let (hits, footer) = transcript_evidence(
+            &path.to_string_lossy(),
+            "plainneedle",
+            64 * 1024 * 1024,
+            &mut budget,
+            &mut scan,
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(footer, format!("scanned ({} bytes)", body.len()));
+        assert_eq!(scan.scanned_bytes, body.len() as u64);
+        assert_eq!(scan.zstd_decoded_files, 0);
+        assert_eq!(scan.zstd_decoded_bytes, 0);
+        assert_eq!(scan.skipped_decode, 0);
+    }
 
     #[test]
     fn search_evidence_uses_go_labels_dedupes_and_caps_matches() {

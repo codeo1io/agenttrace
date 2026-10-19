@@ -957,6 +957,14 @@
 
 ### Fixed
 
+- **Search now sees inside admitted `.jsonl.zst` rollouts (rm-1872 residual, run 0750744d cycle 2, assess 9538968d F1).** The compressed-rollout admission gate (rm-992) landed without a matching search arm, so `--search` grepped raw bytes and silently returned zero hits inside compressed rollouts while the transcript-scan footer still certified the file as scanned — charging COMPRESSED bytes as if they were content. Search now magic-sniffs zstd frames (`28 B5 2F FD`) and rides the same bounded decoder as the parsing lane (`FILE_READ_CAP` + `MAX_DECODED_BYTES` caps preserved, loud refusal beyond them): matches are found inside decoded content, the footer reads `scanned (N bytes decoded from M compressed)` and the JSON report adds `zstd_decoded_files` / `zstd_decoded_bytes` counters; a torn or oversized frame is disclosed as `skipped: zstd decode failed …` with a `skipped_decode` counter instead of a silent zero. The budget still charges DISK bytes; `scanned_bytes` now certifies DECODED bytes. Plain `.jsonl` scanning is byte-identical to before (wording, accounting, and the prior skip disclosures are pinned by the search transcript contract suite).
+
+- **Cold `--quota` no longer panics on past-extreme timestamps (rm-1957, run 0750744d cycle 2, assess 9538968d F2).** A hostile corpus containing the naive Z-less form `-262143-01-01T00:00:00` pinned the window cutoff at chrono's floor, where `cutoff - span` overflowed `DateTime` arithmetic and aborted the whole cold `--quota` lane with rc 101 (a warm cache masked the panic). The window start is now computed with `checked_sub_signed` and saturates at `DateTime::<Utc>::MIN_UTC`: the rendered `start` IS the disclosure (it shows the floor date the window actually spans from), and the lane renders an honest report for hostile corpora instead of crashing.
+
+- **Flat Claude-Code `tool_result` events now honor `is_error` (rm-1958, run 0750744d cycle 2, assess 9538968d F3).** The flat shape (top-level `"type":"tool_result"`) dropped the flag, so a FAILING flat tool result counted as `tool_calls_ok` while the nested message-block shape honored the same flag — understating failure rates and starving governance's fail-rate triggers. Both shapes now feed the failure fold identically (pinned by a paired flat/nested fixture asserting `tool_calls_fail = 1` / `tool_calls_ok = 0` in both).
+
+- **`.jsonl.zst` session names no longer keep a stray `.jsonl` (rm-1959, run 0750744d cycle 2).** `file_stem` strips only the final dot-segment, so `rollout-….jsonl.zst` was named `rollout-….jsonl`; the name is now the true stem for both admission shapes (`edge.zst` and `plain.jsonl` alike), keeping display, diff, and twin-detection lanes unambiguous.
+
 - Non-finite cost folds are gated across the aggregate census (rm-1500,
   run e4209f0c cycle 5, extended by the independent-review fix round): the
   cycle's first pass closed the three band-pinned folds — the cost-audit

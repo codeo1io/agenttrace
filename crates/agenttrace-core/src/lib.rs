@@ -3198,7 +3198,15 @@ fn quota_window(
     cutoff: DateTime<Utc>,
     span: chrono::Duration,
 ) -> QuotaWindow {
-    let start = cutoff - span;
+    // rm-1957: a hostile corpus can pin the cutoff at chrono's floor (the
+    // naive Z-less intake arm accepts `-262143-01-01T00:00:00`), where
+    // `cutoff - span` overflowed DateTime arithmetic and panicked the whole
+    // cold `--quota` lane (rc 101). Saturate the window start at `MIN_UTC`
+    // instead — the rendered `start` IS the disclosure: it shows the floor
+    // date the window actually spans from, never a crash.
+    let start = cutoff
+        .checked_sub_signed(span)
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
     let mut spend_usd = 0.0;
     let mut sessions_contributing = 0;
     for session in sessions {
@@ -5360,6 +5368,30 @@ mod quota_tests {
             err.to_string().contains("-f text and -f json only"),
             "format guard names the supported lanes: {err}"
         );
+    }
+
+    #[test]
+    fn quota_window_saturates_past_extreme_cutoffs() {
+        // rm-1957 (run 0750744d cycle 2, assess 9538968d F2): the naive
+        // Z-less intake arm accepts `-262143-01-01T00:00:00`, pinning the
+        // corpus cutoff at chrono's floor. `cutoff - span` then overflowed
+        // DateTime arithmetic and panicked the whole cold `--quota` lane
+        // (rc 101, pre-fix lib.rs:3201). The window start now saturates at
+        // MIN_UTC: the rendered `window_start_utc` IS the disclosure — it
+        // shows the floor date the window actually spans from — and the
+        // lane renders a report instead of crashing.
+        let sessions = vec![quota_session(
+            "hostile-past",
+            &["-262143-01-01T00:00:00", "-262143-01-01T00:00:00"],
+            0.0,
+        )];
+        let report = quota_report(&sessions);
+        for key in ["five_hour", "weekly"] {
+            assert_eq!(
+                report[key]["window_start_utc"], "-262143-01-01T00:00:00Z",
+                "{key} start saturates at the chrono floor instead of panicking"
+            );
+        }
     }
 
     #[test]

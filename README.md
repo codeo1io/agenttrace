@@ -547,7 +547,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--version` |  | Print the version banner and exit 0; wins over action validation |
 | `--demo` |  | Use the built-in demo corpus instead of discovered agent homes (stable epoch-anchored sessions) |
 | `--doctor` |  | Run environment self-checks (config paths, cache consistency, agent homes) and exit non-zero on failure |
-| `--search <SEARCH>` |  | Full-text search across discovered session transcripts for this query (blank or whitespace-only queries are rejected with a usage error — an empty query matches nothing and is far more likely an unquoted accident than a search) |
+| `--search <SEARCH>` |  | Full-text search across discovered session transcripts for this query (blank or whitespace-only queries are rejected with a usage error — an empty query matches nothing and is far more likely an unquoted accident than a search). Compressed `.jsonl.zst` rollouts are zstd-decoded before scanning with the same bounded decoder and caps as the parser lane: the read budget charges DISK bytes, `scanned_bytes` certifies DECODED bytes, and the scan summary discloses `zstd_decoded_files` / `zstd_decoded_bytes` plus a `skipped_decode` counter for frames that fail bounded decode (rm-1872) |
 | `--search-limit <SEARCH_LIMIT>` | `20` | Cap the number of `--search` hits reported (default 20) |
 | `--fail-under-health <FAIL_UNDER_HEALTH>` | `0` | CI gate: exit non-zero when corpus health drops below this score (0 disables the gate) |
 | `--fail-on-critical` |  | CI gate: exit non-zero when any critical-severity finding exists |
