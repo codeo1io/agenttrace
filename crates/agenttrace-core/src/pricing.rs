@@ -18,7 +18,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-19";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -535,6 +535,26 @@ pub fn bundled_snapshot_model_count() -> usize {
                     .map(|models| models as usize)
             })
             .unwrap_or(0)
+    })
+}
+
+/// rm-176 (cycle-3 reconcile): the exact upstream BerriAI/litellm
+/// commit the bundled catalog IS. The date alone is ambiguous at 3+
+/// upstream catalog commits per day, so drift triage and censuses pin
+/// against this instead. Empty when a legacy bundle predates the
+/// stamp (the first carry is 748c973f421f807f6b26682d5835d3fcb3ce344b,
+/// the 2026-10-19 reconcile).
+pub fn bundled_snapshot_source_commit() -> &'static str {
+    static COMMIT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    COMMIT.get_or_init(|| {
+        serde_json::from_str::<serde_json::Value>(PRICING_SNAPSHOT_JSON)
+            .ok()
+            .and_then(|value| {
+                value["_snapshot"]["source_commit"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
     })
 }
 

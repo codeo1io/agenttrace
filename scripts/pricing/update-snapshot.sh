@@ -50,7 +50,13 @@ it rewrites a tracked file.
 
 Environment overrides:
     LITELLM_SNAPSHOT_SRC  path to a captured LiteLLM catalog file; refreshes
-                          offline from it instead of fetching
+                          offline from it instead of fetching (REQUIRES
+                          LITELLM_SNAPSHOT_COMMIT so the stamped provenance
+                          names the exact commit the captured file is)
+    LITELLM_SNAPSHOT_COMMIT  upstream BerriAI/litellm commit stamped into
+                          _snapshot.source_commit; with a live fetch it is
+                          resolved automatically (file-tip commit via gh,
+                          branch tip via git ls-remote as a fallback)
     SNAPSHOT_DATE         date stamped into _snapshot.date and compared
                           against manual-drop notes (default: today UTC)
 
@@ -85,12 +91,49 @@ else
     echo "refresh source: $url (live fetch)"
 fi
 
-python3 - "$tmp" "$out" "$date" "$drops" <<'EOF'
+# rm-176 (cycle-3 reconcile): provenance is the COMMIT, not just the
+# date — upstream lands 3+ catalog commits on some days, so a date-only
+# stamp cannot name which catalog a bundle actually came from.
+# Discipline: a captured file (LITELLM_SNAPSHOT_SRC) must come with an
+# explicit LITELLM_SNAPSHOT_COMMIT (the operator states which commit
+# the bytes are — a freshly-resolved tip could have moved past the
+# capture); a live fetch resolves the file-tip commit of
+# model_prices_and_context_window.json via gh, falling back to the
+# branch tip. Unresolvable provenance REFUSES the refresh (fail-closed):
+# an unauditable bundle is exactly what the drift gate exists to stop.
+commit="${LITELLM_SNAPSHOT_COMMIT:-}"
+if [[ -n "$src" && -z "$commit" ]]; then
+    echo "REFUSED: offline refresh from a captured file requires" >&2
+    echo "  LITELLM_SNAPSHOT_COMMIT=<sha> naming the commit the capture is" >&2
+    echo "  (resolve with: gh api 'repos/BerriAI/litellm/commits?path=model_prices_and_context_window.json&per_page=1')" >&2
+    exit 1
+fi
+if [[ -z "$commit" ]]; then
+    commit="$(gh api 'repos/BerriAI/litellm/commits?path=model_prices_and_context_window.json&per_page=1' \
+        --jq '.[0].sha' 2>/dev/null || true)"
+fi
+if [[ -z "$commit" ]]; then
+    commit="$(git ls-remote https://github.com/BerriAI/litellm main 2>/dev/null | cut -f1)"
+fi
+if [[ -z "$commit" ]]; then
+    echo "REFUSED: could not resolve the upstream LiteLLM commit for provenance;" >&2
+    echo "  pass LITELLM_SNAPSHOT_COMMIT=<sha> explicitly" >&2
+    exit 1
+fi
+echo "refresh provenance: BerriAI/litellm@${commit:0:12}"
+
+python3 - "$tmp" "$out" "$date" "$drops" "$commit" <<'EOF'
 import json
 import os
 import sys
 
-src, dst, date, drops_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+src, dst, date, drops_path, commit = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3],
+    sys.argv[4],
+    sys.argv[5],
+)
 
 RATE_FIELDS = (
     "input_cost_per_token",
@@ -310,6 +353,12 @@ snapshot = {
         "source": "BerriAI/litellm model_prices_and_context_window.json",
         "date": date,
         "models": len(merged),
+        # rm-176 cycle-3 reconcile: the exact upstream commit this
+        # catalog IS — the date alone is ambiguous at 3+ upstream
+        # catalog commits per day, so drift triage and future censuses
+        # diff against this pin (pricing.rs surfaces it via
+        # bundled_snapshot_source_commit / doctor).
+        "source_commit": commit,
         # Keys that survived ONLY through the never-drop union: upstream
         # no longer prices them, the committed bundle did. rm-588.
         "retained_from_previous": retained,

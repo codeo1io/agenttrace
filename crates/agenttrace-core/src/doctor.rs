@@ -576,10 +576,17 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         directories,
         statusline: doctor_statusline_report(demo),
         pricing: format!(
-            "LiteLLM snapshot {} (bundled, {} models, {})",
+            "LiteLLM snapshot {} (bundled, {} models, {}, @{})",
             crate::pricing::bundled_snapshot_date(),
             crate::pricing::bundled_snapshot_model_count(),
-            snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1))
+            snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1)),
+            // rm-176 cycle-3: provenance is the commit, not just the
+            // date — upstream lands 3+ catalog commits some days, and
+            // the doctor lane is where a human checks which catalog
+            // they are actually paying from. Short form (12 hex) for
+            // the line; the full 40-hex pin lives in the bundle's
+            // `_snapshot.source_commit`.
+            short_source_commit()
         ) + &doctor_deprecation_suffix(),
         sqlite_read_failures: sqlite_ingest.unreadable,
         recommendations: Vec::new(),
@@ -821,6 +828,18 @@ fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session
             );
         }
     }
+}
+
+/// rm-176 cycle-3: 12-hex short form of the bundled catalog's upstream
+/// commit for the doctor pricing line ("unpinned" only for a legacy
+/// bundle that predates the `source_commit` stamp — nothing currently
+/// checked in does).
+fn short_source_commit() -> String {
+    let commit = crate::pricing::bundled_snapshot_source_commit();
+    if commit.is_empty() {
+        return "unpinned".to_string();
+    }
+    commit.chars().take(12).collect()
 }
 
 /// Snapshot age with singular/plural grammar (rm-512): the bundled
