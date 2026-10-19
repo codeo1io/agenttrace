@@ -3188,7 +3188,14 @@ fn quota_window(
     cutoff: DateTime<Utc>,
     span: chrono::Duration,
 ) -> QuotaWindow {
-    let start = cutoff - span;
+    // rm-2031 (run e40a66d3 cycle 6): a past-extreme event timestamp
+    // puts `cutoff` at the very floor of the chrono range and the plain
+    // subtraction overflowed (`DateTime - TimeDelta overflowed`, a panic
+    // on a 94-byte hostile journal). Saturate at MIN_UTC instead: the
+    // window starts at the floor and renders — never crashes the lane.
+    let start = cutoff
+        .checked_sub_signed(span)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
     let mut spend_usd = 0.0;
     let mut sessions_contributing = 0;
     for session in sessions {
@@ -5411,6 +5418,24 @@ mod quota_tests {
             text.contains("no session carries placeable time"),
             "fully future corpus renders the undefined-cutoff lane: {text}"
         );
+    }
+
+    #[test]
+    fn quota_extreme_event_timestamps_never_panic() {
+        // rm-2031 (run e40a66d3 cycle 6; red-first at f0649493: a
+        // past-extreme event anchor put `cutoff` at the chrono floor and
+        // `cutoff - span` panicked `DateTime - TimeDelta overflowed`
+        // on a 94-byte journal). Both extremes and both window spans
+        // must render — window math saturates at the floor, the lane
+        // never crashes.
+        for stamp in ["-262143-01-01T00:00:00", "+262143-12-31T23:59:59.999"] {
+            let sessions = vec![quota_session(stamp, &[], 1.0)];
+            let report = quota_report(&sessions);
+            // The window (if any) renders finite money, never a panic —
+            // and the JSON itself stays serializable.
+            let text = serde_json::to_string(&report).expect("quota JSON renders");
+            assert!(!text.is_empty());
+        }
     }
 
     #[test]

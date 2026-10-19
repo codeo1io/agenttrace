@@ -71,6 +71,11 @@ pub struct ModelCostAudit {
     /// Thinking-token share of billed output tokens (0-100), only when
     /// the source reports a separate thinking count (pass-9 CU-20).
     pub reasoning_share_pct: Option<f64>,
+    /// rm-1500 residual (run e40a66d3 cycle 6): sessions excluded from
+    /// `stored_estimated_cost_usd` for a non-finite cost estimate.
+    /// Absent when zero — zero output-byte drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_finite_sessions: Option<usize>,
     pub rates_per_million_usd: Option<PriceBreakdown>,
     pub component_cost_usd: Option<PriceBreakdown>,
     pub estimated_cost_usd: Option<f64>,
@@ -350,6 +355,11 @@ pub struct ContextTrendTotals {
     pub cache_effectiveness_pct: f64,
     pub read_to_write_ratio: f64,
     pub output_cost_per_million_tokens: f64,
+    /// rm-1500 residual (run e40a66d3 cycle 6): sessions excluded from
+    /// the dollar basis of `output_cost_per_million_tokens` for a
+    /// non-finite cost estimate. Absent when zero — zero output-byte drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_finite_cost_sessions: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -361,6 +371,9 @@ pub struct ProjectContextTrend {
     pub repeated_file_reads: usize,
     pub read_to_write_ratio: f64,
     pub output_cost_per_million_tokens: f64,
+    /// rm-1500 residual (run e40a66d3 cycle 6): as `ContextTrendTotals`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_finite_cost_sessions: Option<usize>,
 }
 
 #[derive(Default)]
@@ -373,6 +386,9 @@ struct ContextAggregate {
     input: i64,
     output: i64,
     cost: f64,
+    /// rm-1500 residual (run e40a66d3 cycle 6): excluded non-finite
+    /// cost sessions — see `Aggregate::non_finite_sessions`.
+    non_finite_sessions: usize,
     reads: usize,
     writes: usize,
     files: BTreeMap<String, usize>,
@@ -417,6 +433,11 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         sessions: usize,
         tokens: TokenBreakdown,
         cost: f64,
+        /// rm-1500 residual (run e40a66d3 cycle 6): sessions excluded
+        /// from `cost` because their estimate is non-finite — the row's
+        /// dollars must never read NaN/inf, and the exclusion must be
+        /// countable, not silent.
+        non_finite_sessions: usize,
         /// rm-578: some session in the row carries recorded dollars
         /// without their token split (rows written before the rm-520
         /// schema bump, or any other lossy path, drop the counters) —
@@ -497,7 +518,14 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .cache_read
             .saturating_add(session.metrics.tokens_cache_r);
         row.tokens.total = row.tokens.total.saturating_add(total_tokens(session));
-        row.cost += session.metrics.cost_estimated;
+        if session.metrics.cost_estimated.is_finite() {
+            row.cost += session.metrics.cost_estimated;
+        } else {
+            // rm-1500 residual: skip-while-counting, the rule the
+            // overview folds landed — a poisoned estimate must not
+            // poison the audit row's dollars.
+            row.non_finite_sessions += 1;
+        }
         // rm-520: carry each session's rm-436 recorded-cost basis into
         // the row so the drift comparison prices recorded classes
         // exactly once instead of re-estimating them at catalog rates.
@@ -662,6 +690,17 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 row.recorded.usd,
                 !row.split_lost,
             );
+            // rm-1500 residual (run e40a66d3 cycle 6): the row's stored
+            // estimate excludes poisoned sessions — say so on the row
+            // itself, not just in the machine field.
+            let pricing_note = if row.non_finite_sessions > 0 {
+                format!(
+                    "{pricing_note}; {} session(s) excluded for a non-finite cost estimate",
+                    row.non_finite_sessions
+                )
+            } else {
+                pricing_note
+            };
             // rm-570 (run e88f2da2 cycle 3, review 9af53c3f F1): name
             // the recorded/estimate-only split on every row that
             // carries vendor-recorded dollars — how many sessions
@@ -727,6 +766,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 sessions: row.sessions,
                 tokens: row.tokens,
                 reasoning_share_pct,
+                non_finite_sessions: (row.non_finite_sessions > 0).then_some(row.non_finite_sessions),
                 rates_per_million_usd,
                 component_cost_usd,
                 estimated_cost_usd,
@@ -741,10 +781,15 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             }
         })
         .collect::<Vec<_>>();
+    // rm-1500 residual (run e40a66d3 cycle 6): the corpus total folds
+    // the same guarded basis as the rows — poisoned sessions are
+    // excluded here too (disclosed per-row via non_finite_sessions,
+    // so the total needs no separate counter).
     let stored_estimated_cost_usd = round4(
         sessions
             .iter()
             .map(|session| session.metrics.cost_estimated)
+            .filter(|cost| cost.is_finite())
             .sum(),
     );
     let current_estimated_cost_usd = by_provider_model
@@ -1164,6 +1209,8 @@ pub fn context_trends(sessions: &[Session]) -> ContextTrend {
                 .sum(),
             read_to_write_ratio: ratio(value.reads, value.writes),
             output_cost_per_million_tokens: per_million_output_cost(&value),
+            non_finite_cost_sessions: (value.non_finite_sessions > 0)
+                .then_some(value.non_finite_sessions),
         })
         .collect::<Vec<_>>();
     projects.sort_by(|left, right| {
@@ -1611,7 +1658,13 @@ fn add_context_session(aggregate: &mut ContextAggregate, session: &Session) {
     aggregate.output = aggregate
         .output
         .saturating_add(session.metrics.tokens_output);
-    aggregate.cost += session.metrics.cost_estimated;
+    if session.metrics.cost_estimated.is_finite() {
+        aggregate.cost += session.metrics.cost_estimated;
+    } else {
+        // rm-1500 residual: the context totals fold skips a poisoned
+        // estimate and counts the exclusion.
+        aggregate.non_finite_sessions += 1;
+    }
     aggregate.reads += session
         .metrics
         .tool_usage
@@ -1646,6 +1699,8 @@ fn context_totals(value: &ContextAggregate) -> ContextTrendTotals {
         ),
         read_to_write_ratio: ratio(value.reads, value.writes),
         output_cost_per_million_tokens: per_million_output_cost(value),
+        non_finite_cost_sessions: (value.non_finite_sessions > 0)
+            .then_some(value.non_finite_sessions),
     }
 }
 

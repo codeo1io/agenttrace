@@ -41,7 +41,11 @@ order BEFORE redoing anything:
    turned out to be the *prior* phase's gate fix, not the dead attempt's).
 4. **Adopt only after re-verifying every load-bearing claim** in the found work
    against surviving typed artifacts and read-only repo checks — a truncated
-   turn wrote its text before dying, and nobody reviewed it.
+   turn wrote its text before dying, and nobody reviewed it. For a code delta
+   this includes two hard gates a file-list census cannot substitute for:
+   **COMPILE the tree** (a reaped author may never have compiled what it wrote)
+   and **MAP every acceptance clause to landed behavior** (an implemented-looking
+   arm may satisfy only some of the classes the acceptance names).
 
 ## Case (repository-maintenance 4f9d9268, cycle 1, 2026-10-14/15)
 
@@ -63,3 +67,23 @@ recorded in-band and in
 The asymmetric costs drive the rule: redoing adoptable work wastes the dead
 turn's entire output; adopting unverified work launders its errors into the
 repository's most durable artifact — the wall.
+
+## Case (repository-maintenance 71aba0acc95c40c78adfd424f5b359f2, cycle 6, 2026-10-18/19)
+
+Three attempts died to provider failures: prioritize 3dee432b (15 messages,
+lifecycle-only — nothing durable, redone from scratch), implement 448da7a8
+(~19 messages — its work survived as the uncommitted 13-path tree delta), and
+compound 5f85cfd9 (16 messages — envelope absent, no scratch, tree untouched:
+zero durable, redone). The implement adoption is the instructive one: the
+delta matched the batch file set exactly and read complete, but the
+hunk-by-hunk audit plus a compile found it had NEVER COMPILED (a struct-literal
+error sat in the cost_non_finite_contract tests) and its telemetry disclosure
+covered only 3 of the 5 skip classes the batch acceptance named — invisible to
+a presence check, fatal to a batch titled "no invisible skips". Completion
+(567e6c1c) fixed both and added the missing red pin; the compound band records
+the adoption provenance in-roadmap
+(docs/stewardship/2026-10-19-cycle6-compound-record-rune40a66d3.md). Companion
+prose rule from the same cycle: roadmap/rider text must never spell a literal
+bracket-parenthesis link form — the docs gate's own inline-link regex matches it
+as a broken relative target; spell link shapes descriptively and amend in-band
+with a dated note when a defuse lands.

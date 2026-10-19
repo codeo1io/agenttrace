@@ -107,6 +107,11 @@ pub struct CodexReplayAdjustment {
     /// Each also carries a per-session
     /// `codex_multiagent_reconcile_skipped_unreadable` disclosure.
     pub rollouts_unreadable: usize,
+    /// rm-451 residual (run e40a66d3 cycle 6): rollouts refused for
+    /// exceeding the parse lane's read cap — skipped and disclosed
+    /// distinctly, never slurped whole at reconcile just to be refused
+    /// later at parse.
+    pub rollouts_over_cap: usize,
     /// Families whose members do not ALL carry `task_started` turn
     /// evidence (rm-1949 arm d): left fully counted — over-billed
     /// rather than risked — with a per-child disclosure
@@ -118,6 +123,79 @@ pub struct CodexReplayAdjustment {
     pub tokens_cache_write_dropped: i64,
     pub tokens_output_dropped: i64,
     pub tokens_reasoning_dropped: i64,
+}
+
+impl CodexReplayAdjustment {
+    /// rm-1956 residual (run e40a66d3 cycle 6): one stderr line for the
+    /// CLI disclosure lane summarizing the corpus-level reconcile
+    /// outcome. `None` when every skip counter is zero — a healthy
+    /// corpus keeps its exact historical output bytes.
+    pub fn disclosure_line(&self) -> Option<String> {
+        if self.families_skipped_no_task_started == 0
+            && self.rollouts_unreadable == 0
+            && self.rollouts_over_cap == 0
+            && self.children_skipped_upstream == 0
+            && self.children_below_baseline == 0
+        {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if self.families_skipped_no_task_started > 0 {
+            parts.push(format!(
+                "{} famil{} skipped (no task_started evidence; inline turns kept)",
+                self.families_skipped_no_task_started,
+                if self.families_skipped_no_task_started == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            ));
+        }
+        if self.children_skipped_upstream > 0 {
+            parts.push(format!(
+                "{} child{} skipped (upstream-recorded cost; kept as-priced)",
+                self.children_skipped_upstream,
+                if self.children_skipped_upstream == 1 {
+                    ""
+                } else {
+                    "ren"
+                }
+            ));
+        }
+        if self.children_below_baseline > 0 {
+            parts.push(format!(
+                "{} child{} skipped (below parent baseline; usage kept)",
+                self.children_below_baseline,
+                if self.children_below_baseline == 1 {
+                    ""
+                } else {
+                    "ren"
+                }
+            ));
+        }
+        if self.rollouts_unreadable > 0 {
+            parts.push(format!(
+                "{} rollout{} unreadable at reconcile",
+                self.rollouts_unreadable,
+                if self.rollouts_unreadable == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+        if self.rollouts_over_cap > 0 {
+            parts.push(format!(
+                "{} rollout{} over the read cap",
+                self.rollouts_over_cap,
+                if self.rollouts_over_cap == 1 { "" } else { "s" }
+            ));
+        }
+        Some(format!(
+            "codex multiagent replay reconcile: {}",
+            parts.join("; ")
+        ))
+    }
 }
 
 /// Cumulative `total_token_usage` snapshot of one rollout, per wire field.
@@ -179,6 +257,9 @@ struct RolloutScan {
     /// may still be in the corpus via the cache — the caller discloses
     /// the verification gap loudly instead of silently opting out.
     unreadable: bool,
+    /// rm-451 residual (run e40a66d3 cycle 6): the rollout exceeds the
+    /// parse lane's read cap and was never decoded.
+    over_cap: bool,
     /// Final cumulative `total_token_usage` snapshot (the file's last one).
     total: TotalSnapshot,
     /// First RFC3339 `timestamp` seen on any line of the file — the
@@ -214,17 +295,28 @@ struct RolloutScan {
 /// (rm-1542) instead of yielding an error:
 /// the parser has already failed loudly for that file at parse time, and
 /// reconciliation must never turn one parse-level refusal into a second one.
-fn scan_rollout(path: &Path) -> RolloutScan {
+fn scan_rollout(path: &Path, cap: u64) -> RolloutScan {
     let mut scan = RolloutScan {
         fingerprint: None,
         cwd: None,
         unreadable: false,
+        over_cap: false,
         total: TotalSnapshot::default(),
         first_timestamp: None,
         response_items: 0,
         task_started_seen: false,
     };
-    let Ok(mut raw) = std::fs::read(path) else {
+    // rm-451 residual (run e40a66d3 cycle 6): metadata fast-path first —
+    // an over-cap rollout is refused and disclosed here rather than read
+    // whole just to be refused later at parse. The bounded reader below
+    // re-guards the stat/read race with its own take(cap+1).
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > cap {
+            scan.over_cap = true;
+            return scan;
+        }
+    }
+    let Ok(mut raw) = crate::parser::read_session_file_bounded(path, cap) else {
         // rm-1542: unreadable at reconcile time (missing / chmod-000) —
         // report the gap so the caller can disclose it; a session that
         // only survives via the cache must not silently opt out of the
@@ -417,7 +509,19 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
             stats.rollouts_unreadable += 1;
             continue;
         };
-        let scan = scan_rollout(&path);
+        let scan = scan_rollout(&path, crate::parser::file_read_cap_bytes());
+        // rm-451 residual: over-cap rollouts never decode — the session
+        // keeps its inline turns and the skip is disclosed distinctly.
+        if scan.over_cap {
+            session
+                .metrics
+                .disclosure_counters
+                .entry("codex_multiagent_reconcile_skipped_over_read_cap".to_string())
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
+            stats.rollouts_over_cap += 1;
+            continue;
+        }
         if scan.unreadable {
             note_reconcile_skip(session);
             stats.rollouts_unreadable += 1;
@@ -597,4 +701,61 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
         }
     }
     stats
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::CodexReplayAdjustment;
+
+    #[test]
+    fn disclosure_line_is_none_when_the_reconcile_was_clean() {
+        // rm-1956 residual (run e40a66d3 cycle 6): a healthy corpus keeps
+        // its exact historical stderr bytes — the disclosure is opt-in
+        // by content, never a standing line.
+        let clean = CodexReplayAdjustment {
+            children_adjusted: 12,
+            ..Default::default()
+        };
+        assert!(clean.disclosure_line().is_none());
+    }
+
+    #[test]
+    fn disclosure_line_names_every_skip_class() {
+        let skipped = CodexReplayAdjustment {
+            families_skipped_no_task_started: 2,
+            rollouts_unreadable: 1,
+            rollouts_over_cap: 1,
+            children_skipped_upstream: 3,
+            children_below_baseline: 2,
+            ..Default::default()
+        };
+        let line = skipped.disclosure_line().expect("skips are disclosed");
+        assert!(
+            line.starts_with("codex multiagent replay reconcile:"),
+            "{line}"
+        );
+        assert!(line.contains("2 families skipped"), "{line}");
+        assert!(line.contains("1 rollout unreadable"), "{line}");
+        assert!(line.contains("1 rollout over the read cap"), "{line}");
+        assert!(
+            line.contains("3 children skipped (upstream-recorded cost"),
+            "{line}"
+        );
+        assert!(
+            line.contains("2 children skipped (below parent baseline"),
+            "{line}"
+        );
+        let singular = CodexReplayAdjustment {
+            families_skipped_no_task_started: 1,
+            ..Default::default()
+        };
+        let line = singular.disclosure_line().expect("skips are disclosed");
+        assert!(line.contains("1 family skipped"), "{line}");
+        let singular = CodexReplayAdjustment {
+            children_skipped_upstream: 1,
+            ..Default::default()
+        };
+        let line = singular.disclosure_line().expect("skips are disclosed");
+        assert!(line.contains("1 child skipped"), "{line}");
+    }
 }

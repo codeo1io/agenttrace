@@ -127,7 +127,10 @@ impl std::error::Error for ReadCapRefused {}
 /// allocate more than one byte over the cap. Every other failure
 /// keeps the exact `read session file {}` context wording the bare
 /// `std::fs::read` produced, so non-cap behavior is unchanged.
-fn read_session_file_bounded(path: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
+/// rm-451 residual (run e40a66d3 cycle 6): also consumed by the codex
+/// multiagent reconcile re-scan — the replay lane honors the same read
+/// cap as the parse lane.
+pub(crate) fn read_session_file_bounded(path: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
     let metadata_len = std::fs::metadata(path)
         .with_context(|| format!("read session file {}", path.display()))?
         .len();
