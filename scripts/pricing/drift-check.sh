@@ -29,6 +29,16 @@
 # removal_guard. The workflow refuses to auto-PR while removal_guard is set: a bundle model vanishing
 # without an upstream deprecation trail is exactly the silent-unpricing event this gate exists to stop.
 #
+# Manifest-aware guard (rm-1957, run 9596d7bb cycle 2): the guard now consumes the SAME manual-drop
+# manifest the refresh consumes (scripts/pricing/snapshot-drops.txt, rm-588 — the one sanctioned way
+# a price leaves the bundle). A retirement carrying a dated note (dated on/before the bundle's
+# _snapshot.date) is an ADJUDICATED retirement: still reported as retired and still actionable (the
+# bundle is stale until the refresh drops the key) but the guard reads CLEAR for it, so a sanctioned
+# retirement no longer pins the scheduled gate red forever — the documented retirement can ride the
+# bump PR. Notes dated after the bundle cannot have sanctioned THIS bundle (guard stays SET for those
+# keys), and a malformed manifest is an INFRA failure (rc 2): an unprovable manifest is never "clean",
+# mirroring the refresh's fail-closed parser.
+#
 # Exit contract: 0 = no actionable drift and no desync; 1 = actionable drift (any class) or desync or
 # removal guard; 2 = infra error (fetch/parse/missing input — including an unprovable desync pair:
 # absent const declaration or absent _snapshot.date; fail-closed, never "clean"). Machine report: --json.
@@ -37,9 +47,10 @@
 #   scripts/pricing/drift-check.sh                 # fetch live LiteLLM and compare against the bundle
 #   scripts/pricing/drift-check.sh --live F.json   # offline: use a cached copy of the live catalog
 #   ... --bundle F.json --pricing-rs F.rs          # overrides for red-arm testing
+#   ... --drops F.txt                              # override the manual-drop manifest (red-arm testing)
 #   ... --json                                     # emit the machine report on stdout (summary goes to stderr
 #                                                  #   then — stdout is PURE JSON; review-2 fix F2)
-#   scripts/pricing/drift-check.sh --selftest      # eight embedded offline arms, rc 0 iff all pass
+#   scripts/pricing/drift-check.sh --selftest      # ten embedded offline arms, rc 0 iff all pass
 
 set -euo pipefail
 
@@ -49,6 +60,7 @@ repo_root="$(cd "$here/../.." && pwd)"
 live=""
 bundle="$repo_root/crates/agenttrace-core/src/pricing_snapshot.json"
 pricing_rs="$repo_root/crates/agenttrace-core/src/pricing.rs"
+drops="$repo_root/scripts/pricing/snapshot-drops.txt"
 emit_json=0
 selftest=0
 
@@ -57,6 +69,7 @@ while [ $# -gt 0 ]; do
     --live) live="${2:?--live needs a file}"; shift 2 ;;
     --bundle) bundle="${2:?--bundle needs a file}"; shift 2 ;;
     --pricing-rs) pricing_rs="${2:?--pricing-rs needs a file}"; shift 2 ;;
+    --drops) drops="${2:?--drops needs a file}"; shift 2 ;;
     --json) emit_json=1; shift ;;
     --selftest) selftest=1; shift ;;
     -h|--help) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 0 ;;
@@ -64,13 +77,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# analyze <live_json> <bundle_json> <const_date> <emit_json 0|1>
+# analyze <live_json> <bundle_json> <const_date> <emit_json 0|1> <drops_txt>
 # Prints the human summary, optionally the JSON report, and returns the contract rc.
 analyze() {
-  python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+  python3 - "$1" "$2" "$3" "$4" "$5" <<'PYEOF'
 import json, sys
 
-live_path, bundle_path, const_date, emit_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+live_path, bundle_path, const_date = sys.argv[1], sys.argv[2], sys.argv[3]
+emit_json, drops_path = sys.argv[4] == "1", sys.argv[5]
 
 try:
     with open(live_path, "r", encoding="utf-8") as fh:
@@ -131,6 +145,46 @@ try:
 
     new_costed = sorted(set(live_kept) - set(bundle_kept))
     retired = sorted(set(bundle_kept) - set(live_kept))
+
+    # rm-1957 manifest lane: parse the same manual-drop manifest the
+    # refresh parses (update-snapshot.sh manual_drops, rm-588), with the
+    # same shape rules and the same fail-closed posture — a malformed
+    # manifest is an INFRA failure (rc 2), never "clean": an unprovable
+    # manifest must not be able to disarm the removal guard. Notes
+    # dated after the bundle's own snapshot date cannot have sanctioned
+    # THIS bundle, so they are excluded here (the guard stays SET for
+    # their keys until a refresh stamped on/after the note's date).
+    def manual_drops(path, snapshot_date):
+        drops = {}
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError as exc:
+            print(f"drift-check: infra error: manual-drop manifest unreadable ({exc})", file=sys.stderr)
+            sys.exit(2)
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 2)
+            if len(parts) < 3 or len(parts[0]) != 10:
+                print(f"drift-check: infra error: malformed drop note (want 'YYYY-MM-DD <key> <reason>'), "
+                      f"failing CLOSED: {line!r}", file=sys.stderr)
+                sys.exit(2)
+            when, key, reason = parts
+            try:
+                int(when.replace("-", ""))
+            except ValueError:
+                print(f"drift-check: infra error: malformed drop date {when!r}, failing CLOSED: {line!r}", file=sys.stderr)
+                sys.exit(2)
+            if when <= snapshot_date:
+                drops[key] = (when, reason)
+        return drops
+
+    drops = manual_drops(drops_path, bundle_date)
+    retired_documented = sorted(key for key in retired if key in drops)
+    retired_undocumented = sorted(key for key in retired if key not in drops)
+
     rate_changed, deprecation_new, context_changed, provider_changed = [], [], [], []
     for name in sorted(set(live_kept) & set(bundle_kept)):
         lrow, brow = live_kept[name], bundle_kept[name]
@@ -144,7 +198,7 @@ try:
             provider_changed.append(name)
 
     desync = const_date != bundle_date  # both sides proven present above (fail-closed, review fix F1)
-    removal_guard = bool(retired)
+    removal_guard = bool(retired_undocumented)
     actionable = bool(new_costed or retired or rate_changed or deprecation_new or desync)
 except SystemExit:
     raise
@@ -168,7 +222,9 @@ print(f"pricing drift check (keep-filter basis: mode==chat AND input-or-output p
 print(f"  bundled: {len(bundle_kept)} costed-chat models, _snapshot.date={bundle_date or '<none>'}, PRICING_SNAPSHOT_DATE={const_date or '<none>'}", file=out)
 print(f"  live   : {len(live_kept)} costed-chat models", file=out)
 print(f"  new-costed: {len(new_costed)}{' — ' + sample(new_costed) if new_costed else ''}", file=out)
-print(f"  retired   : {len(retired)}{' — ' + sample(retired) if retired else ''} (removal_guard={'SET' if removal_guard else 'clear'})", file=out)
+print(f"  retired   : {len(retired)}{' — ' + sample(retired) if retired else ''} (documented {len(retired_documented)}, undocumented {len(retired_undocumented)}; removal_guard={'SET' if removal_guard else 'clear'})", file=out)
+if retired_documented:
+    print(f"  documented drops (manifest notes dated on/before {bundle_date}): {sample(retired_documented)} — sanctioned; the refresh drops them, guard clear for these", file=out)
 print(f"  rate-changed: {len(rate_changed)}{' — ' + sample(rate_changed) if rate_changed else ''} (4 cost fields incl. cache)", file=out)
 print(f"  deprecation-new: {len(deprecation_new)}{' — ' + sample(deprecation_new) if deprecation_new else ''}", file=out)
 print(f"  context-window-changed (max_input only, informational): {len(context_changed)}{' — ' + sample(context_changed) if context_changed else ''}", file=out)
@@ -182,13 +238,18 @@ if emit_json:
         "live": {"costed_chat_models": len(live_kept)},
         "pricing_snapshot_date_const": const_date,
         "counts": {
-            "new_costed": len(new_costed), "retired": len(retired), "rate_changed": len(rate_changed),
+            "new_costed": len(new_costed), "retired": len(retired), "retired_documented": len(retired_documented),
+            "retired_undocumented": len(retired_undocumented), "rate_changed": len(rate_changed),
             "deprecation_new": len(deprecation_new), "context_window_changed": len(context_changed),
             "provider_changed": len(provider_changed),
         },
         "examples": {"new_costed": new_costed[:10], "retired": retired[:10], "rate_changed": rate_changed[:10],
                      "deprecation_new": deprecation_new[:10], "context_window_changed": context_changed[:10],
                      "provider_changed": provider_changed[:10]},
+        "documented_drops": {"manifest": "scripts/pricing/snapshot-drops.txt",
+                             "notes_effective_for_bundle": len(drops),
+                             "retired": {key: {"date": drops[key][0], "reason": drops[key][1]}
+                                         for key in retired_documented}},
         "desync": desync, "removal_guard": removal_guard, "actionable_drift": actionable,
     }
     print(json.dumps(report, indent=2, sort_keys=True))
@@ -220,13 +281,17 @@ run_check() { # resolves inputs, fetches live if needed, dispatches analyze; ret
     echo "drift-check: infra error: pricing.rs not found: $pricing_rs" >&2
     return 2
   fi
+  if [ ! -f "$drops" ]; then
+    echo "drift-check: infra error: manual-drop manifest not found: $drops" >&2
+    return 2
+  fi
   local rc=0 const_date
   const_date="$(const_date_of "$pricing_rs")"
   if [ -z "$const_date" ]; then
     echo "drift-check: infra error: no 'const PRICING_SNAPSHOT_DATE: &str = \"<date>\"' declaration found in $pricing_rs (fail-closed, review fix F1: an absent token is never 'clean' — reconcile pricing.rs)" >&2
     return 2
   fi
-  analyze "$live" "$bundle" "$const_date" "$emit_json" || rc=$?
+  analyze "$live" "$bundle" "$const_date" "$emit_json" "$drops" || rc=$?
   [ -n "$tmp" ] && rm -f "$tmp"
   return "$rc"
 }
@@ -372,6 +437,32 @@ PY
     echo "  arm 8 rm-903 wildcard ..... PASS (glob row = parity rc 0; concrete commitment key still new-costed rc 1)"
   else echo "  arm 8 rm-903 wildcard ..... FAIL (parity sub-arm e=$e, commitment sub-arm f=$f)"; sed -n '1,8p' "$t/out8a.txt"; sed -n '1,12p' "$t/out8b.txt"; ok=1; fi
 
+  # Arm 9 — rm-1957 documented drop clears the guard: model-d retires from live BUT carries a
+  # dated manifest note (on/before the bundle's 2026-10-04 date): still retired=1 and still
+  # actionable rc 1 (the bundle is stale until the refresh drops the key) but removal_guard reads
+  # CLEAR — a sanctioned retirement no longer pins the gate red forever, the first-fire unblock.
+  printf '# selftest manifest\n2026-10-04 model-d selftest sanctioned retirement\n' > "$t/drops-ok.txt"
+  rc=0; "$0" --live "$t/live-removal.json" --bundle "$t/base.json" --pricing-rs "$t/pricing.rs" --drops "$t/drops-ok.txt" --json > "$t/out9.txt" 2>&1 || rc=$?
+  if [ "$rc" -eq 1 ] && grep -q '"retired": 1' "$t/out9.txt" && grep -q '"retired_documented": 1' "$t/out9.txt" \
+     && grep -q '"retired_undocumented": 0' "$t/out9.txt" && grep -q '"removal_guard": false' "$t/out9.txt" \
+     && grep -q '"actionable_drift": true' "$t/out9.txt"; then
+    echo "  arm 9 documented drop .... PASS (rc 1, retired=1 documented=1, guard clear, still actionable)"
+  else echo "  arm 9 documented drop .... FAIL (rc $rc)"; sed -n '1,12p' "$t/out9.txt"; ok=1; fi
+
+  # Arm 10 — rm-1957 fail-closed manifest lane: (a) a note dated AFTER the bundle cannot have
+  # sanctioned this bundle — the guard stays SET; (b) a malformed note line is an INFRA failure
+  # (rc 2, stdout empty) — an unprovable manifest is never "clean", mirroring the refresh's parser.
+  printf '# future-dated only\n2027-01-01 model-d not yet effective\n' > "$t/drops-future.txt"
+  local g=0 h=0
+  rc=0; "$0" --live "$t/live-removal.json" --bundle "$t/base.json" --pricing-rs "$t/pricing.rs" --drops "$t/drops-future.txt" --json > "$t/out10a.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 1 ] && grep -q '"removal_guard": true' "$t/out10a.txt" && grep -q '"retired_undocumented": 1' "$t/out10a.txt" && g=1
+  printf 'model-d no date no reason\n' > "$t/drops-bad.txt"
+  rc=0; "$0" --live "$t/live-parity.json" --bundle "$t/base.json" --pricing-rs "$t/pricing.rs" --drops "$t/drops-bad.txt" > "$t/out10b.txt" 2> "$t/out10b.err" || rc=$?
+  [ "$rc" -eq 2 ] && [ ! -s "$t/out10b.txt" ] && grep -q 'malformed drop note' "$t/out10b.err" && h=1
+  if [ "$g" -eq 1 ] && [ "$h" -eq 1 ]; then
+    echo "  arm 10 manifest lane ..... PASS (future-dated note keeps guard SET; malformed note -> rc 2)"
+  else echo "  arm 10 manifest lane ..... FAIL (future sub-arm g=$g, malformed sub-arm h=$h)"; sed -n '1,8p' "$t/out10a.txt"; sed -n '1,6p' "$t/out10b.err"; ok=1; fi
+
   # Control — the keep-filter basis itself: non-chat and uncosted rows never count either side.
   if grep -q 'costed-chat models' "$t/out1.txt"; then
     echo "  control keep-filter ...... PASS (basis line present)"
@@ -381,7 +472,7 @@ PY
 }
 
 if [ "$selftest" -eq 1 ]; then
-  echo "drift-check --selftest (eight offline arms, no network)"
+  echo "drift-check --selftest (ten offline arms, no network)"
   self_test
   rc=$?
   [ "$rc" -eq 0 ] && echo "selftest: ALL ARMS PASS" || echo "selftest: FAILURES PRESENT"

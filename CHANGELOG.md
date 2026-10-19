@@ -4,6 +4,33 @@
 
 ### Added
 
+- MCP 2026-07-28 stateless surface (rm-1960, run 9596d7bb cycle 2,
+  batch "protocol-current, crash-free machine surfaces"): the
+  server is now dual-era. `server/discover` — the revision's one
+  mandatory server RPC, previously absent — answers `supportedVersions`
+  (newest first), `capabilities`, identity in
+  `_meta['io.modelcontextprotocol/serverInfo']`, and the same
+  `instructions` string as `initialize`, with no handshake at all
+  (`agenttrace mcp` used to answer `-32601` to a modern stdio client's
+  first line; spec facts fetched live from modelcontextprotocol.io
+  2026-07-28). A request carrying a modern per-request version in
+  `_meta` (the revision's reserved key
+  `io.modelcontextprotocol/protocolVersion`; the bare `protocolVersion`
+  spelling is honored as a lenient alias, and the reserved key wins
+  when both are present)
+  selects stateless semantics for that request; a version this server
+  does not speak answers the spec's `UnsupportedProtocolVersionError`
+  (`-32022`, `error.data: {supported, requested}`). `initialize` stays
+  for legacy-era clients (negotiated per rm-780), `ping` keeps
+  answering as harmless back-compat, and `subscriptions/listen` plus
+  the `resources/subscribe` lineage it replaces answer a named `-32601`
+  (read-only server, no subscriptions). Two wire riders land with it:
+  the request-id echo is byte-exact — an integer id past `u64::MAX`
+  (`999999999999999999999999`) used to echo as serde's f64 mangling
+  (`1e24`); the raw input token is now spliced back — and an id-less
+  line that is not notification-shaped (`{}`) answers `-32600` with
+  `id: null` instead of silence (crates/agenttrace-cli/src/mcp.rs,
+  tests/mcp_server.rs, docs/guides/mcp-server.md).
 - codex turn-boundary ledger + replay guardrail (rm-1949, run
   e4bff731 cycle 1): codex 0.147+ journals turn boundaries as `event_msg`
   payloads — `task_started`, `task_complete`, `user_message` (live census
@@ -892,6 +919,20 @@
 
 ### Fixed
 
+- `--quota` no longer panics on a chrono-MIN anchored corpus (rm-1959,
+  run 9596d7bb cycle 2, batch "protocol-current, crash-free machine
+  surfaces"): a journal whose newest placeable timestamp is an expanded
+  far-past year (`-262143-01-01T00:00:00`, the naive no-suffix shape
+  chrono parses) anchored the quota window cutoff below the
+  representable range, so `cutoff - 5h` overflowed and the whole
+  `--quota` lane exited 101 with no report (live PoC at assess,
+  lib.rs:3191: `DateTime - TimeDelta overflowed`). The window math now
+  clamps at chrono's `MIN_UTC` — numerically identical for every
+  in-range corpus, the clamp self-discloses through `window_start_utc`,
+  and the hostile event still bills inside the window. Red-first: the
+  pinned CLI test reproduces the panic against the unpatched window
+  math (tests/entrypoints.rs
+  `cli_quota_survives_a_chrono_min_anchored_corpus`).
 - Codex replay families corroborate on cwd, and warm-cache totals flip
   LOUDLY instead of silently (rm-1956 at this landing — campaign-local
   numeral rm-1541, run cd6782b46fb4 cycle 2, batch "replay-family
@@ -1758,6 +1799,7 @@
 
 ### Changed
 
+- The pricing-drift removal guard consumes the manual-drop manifest (rm-1957, run 9596d7bb cycle 2, batch "protocol-current, crash-free machine surfaces"): `retired` keys — bundled models live no longer prices — are now split by evidence in `scripts/pricing/drift-check.sh`. A key carrying a dated note in `scripts/pricing/snapshot-drops.txt` (dated on/before the bundle's `_snapshot.date`, the same manifest the refresh has consumed since rm-588) counts as `retired_documented`: still reported as retired and still actionable rc 1 (the bundle is stale until the refresh drops the key) but the `removal_guard` reads CLEAR for it, so an adjudicated retirement can ride the scheduled bump PR instead of pinning the gate red forever. `retired_undocumented` — retirements with no note, or a note dated after the bundle (it cannot have sanctioned this bundle) — keeps the guard SET and the auto-PR refused. The workflow's refusal message now names the manifest as the reconciliation path, the JSON report gains `retired_documented`/`retired_undocumented` counts and a `documented_drops` block (date + reason per sanctioned key), and `--drops F.txt` joins `--live`/`--bundle`/`--pricing-rs` as a red-arm override. A malformed manifest fails CLOSED (rc 2, stdout empty) — an unprovable manifest must not be able to disarm the guard — mirroring the refresh's own parser. The selftest grows from eight to ten arms: arm 9 pins a documented drop clearing the guard while staying actionable, arm 10 pins future-dated notes keeping it SET and malformed notes failing closed. New maintainer runbook: `docs/maintainers/pricing-drift-runbook.md` (triage, adjudication, the first-fire walk).
 - One shared cache-directory resolver replaces the four byte-identical per-module copies (rm-1536, assess F4, run 79fe78c0 cycle 3; adoption of salvage 9b2a7a1 U2): doctor, pricing, session_cache, and statusline each carried their own `user_cache_dir` ladder for locating the `agenttrace` cache root (sessions.json, pricing.json, the statusline capture journal, the doctor cache report). The ladder now lives once in `agenttrace-core::cache_dir` — `resolve_user_cache_dir(home, xdg_cache_home, macos)` takes the platform arm as an injected boolean so the Linux CI legs can pin the macOS behavior that `cfg!` copies made compile-time dead code, and one 17-row decision table replaces the four per-module pin tests. Two order-of-precedence disclosures ride the consolidation: an ABSOLUTE, non-empty `$XDG_CACHE_HOME` now wins on EVERY OS — the old macOS arm returned `$HOME/Library/Caches` first, so the rm-596 doctor demo sandbox (HOME + absolute XDG override asserting no $HOME text in the report) was unsatisfiable on macOS — and the landed rm-248 rider stays on the home arms (a set-but-empty OR RELATIVE `HOME` is unset-equivalent on both arms; an unusable HOME never yields a per-cwd cache). No environment variable is read anywhere new — the `user_cache_dir()` wrapper reads exactly the same two variables through one code path.
 - `resolve_user_cache_dir` is defined exactly once (rm-1389, run 1a4cce3a cycle 3, batch "one truth on the money-and-cache path"; reliability 30.0): the user-cache base resolver existed as four hand-synced private copies (session_cache, doctor, pricing, statusline — byte-identical 29-line bodies at the consolidation base 3e90993, verified) that had already drifted twice in three days — the empty/relative-HOME fix (rm-248 rider, dade9cd) landed on three copies while statusline's lagged, and the relative-HOME review fix then landed on statusline alone. The session_cache copy — the module that owns the cache-root policy — is now the single `pub(crate)` definition, imported by the other three; it stays pure over `(HOME, XDG_CACHE_HOME)` so every call path remains test-injectable. No behavior change (the bodies were identical); the consolidation is pinned by `shared_user_cache_resolver_census_pins_one_definition` (session_cache unit test that walks every `crates/**/*.rs` and asserts exactly one `fn` definition — the needle is assembled at runtime so the test's own source cannot count itself) on top of the existing per-module parity tests (`user_cache_dir_treats_empty_and_relative_home_as_unset` in session_cache/doctor/pricing plus statusline's historical pins), which now exercise the one shared body from all four beds. (Integration, conflict case 4d82812f: this run's session_cache-hosted consolidation is superseded at the merge by the landed rm-1536 `cache_dir` consolidation above — same one-definition intent, mechanics rehomed: the shared resolver lives in `agenttrace-core::cache_dir` as `resolve_user_cache_dir(home, xdg_cache_home, macos)` with an injected macOS arm, so the Linux CI legs can pin it; the census pin `shared_user_cache_resolver_census_pins_one_definition` relocated to cache_dir.rs beside the one definition, and the per-module parity tests this entry cites were themselves folded into cache_dir's 17-row `user_cache_dir_decision_table`.)
 

@@ -72,15 +72,30 @@ error naming the cap, and the messages after it still answer.
 
 | Method | Answers |
 | --- | --- |
-| `initialize` | `serverInfo`, `capabilities.tools`, and the newest **mutually supported** `protocolVersion` of `2026-07-28`, `2025-11-25`, `2025-06-18` — negotiated, never echoed; an unknown or absent client version falls back to the server's newest with a one-line stderr disclosure (rm-780) |
+| `server/discover` | the 2026-07-28 revision's stateless discovery surface: `supportedVersions` (newest first), `capabilities`, identity in `_meta['io.modelcontextprotocol/serverInfo']`, and the same `instructions` string as `initialize` — with **no handshake at all** (rm-1960) |
+| `initialize` | `serverInfo`, `capabilities.tools`, and the newest **mutually supported** `protocolVersion` of `2026-07-28`, `2025-11-25`, `2025-06-18` — negotiated, never echoed; an unknown or absent client version falls back to the server's newest with a one-line stderr disclosure (rm-780). Kept for legacy-era clients: the server is dual-era, and a request carrying a modern per-request version in `_meta` (reserved key `io.modelcontextprotocol/protocolVersion`) selects stateless semantics for that request |
 | `notifications/initialized` | silence (notifications are never answered) |
-| `ping` | `{}` |
+| `ping` | `{}` (the 2026-07-28 revision removed `ping`; answering it anyway is harmless back-compat for legacy clients) |
+| `subscriptions/listen` | `-32601` naming the method — this server is read-only and implements no subscriptions (rm-1960) |
+| `resources/subscribe` / `resources/unsubscribe` | `-32601` naming the superseded lineage (rm-1960) |
 | `tools/list` | the two tools below |
 | `tools/call` | tool result or `isError` result |
 
 JSON-RPC batching is rejected (`-32600`), matching the current MCP
 spec revision. Malformed JSON answers `-32700`; unknown methods answer
-`-32601`; invalid tool parameters answer `-32602`. The wire reader is
+`-32601`; invalid tool parameters answer `-32602`. Modern (stateless,
+2026-07-28) clients carry the requested protocol version per request
+in `_meta`, under the revision's reserved key
+`io.modelcontextprotocol/protocolVersion` (the bare `protocolVersion`
+spelling is honored as a lenient alias; the reserved key wins when
+both are present): a version this server does not speak answers
+the spec's `UnsupportedProtocolVersionError` — code `-32022` with
+`error.data: {supported, requested}` (rm-1960). The id echo is
+byte-exact: an integer id past `u64::MAX`
+(`999999999999999999999999`) is spliced back from the raw input token
+instead of echoing serde's f64 mangling (`1e24`), and an id-less line
+that is not notification-shaped (`{}`) answers `-32600` with `id: null`
+instead of silence (rm-1960). The wire reader is
 disciplined (rm-782): a non-UTF-8 line answers `-32700` and the
 server keeps serving (the byte-level lane never dies on undecodable
 input), request ids outside String/Number/Null answer `-32600` with

@@ -1294,3 +1294,246 @@ fn rm1918_poisoned_names_escape_on_the_wire_with_cli_parity() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn server_discover_answers_without_initialize() {
+    // rm-1960 (stateless discovery): `server/discover` is the one
+    // mandatory server RPC of the 2026-07-28 revision and must answer
+    // with NO handshake at all — a modern stdio client's first line.
+    // The result carries the revision's DiscoverResult shape
+    // (supportedVersions newest first, capabilities, and identity in
+    // `_meta['io.modelcontextprotocol/serverInfo']`), and a subsequent
+    // `tools/list` on the same connection keeps answering without any
+    // initialize: the server is stateless per-request.
+    let (home, cache) = seed_home("discover-stateless", false);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code, "a discovery script exits rc0 on EOF");
+    assert_eq!(
+        2,
+        responses.len(),
+        "one response per request, no handshake needed"
+    );
+    let discover = &responses[0]["result"];
+    let versions: Vec<&str> = discover["supportedVersions"]
+        .as_array()
+        .expect("supportedVersions is an array")
+        .iter()
+        .map(|version| version.as_str().expect("version strings"))
+        .collect();
+    assert_eq!(
+        vec!["2026-07-28", "2025-11-25", "2025-06-18"],
+        versions,
+        "supportedVersions is the same array initialize negotiates, newest first"
+    );
+    assert!(
+        discover["capabilities"]["tools"].is_object(),
+        "capabilities advertise the tools surface"
+    );
+    let server_info = &discover["_meta"]["io.modelcontextprotocol/serverInfo"];
+    assert_eq!(
+        Some("agenttrace"),
+        server_info["name"].as_str(),
+        "identity rides the spec's _meta serverInfo slot"
+    );
+    assert!(
+        server_info["version"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "serverInfo carries a version"
+    );
+    assert!(
+        responses[1]["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "tools/list answers after discover with no initialize in between"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn modern_meta_version_lane_answers_32022_with_supported_and_requested() {
+    // rm-1960 (modern version lane): in the stateless revision the
+    // client carries its requested protocol version per request in
+    // `_meta`, under the revision's reserved key
+    // `io.modelcontextprotocol/protocolVersion` (basic/index#meta).
+    // A version this server does not speak answers the spec's
+    // UnsupportedProtocolVersionError — code -32022 with
+    // `data: {supported, requested}` — instead of serving the request
+    // on an unagreed revision; a supported modern version serves
+    // normally. The bare `protocolVersion` spelling is honored as a
+    // lenient alias, and the reserved key wins when both are present
+    // (a non-reserved key must never veto the spec's own spelling).
+    let (home, cache) = seed_home("meta-version-lane", false);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"protocolVersion":"1999-01-01"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"protocolVersion":"2026-07-28"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","protocolVersion":"1999-01-01"}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(5, responses.len());
+    let error = &responses[0]["error"];
+    assert_eq!(
+        Some(-32022),
+        error["code"].as_i64(),
+        "the modern error code is the spec's UnsupportedProtocolVersionError"
+    );
+    assert_eq!(
+        serde_json::json!("1999-01-01"),
+        error["data"]["requested"],
+        "data.requested names what the client asked for"
+    );
+    assert_eq!(
+        serde_json::json!(["2026-07-28", "2025-11-25", "2025-06-18"]),
+        error["data"]["supported"],
+        "data.supported lists what this server speaks"
+    );
+    assert!(
+        responses[1]["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "a supported modern version serves the same request normally"
+    );
+    // The reserved key drives the same gate: unsupported answers
+    // -32022 with the same data shape, supported serves normally.
+    assert_eq!(
+        Some(-32022),
+        responses[2]["error"]["code"].as_i64(),
+        "the reserved _meta key is the canonical version lane"
+    );
+    assert_eq!(
+        serde_json::json!("1999-01-01"),
+        responses[2]["error"]["data"]["requested"],
+    );
+    assert_eq!(
+        serde_json::json!(["2026-07-28", "2025-11-25", "2025-06-18"]),
+        responses[2]["error"]["data"]["supported"],
+    );
+    assert!(
+        responses[3]["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "a supported reserved-key version serves normally"
+    );
+    assert!(
+        responses[4]["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "a conflicting bare alias never vetoes the reserved key"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn subscription_methods_are_refused_by_name() {
+    // rm-1960: the 2026-07-28 revision replaces resources/subscribe
+    // with subscriptions/listen. This server is read-only and
+    // implements no subscriptions, so both spellings answer a named
+    // -32601 (a plain "Method not found" for a spec method would read
+    // as a versioning accident; the name tells the host why).
+    let (home, cache) = seed_home("subscriptions-refused", false);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"resources/subscribe","params":{"uri":"file:///nowhere"}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(2, responses.len());
+    for (index, name) in [
+        (0_usize, "subscriptions/listen"),
+        (1, "resources/subscribe"),
+    ] {
+        assert_eq!(
+            Some(-32601),
+            responses[index]["error"]["code"].as_i64(),
+            "{name}: refused as unknown"
+        );
+        assert!(
+            responses[index]["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains(name),
+            "{name}: the refusal names the method"
+        );
+    }
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn request_id_echo_is_byte_exact_for_f64_mangling_integers() {
+    // rm-1960 rider (exact id echo): serde_json's default number lane
+    // parses integers past u64::MAX as f64, so the id
+    // 999999999999999999999999 used to echo as 1e24 — corrupting the
+    // host's correlation id at the one place the spec demands a
+    // byte-exact echo. The raw input token is spliced back, so the
+    // response line carries the id VERBATIM (asserted on the raw
+    // text, because parsing the response would mangle it again); an
+    // in-range id is untouched, and the id-less `{}` line — not a
+    // notification, no method — now answers -32600 with id null
+    // instead of silence.
+    let (home, cache) = seed_home("id-echo-raw", false);
+    let mut input = String::new();
+    input.push_str(r#"{"jsonrpc":"2.0","id":999999999999999999999999,"method":"ping"}"#);
+    input.push('\n');
+    input.push_str(r#"{"jsonrpc":"2.0","id":41,"method":"ping"}"#);
+    input.push('\n');
+    input.push_str("{}\n");
+    let (code, responses, stderr) = mcp_session_raw(&home, &cache, &["mcp"], input.as_bytes());
+    assert_eq!(Some(0), code, "the id-probe script exits rc0 on EOF");
+    assert_eq!(
+        3,
+        responses.len(),
+        "the id-less non-notification line answers; stderr: {stderr}"
+    );
+    // Re-run through raw stdout for the byte-exact assertion.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("mcp")
+        .env("HOME", &home)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("AGENTTRACE_PRICING_FILE")
+        .env_remove("AGENTTRACE_HISTORY_DIR")
+        .current_dir(home.parent().expect("root"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agenttrace");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(input.as_bytes())
+        .expect("write request script");
+    let output = child.wait_with_output().expect("collect output");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let huge_line = stdout
+        .lines()
+        .find(|line| line.contains("999999999999999999999999"))
+        .expect("the huge id survives verbatim on the wire");
+    assert!(
+        !huge_line.contains("1e24") && !huge_line.contains("1e+24"),
+        "no f64-mangled id echo may appear: {huge_line}"
+    );
+    let parsed: Value = serde_json::from_str(huge_line.trim_end()).expect("line is JSON");
+    assert!(
+        parsed["id"].is_number(),
+        "the spliced id is still a JSON number on the wire"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}

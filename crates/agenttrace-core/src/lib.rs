@@ -3188,7 +3188,21 @@ fn quota_window(
     cutoff: DateTime<Utc>,
     span: chrono::Duration,
 ) -> QuotaWindow {
-    let start = cutoff - span;
+    // rm-1959 (assess 2edf6355 F-live PoC): the cutoff is anchored on
+    // the newest at-or-before-now event timestamp, so a hostile
+    // journal carrying a far-past expanded year (-262143-01-01 is the
+    // first shape chrono parses) makes `cutoff - span` fall off the
+    // bottom of the representable range — `DateTime - Duration` PANICS
+    // on out-of-range subtraction (the PoC: `--quota` exited 101 with
+    // no report at all). Clamp instead of panicking: the window
+    // becomes [chrono MIN, cutoff], which is numerically identical for
+    // every in-range corpus (nothing real sits below chrono MIN) and
+    // bills the hostile corpus fully inside the window instead of
+    // crashing. The clamp is self-disclosing: `start_utc` renders the
+    // clamped bound in the json and text lanes.
+    let start = cutoff
+        .checked_sub_signed(span)
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
     let mut spend_usd = 0.0;
     let mut sessions_contributing = 0;
     for session in sessions {

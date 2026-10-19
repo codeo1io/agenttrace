@@ -3363,6 +3363,77 @@ fn cli_quota_view_clamps_a_future_skewed_corpus() {
 }
 
 #[test]
+fn cli_quota_survives_a_chrono_min_anchored_corpus() {
+    // rm-1959 (assess 2edf6355, live PoC `at-assess-poc1/edge.jsonl`):
+    // a journal whose newest timestamp is an expanded far-past year
+    // (-262143-01-01 parses fine) anchored the quota cutoff below the
+    // representable range, so `cutoff - span` PANICKED — `--quota`
+    // exited 101 with no report. The window math must clamp at
+    // chrono's MIN_UTC instead: both lanes exit 0, the schema keeps
+    // rendering, and the hostile event still bills inside the window.
+    let sandbox = scratch("at-quota-chrono-min-cli");
+    std::fs::create_dir_all(&sandbox).expect("sandbox dir");
+    let journal = sandbox.join("chrono-min.jsonl");
+    let body =
+        "{\"timestamp\":\"-262143-01-01T00:00:00\",\"type\":\"assistant\",\"message\":{\"id\":\"m\",\"model\":\"gpt-5\",\"content\":[{\"type\":\"text\",\"text\":\"deep past\"}],\"usage\":{\"input_tokens\":1000,\"output_tokens\":200}}}\n";
+    std::fs::write(&journal, body).expect("fixture write");
+
+    let json = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--quota",
+            "-f",
+            "json",
+            journal.to_str().expect("fixture path is UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        json.status.success(),
+        "quota must not panic on a chrono-MIN anchor: {:?}",
+        json
+    );
+    assert!(
+        json.status.code() != Some(101),
+        "no rust panic exit may leak through the quota lane"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&json.stdout).trim_end())
+            .expect("quota json lane is one pure JSON document");
+    assert_eq!(
+        report["schema"].as_str().unwrap_or_default(),
+        "agenttrace.quota/1",
+        "the quota schema keeps rendering"
+    );
+    let start = report["five_hour"]["window_start_utc"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        start.starts_with("-262143-01-01T00"),
+        "the clamped window start renders truthfully, got {start:?}"
+    );
+    assert_eq!(
+        report["five_hour"]["sessions_contributing"], 1,
+        "the hostile corpus sits inside the clamped 5h window"
+    );
+    assert!(
+        report["five_hour"]["spend_usd"].as_f64().unwrap_or(0.0) > 0.0,
+        "the hostile events still bill through the clamped window"
+    );
+
+    let text = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", journal.to_str().expect("fixture path is UTF-8")])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        text.status.success(),
+        "quota text lane must not panic either: {:?}",
+        text
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
 fn cli_quota_view_reports_plan_windows_and_guards_its_lane() {
     // rm-201 (run 12a73275 cycle 4): --quota emits the stable
     // agenttrace.quota/1 schema with TTL-correct rolling windows and

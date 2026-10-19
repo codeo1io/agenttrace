@@ -31,6 +31,27 @@
 //!   client-supplied echo; an unknown or absent client version falls
 //!   back to the newest supported revision with a one-line stderr
 //!   disclosure (stdout stays protocol-only).
+//! * stateless discovery (rm-1960) — the server is dual-era per the
+//!   2026-07-28 revision: a request carrying a modern per-request
+//!   protocol version in `_meta` (the revision's reserved key
+//!   `io.modelcontextprotocol/protocolVersion`; the bare
+//!   `protocolVersion` spelling is honored as a lenient alias) selects
+//!   stateless semantics — an unsupported version answers the spec's
+//!   `UnsupportedProtocolVersionError` `-32022` with
+//!   `data: {supported, requested}` — while `initialize` stays for legacy
+//!   clients, and `server/discover` — the revision's one mandatory
+//!   server RPC, previously absent — answers `supportedVersions`,
+//!   `capabilities`, and `_meta['io.modelcontextprotocol/serverInfo']`
+//!   with no handshake at all. `ping` keeps answering for legacy
+//!   clients (the revision removed it; answering anyway is harmless
+//!   back-compat). `subscriptions/listen` (and the
+//!   `resources/subscribe` lineage it replaces) is refused with a
+//!   named `-32601`: this server is read-only and implements no
+//!   subscriptions. The id echo is byte-exact: an id that overflows
+//!   serde_json's number lane (999999999999999999999999 → f64 1e24)
+//!   is spliced back from the raw input token, and an id-less line
+//!   that is not notification-shaped (`{}`) answers `-32600` with
+//!   id null instead of silence.
 //! * wire discipline (rm-782 + landed rm-923) — notifications are
 //!   never answered; unknown methods answer `-32601`; malformed
 //!   input answers `-32700` and the server stays up, including a
@@ -84,7 +105,20 @@ use serde_json::{json, Map, Value};
 const CODE_PARSE_ERROR: i64 = -32700;
 const CODE_INVALID_REQUEST: i64 = -32600;
 const CODE_METHOD_NOT_FOUND: i64 = -32601;
+// rm-1960: `UnsupportedProtocolVersionError`, the spec-named modern
+// error of the 2026-07-28 revision (`data: {supported, requested}`) —
+// the recognized error stdio clients probe `server/discover` for.
+const CODE_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const CODE_INVALID_PARAMS: i64 = -32602;
+
+/// rm-1960: the `_meta` key the 2026-07-28 revision reserves for the
+/// per-request protocol version (basic/index reserved-keys table; the
+/// whole `io.modelcontextprotocol/` prefix is spec-reserved). The
+/// revision's own prose is explicit that "every request" carries its
+/// version here — NOT in a bare `protocolVersion` member, which is a
+/// client-chosen, non-reserved key. See [`requested_meta_version`]
+/// for the alias policy this server pairs with it.
+const META_PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 
 /// MCP protocol revisions this server speaks, NEWEST FIRST — the
 /// order is the negotiation preference (rm-780). `initialize` answers
@@ -318,6 +352,16 @@ fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
         Ok(message) => message,
         Err(_) => return Some(error_response(None, CODE_PARSE_ERROR, "Parse error")),
     };
+    // rm-1960 rider (exact id echo): serde_json's default number lane
+    // parses integers past `u64::MAX` as f64, so the id
+    // 999999999999999999999999 used to echo as `1e24`, corrupting the
+    // host's correlation id at the one place the spec demands a
+    // byte-exact echo. The raw token is captured via `RawValue` (it
+    // preserves the input bytes) and spliced back into the response
+    // whenever serde's rendering of the parsed id differs from it.
+    let raw_id_token: Option<String> = serde_json::from_str::<IdTokenProbe>(raw)
+        .ok()
+        .and_then(|probe| probe.id.map(|token| token.get().to_string()));
     // MCP drops JSON-RPC batching (since the 2025-06-18 revision);
     // answer arrays loudly instead of misparsing them as one request.
     if message.is_array() {
@@ -370,23 +414,49 @@ fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
     match object.get("jsonrpc") {
         Some(Value::String(version)) if version == "2.0" => {}
         _ => {
+            // rm-1960 rider: silence is reserved for notifications. A
+            // line with no id AND no string `method` is not one
+            // (JSON-RPC 2.0 §5.1 requires the method member), so it
+            // answers Invalid Request with id null instead of going
+            // quiet — `{}` used to produce no response at all.
+            if id.is_none() && !notification_shaped(object) {
+                return Some(error_response(
+                    None,
+                    CODE_INVALID_REQUEST,
+                    "Invalid Request: `jsonrpc` must be exactly \"2.0\"",
+                ));
+            }
             id.as_ref()?;
-            return Some(error_response(
-                id,
-                CODE_INVALID_REQUEST,
-                "Invalid Request: `jsonrpc` must be exactly \"2.0\"",
+            return Some(splice_raw_id(
+                error_response(
+                    id,
+                    CODE_INVALID_REQUEST,
+                    "Invalid Request: `jsonrpc` must be exactly \"2.0\"",
+                ),
+                raw_id_token.as_deref(),
             ));
         }
     }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
         // No method: a request is invalid, a notification is ignorable.
-        // (`id.as_ref()?` silences a notification here without moving it.)
-        id.as_ref()?;
-        return Some(error_response(
-            id,
-            CODE_INVALID_REQUEST,
-            "Invalid Request: missing method",
-        ));
+        // rm-1960 rider: an id-less no-method line is not a
+        // notification, so it answers with id null rather than
+        // silence (previously `id.as_ref()?` swallowed it whole).
+        return Some(match id {
+            Some(id) => splice_raw_id(
+                error_response(
+                    Some(id),
+                    CODE_INVALID_REQUEST,
+                    "Invalid Request: missing method",
+                ),
+                raw_id_token.as_deref(),
+            ),
+            None => error_response(
+                None,
+                CODE_INVALID_REQUEST,
+                "Invalid Request: missing method",
+            ),
+        });
     };
     // Notifications (no id) are acknowledged by staying silent — that
     // includes `notifications/initialized`, which simply transitions
@@ -401,31 +471,180 @@ fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
         None | Some(Value::Null) => Value::Null,
         Some(value) if value.is_object() => value.clone(),
         Some(_) => {
-            return Some(error_response(
-                Some(id),
-                CODE_INVALID_PARAMS,
-                "Invalid params: `params` must be an object",
+            return Some(splice_raw_id(
+                error_response(
+                    Some(id),
+                    CODE_INVALID_PARAMS,
+                    "Invalid params: `params` must be an object",
+                ),
+                raw_id_token.as_deref(),
             ));
         }
     };
+    // rm-1960: modern (2026-07-28) per-request version lane. The
+    // stateless revision carries the requested protocol version in
+    // `_meta` on every request — under its reserved key
+    // `io.modelcontextprotocol/protocolVersion` — instead of the
+    // legacy `initialize` handshake. A version this server does not
+    // speak answers the spec's `UnsupportedProtocolVersionError`
+    // (-32022, `data: {supported, requested}`) — the recognized
+    // modern error stdio clients probe for; an absent or supported
+    // version serves normally on the newest supported revision.
+    if let Some(requested) = requested_meta_version(&params) {
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+            return Some(splice_raw_id(
+                unsupported_protocol_version_response(id, requested),
+                raw_id_token.as_deref(),
+            ));
+        }
+    }
     let result = match method {
         "initialize" => initialize_result(params),
         "ping" => Ok(json!({})),
+        "server/discover" => Ok(discover_result()),
+        "subscriptions/listen" => Err((
+            CODE_METHOD_NOT_FOUND,
+            "Method not found: subscriptions/listen — this server is read-only \
+             and implements no subscriptions"
+                .to_string(),
+        )),
+        "resources/subscribe" | "resources/unsubscribe" => Err((
+            CODE_METHOD_NOT_FOUND,
+            "Method not found: resources/subscribe is superseded by \
+             subscriptions/listen in the 2026-07-28 revision; this server is \
+             read-only and implements no subscriptions"
+                .to_string(),
+        )),
         "tools/list" => Ok(tools_list_result()),
         "tools/call" => call_tool(params, root),
         _ => {
-            return Some(error_response(
-                Some(id),
-                CODE_METHOD_NOT_FOUND,
-                "Method not found",
+            return Some(splice_raw_id(
+                error_response(Some(id), CODE_METHOD_NOT_FOUND, "Method not found"),
+                raw_id_token.as_deref(),
             ));
         }
     };
     Some(match result {
-        Ok(value) => {
-            wire_sanitize(json!({"jsonrpc": "2.0", "id": id, "result": value}).to_string())
-        }
-        Err((code, message)) => error_response(Some(id), code, &message),
+        Ok(value) => splice_raw_id(
+            wire_sanitize(json!({"jsonrpc": "2.0", "id": id, "result": value}).to_string()),
+            raw_id_token.as_deref(),
+        ),
+        Err((code, message)) => splice_raw_id(
+            error_response(Some(id), code, &message),
+            raw_id_token.as_deref(),
+        ),
+    })
+}
+
+/// Server identity payload reused by the legacy `initialize` result
+/// and the modern `server/discover` result (rm-1960): one string, one
+/// truth — the two surfaces must never drift apart.
+const SERVER_INSTRUCTIONS: &str = "Read-only usage reporting over locally discovered \
+    agent sessions. Tools: usage_overview (the CLI --overview JSON), \
+    by_model_breakdown (cost and sessions per model). The server is offline \
+    and stdio-only; it writes nothing outside the agenttrace session cache.";
+
+/// rm-1960 rider (exact id echo): probe struct that captures the `id`
+/// member of a request line as its RAW JSON text. `RawValue` preserves
+/// the input bytes, so an integer that overflows serde_json's default
+/// number lane (parsed as f64) is still available verbatim.
+#[derive(serde::Deserialize)]
+struct IdTokenProbe<'a> {
+    #[serde(borrow, default)]
+    id: Option<&'a serde_json::value::RawValue>,
+}
+
+/// JSON-RPC 2.0 §5.1: a Notification is a Request object without an
+/// `id` — which still requires a string `method` member. Lines that
+/// lack both are not notifications and must be answered, not silenced.
+fn notification_shaped(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("method").and_then(Value::as_str).is_some()
+}
+
+/// rm-1960: the per-request protocol version of a modern request, as
+/// declared in `params._meta`. The revision's reserved key
+/// [`META_PROTOCOL_VERSION_KEY`] is the canonical lane; the bare
+/// `protocolVersion` spelling is honored as a lenient alias — it is
+/// NOT a reserved key, but honoring it costs nothing and a thin
+/// client that omits the prefix still gets the version gate. When
+/// both are present the reserved key wins (a non-reserved key must
+/// never be able to veto the spec's own spelling).
+fn requested_meta_version(params: &Value) -> Option<&str> {
+    let meta = params.get("_meta")?;
+    meta.get(META_PROTOCOL_VERSION_KEY)
+        .or_else(|| meta.get("protocolVersion"))
+        .and_then(Value::as_str)
+}
+
+/// rm-1960 rider: restore a byte-exact id echo. When serde's rendering
+/// of the parsed id differs from the raw input token (the f64 mangling
+/// case), splice the token back into the already-serialized response.
+/// In-range integers, strings, and null render identically and are
+/// untouched; a token that cannot be located is a no-op, never a
+/// corruption.
+fn splice_raw_id(response: String, raw_token: Option<&str>) -> String {
+    let Some(token) = raw_token else {
+        return response;
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&response) else {
+        return response;
+    };
+    let Some(rendered) = parsed.get("id").map(|id| id.to_string()) else {
+        return response;
+    };
+    if rendered == token {
+        return response;
+    }
+    response.replacen(&format!("\"id\":{rendered}"), &format!("\"id\":{token}"), 1)
+}
+
+/// rm-1960: `UnsupportedProtocolVersionError` — the 2026-07-28
+/// revision's spec-named modern error (code -32022, error.data carries
+/// `supported` and `requested`). Built directly because
+/// [`error_response`] carries no `data` member.
+fn unsupported_protocol_version_response(id: Value, requested: &str) -> String {
+    let mut object = Map::new();
+    object.insert("jsonrpc".to_string(), json!("2.0"));
+    object.insert("id".to_string(), id);
+    object.insert(
+        "error".to_string(),
+        json!({
+            "code": CODE_UNSUPPORTED_PROTOCOL_VERSION,
+            "message": format!(
+                "Unsupported protocol version: {requested} (supported: {})",
+                SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+            ),
+            "data": {
+                "supported": SUPPORTED_PROTOCOL_VERSIONS,
+                "requested": requested,
+            },
+        }),
+    );
+    wire_sanitize(Value::Object(object).to_string())
+}
+
+/// rm-1960: `server/discover` result — the 2026-07-28 revision's one
+/// mandatory server RPC, replacing the initialize handshake for
+/// modern (stateless, per-request `_meta`) clients. `supportedVersions`
+/// is the same array [`initialize_result`] negotiates from, newest
+/// first; `capabilities` and `_meta['io.modelcontextprotocol/serverInfo']`
+/// follow the DiscoverResult shape the revision specifies. No state is
+/// consulted: the answer is identical before or after any other
+/// request, which is exactly what a stdio client's
+/// backward-compatibility probe expects.
+fn discover_result() -> Value {
+    json!({
+        "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+        "capabilities": {
+            "tools": { "listChanged": false }
+        },
+        "_meta": {
+            "io.modelcontextprotocol/serverInfo": {
+                "name": "agenttrace",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        },
+        "instructions": SERVER_INSTRUCTIONS,
     })
 }
 
@@ -465,10 +684,7 @@ fn initialize_result(params: Value) -> Result<Value, (i64, String)> {
             "name": "agenttrace",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Read-only usage reporting over locally discovered \
-    agent sessions. Tools: usage_overview (the CLI --overview JSON), \
-    by_model_breakdown (cost and sessions per model). The server is offline \
-    and stdio-only; it writes nothing outside the agenttrace session cache."
+        "instructions": SERVER_INSTRUCTIONS,
     }))
 }
 

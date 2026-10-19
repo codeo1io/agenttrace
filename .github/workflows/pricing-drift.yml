@@ -53,7 +53,7 @@ jobs:
             echo "drift gate infra error — failing loudly"; exit 2
           fi
           if grep -q '"removal_guard": true' drift-report.txt; then
-            echo "::error::removal_guard SET — bundled models would drop out of the keep-filter basis. No auto-PR (additive-growth guard, rm-176); reconcile manually. See drift-report.txt"
+            echo "::error::removal_guard SET — bundled models would drop out of the keep-filter basis with no dated drop note (retired_undocumented > 0). No auto-PR (additive-growth guard, rm-176). Adjudicate each retirement in scripts/pricing/snapshot-drops.txt (rm-1957) — a dated note on/before the bundle date clears the guard for that key — then reconcile manually. See drift-report.txt"
             exit 1
           fi
           if grep -q '"desync": true' drift-report.txt; then
