@@ -4980,3 +4980,58 @@ fn cline_cli_gates_hold_for_a_relative_env_store_root() {
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cache);
 }
+
+#[test]
+fn codex_zst_named_rollout_is_admitted_and_decoded_in_one_pass() {
+    // rm-992 (run d57c2e56 cycle 1): the session-file NAME gate dropped
+    // `.jsonl.zst` before any content sniff - the assess PoC saw 0 of 4
+    // compressed codex lanes discovered and `--doctor` disclosing
+    // nothing. The gate now admits exactly that suffix, so ONE pass
+    // walks the rollout by name AND decodes it by magic: tokens arrive
+    // non-zero and the decode is disclosed on the session.
+    let root = temp_root("rm992-zst-admission");
+    let home = root.join("home");
+    let sessions_dir = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("10")
+        .join("18");
+    fs::create_dir_all(&sessions_dir).expect("create codex sessions dir");
+    fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex-zstd/rollout.jsonl.zst"),
+        sessions_dir.join("rollout-2026-10-18T09-00-00-4f1c9d21.jsonl.zst"),
+    )
+    .expect("copy the migrated-name compressed fixture");
+    with_home(&home, || {
+        let files = find_session_files(None);
+        assert_eq!(
+            files.len(),
+            1,
+            "the .jsonl.zst rollout must be admitted by name: {files:?}"
+        );
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1, "admitted AND decoded in one pass");
+        let session = &sessions[0];
+        assert_eq!(session.metrics.source_tool, "codex_cli");
+        assert!(
+            session.metrics.tokens_input > 0,
+            "decoded usage must be non-zero"
+        );
+        assert!(
+            session.metrics.tokens_output > 0,
+            "decoded usage must be non-zero"
+        );
+        assert!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("zstd_rollout_decoded")
+                .is_some_and(|count| *count > 0),
+            "the decode must be disclosed per session: {:?}",
+            session.metrics.disclosure_counters
+        );
+    });
+    let _ = fs::remove_dir_all(root);
+}

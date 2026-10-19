@@ -211,3 +211,48 @@ fn doctor_hints_at_near_miss_cache_env_var() {
     restore_env("AGENTTRACE_CACHE_DIR", previous);
     let _ = fs::remove_dir_all(&corpus);
 }
+
+#[test]
+fn doctor_discloses_zstd_decoded_rollouts() {
+    // rm-992 (run d57c2e56 cycle 1): before the name-gate widening a
+    // `.jsonl.zst` codex rollout was invisible end to end - discovery
+    // dropped it by name, so `--doctor` walked away with zero
+    // disclosures. The lane is now parsed AND disclosed: the
+    // `zstd_rollout_decoded` parse counter flows through the doctor's
+    // generic disclosure fold into both the report map and the rendered
+    // json/text.
+    let home = temp_home("zstd-disclose");
+    let sessions_dir = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("10")
+        .join("18");
+    fs::create_dir_all(&sessions_dir).expect("create codex sessions dir");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-zstd/rollout.jsonl.zst"),
+        sessions_dir.join("rollout-2026-10-18T09-00-00-4f1c9d21.jsonl.zst"),
+    )
+    .expect("copy the migrated-name compressed fixture");
+    with_home(&home, || {
+        let report = build_doctor_report(Some(&sessions_dir), false);
+        assert_eq!(
+            report.sessions, 1,
+            "the compressed rollout must parse under its migrated name"
+        );
+        assert!(
+            report
+                .disclosures
+                .get("zstd_rollout_decoded")
+                .is_some_and(|count| *count >= 1),
+            "doctor must disclose the zstd decode: {:?}",
+            report.disclosures
+        );
+        let json = render_doctor_report(Some(&sessions_dir), false, "json").expect("render json");
+        assert!(
+            json.contains("\"zstd_rollout_decoded\""),
+            "json doctor report must carry the disclosure: {json}"
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+}

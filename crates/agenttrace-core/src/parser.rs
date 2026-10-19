@@ -26,11 +26,49 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
             }
         }
     }
-    let raw =
-        std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
+    // rm-992 arm b (run d57c2e56 cycle 1): codex compresses a finished
+    // rollout (`.jsonl` -> `.jsonl.zst`) and restores it on demand, so a
+    // path handed over by an earlier discovery walk can be gone at read
+    // time. The compress/restore flip renames the same journal, so a
+    // NotFound on one name retries the sibling before giving up — the
+    // encoding-fallback ccusage's codex reader ships (#1888 -> #1890).
+    // Any other error (permissions, dangling symlink) propagates
+    // untouched, and a missing pair still reports the REQUESTED path.
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match read_sibling_rollout(path) {
+                Some(raw) => raw,
+                None => {
+                    return Err(error)
+                        .with_context(|| format!("read session file {}", path.display()))
+                }
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read session file {}", path.display()))
+        }
+    };
     let name = session_name(path);
     let path_text = path.to_string_lossy().to_string();
     parse_session_bytes(raw, &path_text, &name)
+}
+
+/// The compress/restore sibling of a Codex rollout name (rm-992):
+/// `x.jsonl` <-> `x.jsonl.zst`. `None` for names that are neither — a
+/// NotFound then stays a NotFound. The parse label never changes to the
+/// sibling's name: the caller asked for this session, and the zstd probe
+/// plus the `zstd_rollout_decoded` disclosure report what was read.
+fn read_sibling_rollout(path: &Path) -> Option<Vec<u8>> {
+    let name = path.file_name()?.to_str()?;
+    let parent = path.parent()?;
+    let sibling = if let Some(stem) = name.strip_suffix(".jsonl.zst") {
+        parent.join(format!("{stem}.jsonl"))
+    } else {
+        let stem = name.strip_suffix(".jsonl")?;
+        parent.join(format!("{stem}.jsonl.zst"))
+    };
+    std::fs::read(&sibling).ok()
 }
 
 /// Decode + parse one session stream (rm-503): the shared tail of
@@ -47,22 +85,40 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
             label
         );
     }
-    // Codex ≥0.152 stores rollouts as zstd frames (magic 28 B5 2F FD,
-    // upstream PR #41357); they are no longer plain JSONL. Decode them
+    // Codex stores rollouts as zstd frames (magic 28 B5 2F FD;
+    // reader tolerance since upstream >= 0.152, PR #41357 merged
+    // 2026-10-13): stable 0.162.x migrates cold rollouts to `.jsonl.zst`
+    // names while writing compressed-by-default stays feature-flagged
+    // (#53732 rode the 0.163 alphas; the flag was still off at tag
+    // rust-v0.163.0 — see the rm-1518 correction in CHANGELOG), so
+    // compressed history is already on real users' disks (ccusage
+    // #1888, fixed #1890). Decode them
     // in-process — bounded, because a rollout is untrusted input and a
     // frame may decompress arbitrarily large — and keep the named-format
     // failure wording for bytes we still cannot use (rm-992). A rollout
     // may carry CONCATENATED frames (Codex appends by materializing and
     // re-encoding; upstream's own reader tolerates them), so the decode
     // runs to true EOF, never just the first frame (rm-1516).
-    let raw = if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+    let zstd_decoded = raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
+    let raw = if zstd_decoded {
         decode_zstd_rollout_bounded(raw, label)?
     } else {
         raw
     };
     let raw = String::from_utf8(raw)
         .with_context(|| format!("read session file {} (not valid UTF-8)", label))?;
-    parse_raw_session(name, label, &raw)
+    let mut session = parse_raw_session(name, label, &raw)?;
+    if zstd_decoded {
+        // rm-992 (run d57c2e56 cycle 1): decoding a compressed rollout is
+        // never silent - disclose it on the session so `doctor` can count
+        // decoded lanes honestly.
+        *session
+            .metrics
+            .disclosure_counters
+            .entry("zstd_rollout_decoded".to_string())
+            .or_insert(0) += 1;
+    }
+    Ok(session)
 }
 
 /// Output cap for in-process zstd rollout decode (rm-992). Compressed
