@@ -1076,6 +1076,9 @@ fn run() -> anyhow::Result<()> {
                 // disclosed, never a silent drop.
                 report.future_excluded_sessions,
                 report.sqlite.unreadable.clone(),
+                // rm-1435: manifest-less Cline CLI session dirs the
+                // walk refused — same disclosure discipline.
+                report.cline_manifestless,
             ),
             None => data_health(&sessions, sessions.len(), 0),
         };

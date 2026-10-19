@@ -1,0 +1,38 @@
+{
+	"version": 1,
+	"updated_at": "2026-10-18T09:05:09.000Z",
+	"agent": "lead",
+	"sessionId": "sess-disagree",
+	"messages": [
+		{
+			"id": "msg_user_1",
+			"role": "user",
+			"content": [
+				{ "type": "text", "text": "Re-run the census." }
+			]
+		},
+		{
+			"id": "msg_assistant_1",
+			"role": "assistant",
+			"ts": 1760773501000,
+			"modelInfo": {
+				"id": "gpt-5.2-codex",
+				"provider": "openai",
+				"family": "gpt-5.2"
+			},
+			"metrics": {
+				"inputTokens": 11,
+				"outputTokens": 4,
+				"cacheReadTokens": 0,
+				"cacheWriteTokens": 2,
+				"cost": 0.05
+			},
+			"content": [
+				{
+					"type": "text",
+					"text": "Census re-run; envelope disagrees with the manifest on purpose."
+				}
+			]
+		}
+	]
+}

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "session_id": "sess-disagree",
+  "source": "cli",
+  "pid": 42134,
+  "started_at": "2026-10-18T09:05:00.000Z",
+  "ended_at": "2026-10-18T09:05:09.000Z",
+  "exit_code": null,
+  "status": "completed",
+  "interactive": true,
+  "provider": "cline",
+  "model": "claude-sonnet-4-6",
+  "cwd": "/work/projects/agenttrace",
+  "workspace_root": "/work/projects/agenttrace",
+  "enable_tools": true,
+  "enable_spawn": true,
+  "enable_teams": false,
+  "messages_path": "sess-disagree.messages.json"
+}

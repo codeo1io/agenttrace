@@ -704,6 +704,8 @@ fn usage_overview(root: Option<&Path>, range: TimeRange) -> Result<Value, (i64, 
         // future-bound exclusion count flows through here too.
         report.future_excluded_sessions,
         report.sqlite.unreadable.clone(),
+        // rm-1435: manifest-less Cline CLI refusals agree too.
+        report.cline_manifestless,
     );
     let text = report_overview_json_with_context(
         &overview,

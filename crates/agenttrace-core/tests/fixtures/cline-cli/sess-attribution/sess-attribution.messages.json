@@ -1,0 +1,72 @@
+{
+	"version": 1,
+	"updated_at": "2026-10-18T09:00:12.000Z",
+	"agent": "lead",
+	"sessionId": "sess-attribution",
+	"messages": [
+		{
+			"id": "msg_user_1",
+			"role": "user",
+			"content": [
+				{ "type": "text", "text": "Inspect the drift pins and summarize." }
+			]
+		},
+		{
+			"id": "msg_assistant_1",
+			"role": "assistant",
+			"ts": 1760773201000,
+			"modelInfo": {
+				"id": "claude-sonnet-4-6",
+				"provider": "anthropic",
+				"family": "claude-sonnet-4"
+			},
+			"content": [
+				{
+					"type": "thinking",
+					"thinking": "I should read the pins before summarizing."
+				},
+				{
+					"type": "tool_use",
+					"id": "tool-call-1",
+					"name": "read_files",
+					"input": { "path": "/tmp/project/pins.md" }
+				}
+			]
+		},
+		{
+			"id": "msg_user_2",
+			"role": "user",
+			"content": [
+				{
+					"type": "tool_result",
+					"tool_use_id": "tool-call-1",
+					"content": "# Pins\n\nA small fixture.",
+					"is_error": false
+				}
+			]
+		},
+		{
+			"id": "msg_assistant_2",
+			"role": "assistant",
+			"ts": 1760773202000,
+			"modelInfo": {
+				"id": "claude-sonnet-4-6",
+				"provider": "anthropic",
+				"family": "claude-sonnet-4"
+			},
+			"metrics": {
+				"inputTokens": 21,
+				"outputTokens": 8,
+				"cacheReadTokens": 3,
+				"cacheWriteTokens": 1,
+				"cost": 0.13
+			},
+			"content": [
+				{
+					"type": "text",
+					"text": "The pins describe a small fixture corpus."
+				}
+			]
+		}
+	]
+}

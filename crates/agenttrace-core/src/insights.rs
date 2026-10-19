@@ -897,6 +897,10 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
 /// count, `parse_failures` is the loader's `skipped`, and everything
 /// else the loader discovered but the report excludes lands in
 /// `out_of_scope` instead of shrinking the denominator.
+// rm-1435: the cline manifestless refusal rides the same parts
+// contract as the other exclusion ledgers (one more disclosure
+// channel, same positional truth).
+#[allow(clippy::too_many_arguments)]
 pub fn data_health_scoped(
     sessions: &[Session],
     discovered: usize,
@@ -905,6 +909,7 @@ pub fn data_health_scoped(
     opencode_fork_excluded: usize,
     future_excluded: usize,
     sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
+    cline_manifestless: usize,
 ) -> DataHealth {
     let parsed = sessions.len();
     let out_of_scope = discovered.saturating_sub(parsed + parse_failures);
@@ -942,6 +947,20 @@ pub fn data_health_scoped(
             .disclosures
             .get_mut("future_timestamp_sessions")
             .expect("just inserted") += future_excluded;
+    }
+    // rm-1435: Cline CLI session dirs the walk refused for lacking
+    // the `session.json` manifest ride the same disclosure channel —
+    // each refusal is a whole session dropped at read time, so the
+    // count must surface instead of vanishing from every report.
+    if cline_manifestless > 0 {
+        health
+            .disclosures
+            .entry("cline_manifestless_sessions".to_string())
+            .or_insert(0);
+        *health
+            .disclosures
+            .get_mut("cline_manifestless_sessions")
+            .expect("just inserted") += cline_manifestless;
     }
     health
 }

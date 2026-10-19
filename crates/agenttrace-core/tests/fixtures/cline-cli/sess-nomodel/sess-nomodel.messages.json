@@ -1,0 +1,33 @@
+{
+	"version": 1,
+	"updated_at": "2026-10-18T09:15:04.000Z",
+	"agent": "lead",
+	"sessionId": "sess-nomodel",
+	"messages": [
+		{
+			"id": "msg_user_1",
+			"role": "user",
+			"content": [
+				{ "type": "text", "text": "Ping." }
+			]
+		},
+		{
+			"id": "msg_assistant_1",
+			"role": "assistant",
+			"ts": 1760774101000,
+			"metrics": {
+				"inputTokens": 3,
+				"outputTokens": 1,
+				"cacheReadTokens": 0,
+				"cacheWriteTokens": 0,
+				"cost": 0.01
+			},
+			"content": [
+				{
+					"type": "text",
+					"text": "Pong — no modelInfo on any row and an empty manifest model."
+				}
+			]
+		}
+	]
+}

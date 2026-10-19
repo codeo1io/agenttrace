@@ -81,4 +81,35 @@ if grep -q '^## Unreleased' "$changelog"; then
 		fail "Unreleased section is present but carries no entries (rm-1390): a header over zero bullets claims a landing lane that does not exist — land the entries, date the section, or drop the header"
 fi
 
-echo "check-changelog-structure: no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous)"
+# Pass 4 (rm-1985): byte-identical ENTRY duplication. The rm-1036/
+# rm-1390 passes police section headings, but the duplication that
+# actually re-accumulated (observed at the cycle-4 base: 39 Unreleased
+# entries pasted twice, lines 424-493 == 496-597) was whole bullets, not
+# headings — every pass above stayed rc0 while the file carried a full
+# second copy of a landed release-note block. A bullet entry is a
+# column-0 `- ` line plus its indented continuation lines; the same
+# byte-identical entry appearing twice anywhere in the file fails here.
+# (A titled-but-divergent near-duplicate is NOT flagged — only exact
+# bytes, so deliberate "also lands in vX" re-mentions keep working.)
+if ! dupent="$(awk '
+	function flush() {
+		if (inentry) {
+			if (buf in seen) {
+				printf("  entry at line %d byte-identical to line %d: %s...\n", start, seen[buf], substr(buf, 1, 72))
+				bad = 1
+			} else {
+				seen[buf] = start
+			}
+			inentry = 0
+		}
+	}
+	/^## / || /^### / { flush(); next }
+	/^- / { flush(); buf = $0; start = NR; inentry = 1; next }
+	inentry && /^ / { buf = buf "\n" $0; next }
+	{ flush() }
+	END { flush(); exit bad ? 1 : 0 }
+' "$changelog")"; then
+	fail "byte-identical duplicate entries in CHANGELOG.md:"$'\n'"$dupent"
+fi
+
+echo "check-changelog-structure: no duplicate section kinds; no byte-identical entries; first-per-kind Unreleased parse sees all $total entries (non-vacuous)"

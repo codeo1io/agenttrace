@@ -1,0 +1,38 @@
+{
+	"version": 1,
+	"updated_at": "2026-10-18T09:10:05.000Z",
+	"agent": "lead",
+	"sessionId": "sess-beta-nomanifest",
+	"messages": [
+		{
+			"id": "msg_user_1",
+			"role": "user",
+			"content": [
+				{ "type": "text", "text": "Draft the release note." }
+			]
+		},
+		{
+			"id": "msg_assistant_1",
+			"role": "assistant",
+			"ts": 1760773801000,
+			"modelInfo": {
+				"id": "claude-sonnet-4-6",
+				"provider": "anthropic",
+				"family": "claude-sonnet-4"
+			},
+			"metrics": {
+				"inputTokens": 7,
+				"outputTokens": 2,
+				"cacheReadTokens": 1,
+				"cacheWriteTokens": 0,
+				"cost": 0.02
+			},
+			"content": [
+				{
+					"type": "text",
+					"text": "Drafted — this store has no session.json manifest sibling."
+				}
+			]
+		}
+	]
+}

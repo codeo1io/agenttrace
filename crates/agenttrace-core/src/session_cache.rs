@@ -1177,7 +1177,14 @@ const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 /// manifest and `hooks.jsonl` siblings no longer are. A listing stored
 /// by a pre-rm-1881 walk of that root replays the old admission set,
 /// so the lane bumps once to retire every stored listing.
-const DIR_LISTING_WALK_VERSION: i64 = 6;
+///
+/// v7 (rm-1435): listings gained the manifest-less Cline refusal
+/// count (`refused_cline_manifestless`) the cold walk records per
+/// directory, so warm replays disclose the sessions the rm-1881 gate
+/// refuses. The admission set is unchanged, but a pre-v7 listing
+/// replays the disclosure as zero — an undercounted report — so the
+/// lane bumps once to re-walk (never re-parse) every listing.
+const DIR_LISTING_WALK_VERSION: i64 = 7;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")
@@ -1291,12 +1298,25 @@ struct DirCacheEntry {
     /// serialize byte-identically.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     fork_parents: BTreeMap<String, (FileFingerprint, Option<String>)>,
+    /// rm-1435: manifest-less Cline CLI session dirs the cold walk
+    /// refused under this directory — the disclosure the rm-1881
+    /// admission gate owes (`cline_manifestless_sessions`). Absent
+    /// (listings written before the field existed) discloses zero,
+    /// which is why the `DIR_LISTING_WALK_VERSION` v7 rung retires
+    /// them. Skipped when zero so non-Cline directories serialize
+    /// byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refused_cline_manifestless: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct CachedDirListing {
     pub files: Vec<PathBuf>,
     pub dirs: Vec<PathBuf>,
+    /// rm-1435: manifest-less Cline refusals recorded for this
+    /// directory by the walk that stored the listing — replayed as the
+    /// warm-run disclosure so cold and warm agree.
+    pub refused_cline_manifestless: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2456,6 +2476,7 @@ pub(crate) fn cached_dir_listing(dir: &Path, cache: &mut SessionCache) -> Option
             .iter()
             .map(|child| path_from_key(child))
             .collect(),
+        refused_cline_manifestless: entry.refused_cline_manifestless.unwrap_or(0),
     })
 }
 
@@ -2480,6 +2501,7 @@ pub(crate) fn store_dir_listing(
     files: &[PathBuf],
     dirs: &[PathBuf],
     cache: &mut SessionCache,
+    refused_cline_manifestless: usize,
 ) -> anyhow::Result<()> {
     let metadata = fs::metadata(dir)?;
     let key = cache_key(dir);
@@ -2494,6 +2516,8 @@ pub(crate) fn store_dir_listing(
             files: files.iter().map(|path| cache_key(path)).collect(),
             dirs: dirs.iter().map(|path| cache_key(path)).collect(),
             fork_parents: BTreeMap::new(),
+            refused_cline_manifestless: (refused_cline_manifestless > 0)
+                .then_some(refused_cline_manifestless),
         },
     );
     cache.dirty = true;
@@ -4221,6 +4245,7 @@ mod tests {
             files: Vec::new(),
             dirs: Vec::new(),
             fork_parents: BTreeMap::new(),
+            refused_cline_manifestless: None,
         };
         cache
             .dirs
@@ -4786,6 +4811,7 @@ mod tests {
                     files: vec!["f".repeat(120); 6],
                     dirs: Vec::new(),
                     fork_parents: BTreeMap::new(),
+                    refused_cline_manifestless: None,
                 },
             );
         }
@@ -4881,6 +4907,7 @@ mod tests {
                 files: vec!["f".repeat(120); 6],
                 dirs: Vec::new(),
                 fork_parents: BTreeMap::new(),
+                refused_cline_manifestless: None,
             },
         );
         let projected = serialized_doc_size(&cache);
@@ -4924,7 +4951,7 @@ mod tests {
             path: root.join("sessions.json"),
             ..SessionCache::default()
         };
-        store_dir_listing(&info_dir, &[], &[], &mut cache).expect("store listing");
+        store_dir_listing(&info_dir, &[], &[], &mut cache, 0).expect("store listing");
         assert_eq!(
             cached_fork_parent(&info, &cache),
             None,
@@ -4961,6 +4988,68 @@ mod tests {
     }
 
     #[test]
+    fn refused_cline_manifestless_listing_round_trips() {
+        // rm-1435: the disclosure counter must survive the cache
+        // round-trip — `Some(n)` written by `store_dir_listing` reads
+        // back as `Some(n)` after save/load, and a pre-rm-1435 cache
+        // (no field on disk) reads back as `None` so the caller's
+        // `unwrap_or(0)` keeps it 0-count-clean.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-cline-manifestless-rt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let dir = root.join("sessions/alpha");
+        fs::create_dir_all(&dir).expect("create session dir");
+        let mut cache = SessionCache {
+            path: root.join("sessions.json"),
+            ..SessionCache::default()
+        };
+        store_dir_listing(&dir, &[dir.join("x.messages.json")], &[], &mut cache, 2)
+            .expect("store listing");
+        save_session_cache(&mut cache).expect("save cache");
+        // Hermetic by construction: no cache-dir env surgery (the env
+        // is process-global and this suite runs parallel — a racing
+        // set/remove robbed the concurrent-save test of its root), so
+        // the round-trip parses the saved BYTES through the same
+        // `from_value::<DirCacheEntry>` lane `load_session_cache`
+        // uses on the document it read from disk.
+        let doc = fs::read_to_string(root.join("sessions.json")).expect("read cache file");
+        assert!(
+            // `save_session_cache` serializes compact (`to_vec`), so
+            // the field appears with no space after the colon.
+            doc.contains("\"refused_cline_manifestless\":2"),
+            "the written document names the refusal count"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&doc).expect("saved doc is JSON");
+        let stored = parsed
+            .get("dirs")
+            .and_then(|dirs| dirs.get(dir.to_string_lossy().as_ref()))
+            .cloned()
+            .expect("stored listing survives the round-trip");
+        let entry: DirCacheEntry =
+            serde_json::from_value(stored).expect("listing entry deserializes");
+        assert_eq!(
+            entry.refused_cline_manifestless,
+            Some(2),
+            "the refusal count persists with the listing"
+        );
+        // A pre-rm-1435 listing (no field on disk) reads back as
+        // `None`, so the caller's `unwrap_or(0)` keeps it 0-count-clean
+        // instead of failing the load.
+        let legacy: DirCacheEntry = serde_json::from_value(serde_json::json!({
+            "mod_time": 1,
+            "files": [],
+            "dirs": [],
+        }))
+        .expect("pre-rm-1435 listing shape still parses");
+        assert_eq!(legacy.refused_cline_manifestless, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn dirs_map_gains_count_and_byte_bounds_of_its_own() {
         // rm-298: `dirs` had no bound at all — only entries did — so a
         // broad directory tree grew the snapshot without limit. The
@@ -4976,6 +5065,7 @@ mod tests {
                     files: vec![format!("file-{i}-{}.jsonl", "f".repeat(60)); 4],
                     dirs: Vec::new(),
                     fork_parents: BTreeMap::new(),
+                    refused_cline_manifestless: None,
                 },
             );
         }
@@ -5870,7 +5960,7 @@ mod tests {
             diagnostics: Diagnostics::default(),
         };
         store_session(&journal, &session, &mut cache).expect("store session");
-        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache, 0)
             .expect("store listing");
         save_session_cache(&mut cache).expect("save store");
         assert!(cache.schema_invalidations().is_empty());
@@ -5997,7 +6087,7 @@ mod tests {
             diagnostics: Diagnostics::default(),
         };
         store_session(&journal, &session, &mut cache).expect("store session");
-        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache, 0)
             .expect("store listing");
         save_session_cache(&mut cache).expect("save store");
 
@@ -6107,7 +6197,7 @@ mod tests {
         std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
 
         let mut cache = load_session_cache();
-        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache, 0)
             .expect("store listing");
         save_session_cache(&mut cache).expect("save store");
 
@@ -6228,7 +6318,7 @@ mod tests {
         // Self-heal forward: the re-walk stores the listing with the
         // lossless member, and the store serves the real path after a
         // save/reload.
-        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache, 0)
             .expect("store fresh listing");
         save_session_cache(&mut cache).expect("save store");
         let mut cache = load_session_cache();
@@ -6267,7 +6357,7 @@ mod tests {
 
         let rewrite_listing = |mod_time: i64, dir_size: serde_json::Value| {
             let mut cache = load_session_cache();
-            store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+            store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache, 0)
                 .expect("store listing");
             save_session_cache(&mut cache).expect("save store");
             let raw = fs::read_to_string(session_cache_path()).expect("read store");

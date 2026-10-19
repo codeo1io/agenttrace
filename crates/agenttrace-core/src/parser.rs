@@ -737,11 +737,9 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         // the envelope's own modelInfo is the fallback and the
         // per-message truth; a manifest/envelope disagreement is
         // disclosed, never silently resolved.
-        if let Some(events) = parse_cline_value(
-            &value,
-            "unknown",
-            cline_manifest_model(path).as_deref(),
-        ) {
+        if let Some(events) =
+            parse_cline_value(&value, "unknown", cline_manifest_model(path).as_deref())
+        {
             return session_from_events(name, path, events);
         }
         if let Some(events) = parse_messages_value(&value, "codex_cli") {
@@ -7758,11 +7756,7 @@ fn parse_cline_value(
     // provenance flips to reported_by_agent downstream. A metrics-free
     // envelope takes none of this path (carriers == 0 gates the event)
     // and renders byte-identically to the pre-rm-1881 walk.
-    if let Some(event) = cline_usage_event(
-        &usage_state,
-        &resolved,
-        envelope_provider.as_deref(),
-    ) {
+    if let Some(event) = cline_usage_event(&usage_state, &resolved, envelope_provider.as_deref()) {
         events.push(event);
     }
     if manifest_envelope_disagreement {
@@ -7820,7 +7814,10 @@ fn cline_manifest_model(transcript_path: &str) -> Option<String> {
             .get("metadata")
             .and_then(|metadata| metadata.get("model")),
     ] {
-        if let Some(model) = string(candidate).map(str::trim).filter(|model| !model.is_empty()) {
+        if let Some(model) = string(candidate)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
             return Some(model.to_string());
         }
     }

@@ -79,6 +79,14 @@ pub struct LoadReport {
     /// can report the exclusion instead of dropping sessions silently
     /// from every ranged view.
     pub future_excluded_sessions: usize,
+    /// rm-1435: Cline CLI session dirs the walk refused because their
+    /// `<id>.messages.json` transcript carries no sibling `session.json`
+    /// manifest (the rm-1881 admission gate) — each refusal is a whole
+    /// session dropped at read time. Counted cold and warm (the dir
+    /// listing persists the refusal count) and disclosed on the
+    /// data-health channel (`cline_manifestless_sessions`) instead of
+    /// vanishing from every report silently.
+    pub cline_manifestless: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -317,18 +325,28 @@ fn canonical_identity(path: &Path) -> PathBuf {
 }
 
 pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
+    find_session_files_counted(dir).0
+}
+
+/// rm-1435: `find_session_files` keeping the walk's disclosure counts —
+/// the same admission set, plus the manifest-less Cline CLI session
+/// dirs the rm-1881 gate refused along the way.
+pub fn find_session_files_counted(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return vec![dir.to_path_buf()];
+            return (vec![dir.to_path_buf()], 0);
         }
-        return collect_session_files(dir);
+        return collect_session_files_counted(dir);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
     let mut identities: HashSet<PathBuf> = HashSet::new();
     let mut all = Vec::new();
+    let mut cline_manifestless = 0usize;
     for dir in dirs {
-        for path in collect_session_files(&dir) {
+        let (paths, refused_cline_manifestless) = collect_session_files_counted(&dir);
+        cline_manifestless += refused_cline_manifestless;
+        for path in paths {
             // rm-338: dedup across roots by canonical identity so roots
             // aliasing or nesting one canonical directory cannot
             // double-count a session file; listed paths are kept as-is.
@@ -345,7 +363,7 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     // rm-1881: the same session id in both the canonical CLI store and
     // the legacy VS Code tasks root renders one session (canonical wins).
     retain_single_cline_session_per_id(&mut all);
-    sort_paths_by_mod_time(all)
+    (sort_paths_by_mod_time(all), cline_manifestless)
 }
 
 pub fn load_sessions_from_dir(dir: Option<&Path>) -> Vec<Session> {
@@ -459,7 +477,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // for org-less claude_code journals served from an override root.
     let override_root = std::env::var_os("CLAUDE_CONFIG_DIR").is_some();
     let mut sessions = Vec::new();
-    let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
+    let (files, json_fork_excluded, cline_manifestless) =
+        find_session_files_cached(dir, cache, true);
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
@@ -683,6 +702,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         parse_failure_paths,
         unlinked_subagents,
         future_excluded_sessions,
+        cline_manifestless,
     }
 }
 
@@ -704,13 +724,24 @@ fn matches_filter(value: &str, filter: &str) -> bool {
 }
 
 pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
+    collect_session_files_counted(dir).0
+}
+
+/// rm-1435: `collect_session_files` keeping the walk's refusal counts —
+/// the usize is the number of Cline CLI session dirs whose
+/// `<id>.messages.json` transcript was refused by the rm-1881 gate for
+/// lacking the `session.json` manifest (a whole session each). The
+/// manifest/`hooks.jsonl` siblings refused alongside are not
+/// transcripts and never count.
+pub fn collect_session_files_counted(dir: &Path) -> (Vec<PathBuf>, usize) {
     if is_cline_task_dir(dir) {
-        return vec![dir.to_path_buf()];
+        return (vec![dir.to_path_buf()], 0);
     }
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
     let mut visited = SymlinkTargets::new(dir);
     let mut file_targets = SessionFileTargets::new();
+    let mut cline_manifestless = 0usize;
     walk_session_files(
         dir,
         0,
@@ -718,34 +749,42 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
         &mut items,
         &mut visited,
         &mut file_targets,
+        &mut cline_manifestless,
     );
     items.sort_by_key(|item| Reverse(item.1));
-    items.into_iter().map(|item| item.0).collect()
+    (
+        items.into_iter().map(|item| item.0).collect(),
+        cline_manifestless,
+    )
 }
 
 pub(crate) fn find_session_files_cached(
     dir: Option<&Path>,
     cache: &mut SessionCache,
     skip_sqlite_backed: bool,
-) -> (Vec<PathBuf>, usize) {
+) -> (Vec<PathBuf>, usize, usize) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return (vec![dir.to_path_buf()], 0);
+            return (vec![dir.to_path_buf()], 0, 0);
         }
         // rm-548: an explicitly requested directory keeps every file —
         // a forked copy loaded by explicit path still renders (the
         // exclusion is an aggregation rule, not a parse block).
-        return (collect_session_files_cached(dir, cache), 0);
+        let (paths, cline_manifestless) = collect_session_files_cached(dir, cache);
+        return (paths, 0, cline_manifestless);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
     let mut seen = HashSet::new();
     let mut all = Vec::new();
+    let mut cline_manifestless = 0usize;
     for dir in dirs {
         if skip_sqlite_backed && skip_sqlite_backed_file_dir(&dir) {
             continue;
         }
-        for path in collect_session_files_cached(&dir, cache) {
+        let (paths, refused_cline_manifestless) = collect_session_files_cached(&dir, cache);
+        cline_manifestless += refused_cline_manifestless;
+        for path in paths {
             // rm-338: dedup across roots by canonical identity (see
             // canonical_identity); listed paths are kept as-is.
             let identity = if cross_root {
@@ -778,7 +817,11 @@ pub(crate) fn find_session_files_cached(
     // rm-1881: the same session id in both the canonical CLI store and
     // the legacy VS Code tasks root renders one session (canonical wins).
     retain_single_cline_session_per_id(&mut all);
-    (sort_paths_by_cache(all, cache), opencode_fork_excluded)
+    (
+        sort_paths_by_cache(all, cache),
+        opencode_fork_excluded,
+        cline_manifestless,
+    )
 }
 
 /// rm-548: an opencode storage session doc (`.../storage/session/info/
@@ -842,14 +885,17 @@ pub(crate) fn opencode_session_fork_parent_cached(
     probed
 }
 
-fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<PathBuf> {
+fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> (Vec<PathBuf>, usize) {
     if is_cline_task_dir(dir) {
-        return vec![dir.to_path_buf()];
+        return (vec![dir.to_path_buf()], 0);
     }
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
     let mut visited = SymlinkTargets::new(dir);
     let mut file_targets = SessionFileTargets::new();
+    // rm-1435: the manifest-less Cline refusal count rides the cached
+    // walk (persisted per-dir with the listing for warm replays).
+    let mut cline_manifestless = 0usize;
     walk_session_files_cached(
         dir,
         0,
@@ -858,8 +904,9 @@ fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<Pat
         &mut items,
         &mut visited,
         &mut file_targets,
+        &mut cline_manifestless,
     );
-    sort_paths_by_cache(items, cache)
+    (sort_paths_by_cache(items, cache), cline_manifestless)
 }
 
 /// Loop guard for symlinked session directories (Codex `#42135`):
@@ -972,6 +1019,9 @@ fn entry_is_dir_entry(file_type: &fs::FileType, path: &Path) -> bool {
     false
 }
 
+// rm-1435: the refusal accumulator threads the cline manifestless
+// count out of the walk alongside the other skip ledgers.
+#[allow(clippy::too_many_arguments)]
 fn walk_session_files_cached(
     dir: &Path,
     depth: usize,
@@ -980,6 +1030,7 @@ fn walk_session_files_cached(
     items: &mut Vec<PathBuf>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
+    cline_manifestless: &mut usize,
 ) {
     if depth > max_depth {
         return;
@@ -995,6 +1046,11 @@ fn walk_session_files_cached(
         return;
     }
     if let Some(listing) = cached_dir_listing(dir, cache) {
+        // rm-1435: the stored listing carries the manifest-less Cline
+        // refusal count the cold walk recorded for this directory, so
+        // a warm replay discloses the same number the cold walk saw
+        // instead of zeroing it behind the replay.
+        *cline_manifestless += listing.refused_cline_manifestless;
         // rm-597: replayed listings are raw (pre-dedup), so the same
         // same-file admission applies on warm replay as on a cold walk.
         // rm-732: the cold walk's file-kind gate re-validates here too —
@@ -1023,6 +1079,7 @@ fn walk_session_files_cached(
                     items,
                     visited,
                     file_targets,
+                    cline_manifestless,
                 );
             }
         }
@@ -1034,6 +1091,10 @@ fn walk_session_files_cached(
     };
     let mut files = Vec::new();
     let mut dirs = Vec::new();
+    // rm-1435: refusals recorded for THIS directory — persisted with
+    // the listing (see the store below) so warm replays disclose the
+    // same count.
+    let mut refused_cline_manifestless = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
@@ -1082,6 +1143,15 @@ fn walk_session_files_cached(
         // and the name alone never qualifies (content-shaped gates in
         // `is_cline_cli_session_file`).
         if is_cline_cli_session_path(&path) && !is_cline_cli_session_file(&path) {
+            // rm-1435: a refused TRANSCRIPT is a manifest-less Cline
+            // CLI session dir — one whole session dropped at read time.
+            // Counted here, and persisted with the listing below, so
+            // cold and warm runs disclose the same number. The
+            // manifest/hooks siblings refused alongside are not
+            // transcripts and never count.
+            if is_cline_cli_transcript_name(&path) {
+                refused_cline_manifestless += 1;
+            }
             continue;
         }
         files.push(path);
@@ -1091,7 +1161,11 @@ fn walk_session_files_cached(
     // rm-597: the stored listing is deliberately raw (undecidable at
     // per-directory scope); dedup happens as the list merges into the
     // walk output, keeping cached and uncached walks identical.
-    let _ = store_dir_listing(dir, &files, &dirs, cache);
+    // rm-1435: persist THIS directory's refusal count with the listing
+    // so the warm replay above discloses it; the walk-wide total gets
+    // it here plus whatever the recursive children add.
+    let _ = store_dir_listing(dir, &files, &dirs, cache, refused_cline_manifestless);
+    *cline_manifestless += refused_cline_manifestless;
 
     items.extend(files.into_iter().filter(|path| file_targets.admit(path)));
     for child in dirs {
@@ -1115,6 +1189,7 @@ fn walk_session_files(
     items: &mut Vec<(PathBuf, SystemTime)>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
+    cline_manifestless: &mut usize,
 ) {
     if depth > max_depth {
         return;
@@ -1147,7 +1222,15 @@ fn walk_session_files(
             if !visited.admit(&path) {
                 continue;
             }
-            walk_session_files(&path, depth + 1, max_depth, items, visited, file_targets);
+            walk_session_files(
+                &path,
+                depth + 1,
+                max_depth,
+                items,
+                visited,
+                file_targets,
+                cline_manifestless,
+            );
             continue;
         }
         let name = entry.file_name();
@@ -1176,6 +1259,13 @@ fn walk_session_files(
         // and the name alone never qualifies (content-shaped gates in
         // `is_cline_cli_session_file`).
         if is_cline_cli_session_path(&path) && !is_cline_cli_session_file(&path) {
+            // rm-1435: same disclosure as the cached walk — a refused
+            // transcript (a manifest-less session dir) is counted; the
+            // manifest/hooks siblings refused alongside are not
+            // transcripts and never count.
+            if is_cline_cli_transcript_name(&path) {
+                *cline_manifestless += 1;
+            }
             continue;
         }
         // rm-597: same-file admission — a symlink or hardlink alias of an
