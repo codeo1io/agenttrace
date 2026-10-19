@@ -164,6 +164,46 @@ fn overview_csv_emits_summary_and_attribution_tables() {
     fs::remove_dir_all(dir).ok();
 }
 
+#[test]
+fn overview_csv_by_model_carries_pricing_basis_column() {
+    // rm-1574 extension: the by_model machine surface must let
+    // consumers tell exact-priced rows from fallback-priced ones. The
+    // column is additive at the END of the row; by_provider/
+    // by_branch keep the 3-column shape (their keys have no pricing
+    // semantics).
+    let dir = fixture_dir(
+        "overview-basis",
+        &[
+            user_line("check the billing please"),
+            assistant_line(ALL_ZERO, CLAUDE_MODEL),
+        ],
+    );
+    let out = run_csv(&dir, &["--overview", "-f", "csv"]);
+    assert!(
+        out.contains("# by_model\r\nname,sessions,cost,pricing_basis\r\n"),
+        "by_model header carries the basis column: {out}"
+    );
+    let model_row = out
+        .lines()
+        .find(|l| l.contains("claude-sonnet-4-5-20250929,"))
+        .expect("by_model row present");
+    assert_eq!(
+        model_row.split(',').count(),
+        4,
+        "by_model rows carry 4 cells (name, sessions, cost, basis): {model_row}"
+    );
+    assert!(
+        model_row.ends_with(",exact") || model_row.ends_with(",fallback"),
+        "basis cell carries a machine token: {model_row}"
+    );
+    assert!(
+        !out.contains("by_provider,name,sessions,cost,pricing_basis"),
+        "by_provider keeps the 3-column shape"
+    );
+    assert!(!out.contains("by_branch,name,sessions,cost,pricing_basis"));
+    fs::remove_dir_all(dir).ok();
+}
+
 fn scratch_path(name: &str) -> std::path::PathBuf {
     // rm-1882 (rm-1065 discipline): per-call unique scratch paths. The
     // pid separates concurrent cargo-test processes on one host; the

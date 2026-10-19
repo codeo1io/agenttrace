@@ -1,11 +1,30 @@
 # agenttrace Windows installer (PowerShell)
 # Usage: powershell -ExecutionPolicy Bypass -File install.ps1
 # Or:    iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+#
+# Release pinning (rm-2014): an `iex` pipe cannot pass parameters, so
+# environment variables are the ONLY way to pin from the one-liner —
+#   AGENTTRACE_VERSION=v0.10.1  install that release tag instead of
+#                               latest. A tag that does not exist
+#                               fails closed; the installer never
+#                               silently falls back to latest.
+#   AGENTTRACE_INSTALL_DIR=...  override the install directory.
+#   AGENTTRACE_NO_MODIFY_PATH=1 this installer never edits PATH; the
+#                               flag only silences the PATH hint.
+# An explicit -Version/-InstallDir parameter (a -File invocation) wins
+# over the environment, matching install.sh's contract.
 
 param(
-    [string]$Version = "latest",
-    [string]$InstallDir = "$env:LOCALAPPDATA\agenttrace"
+    [string]$Version = "",
+    [string]$InstallDir = ""
 )
+
+# rm-2014: explicit parameters (only usable with -File), then the
+# environment (the iex one-liner's only channel), then defaults.
+if (-not $Version) { $Version = "${env:AGENTTRACE_VERSION}" }
+if (-not $Version) { $Version = "latest" }
+if (-not $InstallDir) { $InstallDir = "${env:AGENTTRACE_INSTALL_DIR}" }
+if (-not $InstallDir) { $InstallDir = "$env:LOCALAPPDATA\agenttrace" }
 
 $REPO = "luoyuctl/agenttrace"
 $BIN = "agenttrace.exe"
@@ -17,16 +36,25 @@ $ARCH = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArch
     default { throw "Unsupported architecture: $_" }
 }
 
-Write-Host "🔍 Fetching latest release..." -ForegroundColor Cyan
+$Pinned = $Version -ne "latest"
+Write-Host "🔍 Fetching release ($Version)..." -ForegroundColor Cyan
 
-if ($Version -eq "latest") {
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$REPO/releases/latest"
-    $Version = $release.tag_name
+try {
+    if ($Pinned) {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$REPO/releases/tags/$Version"
+    } else {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$REPO/releases/latest"
+        $Version = $release.tag_name
+    }
     $assets = $release.assets | Where-Object { $_.name -eq "agenttrace-windows-${ARCH}.exe" }
-} else {
-    $assets = Invoke-RestMethod -Uri "https://api.github.com/repos/$REPO/releases/tags/$Version" |
-        Select-Object -ExpandProperty assets |
-        Where-Object { $_.name -eq "agenttrace-windows-${ARCH}.exe" }
+} catch {
+    if ($Pinned) {
+        Write-Host "❌ Release '$Version' not found (AGENTTRACE_VERSION/-Version); refusing to fall back to latest." -ForegroundColor Red
+        Write-Host "   Unset AGENTTRACE_VERSION to track the newest release."
+    } else {
+        Write-Host "❌ Could not resolve the latest release from GitHub: $_" -ForegroundColor Red
+    }
+    exit 1
 }
 
 if (-not $assets) {
@@ -99,15 +127,20 @@ try {
     if (Test-Path $sidecarTmp) { Remove-Item $sidecarTmp -Force }
 }
 
-# PATH check
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*$InstallDir*") {
-    Write-Host ""
-    Write-Host "⚠️  $InstallDir is not in your PATH." -ForegroundColor Yellow
-    Write-Host "   Run this to add it:"
-    Write-Host '     [Environment]::SetEnvironmentVariable("Path", "$env:LOCALAPPDATA\agenttrace;$env:PATH", "User")'
-    Write-Host "   Then restart your terminal."
-    Write-Host ""
+# PATH check — rm-2014: this installer never edits PATH on its own; it
+# prints how to add the install directory. AGENTTRACE_NO_MODIFY_PATH=1
+# (or -Version-style explicit opt-out parity with install.sh) silences
+# the hint for scripted installs.
+if (-not ${env:AGENTTRACE_NO_MODIFY_PATH}) {
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if ($userPath -notlike "*$InstallDir*") {
+        Write-Host ""
+        Write-Host "⚠️  $InstallDir is not in your PATH." -ForegroundColor Yellow
+        Write-Host "   Run this to add it:"
+        Write-Host '     [Environment]::SetEnvironmentVariable("Path", "$env:LOCALAPPDATA\agenttrace;$env:PATH", "User")'
+        Write-Host "   Then restart your terminal."
+        Write-Host ""
+    }
 }
 
 Write-Host ""

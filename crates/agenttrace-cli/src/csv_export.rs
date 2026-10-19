@@ -28,7 +28,7 @@
 //!   prefixes when deciding a cell is a formula). Plain numbers stay
 //!   bare so cost/token columns import as values.
 
-use agenttrace_core::{sanitize_line_segment, Overview};
+use agenttrace_core::{pricing_basis_label, sanitize_line_segment, Overview};
 
 /// One `--sessions -f csv` row; mirrors the TSV columns plus the
 /// rm-408 disclosure column, so the statement never reports clean
@@ -139,6 +139,13 @@ pub fn overview_csv(overview: &Overview) -> String {
         // sections render the FULL group set (no GROUP_TAKE cut, no
         // marker); the human surfaces (text/html/markdown) cap at
         // GROUP_TAKE with an explicit "+N more not shown" disclosure.
+        // rm-1574 extension: by_model additionally carries a
+        // `pricing_basis` column (exact | fallback | unknown) so
+        // machine consumers can tell exact-priced rows from
+        // fallback-priced ones. The column is ADDITIVE at the end of
+        // the row — the first three columns stay byte-stable. by_provider
+        // / by_branch keys have no pricing semantics and keep the
+        // 3-column shape.
         ("by_model", &overview.by_model),
         ("by_provider", &overview.by_provider),
         // rm-585 (spend-by-branch, first cut): same GroupOverview
@@ -149,13 +156,24 @@ pub fn overview_csv(overview: &Overview) -> String {
         if rows.is_empty() {
             continue;
         }
-        out.push_str(&table(name, &["name", "sessions", "cost"]));
+        let model_basis = name == "by_model";
+        if model_basis {
+            out.push_str(&table(name, &["name", "sessions", "cost", "pricing_basis"]));
+        } else {
+            out.push_str(&table(name, &["name", "sessions", "cost"]));
+        }
         for (group, entry) in rows {
-            out.push_str(&csv_row(&[
-                group,
-                &entry.sessions.to_string(),
-                &format!("{:.4}", entry.cost),
-            ]));
+            let sessions = entry.sessions.to_string();
+            let cost = format!("{:.4}", entry.cost);
+            if model_basis {
+                let basis = match pricing_basis_label(group) {
+                    None => "exact",
+                    Some(label) => label,
+                };
+                out.push_str(&csv_row(&[group, &sessions, &cost, basis]));
+            } else {
+                out.push_str(&csv_row(&[group, &sessions, &cost]));
+            }
         }
     }
     if !overview.by_task_type.is_empty() {

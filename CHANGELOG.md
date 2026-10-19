@@ -4,6 +4,30 @@
 
 ### Added
 
+- installer release pinning + hostile-timestamp no-panic + CSV/TUI
+  pricing basis (rm-2014 + rm-2013 + rm-1574 extension, run 91066ba0
+  cycle 2): `install.ps1`'s `-Version` parameter was unreachable under
+  its own documented `iex` one-liner — Windows had NO way to pin a
+  release. Both installers now honor the same environment contract
+  (`AGENTTRACE_VERSION`, `AGENTTRACE_INSTALL_DIR`, and
+  `AGENTTRACE_NO_MODIFY_PATH`, documented in README.md and
+  README.zh-CN.md): a pinned-but-missing tag fails closed and the
+  installer never silently falls back to latest; the README's claim
+  that installers "add the install directory to your PATH" is
+  corrected to the truth (they print the addition — they never edit
+  shell profiles). Separately, a journal carrying a hostile
+  naive-profile timestamp (chrono 0.4.45 parses `-262143-01-01T00:00:00`;
+  the hole is one-sided — `+262143-…` is rejected) panicked the
+  process in `--quota` (`DateTime - TimeDelta overflowed` at
+  `quota_window`'s window bound) and in the governance commit window;
+  `parse_ts` now accepts only 4-digit years, so expanded-year rows are
+  disclosed unplaced by the corpus census instead of aborting the run.
+  Finally the CSV by-model export carries a new additive
+  `pricing_basis` column and the TUI top-model row the same
+  ` (fallback pricing)` / ` (pricing unknown)` markers as the text
+  lane — fallback-priced totals are no longer indistinguishable from
+  exact-priced ones on the machine and human surfaces.
+
 - daybreak money truth + hostile-org bound + per-row pricing basis
   (rm-1570 + rm-1571 + rm-1574, run fd0e91a2 cycle 3): the gpt-daybreak
   family is codex 0.163.0's DEFAULT model set, and LiteLLM publishes the

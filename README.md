@@ -81,12 +81,33 @@ Windows CMD:
 curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
-The install scripts download the release binary for your platform, verify its
-SHA-256 against the published checksum, and add the install directory to your
-PATH (`~/.local/bin`, or `%LOCALAPPDATA%\agenttrace` on Windows). The shell
-installer always fetches the newest release (pin its build-from-source
-fallback with `AGENTTRACE_SOURCE_REF=v0.10.1`); on Windows, pin a release
-with `-Version v0.10.1` (PowerShell).
+The install scripts download the release binary for your platform and verify its
+SHA-256 against the published checksum before installing. They never edit your
+shell profile — they print the `PATH` addition instead (`~/.local/bin`, or
+`%LOCALAPPDATA%\agenttrace` on Windows).
+
+Install a specific release (rm-2014) — both installers honor the same
+environment variables, which is the only way to pin from a piped one-liner
+(PowerShell's `iex` pipe cannot pass parameters, so `-Version` never worked
+there):
+
+| Variable | Meaning |
+| --- | --- |
+| `AGENTTRACE_VERSION` | Release tag to install (default: newest). A tag that does not exist fails closed — the installer never silently falls back to latest. |
+| `AGENTTRACE_INSTALL_DIR` | Override the install directory. |
+| `AGENTTRACE_NO_MODIFY_PATH` | `1` silences the `PATH` hint for scripted installs. |
+| `AGENTTRACE_SOURCE_REF` | Pin the shell installer's build-from-source fallback (default `v0.10.1`). |
+| `AGENTTRACE_DOWNLOAD_URL` | Override the binary URL entirely (offline CI tests). |
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh \
+  | AGENTTRACE_VERSION=v0.10.1 sh
+```
+
+```powershell
+$env:AGENTTRACE_VERSION = "v0.10.1"
+irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+```
 
 Package managers:
 
