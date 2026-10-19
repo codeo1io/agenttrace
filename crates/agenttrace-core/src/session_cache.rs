@@ -1243,9 +1243,9 @@ struct CacheEntryHeader {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct FileFingerprint {
-    mod_time: i64,
-    size: i64,
+pub(crate) struct FileFingerprint {
+    pub(crate) mod_time: i64,
+    pub(crate) size: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2181,7 +2181,12 @@ fn sqlite_shm_path(database: &Path) -> PathBuf {
     PathBuf::from(format!("{}-shm", database.to_string_lossy()))
 }
 
-fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+/// Fingerprint of one file as the memo vouch sees it (`mtime_ns`,
+/// byte size). rm-1888: also the PRE-hash stat the discovery lane
+/// captures before hashing a journal, so the store can refuse to
+/// memoize when the file moved under the read (see
+/// [`fingerprint_unchanged`]).
+pub(crate) fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
     let metadata = fs::metadata(path).ok()?;
     Some(FileFingerprint {
         mod_time: file_mod_time_nanos(&metadata),
@@ -2592,8 +2597,11 @@ pub(crate) fn store_fork_parent_probe(
 /// from the parent directory's cached listing — `(byte size,
 /// FNV-1a-64 of the raw bytes)`. `None` = no usable memo (hash never
 /// run, no listing for the parent directory, or the file's fingerprint
-/// moved — a rewritten journal re-hashes, so the memo can never mask
-/// mutated content). Callers hash the file and persist with
+/// moved). The memo vouch is mtime_ns + size, so on its own it can serve
+/// a stale hash for a size-preserving rewrite; rm-1888 therefore moves
+/// the trust to the suppression decision — discovery byte-verifies on a
+/// hit — and the store only persists fingerprints observed BEFORE the
+/// hash read. Callers hash the file and persist with
 /// [`store_content_signature`]. Used by admission-level content dedup:
 /// a byte-identical journal at a second path is not a second session,
 /// and warm runs must not re-read every journal to prove it.
@@ -2614,27 +2622,62 @@ pub(crate) fn cached_content_signature(path: &Path, cache: &SessionCache) -> Opt
 /// cached listing (see [`cached_content_signature`]). When the parent
 /// directory has no cached listing the result is simply not persisted
 /// — the signature is still correct for this run.
-pub(crate) fn store_content_signature(path: &Path, size: i64, sig: u64, cache: &mut SessionCache) {
+///
+/// rm-1888: the caller supplies the fingerprint captured BEFORE the
+/// hash read (and only calls this when it still matches afterwards) —
+/// the store deliberately does not re-stat, so a write racing between
+/// the read and the store can no longer key old bytes' hash to a new
+/// fingerprint and poison the memo.
+pub(crate) fn store_content_signature(
+    path: &Path,
+    fingerprint: FileFingerprint,
+    sig: u64,
+    cache: &mut SessionCache,
+) {
     let Some(dir) = path.parent() else {
-        return;
-    };
-    let Ok(metadata) = fs::metadata(path) else {
         return;
     };
     let Some(entry) = cache.dirs.get_mut(&cache_key(dir)) else {
         return;
     };
-    entry.content_sigs.insert(
-        cache_key(path),
-        (
-            FileFingerprint {
-                mod_time: file_mod_time_nanos(&metadata),
-                size,
-            },
-            sig,
-        ),
-    );
+    entry
+        .content_sigs
+        .insert(cache_key(path), (fingerprint, sig));
     cache.dirty = true;
+}
+
+/// rm-1888: the fingerprint currently banked in the memo for this
+/// file, if any — the in-crate read side for tests that must prove
+/// WHICH stat a just-banked memo is keyed on (pre-hash, never a
+/// re-stat at store time).
+#[cfg(test)]
+pub(crate) fn banked_content_fingerprint(
+    path: &Path,
+    cache: &SessionCache,
+) -> Option<FileFingerprint> {
+    cache
+        .dirs
+        .get(&cache_key(path.parent()?))?
+        .content_sigs
+        .get(&cache_key(path))
+        .map(|(fingerprint, _)| fingerprint.clone())
+}
+
+/// rm-1888: the memo-store race guard — true when the file's current
+/// fingerprint still equals the one captured BEFORE the hash read.
+/// The caller hashes between the two observations; a write that lands
+/// in that window changes the fingerprint (size or mtime), the guard
+/// turns false, and the store is skipped — so a racing write can no
+/// longer persist old bytes' hash under a new fingerprint and poison
+/// the memo (the old store re-statted at write time, which keyed the
+/// NEW fingerprint to the OLD hash — the losing side of the race).
+/// A vanished file is "moved" by definition.
+pub(crate) fn fingerprint_unchanged(path: &Path, fingerprint: &FileFingerprint) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    metadata.len() as i64 == fingerprint.size
+        && file_mod_time_nanos(&metadata) == fingerprint.mod_time
 }
 
 pub(crate) fn cached_file_mod_time_if_fresh(
@@ -3516,7 +3559,11 @@ impl GoAnomaly {
 // $XDG_CACHE_HOME and joined a set-but-empty OR relative HOME into a
 // RELATIVE `.cache` against the CWD).
 
-fn cache_key(path: &Path) -> String {
+/// Cache key of a filesystem path — the stable lowercase string
+/// identity under which dir listings and content-signature memos are
+/// stored. `pub(crate)` so in-crate lanes (discovery's dedup tests)
+/// can read back the memo they just banked.
+pub(crate) fn cache_key(path: &Path) -> String {
     if let Some(text) = path.to_str() {
         return text.to_string();
     }

@@ -4,6 +4,63 @@
 
 ### Added
 
+- content dedup byte-verifies before it suppresses, and the memo it
+  consults can no longer be poisoned by a racing write (rm-1888, run
+  5cbd75e3 cycle 2, batch "Verify, don't trust: byte-verified counting
+  and bounded I/O"): discovery's content dedup treated a (size,
+  FNV-1a-64) signature match as proof of duplication, but the
+  signature's memo is vouched by `mtime_ns`+size alone — so a
+  same-length mutation with a restored mtime served the ORIGINAL
+  content's hash and the mutated journal was suppressed as a
+  "byte-identical duplicate" it was not (the reaped sibling 3fcbdb02's
+  PoC class, reproduced red-first in this batch's battery). The
+  Occupied arm now byte-verifies the newcomer against every file
+  banked under the matching signature before suppressing anything:
+  distinct bytes under one signature are KEPT and counted in a new
+  `content_signature_conflicts` audit key ("verified distinct", never
+  silently dropped), the same counter rides `--doctor` disclosures
+  and recommendations, and the verification read itself rides the same
+  named-file read cap the signature uses — over-cap files compare as
+  distinct (KEPT), not read whole. The byte-verify covers BOTH
+  admission walks — the cached one (where a stale memo can serve an
+  old hash) and the uncached one (where only a hash collision can
+  present the same way). The memo store closes its T0/T2
+  race the same way the parser lane already did: the fingerprint is
+  captured BEFORE the hash read and the store is skipped when the
+  file moved under it, so a racing write can no longer key old
+  bytes' hash to a new fingerprint — the losing side of the race
+  that used to persist the poison across runs.
+
+- codex rollout reconciliation bounds its file reads (rm-451 rider,
+  same batch): the replay-family scan re-read every rollout
+  whole (`fs::read`, unbounded) once per codex session during
+  reconciliation — the one remaining unbounded materialization after
+  the parser lane got its cap family. The scan now refuses past the
+  same `AGENTTRACE_FILE_CAP_BYTES` cap (default 256 MiB) the parser
+  enforces — stat-first refusal, `take(cap + 1)` on the read, and a
+  post-read length guard for the stat/read TOCTOU — and the refusal
+  is typed (`RolloutReadCapRefused`, naming size and cap), counted on
+  the adjustment (`read_cap_refused`), and disclosed on stderr in
+  both CLI lanes that assemble a corpus (the rm-799 one-line
+  pattern) instead of reading as "no replay families found" — and it
+  never mutates usage.
+
+- the relative-link gate lints reference-style definitions and
+  accepts directory targets (rm-1894, same batch):
+  `scripts/ci/check-docs-links.sh` only extracted INLINE links (the
+  label-in-brackets, destination-in-parentheses form), so a
+  `[label]: destination` definition could dangle
+  invisibly while every rendered inline link resolved; and its
+  existence test was `-f`, which flags a legitimate link to a
+  DIRECTORY (`](docs/quality-gates)`) as broken. The gate now lints
+  both forms (destination + at most one quoted/parenthesized title,
+  per CommonMark — prose status lines like `[REPRODUCED]: opencode
+  DB, ...` in review docs are correctly left alone), accepts file
+  OR directory targets, and a standing fixture
+  (`docs/quality-gates/relative-link-forms.md`) exercises every
+  covered form in the tree the gate lints; both rider gaps are
+  fixture-pinned red-first in `docs_links_gate_contract.rs`.
+
 - catalog-census suites are deterministic battery truth, immune to the
   machine pricing cache (rm-1954, run ce9309d9 cycle 1, batch
   "battery-truth hygiene"): the pricing catalog resolves through the

@@ -64,6 +64,12 @@ pub struct LoadReport {
     /// capped at five, naming the paths so an operator can tell a
     /// copy from a coincidence.
     pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-1888 (run 5cbd75e3 cycle 2): files whose (size, fast-hash)
+    /// signature matched a banked file but whose bytes did NOT — a
+    /// stale memo or an FNV collision presenting as a duplicate.
+    /// Kept and disclosed, never suppressed on cheap evidence alone;
+    /// the verified-distinct counterpart of `duplicate_session_files`.
+    pub content_signature_conflicts: usize,
     /// rm-835 (minted campaign-locally as rm-695 by run f7f81aea, rebound
     /// at integration — the landed wall already holds an rm-695): how many
     /// discovered files failed to parse (the parse share of `skipped`,
@@ -376,13 +382,19 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     // content dedup so an id-level duplicate resolves by the canonical
     // store rather than first-seen path order, matching the cached walk.
     retain_single_cline_session_per_id(&mut all);
-    let mut signatures: HashSet<(i64, u64)> = HashSet::new();
-    all.retain(|path| {
-        // Unreadable: keep (the parse lane owns and discloses those).
-        content_signature(path)
-            .map(|signature| signatures.insert(signature))
-            .unwrap_or(true)
-    });
+    // rm-1888 (run 5cbd75e3 cycle 2): the SAME byte-verify discipline
+    // as the cached walk — a (size, FNV-1a-64) signature hit is cheap
+    // evidence, not proof, so this lane too verifies bytes before
+    // suppressing a newcomer under a signature it already holds (the
+    // collision class; the stale-memo class cannot occur here because
+    // fresh hashes never consult a memo, but the cure is one code
+    // shape for both lanes). Verified-distinct files are KEPT — the
+    // `content_signature_conflicts` disclosure counter is a cache-lane
+    // report surface; here the honest floor is never suppressing on
+    // unverified evidence, the same stance as unreadable files.
+    // (The `-d` arm above keeps every file — rm-548 stance — so this
+    // pass runs on the full home walk only.)
+    retain_byte_verified_signatures(&mut all);
     sort_paths_by_mod_time(all)
 }
 
@@ -657,6 +669,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
     let subagent_artifact_files = suppressed.subagent_artifact_files;
     let duplicate_session_files = suppressed.duplicate_session_files;
     let duplicate_session_file_pairs = suppressed.duplicate_session_file_pairs;
+    let content_signature_conflicts = suppressed.content_signature_conflicts;
     if dir.is_none() {
         let (sqlite_sessions, ingest) =
             crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
@@ -745,6 +758,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         subagent_artifact_files,
         duplicate_session_files,
         duplicate_session_file_pairs,
+        content_signature_conflicts,
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
@@ -818,6 +832,9 @@ pub struct SuppressedSessions {
     /// capped at [`MAX_DUPLICATE_PAIR_SAMPLES`]; the full count rides
     /// `duplicate_session_files`.
     pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-1888: signature conflicts resolved by byte-verification —
+    /// kept files a (size, hash) hit would have wrongly suppressed.
+    pub content_signature_conflicts: usize,
 }
 
 /// rm-1886: cap on the named duplicate pairs carried for disclosure —
@@ -900,9 +917,83 @@ fn content_signature_cached(path: &Path, cache: &mut SessionCache) -> Option<(i6
     if let Some(signature) = crate::session_cache::cached_content_signature(path, cache) {
         return Some(signature);
     }
+    // rm-1888: capture the fingerprint BEFORE the hash read. The memo
+    // is only persisted when the file still carries that fingerprint
+    // AFTER the read (fingerprint_unchanged) — a write racing the read
+    // can no longer key old-content hashes to new fingerprints and
+    // poison the memo persistently (the store used to re-stat at write
+    // time, the losing side of that race).
+    let before = crate::session_cache::file_fingerprint(path);
     let signature = content_signature(path)?;
-    crate::session_cache::store_content_signature(path, signature.0, signature.1, cache);
+    if let Some(before) =
+        before.filter(|before| crate::session_cache::fingerprint_unchanged(path, before))
+    {
+        crate::session_cache::store_content_signature(path, before, signature.1, cache);
+    }
     Some(signature)
+}
+
+/// rm-1888: byte-equality of two candidate journal files — the
+/// verification that outranks a (size, fast-hash) signature hit. The
+/// read rides the SAME named-file read cap the signature itself uses
+/// (rm-451 family): a metadata fast-path refuses over-cap files and
+/// `take(cap + 1)` bounds the allocation, so verification can never
+/// become the unbounded read the cap family closed. Cheap length
+/// check first; unreadable or over-cap files compare as "not equal"
+/// so the newcomer is KEPT (observable downstream) rather than
+/// suppressed on cheap evidence it was impossible to verify.
+fn files_share_content(a: &Path, b: &Path) -> bool {
+    let cap = crate::parser::file_read_cap_bytes();
+    let read_bounded = |path: &Path| -> Option<Vec<u8>> {
+        use std::io::Read;
+        if fs::metadata(path).ok()?.len() > cap {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .ok()?
+            .take(cap.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() as u64 <= cap).then_some(bytes)
+    };
+    match (read_bounded(a), read_bounded(b)) {
+        (Some(bytes_a), Some(bytes_b)) => bytes_a == bytes_b,
+        _ => false,
+    }
+}
+
+/// rm-1888: the uncached walk's admission dedup — same byte-verify
+/// discipline as [`content_dedup_pass`], but with fresh hashes only
+/// (no memo to consult, so only the collision class can present a hit).
+/// In place on the walk's collected file list; a no-signature file
+/// (unreadable, over-cap) is kept, never suppressed.
+fn retain_byte_verified_signatures(all: &mut Vec<PathBuf>) {
+    let mut signatures: HashMap<(i64, u64), Vec<PathBuf>> = HashMap::new();
+    all.retain(|path| {
+        // Unreadable: keep (the parse lane owns and discloses those).
+        let Some(signature) = content_signature(path) else {
+            return true;
+        };
+        match signatures.entry(signature) {
+            std::collections::hash_map::Entry::Occupied(mut survivor) => {
+                let suppressed = survivor
+                    .get()
+                    .iter()
+                    .any(|first_seen| files_share_content(first_seen, path));
+                if suppressed {
+                    false
+                } else {
+                    survivor.get_mut().push(path.clone());
+                    true
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(vec![path.clone()]);
+                true
+            }
+        }
+    });
 }
 
 pub(crate) fn find_session_files_cached(
@@ -989,29 +1080,65 @@ pub(crate) fn find_session_files_cached(
     // silently drop what it cannot verify. Unreadable-file stance
     // keeps this pass observable: suppressed copies are counted and
     // the first pairs named.
+    let deduped = content_dedup_pass(all, cache, &mut suppressed);
+    (sort_paths_by_cache(deduped, cache), suppressed)
+}
+
+/// rm-1886 content dedup, rm-1888 byte-verified: collapse byte-
+/// identical copies of one journal (first-seen survivor wins,
+/// deterministic — the walk yields sorted per-directory files, roots
+/// in registration order). A (size, FNV-1a-64) signature hit is CHEAP
+/// EVIDENCE, not proof — the memo vouch is mtime_ns+size and the hash
+/// is 64-bit, so a stale memo or a collision both present as a hit —
+/// so before suppressing anything the Occupied arm byte-verifies the
+/// newcomer against every file banked under that signature. Distinct
+/// bytes under one signature are KEPT, banked alongside (a later
+/// byte-identical copy still suppresses against either), and counted
+/// in [`SuppressedSessions::content_signature_conflicts`] so the
+/// disclosure channel can say "verified distinct" — never silently
+/// drop, never suppress on evidence nobody verified. A file with no
+/// signature (unreadable, or over the named-file read cap) is kept
+/// the same way.
+fn content_dedup_pass(
+    all: Vec<PathBuf>,
+    cache: &mut SessionCache,
+    suppressed: &mut SuppressedSessions,
+) -> Vec<PathBuf> {
     let mut deduped: Vec<PathBuf> = Vec::with_capacity(all.len());
-    let mut signatures: HashMap<(i64, u64), PathBuf> = HashMap::new();
+    let mut signatures: HashMap<(i64, u64), Vec<PathBuf>> = HashMap::new();
     for path in all {
         let Some(signature) = content_signature_cached(&path, cache) else {
             deduped.push(path);
             continue;
         };
         match signatures.entry(signature) {
-            std::collections::hash_map::Entry::Occupied(survivor) => {
-                suppressed.duplicate_session_files += 1;
-                if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
-                    suppressed
-                        .duplicate_session_file_pairs
-                        .push((survivor.get().clone(), path));
+            std::collections::hash_map::Entry::Occupied(mut survivor) => {
+                if let Some(first_seen) = survivor
+                    .get()
+                    .iter()
+                    .find(|first_seen| files_share_content(first_seen, &path))
+                {
+                    suppressed.duplicate_session_files += 1;
+                    if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
+                        suppressed
+                            .duplicate_session_file_pairs
+                            .push((first_seen.clone(), path));
+                    }
+                } else {
+                    // Verified-distinct under one signature (stale memo
+                    // or hash collision — same presentation, same cure).
+                    suppressed.content_signature_conflicts += 1;
+                    survivor.get_mut().push(path.clone());
+                    deduped.push(path);
                 }
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(path.clone());
+                slot.insert(vec![path.clone()]);
                 deduped.push(path);
             }
         }
     }
-    (sort_paths_by_cache(deduped, cache), suppressed)
+    deduped
 }
 
 /// rm-548: an opencode storage session doc (`.../storage/session/info/
@@ -1849,5 +1976,344 @@ fn report_load_progress(
             cache_hits,
             session: None,
         });
+    }
+}
+
+/// rm-1888 (run 5cbd75e3 cycle 2, "Verify, don't trust"): the dedup
+/// lane's regression battery. A (size, FNV-1a-64) signature hit is
+/// cheap evidence, not proof — these tests pin that the lane now
+/// BYTE-VERIFIES before suppressing, so a stale memo (the fingerprint
+/// vouch is mtime_ns+size: a same-length mutation with restored mtime
+/// serves the old hash) and a signature collision (injected as a
+/// memo entry, byte-for-byte what a real 64-bit collision would
+/// present to this loop) both KEEP the file and count the conflict
+/// instead of silently swallowing a mutated journal. The T0/T2 race
+/// fixture pins the memo-store guard itself: fingerprints captured
+/// before the hash read, store skipped when the file moved under it.
+#[cfg(test)]
+mod content_dedup_tests {
+    use super::*;
+    use crate::session_cache::SessionCache;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-dedup-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create scratch dir");
+        root
+    }
+
+    fn journal(path: &Path, lines: usize) {
+        let mut body = String::new();
+        for index in 0..lines {
+            body.push_str(&format!(
+                "{{\"timestamp\":\"2026-10-18T00:00:{index:02}Z\",\"cost_estimated\":0.01}}\n"
+            ));
+        }
+        fs::write(path, body).expect("write journal");
+    }
+
+    fn seeded_cache(dir: &Path, files: &[PathBuf]) -> SessionCache {
+        let mut cache = SessionCache::default();
+        crate::session_cache::store_dir_listing(dir, files, &[], &mut cache)
+            .expect("seed dir listing");
+        cache
+    }
+
+    #[test]
+    fn byte_identical_copy_still_suppresses() {
+        // Guard rail: the pass keeps collapsing TRUE duplicates
+        // (first-seen survivor wins, pair named) — the rm-1888
+        // byte-verify must not break the rm-1886 dedup it hardens.
+        let root = scratch("identical");
+        let alpha = root.join("a.jsonl");
+        let beta = root.join("b.jsonl");
+        journal(&alpha, 5);
+        fs::copy(&alpha, &beta).expect("copy");
+        let mut cache = seeded_cache(&root, &[alpha.clone(), beta.clone()]);
+        let mut suppressed = SuppressedSessions::default();
+        let kept = content_dedup_pass(
+            vec![alpha.clone(), beta.clone()],
+            &mut cache,
+            &mut suppressed,
+        );
+        assert_eq!(kept, vec![alpha.clone()], "first-seen survivor wins");
+        assert_eq!(suppressed.duplicate_session_files, 1);
+        assert_eq!(suppressed.content_signature_conflicts, 0);
+        assert_eq!(
+            suppressed.duplicate_session_file_pairs,
+            vec![(alpha, beta)],
+            "the suppressed pair is named for disclosure"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_memo_same_length_mutation_is_kept_and_counted() {
+        // THE sibling-PoC class (3fcbdb02), reproduced honestly: bank
+        // the memo for one file, rewrite it SAME-LENGTH, restore the
+        // mtime — the vouch hits and serves the OLD hash, so the
+        // mutated journal signs identically to a pristine copy of the
+        // original. Pre-fix that file was suppressed as a
+        // "byte-identical duplicate" it was not; now the Occupied arm
+        // byte-verifies and keeps it, counting the conflict.
+        let root = scratch("stale-memo");
+        let original = root.join("original.jsonl");
+        let mutated = root.join("mutated.jsonl");
+        journal(&mutated, 5);
+
+        // Bank the memo for `mutated` while it still holds content X.
+        let mut cache = seeded_cache(&root, std::slice::from_ref(&mutated));
+        let signature_x = content_signature_cached(&mutated, &mut cache)
+            .expect("prime pass must produce a signature");
+
+        // Capture the exact mtime, then rewrite same-length (content Y
+        // differs byte-for-byte: timestamps shifted a day) and restore.
+        let mtime = fs::metadata(&mutated)
+            .and_then(|metadata| metadata.modified())
+            .expect("read mtime");
+        let replacement = {
+            let body = fs::read_to_string(&mutated).expect("read body");
+            body.replace("2026-10-18", "2026-10-19")
+        };
+        assert!(
+            replacement.len() == fs::metadata(&mutated).unwrap().len() as usize,
+            "fixture must mutate same-length"
+        );
+        fs::write(&mutated, replacement).expect("rewrite same-length");
+        fs::File::options()
+            .write(true)
+            .open(&mutated)
+            .expect("open for mtime restore")
+            .set_modified(mtime)
+            .expect("restore mtime");
+
+        // Precondition, asserted loudly: the memo vouch STILL HITS and
+        // serves content-X's signature for content-Y bytes. If the
+        // vouch ever stops hitting, this test would pass vacuously —
+        // the assert turns that into a failure.
+        let served = content_signature_cached(&mutated, &mut cache)
+            .expect("vouch must serve after mtime restore");
+        assert_eq!(
+            served, signature_x,
+            "fixture broken: the stale memo no longer vouches (mtime restore failed)"
+        );
+
+        // A pristine copy of X signs (size, hash_X) fresh.
+        journal(&original, 5);
+        let mut suppressed = SuppressedSessions::default();
+        let kept = content_dedup_pass(
+            vec![mutated.clone(), original.clone()],
+            &mut cache,
+            &mut suppressed,
+        );
+        assert!(
+            kept.contains(&mutated) && kept.contains(&original),
+            "the mutated journal must be KEPT, not suppressed: {kept:?}"
+        );
+        assert_eq!(
+            suppressed.duplicate_session_files, 0,
+            "no suppression on unverified evidence"
+        );
+        assert_eq!(
+            suppressed.content_signature_conflicts, 1,
+            "the conflict is counted for disclosure"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn signature_collision_fixture_keeps_both_files() {
+        // A genuine 64-bit FNV-1a collision needs a 2^32 birthday
+        // search — infeasible in a test — so the collision is injected
+        // where the dedup loop actually consumes it: the memo. An
+        // entry keyed to file B's fingerprint but carrying file A's
+        // hash is byte-for-byte what a real collision presents to this
+        // loop (equal signatures, distinct bytes). The cure must not
+        // care which cause produced the equality.
+        let root = scratch("collision");
+        let alpha = root.join("a.jsonl");
+        let beta = root.join("b.jsonl");
+        journal(&alpha, 5);
+        // Same LENGTH, distinct bytes (true hashes differ) — the
+        // signature is the (size, hash) tuple, so the collision
+        // fixture must collide on both halves.
+        let body = fs::read_to_string(&alpha).expect("body");
+        fs::write(&beta, body.replace("0.01", "0.02")).expect("same-length twin");
+        assert_eq!(
+            fs::metadata(&alpha).unwrap().len(),
+            fs::metadata(&beta).unwrap().len(),
+            "fixture: sizes must match"
+        );
+
+        let mut cache = seeded_cache(&root, &[alpha.clone(), beta.clone()]);
+        let signature_a = content_signature_cached(&alpha, &mut cache).expect("sign alpha");
+        let signature_b = content_signature_cached(&beta, &mut cache).expect("sign beta");
+        assert_ne!(signature_a, signature_b, "fixture: true signatures differ");
+
+        // Inject the collision: B's memo entry now claims A's hash
+        // under B's (size, mtime) fingerprint.
+        let fingerprint_b = crate::session_cache::file_fingerprint(&beta).expect("fp beta");
+        crate::session_cache::store_content_signature(
+            &beta,
+            fingerprint_b,
+            signature_a.1,
+            &mut cache,
+        );
+        let served = content_signature_cached(&beta, &mut cache).expect("vouch serves poison");
+        assert_eq!(served, signature_a, "fixture: collision is in the memo");
+
+        let mut suppressed = SuppressedSessions::default();
+        let kept = content_dedup_pass(
+            vec![alpha.clone(), beta.clone()],
+            &mut cache,
+            &mut suppressed,
+        );
+        assert!(
+            kept.contains(&alpha) && kept.contains(&beta),
+            "collision must not suppress: {kept:?}"
+        );
+        assert_eq!(suppressed.duplicate_session_files, 0);
+        assert_eq!(suppressed.content_signature_conflicts, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memo_store_guard_and_fingerprint_unchanged() {
+        // T0/T2 race fixture, deterministic halves: (1) the guard —
+        // a fingerprint captured before a mutation no longer matches
+        // (size drift, mtime-only drift), so the caller skips the
+        // store and the racing write cannot poison the memo; (2) the
+        // memo that IS banked carries the pre-hash stat, which for an
+        // untouched file equals the file's current fingerprint.
+        let root = scratch("race-guard");
+        let path = root.join("race.jsonl");
+        journal(&path, 5);
+        let mut cache = seeded_cache(&root, std::slice::from_ref(&path));
+
+        let before = crate::session_cache::file_fingerprint(&path).expect("pre-hash stat");
+        // (1a) untouched file: guard holds, and the banked memo key IS
+        // that pre-hash stat.
+        assert!(crate::session_cache::fingerprint_unchanged(&path, &before));
+        let signature = content_signature_cached(&path, &mut cache).expect("sign");
+        let entry_fingerprint =
+            crate::session_cache::banked_content_fingerprint(&path, &cache).expect("memo banked");
+        assert_eq!(
+            entry_fingerprint, before,
+            "memo is keyed on the PRE-hash stat, not a re-stat at store time"
+        );
+        let _ = signature;
+
+        // (1b) size drift: the guard must flip false (store skipped).
+        fs::write(&path, "x".repeat(4096)).expect("append-size rewrite");
+        assert!(!crate::session_cache::fingerprint_unchanged(&path, &before));
+
+        // (1c) mtime-only drift: restore size, shift mtime forward —
+        // the guard must still flip false.
+        journal(&path, 5);
+        let drifted = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(drifted)
+            .expect("shift mtime");
+        assert!(!crate::session_cache::fingerprint_unchanged(&path, &before));
+
+        // (1d) vanished file: moved, by definition.
+        let _ = fs::remove_file(&path);
+        assert!(!crate::session_cache::fingerprint_unchanged(&path, &before));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn uncached_lane_still_dedups_and_keeps_distinct_bytes() {
+        // Guard rail for the rm-1888 byte-verify rewrite of the
+        // UNCACHED walk (`find_session_files`): true duplicates still
+        // collapse there, and same-length distinct twins both survive
+        // (fresh hashes differ, so no Occupied — but the rewrite must
+        // not regress the plain-duplicate collapse the lane owned
+        // since rm-1886). Drives `retain_byte_verified_signatures`
+        // directly because the explicit-dir `-d` arm of
+        // `find_session_files` deliberately keeps every file (rm-548
+        // stance) — the dedup runs on the full home walk only.
+        let root = scratch("uncached");
+        let alpha = root.join("a.jsonl");
+        let beta = root.join("b.jsonl");
+        journal(&alpha, 5);
+        fs::copy(&alpha, &beta).expect("copy");
+        let mut admitted = vec![alpha.clone(), beta.clone()];
+        retain_byte_verified_signatures(&mut admitted);
+        assert_eq!(
+            admitted.len(),
+            1,
+            "byte-identical copies still collapse in the uncached lane"
+        );
+        let gamma = root.join("c.jsonl");
+        let body = fs::read_to_string(&alpha).expect("body");
+        fs::write(&gamma, body.replace("2026-10-18", "2026-10-19")).expect("twin");
+        let mut admitted = vec![alpha.clone(), beta.clone(), gamma.clone()];
+        retain_byte_verified_signatures(&mut admitted);
+        assert_eq!(
+            admitted.len(),
+            2,
+            "same-length distinct bytes both survive the uncached lane"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn files_share_content_bounds_and_classifies() {
+        let root = scratch("share");
+        let alpha = root.join("a.jsonl");
+        let beta = root.join("b.jsonl");
+        journal(&alpha, 5);
+        fs::copy(&alpha, &beta).expect("copy");
+        assert!(files_share_content(&alpha, &beta), "identical bytes share");
+
+        // Same length, distinct bytes: not shared.
+        let gamma = root.join("c.jsonl");
+        let body = fs::read_to_string(&alpha).expect("body");
+        fs::write(&gamma, body.replace("cost_estimated", "cost_estimatex")).expect("mutate");
+        assert!(
+            !files_share_content(&alpha, &gamma),
+            "same-length distinct bytes differ"
+        );
+
+        // Size mismatch and missing files: never equal (KEPT, the
+        // observable side of unreadable).
+        let delta = root.join("d.jsonl");
+        journal(&delta, 3);
+        assert!(!files_share_content(&alpha, &delta));
+        assert!(!files_share_content(&alpha, &root.join("missing.jsonl")));
+
+        // Over-cap file: the read is refused (metadata fast-path —
+        // no 256 MiB allocation) and compares as not-equal, so the
+        // newcomer is KEPT rather than suppressed on unverifiable
+        // cheap evidence.
+        let cap = crate::parser::file_read_cap_bytes();
+        let huge = root.join("huge.jsonl");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = fs::File::create(&huge).expect("create sparse");
+            file.seek(SeekFrom::Start(cap)).expect("seek past cap");
+            file.write_all(b"{}").expect("final byte");
+        }
+        assert!(
+            fs::metadata(&huge).unwrap().len() > cap,
+            "fixture: sparse file must exceed the cap"
+        );
+        let started = std::time::Instant::now();
+        assert!(
+            !files_share_content(&alpha, &huge),
+            "over-cap files compare as distinct — kept, never suppressed"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the over-cap compare must be a metadata fast-path, not a read"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
