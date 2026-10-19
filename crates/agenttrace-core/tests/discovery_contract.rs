@@ -5039,7 +5039,9 @@ fn cline_canonical_store_admission_rejections_are_counted_not_silent() {
             !report
                 .sessions
                 .iter()
-                .any(|session| std::path::Path::new(&session.path).file_name().and_then(|n| n.to_str())
+                .any(|session| std::path::Path::new(&session.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
                     == Some("1999999900000_zzzzq.messages.json")),
             "the rejected transcript stays unadmitted"
         );
@@ -5050,6 +5052,32 @@ fn cline_canonical_store_admission_rejections_are_counted_not_silent() {
             .collect();
         assert_eq!(cline.len(), 1, "exactly the admitted session loads");
         assert_eq!(cline[0].metrics.tokens_input, 1500);
+        // The same count at the doctor surface (rm-1995 acceptance):
+        // the default-lane disclosure feeds --doctor's disclosures map
+        // and its text render, mirroring every other admission counter.
+        let doctor = build_doctor_report(None, false);
+        assert_eq!(
+            doctor.disclosures.get("cline_admission_rejected_sessions"),
+            Some(&1),
+            "--doctor must disclose the rejected transcript"
+        );
+        let rendered =
+            agenttrace_core::render_doctor_report(None, false, "text").expect("doctor text");
+        assert!(
+            rendered.contains("cline_admission_rejected_sessions=1"),
+            "doctor text must carry the disclosure with its count: {rendered}"
+        );
+        // And the same count on the WARM loader replay (rm-1995 review
+        // fix): the first load populated the session cache's dir
+        // listings, so this second walk runs on them — the rejection
+        // must survive replay (before `DirCacheEntry::cline_rejected`
+        // the stored listing held only admitted files, so every run
+        // after the first silently reported 0 rejections).
+        let warm = load_sessions_with_options(None, &LoadOptions::default());
+        assert_eq!(
+            warm.cline_admission_rejected, 1,
+            "warm replay must replay the stored rejection count"
+        );
     });
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cache);

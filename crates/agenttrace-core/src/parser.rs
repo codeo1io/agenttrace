@@ -12049,8 +12049,7 @@ mod tests {
                  "metrics":{"inputTokens":30,"outputTokens":5}}
             ]
         });
-        let events =
-            parse_cline_value(&doc, "unknown").expect("cli envelope folds usage events");
+        let events = parse_cline_value(&doc, "unknown").expect("cli envelope folds usage events");
         let meta = events
             .iter()
             .find(|event| event.role == "session_meta")
@@ -12059,8 +12058,17 @@ mod tests {
             meta.model_used, "claude-3-7-sonnet-20250219",
             "last-wins: the most recent modelInfo.id carries the session model"
         );
-        // both fixture ids are real catalog keys — the harvested thread
-        // prices non-fallback by construction (acceptance b)
+        // both fixture ids are real catalog keys — and the pricing lane
+        // agrees on both: the harvested ids must resolve to a catalog
+        // source, never the built-in fallback (acceptance b, pinned
+        // directly rather than by construction)
+        for id in ["claude-sonnet-4-5-20250929", "claude-3-7-sonnet-20250219"] {
+            let source = crate::pricing::pricing_source_for(id);
+            assert!(
+                !source.contains("fallback"),
+                "harvested modelInfo.id {id} must be catalog-backed, got pricing source: {source}"
+            );
+        }
         let ui_events = parse_cline_ui_messages(&doc, "unknown");
         let ui_meta = ui_events
             .iter()
@@ -12107,8 +12115,7 @@ mod tests {
                  "metrics":{"inputTokens":10,"outputTokens":2}}
             ]
         });
-        let events =
-            parse_cline_value(&doc, "gpt-5.2").expect("explicit model threads through");
+        let events = parse_cline_value(&doc, "gpt-5.2").expect("explicit model threads through");
         let meta = events
             .iter()
             .find(|event| event.role == "session_meta")

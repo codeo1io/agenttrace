@@ -8,7 +8,36 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 71;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+// Bumped 71 -> 72 (run 754e0809024d46c38bf8c32b03a4e4a5 cycle 1
+// 'Cline honesty band', rm-1995, implement attempt 4d984ad8, base
+// f50c3f14): cached dir listings now carry the cline canonical-store
+// admission-rejection count (`DirCacheEntry::cline_rejected`) so the
+// loader's `cline_admission_rejected` disclosure is CACHE-INVARIANT.
+// Before the field, a rejection was invisible on every warm run: the
+// cold gate admits only manifest-matching transcripts, so only
+// admitted files persist in the stored listing, and the warm replay
+// walk — which cannot re-run the gate without re-reading the
+// directory — saw nothing to count. Live-proven at the defect: cold
+// doctor disclosed cline_admission_rejected_sessions=1; the second
+// run on the populated cache disclosed nothing while the same
+// transcript sat rejected on disk. Listings written before the field
+// existed decode the count as 0 (serde default), and the schema rung
+// alone CANNOT retire them: the load gate keeps listings whose
+// `dir_listing_version` lane is current across a schema mismatch, so
+// a warm v6-lane listing would keep replaying the silent zero on
+// every upgrade path. DIR_LISTING_WALK_VERSION therefore moves
+// 6 -> 7 in the same unit (independent review d4ea20a6 F1, fix
+// b287ccc7): every pre-field listing retires once — the next scan
+// re-walks the directory (no entry re-parse) and counts admissions
+// live again — rather than serving a permanently silent zero. The
+// rm-548 class (a warm cache must not silently under-disclose)
+// carried by the dir-listing store instead of the session entry. Per
+// the landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c) the
+// numeral may re-base at integration to the lowest rung unique
+// above the then-current fleet ceiling. No SQLite snapshot rung
+// rides this batch; the landed 13 remains the snapshot ceiling.
+// Listings regenerate once on next scan.
 // Bumped 70 -> 71 (integration of run 0915f736aa1c488ebd3b085b73a6d7df
 // cycle 4 'reasoning-effort-suffixed model ids price at their
 // in-catalog base', rm-1511, review fix 1a615b64 / independent review
@@ -1171,6 +1200,19 @@ const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 /// onto the already-landed v4 lane (rm-732) per the same convention one
 /// lane up.
 ///
+/// v7 (rm-1995 review fix, run 754e0809024d cycle 1, independent
+/// review d4ea20a6 F1 -> fix b287ccc7): `DirCacheEntry` gained
+/// `cline_rejected`, but the field alone cannot cure a warm cache on
+/// the upgrade path — listings survive a SESSION_CACHE_SCHEMA_VERSION
+/// bump whenever their walk lane is current (the load gate keeps
+/// lane-current listings across a schema mismatch), so a v6 listing
+/// written before the field decoded the count as a permanent 0 and
+/// the warm disclosure stayed silent exactly as before. The lane
+/// bumps once to retire every stored listing from the field-less
+/// walk: the next scan re-walks the directories (no entry re-parse)
+/// and counts admissions live again. Pinned by the planted
+/// schema-71-store regression test in this module's battery.
+///
 /// v6 (rm-1881): Cline CLI canonical-store admission changed — under
 /// `~/.cline/data/sessions/` (or `CLINE_SESSION_DATA_DIR`) only the
 /// `<id>.messages.json` transcript is admitted; the `session.json`
@@ -1291,12 +1333,31 @@ struct DirCacheEntry {
     /// serialize byte-identically.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     fork_parents: BTreeMap<String, (FileFingerprint, Option<String>)>,
+    /// rm-1995 review fix: transcript-shaped candidates the cline
+    /// canonical-store admission gate rejected in THIS directory at
+    /// cold-walk time — replayed on warm runs so the discovery
+    /// disclosure count is cache-invariant (a cold walk counts them
+    /// live; a warm walk replays this number, because only admitted
+    /// files persist in the listing and the gate cannot re-run
+    /// without re-reading the directory the listing exists to skip).
+    /// Absent (listings written before the field existed) decodes as
+    /// 0 — the DIR_LISTING_WALK_VERSION 6 -> 7 rung retires those
+    /// listings instead (a schema-version bump alone keeps
+    /// lane-current listings; see the load gate).
+    /// Zero is skipped so untouched directories serialize
+    /// byte-identically.
+    #[serde(default, skip_serializing_if = "crate::usize_is_zero")]
+    cline_rejected: usize,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct CachedDirListing {
     pub files: Vec<PathBuf>,
     pub dirs: Vec<PathBuf>,
+    /// rm-1995 review fix: this directory's replayed cline
+    /// canonical-store admission rejections (see
+    /// `DirCacheEntry::cline_rejected`).
+    pub cline_rejected: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2456,6 +2517,7 @@ pub(crate) fn cached_dir_listing(dir: &Path, cache: &mut SessionCache) -> Option
             .iter()
             .map(|child| path_from_key(child))
             .collect(),
+        cline_rejected: entry.cline_rejected,
     })
 }
 
@@ -2479,6 +2541,7 @@ pub(crate) fn store_dir_listing(
     dir: &Path,
     files: &[PathBuf],
     dirs: &[PathBuf],
+    cline_rejected: usize,
     cache: &mut SessionCache,
 ) -> anyhow::Result<()> {
     let metadata = fs::metadata(dir)?;
@@ -2494,6 +2557,7 @@ pub(crate) fn store_dir_listing(
             files: files.iter().map(|path| cache_key(path)).collect(),
             dirs: dirs.iter().map(|path| cache_key(path)).collect(),
             fork_parents: BTreeMap::new(),
+            cline_rejected,
         },
     );
     cache.dirty = true;
@@ -4221,6 +4285,7 @@ mod tests {
             files: Vec::new(),
             dirs: Vec::new(),
             fork_parents: BTreeMap::new(),
+            cline_rejected: 0,
         };
         cache
             .dirs
@@ -4786,6 +4851,7 @@ mod tests {
                     files: vec!["f".repeat(120); 6],
                     dirs: Vec::new(),
                     fork_parents: BTreeMap::new(),
+                    cline_rejected: 0,
                 },
             );
         }
@@ -4881,6 +4947,7 @@ mod tests {
                 files: vec!["f".repeat(120); 6],
                 dirs: Vec::new(),
                 fork_parents: BTreeMap::new(),
+                cline_rejected: 0,
             },
         );
         let projected = serialized_doc_size(&cache);
@@ -4924,7 +4991,7 @@ mod tests {
             path: root.join("sessions.json"),
             ..SessionCache::default()
         };
-        store_dir_listing(&info_dir, &[], &[], &mut cache).expect("store listing");
+        store_dir_listing(&info_dir, &[], &[], 0, &mut cache).expect("store listing");
         assert_eq!(
             cached_fork_parent(&info, &cache),
             None,
@@ -4976,6 +5043,7 @@ mod tests {
                     files: vec![format!("file-{i}-{}.jsonl", "f".repeat(60)); 4],
                     dirs: Vec::new(),
                     fork_parents: BTreeMap::new(),
+                    cline_rejected: 0,
                 },
             );
         }
@@ -5067,6 +5135,107 @@ mod tests {
         write_journal(true);
         let cache = load_session_cache();
         assert_eq!(cache.dirs.len(), 1, "current-version listings survive");
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn planted_schema_71_store_retires_its_v6_walk_listings() {
+        // Independent review d4ea20a6 F1 (fix b287ccc7): the load gate
+        // keeps listings whose `dir_listing_version` lane is current
+        // across a SESSION_CACHE_SCHEMA_VERSION mismatch, so the
+        // schema-72 rung shipped alongside `DirCacheEntry::
+        // cline_rejected` could NOT retire listings written before the
+        // field — a schema-71 store saved by a v6 walker kept replaying
+        // cline_rejected = 0 forever and the warm disclosure stayed
+        // silent on every upgrade path. The lane bumps 6 -> 7 to drop
+        // every pre-field listing once (a re-walk, never an entry
+        // re-parse). Planted with ABSOLUTE literals (schema 71, lane
+        // 6, no `cline_rejected` key — the exact pre-fix store shape)
+        // so a revert of the lane bump fails HERE, not in a host
+        // report; the control leg pins that a lane-current listing
+        // survives whatever the session schema — the property the
+        // lane gate, not the schema rung, owns.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-v71-listing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("sessions.json");
+        let listed_dir = root.join("real");
+        fs::create_dir_all(&listed_dir).expect("create listed dir");
+        let write_journal = |schema_version: i64, dir_listing_version: i64| {
+            let pre_field_listing = serde_json::json!({
+                "mod_time": 1,
+                "files": [],
+                "dirs": [],
+            });
+            let mut doc = serde_json::Map::new();
+            doc.insert(
+                "schema_version".to_string(),
+                serde_json::json!(schema_version),
+            );
+            doc.insert(
+                "dir_listing_version".to_string(),
+                serde_json::json!(dir_listing_version),
+            );
+            doc.insert("entries".to_string(), serde_json::json!({}));
+            doc.insert(
+                "dirs".to_string(),
+                serde_json::json!({listed_dir.to_string_lossy().to_string(): pre_field_listing.clone()}),
+            );
+            fs::write(
+                &journal,
+                serde_json::to_string(&doc).expect("serialize journal"),
+            )
+            .expect("write journal");
+        };
+
+        // Shared env lock (see lib.rs `test_env`): sibling-module
+        // tests (pricing, statusline) mutate the same variables.
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        // The defect leg: the exact store a pre-fix binary leaves
+        // behind on upgrade — schema 71 with a lane-6 listing carrying
+        // no `cline_rejected`. The listing must not survive the load:
+        // without the lane bump this replays cline_rejected = 0 (the
+        // serde default) and the warm disclosure stays silent.
+        write_journal(71, 6);
+        let cache = load_session_cache();
+        assert_eq!(
+            cache.dirs.len(),
+            0,
+            "a lane-6 listing from the field-less walker must retire at \n             load — surviving it replays cline_rejected = 0 forever"
+        );
+        assert!(cache.dirty, "the one-time lane invalidation must persist");
+
+        // The control leg: the same pre-field listing at the CURRENT
+        // walk lane survives a schema mismatch (the schema stays 71),
+        // and decodes cline_rejected = 0 from absence — correct here,
+        // because a lane-current listing can only have been written
+        // by a walker that counted admissions (a lane-7 store with no
+        // count genuinely had zero rejections).
+        write_journal(71, DIR_LISTING_WALK_VERSION);
+        let cache = load_session_cache();
+        assert_eq!(
+            cache.dirs.len(),
+            1,
+            "a lane-current listing must survive a schema mismatch"
+        );
+        let key = listed_dir.to_string_lossy().to_string();
+        assert_eq!(
+            cache.dirs.get(&key).map(|entry| entry.cline_rejected),
+            Some(0),
+            "absence decodes as 0 — a lane-current store with no count \n             genuinely counted zero rejections"
+        );
+
         match prior_cache {
             Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
             None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
@@ -5870,7 +6039,7 @@ mod tests {
             diagnostics: Diagnostics::default(),
         };
         store_session(&journal, &session, &mut cache).expect("store session");
-        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], 0, &mut cache)
             .expect("store listing");
         save_session_cache(&mut cache).expect("save store");
         assert!(cache.schema_invalidations().is_empty());
@@ -5997,7 +6166,7 @@ mod tests {
             diagnostics: Diagnostics::default(),
         };
         store_session(&journal, &session, &mut cache).expect("store session");
-        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], 0, &mut cache)
             .expect("store listing");
         save_session_cache(&mut cache).expect("save store");
 
@@ -6107,7 +6276,7 @@ mod tests {
         std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
 
         let mut cache = load_session_cache();
-        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], 0, &mut cache)
             .expect("store listing");
         save_session_cache(&mut cache).expect("save store");
 
@@ -6228,7 +6397,7 @@ mod tests {
         // Self-heal forward: the re-walk stores the listing with the
         // lossless member, and the store serves the real path after a
         // save/reload.
-        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], 0, &mut cache)
             .expect("store fresh listing");
         save_session_cache(&mut cache).expect("save store");
         let mut cache = load_session_cache();
@@ -6267,7 +6436,7 @@ mod tests {
 
         let rewrite_listing = |mod_time: i64, dir_size: serde_json::Value| {
             let mut cache = load_session_cache();
-            store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+            store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], 0, &mut cache)
                 .expect("store listing");
             save_session_cache(&mut cache).expect("save store");
             let raw = fs::read_to_string(session_cache_path()).expect("read store");

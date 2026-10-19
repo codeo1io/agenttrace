@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 71 and the SQLite snapshot is schema 13; the
+The session cache is schema 72 and the SQLite snapshot is schema 13; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -492,7 +492,16 @@ unchanged digest and a warm entry would keep replaying the over-billed
 integration, conflict case ab19f050f02e4aa882c9c659a9a089b8, lands the
 rung as 70 → 71 — the lowest rung unique above the ceiling at the
 fleet census, one invalidation either way; the SQLite snapshot stays
-13 — no snapshot semantics moved)
+13 — no snapshot semantics moved), and to 72 when the cline
+canonical-store admission-rejection count joined the cached dir
+listings (`DirCacheEntry::cline_rejected`, rm-1995 review fix, run
+754e0809 cycle 1): only admitted files persist in a stored listing,
+so a warm walk saw nothing to count and every run after the first
+silently reported 0 rejections while the first reported the truth
+(live-proven: cold doctor 1, warm doctor absent) — minted 71 → 72 at
+base f50c3f14 and re-based at integration onto the advanced fleet
+ceiling per the landed-rung convention, one invalidation either way;
+the SQLite snapshot stays 13)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

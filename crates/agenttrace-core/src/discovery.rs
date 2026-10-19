@@ -837,7 +837,11 @@ pub(crate) fn find_session_files_cached(
     // rm-1881: the same session id in both the canonical CLI store and
     // the legacy VS Code tasks root renders one session (canonical wins).
     retain_single_cline_session_per_id(&mut all);
-    (sort_paths_by_cache(all, cache), opencode_fork_excluded, cline_rejected)
+    (
+        sort_paths_by_cache(all, cache),
+        opencode_fork_excluded,
+        cline_rejected,
+    )
 }
 
 /// rm-548: an opencode storage session doc (`.../storage/session/info/
@@ -1036,6 +1040,10 @@ fn entry_is_dir_entry(file_type: &fs::FileType, path: &Path) -> bool {
     false
 }
 
+/// rm-1995: the cached walk threads the cline canonical-store
+/// admission-rejection counter so the loader, MCP and doctor surfaces
+/// all see the same counted-not-silent disclosure from one walk.
+#[allow(clippy::too_many_arguments)] // rm-1995 disclosure counter rides the existing rm-597/rm-732 walk state
 fn walk_session_files_cached(
     dir: &Path,
     depth: usize,
@@ -1078,6 +1086,17 @@ fn walk_session_files_cached(
                 .filter(|path| is_cline_task_dir(path) || path.is_file())
                 .filter(|path| file_targets.admit(path)),
         );
+        // rm-1995 review fix: the cold walk's cline canonical-store
+        // admission rejections are REPLAYED from the listing, not
+        // recomputed — only admitted files persist in a stored
+        // listing, so the gate cannot re-run here (re-reading the
+        // directory would defeat the walk the listing exists to
+        // skip). The stored per-directory count keeps the
+        // loader/doctor disclosure cache-invariant; the
+        // SESSION_CACHE_SCHEMA_VERSION rung regenerates listings
+        // written before the field existed rather than serving their
+        // silent zero.
+        *cline_rejected += listing.cline_rejected;
         for child in listing.dirs {
             if visited.admit(&child) {
                 walk_session_files_cached(
@@ -1100,6 +1119,10 @@ fn walk_session_files_cached(
     };
     let mut files = Vec::new();
     let mut dirs = Vec::new();
+    // rm-1995 review fix: rejections counted for THIS directory, so
+    // the listing can replay them on warm walks (see the replay arm
+    // above).
+    let mut cline_rejected_here = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
@@ -1162,6 +1185,7 @@ fn walk_session_files_cached(
                     .is_some_and(|name| name.ends_with(".messages.json"))
             {
                 *cline_rejected += 1;
+                cline_rejected_here += 1;
             }
             if !is_cline_cli_session_file(&path) {
                 continue;
@@ -1174,7 +1198,7 @@ fn walk_session_files_cached(
     // rm-597: the stored listing is deliberately raw (undecidable at
     // per-directory scope); dedup happens as the list merges into the
     // walk output, keeping cached and uncached walks identical.
-    let _ = store_dir_listing(dir, &files, &dirs, cache);
+    let _ = store_dir_listing(dir, &files, &dirs, cline_rejected_here, cache);
 
     items.extend(files.into_iter().filter(|path| file_targets.admit(path)));
     for child in dirs {

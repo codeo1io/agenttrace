@@ -897,6 +897,10 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
 /// count, `parse_failures` is the loader's `skipped`, and everything
 /// else the loader discovered but the report excludes lands in
 /// `out_of_scope` instead of shrinking the denominator.
+/// rm-1995: `cline_admission_rejected` threads the walk's counted
+/// admissions into the disclosures map so a manifest-less or
+/// basename-mismatched transcript is counted, never silent.
+#[allow(clippy::too_many_arguments)] // rm-1995 disclosure counter rides the scoped health inputs
 pub fn data_health_scoped(
     sessions: &[Session],
     discovered: usize,
