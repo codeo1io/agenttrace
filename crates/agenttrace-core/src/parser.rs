@@ -8962,8 +8962,10 @@ fn jsonl_objects(raw: &str) -> impl Iterator<Item = Map<String, Value>> + '_ {
 /// plus a `line_skips` map naming every line the iterator dropped —
 /// `unparseable_line` for lines that survive neither the strict nor the
 /// lenient parse (a torn tail), `non_object_line` for bare JSON values
-/// that parse but are not objects. Empty lines stay skipped silently,
-/// matching the generic fallback's `parse_jsonl_session`.
+/// that parse but are not objects, `numeric_range_overflow` for lines
+/// whose parse fails only because a NUMBER literal sits beyond f64
+/// range (rm-342). Empty lines stay skipped silently, matching the
+/// generic fallback's `parse_jsonl_session`.
 fn jsonl_objects_counted(raw: &str) -> (Vec<Map<String, Value>>, BTreeMap<String, usize>) {
     let mut objs = Vec::new();
     let mut skips: BTreeMap<String, usize> = BTreeMap::new();
@@ -8975,7 +8977,35 @@ fn jsonl_objects_counted(raw: &str) -> (Vec<Map<String, Value>>, BTreeMap<String
         match parse_jsonl_value_lenient(line) {
             Some(Value::Object(obj)) => objs.push(obj),
             Some(_) => *skips.entry("non_object_line".to_string()).or_insert(0) += 1,
-            None => *skips.entry("unparseable_line".to_string()).or_insert(0) += 1,
+            None => {
+                // rm-342 (cycle 4, run 5712cb41 F1): serde_json fails a
+                // whole line with "number out of range" when a NUMBER
+                // literal exceeds f64 range, which used to surface as
+                // `unparseable_line` — a usage-bearing line then read as
+                // a torn tail while its accounting vanished with no
+                // rm-616 marker (assess PoC: a claude_code line whose
+                // input_tokens literal carried 309+ digits reported
+                // health 100 and an empty disclosure channel). The drop
+                // now carries its own class, and the rm-616 accounting-
+                // loss marker fires for it with the same conservative
+                // quoted-key substring rule the generic fallback uses.
+                if fails_only_on_numeric_range_overflow(line) {
+                    *skips
+                        .entry("numeric_range_overflow".to_string())
+                        .or_insert(0) += 1;
+                    if line.contains("model_used")
+                        || line.contains("ModelUsed")
+                        || line.contains("\"usage\"")
+                        || line.contains("\"Usage\"")
+                    {
+                        *skips
+                            .entry("model_or_usage_dropped".to_string())
+                            .or_insert(0) += 1;
+                    }
+                } else {
+                    *skips.entry("unparseable_line".to_string()).or_insert(0) += 1;
+                }
+            }
         }
     }
     (objs, skips)
@@ -8989,6 +9019,108 @@ pub(crate) fn parse_jsonl_value_lenient(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(line)
         .ok()
         .or_else(|| repair_lone_surrogates(line).and_then(|line| serde_json::from_str(&line).ok()))
+}
+
+/// rm-342 (cycle 4, run 5712cb41 F1): true when `line` survives neither
+/// the strict nor the lenient parse ONLY because at least one NUMBER
+/// literal sits beyond f64 range — the line parses cleanly once every
+/// out-of-range literal is clamped to a representable sentinel. Verified
+/// boundary against the pinned serde_json 1.0.151: the refusal is
+/// magnitude-based at f64::MAX (≈1.7976931348623157e308) — every
+/// all-digits literal up to 308 digits is finite and parses, while 309
+/// all-nines digits and explicit exponents past the max (`1e309`,
+/// `1e400`, `-1e400`) fail the WHOLE line with "number out of range",
+/// indistinguishable from a torn tail on the old single-class channel.
+/// Number-looking text inside strings is data, never a literal, and is
+/// never clamped (so an overflow-looking token inside a torn string
+/// still reports as a torn tail).
+pub(crate) fn fails_only_on_numeric_range_overflow(line: &str) -> bool {
+    let Some(clamped) = clamp_out_of_range_numeric_literals(line) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&clamped).is_ok()
+}
+
+/// Rebuilds `line` with every out-of-range JSON number literal (outside
+/// string data) replaced by the sentinel `0`, returning `None` when no
+/// such literal exists. Rust's `f64::from_str` is the oracle: it never
+/// errors on magnitude — it returns `inf`/`-inf` exactly for literals
+/// beyond f64 range, the same threshold at which serde_json refuses the
+/// line — so the clamp fires precisely where the strict parse cannot.
+/// The sentinel value is irrelevant: the rebuilt line is only ever
+/// re-parsed to classify the drop, never ingested.
+fn clamp_out_of_range_numeric_literals(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut found = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_string {
+            out.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            out.push(byte);
+            i += 1;
+            continue;
+        }
+        if byte != b'-' && !byte.is_ascii_digit() {
+            out.push(byte);
+            i += 1;
+            continue;
+        }
+        // Consume the candidate literal over the JSON number charset.
+        // '+', '-' (mid-literal), 'e', 'E' and '.' can only sit inside a
+        // literal in valid JSON; trailing bytes that cannot END a number
+        // are handed back so malformed text still round-trips unchanged.
+        let start = i;
+        while i < bytes.len() && matches!(bytes[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+        {
+            i += 1;
+        }
+        while i > start && matches!(bytes[i - 1], b'-' | b'+' | b'.' | b'e' | b'E') {
+            i -= 1;
+        }
+        if i == start {
+            // Not a number after all: the candidate was a stray '-',
+            // '.', 'e' or '+' (garbage the strict parse already
+            // refused) and the backtrack consumed the whole token.
+            // Emit the byte verbatim and ADVANCE — re-examining the
+            // same byte would spin forever (found by re-verification of
+            // the adopted diff: a torn tail like `{"a": -}` hits this
+            // on the stray sign).
+            out.push(byte);
+            i += 1;
+            continue;
+        }
+        // ASCII-only slice: number bytes never split a UTF-8 sequence.
+        let token = &line[start..i];
+        let out_of_range = token.parse::<f64>().map(f64::is_infinite).unwrap_or(false);
+        if out_of_range {
+            found = true;
+            out.extend_from_slice(b"0");
+        } else {
+            out.extend_from_slice(&bytes[start..i]);
+        }
+    }
+    if !found {
+        return None;
+    }
+    // Only ASCII number tokens were swapped for a one-byte sentinel;
+    // every other byte is a verbatim copy, so the rebuild is UTF-8.
+    String::from_utf8(out).ok()
 }
 
 /// Parses the four bytes of a `\uXXXX` escape. Reading hex from **bytes**

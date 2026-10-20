@@ -176,7 +176,8 @@ pub struct DataHealth {
     /// of hiding it behind `confidence: high`.
     pub naive_utc_sessions: usize,
     /// Parse lines lost inside otherwise-parsed sessions, by reason
-    /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
+    /// (pass-7 P7-1): `unparseable_line`, `numeric_range_overflow`
+    /// (rm-342), `event_schema`, `non_event`.
     /// Pure parse loss only — assumption disclosures live in
     /// `disclosures` (rm-538 moved the rm-450 workbuddy input-basis
     /// counters there), so nothing in this map is an assumption note

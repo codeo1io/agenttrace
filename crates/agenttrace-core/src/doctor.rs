@@ -154,7 +154,8 @@ pub struct DoctorReport {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub disclosures: BTreeMap<String, usize>,
     /// rm-862: parse-loss counters (`metrics.line_skips`:
-    /// `unparseable_line`, `non_object_line`, `event_schema`,
+    /// `unparseable_line`, `numeric_range_overflow` (rm-342),
+    /// `non_object_line`, `event_schema`,
     /// `codex_ignorable_line`, …) aggregated over scanned sessions.
     /// The rm-526 fold landed them under `disclosures`, rendering
     /// next to informational counters under one "Disclosed facts"

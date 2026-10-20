@@ -548,6 +548,21 @@ fn transcript_evidence(
             return (Vec::new(), "skipped: unreadable".to_string());
         }
     };
+    // rm-1871 (cycle 4, run 5712cb41 R3): the `is_file` verdict above
+    // describes the path as it was at stat time; the path can be
+    // swapped for a FIFO, socket or directory before the open (the
+    // stat→read TOCTOU). Re-validate the kind on the OPEN handle —
+    // `File::metadata` is an fstat of what this process actually
+    // opened, so it cannot describe anything but the object about to
+    // be read — and refuse non-regular kinds instead of reading them:
+    // a FIFO there would block the whole search on open or never EOF
+    // on read. The skip keeps its `skipped_non_file` class, so the
+    // corpus-level summary discloses the refusal like every other
+    // skip and the metadata lanes above keep working verbatim.
+    if !open_reached_regular_file(&file) {
+        scan.skipped_non_file += 1;
+        return (Vec::new(), "skipped: non-file path".to_string());
+    }
     let mut bytes = Vec::with_capacity(len as usize);
     if file.take(file_byte_cap).read_to_end(&mut bytes).is_err() {
         scan.skipped_unreadable += 1;
@@ -570,6 +585,16 @@ fn transcript_evidence(
         }
     }
     (out, format!("scanned ({read} bytes)"))
+}
+
+/// rm-1871 (cycle 4, run 5712cb41 R3): kind re-validation for the
+/// stat→read race in [`transcript_evidence`] — true only when the
+/// already-open `file` handle itself is a regular file. This is an
+/// fstat of the descriptor, not a second path stat, so nothing that
+/// happened to the path AFTER the open can change the verdict — the
+/// one thing the pre-open `metadata.is_file()` check cannot promise.
+fn open_reached_regular_file(file: &File) -> bool {
+    file.metadata().is_ok_and(|metadata| metadata.is_file())
 }
 
 /// A `…window…` snippet centered on the first case-insensitive hit of
@@ -822,5 +847,55 @@ mod tests {
             transcript_scan: "scanned (0 bytes)".to_string(),
         }]);
         assert!(json.contains("\"=2+5|cmd\""));
+    }
+
+    /// rm-1871 (cycle 4, run 5712cb41 R3): the stat→read race. The kind
+    /// check must ride the OPEN handle (fstat), not a second path stat —
+    /// so a FIFO that slips past the pre-open `metadata.is_file()`
+    /// verdict (a swap between stat and open) is still refused instead
+    /// of blocking the search on open or never EOF-ing on read. Pinned
+    /// through the seam helper with a real FIFO rendezvous: a writer
+    /// thread opens the write end so `File::open` on the read end
+    /// returns instead of blocking, and the fstat verdict must say
+    /// non-file. The regular-file twin keeps the guard honest (the
+    /// refusal is the kind check, not a blanket pessimism).
+    #[test]
+    #[cfg(unix)]
+    fn stat_to_read_race_cannot_smuggle_a_fifo_past_the_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-search-fifo-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let fifo = dir.join("session.jsonl");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo available");
+        assert!(status.success(), "mkfifo failed");
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                // The write end of a FIFO opens only once a reader
+                // arrives — this rendezvous is what unblocks the main
+                // thread's `File::open` below.
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            })
+        };
+        let opened = File::open(&fifo).expect("read end opens at the rendezvous");
+        assert!(
+            !open_reached_regular_file(&opened),
+            "an opened FIFO must not read as a regular file — the fstat re-validation is the whole rm-1871 fix"
+        );
+        writer.join().expect("writer thread");
+        let regular = dir.join("regular.jsonl");
+        std::fs::write(&regular, b"{}\n").expect("write regular file");
+        let opened = File::open(&regular).expect("open regular file");
+        assert!(
+            open_reached_regular_file(&opened),
+            "an opened regular file must read as a regular file"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

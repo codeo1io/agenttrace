@@ -957,6 +957,65 @@
 
 ### Fixed
 
+- A history quarantine that does not verifiably happen is now a loud
+  refusal instead of a success print (rm-2059, run 5712cb41 cycle 4,
+  batch "hostile-input truth wave"): the corrupt-history arm of
+  `records_from_bytes` swallowed the `fs::rename` result (`let _ =`) and
+  printed "quarantined as …" unconditionally, so a rename that failed
+  (read-only directory, full disk, vanished path) reported success,
+  returned an empty history map, and the NEXT save overwrote the
+  still-corrupt bytes for real. The move now goes through
+  `quarantine_corrupt_history`, which re-validates the generation
+  suffix, verifies the target exists on disk AFTER the rename before
+  any success is reported, and on any failure refuses loudly — source,
+  target and the errno on stderr — and exits nonzero, leaving the bytes
+  untouched so no later save can destroy them; the exhausted
+  10_000-generation bound (rm-703) likewise refuses instead of falling
+  through to clobber `.corrupt.10000`. Pinned by three seam tests
+  (verified success moves the bytes, an ENOENT refusal names
+  source/target/errno and leaves nothing behind, cap exhaustion leaves
+  every generation and the live file untouched).
+
+- A NUMBER literal beyond f64 range is a disclosed numeric-range drop,
+  never a silent torn tail (rm-342, run 5712cb41 cycle 4, assess F1):
+  serde_json refuses the WHOLE line with "number out of range" when a
+  single literal overflows f64 (309 all-nines digits, `1e400`), which
+  both parse lanes classified as generic `unparseable_line` — a
+  usage-bearing claude_code line then read as a writer crash while its
+  accounting vanished with NO rm-616 marker (assess PoC: health 100 and
+  an empty disclosure channel on `--diagnostics` for a line whose
+  `input_tokens` literal carried 308+ digits). Both lanes — the probe
+  lanes' `jsonl_objects_counted` and the generic `parse_jsonl_session`
+  fallback — now classify the drop as `numeric_range_overflow` via
+  `fails_only_on_numeric_range_overflow` (Rust's `f64::from_str` is the
+  oracle: infinite exactly where serde_json refuses, so the boundary is
+  magnitude, not digit count; number-looking text inside strings is
+  never clamped, so a torn tail keeps its own class), and the rm-616
+  accounting-loss marker fires for it. The class flows through every
+  existing loss surface unchanged: `metrics.line_skips`, aggregate
+  `data_health.line_skips` (confidence drops to low), and `--doctor`'s
+  dropped-lines tier — never the informational disclosures. Pinned by
+  `tests/numeric_range_overflow_contract.rs` across the parse/drop
+  boundary (25/40/100/301/308-digit literals parse and count their
+  usage; 309/310 digits and ±`1e400` drop-and-disclose with the
+  marker), the fallback lane, a torn-tail negative, and the
+  data-health/doctor folds.
+
+- The search transcript reader re-validates the file kind on the open
+  handle (rm-1871, run 5712cb41 cycle 4, assess R3):
+  `transcript_evidence` statted the path (`metadata.is_file()`), then
+  opened it with no re-validation, so a path swapped for a
+  FIFO/socket/directory between stat and open (the stat→read TOCTOU)
+  reached the read — a FIFO there blocks the whole search on open or
+  never EOFs on read. The kind check now rides the open handle
+  (`File::metadata` is an fstat of what this process actually opened,
+  so nothing that happened to the path after the open can change the
+  verdict) and refuses non-regular kinds on the existing
+  `skipped_non_file` skip class, disclosed in the corpus-level summary
+  like every other skip. Pinned by a real-FIFO rendezvous test (a
+  writer thread unblocks the read-end open; the fstat verdict must say
+  non-file) with a regular-file twin keeping the guard honest.
+
 - Non-finite cost folds are gated across the aggregate census (rm-1500,
   run e4209f0c cycle 5, extended by the independent-review fix round): the
   cycle's first pass closed the three band-pinned folds — the cost-audit
@@ -1919,6 +1978,20 @@
 - Fixed a `clippy::useless_format` finding in the TUI provider/model row label under the current toolchain.
 
 - The minimum supported Rust version is now 1.89 (1.80 → 1.88 in cycle 1, rm-386; 1.88 → 1.89 in cycle 3, rm-166, for the stabilized `std::fs::File::lock`): `rust-version` matches the dependency-greatest floor, a gated CI lane (schedule/workflow_dispatch) proves the declared floor with `cargo +<floor> check --locked`, and the manifest-alignment gate's expectation moved with it.
+
+### Documentation
+
+- README.zh-CN.md carries the full CLI flag reference (rm-931, run
+  5712cb41 cycle 4, assess F3): the Chinese README documented 2 of the
+  binary's 58 flags (56 gate-counted rows plus the short-only `-m` and
+  `-o`) while the English README's flag table — pinned to `--help` by
+  the check-docs-commands gate (rm-207) — carried all of them, so a zh
+  reader had no flag documentation at all. The table is translated
+  row-for-row in the English table's order — flag spellings, defaults,
+  JSON keys and format names stay verbatim — and the section intro
+  states the gate's actual scope honestly: the rm-207 count check reads
+  the English table; the Chinese table is its synchronized translation,
+  not an independently pinned surface.
 
 ### Build and CI
 

@@ -671,7 +671,8 @@ pub struct Metrics {
     /// Zero unless stored totals were applied.
     pub stored_totals_delta: i64,
     /// Parse lines lost inside this session's source file, by reason
-    /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
+    /// (pass-7 P7-1): `unparseable_line`, `numeric_range_overflow`
+    /// (rm-342), `event_schema`, `non_event`.
     /// Parse loss and lost-accounting disclosures. Assumption
     /// disclosures — including the rm-450 workbuddy basis counters
     /// (`workbuddy_input_basis:*`) — live in `disclosure_counters`
@@ -1202,7 +1203,16 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
             continue;
         }
         let Some(mut value) = parser::parse_jsonl_value_lenient(line) else {
-            count_skip("unparseable_line", &mut line_skips);
+            // rm-342 (cycle 4, run 5712cb41 F1): a line refused by
+            // serde_json solely because a NUMBER literal exceeds f64
+            // range (309+ digits, `1e400`) gets its own class instead of
+            // masquerading as a torn tail — same rule the probe lanes'
+            // `jsonl_objects_counted` applies.
+            if parser::fails_only_on_numeric_range_overflow(line) {
+                count_skip("numeric_range_overflow", &mut line_skips);
+            } else {
+                count_skip("unparseable_line", &mut line_skips);
+            }
             // rm-616: a rejected line that itself carries model identity
             // or a usage block is not just a lost message — it is lost
             // ACCOUNTING. Count it separately so the drop is disclosed,

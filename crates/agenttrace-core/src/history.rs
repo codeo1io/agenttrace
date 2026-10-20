@@ -141,22 +141,111 @@ fn records_from_bytes(path: &Path, raw: &[u8]) -> BTreeMap<String, DerivedSessio
             // first, destroying evidence exactly when forensics
             // needed the older bytes. Successive corruptions stack as
             // `<name>.json.corrupt`, `.corrupt.1`, `.corrupt.2`, ...;
-            // the bound only guards a pathological directory (the
-            // last slot is reused rather than looping forever).
-            let mut quarantine = path.with_extension("json.corrupt");
-            let mut generation = 0u32;
-            while quarantine.exists() && generation < 10_000 {
-                generation += 1;
-                quarantine = path.with_extension(format!("json.corrupt.{generation}"));
+            // the bound only guards a pathological directory.
+            //
+            // rm-2059 (cycle 4, run 5712cb41): this arm used to swallow
+            // the rename result (`let _ =`) and print "quarantined as …"
+            // unconditionally — a rename that failed (read-only
+            // directory, full disk, vanished path) reported success,
+            // returned an empty map, and the NEXT history save then
+            // overwrote the still-corrupt bytes, destroying them for
+            // real. A quarantine that does not verifiably happen is now
+            // a hard stop: the refusal prints source, target and the
+            // errno, leaves the bytes untouched, and exits nonzero so
+            // no later save can overwrite them.
+            match quarantine_corrupt_history(path) {
+                QuarantineOutcome::Quarantined(target) => {
+                    eprintln!(
+                        "agenttrace: history file {} was unreadable; quarantined as {} (new history starts empty)",
+                        path.display(),
+                        target.display()
+                    );
+                }
+                QuarantineOutcome::Refused {
+                    source,
+                    target,
+                    reason,
+                } => {
+                    eprintln!(
+                        "agenttrace: REFUSED: history file {} was unreadable and could NOT be quarantined as {}: {}. The original bytes are untouched at {}; fix the cause (permissions, disk, …) and rerun — continuing would save a new history over them",
+                        source.display(),
+                        target.display(),
+                        reason,
+                        source.display()
+                    );
+                    std::process::exit(1);
+                }
             }
-            let _ = std::fs::rename(path, &quarantine);
-            eprintln!(
-                "agenttrace: history file {} was unreadable; quarantined as {} (new history starts empty)",
-                path.display(),
-                quarantine.display()
-            );
             BTreeMap::new()
         }
+    }
+}
+
+/// What attempting to quarantine an unreadable history file left
+/// behind (rm-2059, cycle 4, run 5712cb41).
+#[derive(Debug)]
+enum QuarantineOutcome {
+    /// The corrupt bytes now live at this path — verified on disk
+    /// AFTER the rename, because the caller's success print certifies
+    /// the move.
+    Quarantined(PathBuf),
+    /// The bytes are still sitting at `source`: continuing would start
+    /// an empty history whose next save overwrites them. `reason` is
+    /// the human-facing cause (errno included where one exists).
+    Refused {
+        source: PathBuf,
+        target: PathBuf,
+        reason: String,
+    },
+}
+
+/// Move an unreadable history file aside under
+/// `<name>.json.corrupt[.N]` without ever overwriting a prior
+/// quarantine generation (rm-703), and without ever reporting success
+/// for a move that did not verifiably happen (rm-2059).
+fn quarantine_corrupt_history(path: &Path) -> QuarantineOutcome {
+    let mut quarantine = path.with_extension("json.corrupt");
+    let mut generation = 0u32;
+    while quarantine.exists() && generation < 10_000 {
+        generation += 1;
+        quarantine = path.with_extension(format!("json.corrupt.{generation}"));
+    }
+    if quarantine.exists() {
+        // The rm-703 bound is exhausted. The old loop fell through here
+        // and renamed onto `.corrupt.10000`, clobbering the newest
+        // existing generation; the bound now refuses loudly instead.
+        return QuarantineOutcome::Refused {
+            source: path.to_path_buf(),
+            target: quarantine.clone(),
+            reason: format!(
+                "every quarantine generation up to .corrupt.{generation} already exists (rm-703 bound); refusing to overwrite {}",
+                quarantine.display()
+            ),
+        };
+    }
+    match std::fs::rename(path, &quarantine) {
+        Ok(()) => {
+            // rm-2059: the success print certifies a move, so the move
+            // is verified on disk before it is reported — a rename that
+            // returned Ok with no target must never read as quarantined.
+            if quarantine.exists() {
+                QuarantineOutcome::Quarantined(quarantine)
+            } else {
+                QuarantineOutcome::Refused {
+                    source: path.to_path_buf(),
+                    target: quarantine.clone(),
+                    reason: format!(
+                        "rename returned Ok but {} is missing afterwards",
+                        quarantine.display()
+                    ),
+                }
+            }
+        }
+        Err(err) => QuarantineOutcome::Refused {
+            source: path.to_path_buf(),
+            target: quarantine,
+            reason: format!("rename failed: {err}"),
+        },
     }
 }
 
@@ -421,6 +510,134 @@ mod tests {
             "the second generation's bytes must be preserved too"
         );
         assert!(!path.exists(), "the live file moved aside both times");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quarantine_success_verifies_the_move_before_reporting_it() {
+        // rm-2059 (cycle 4, run 5712cb41): the success print certifies a
+        // move, so the seam only reports Quarantined for a target that
+        // exists on disk AFTER the rename, with the source gone and the
+        // bytes preserved at the target.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-verify-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("history.json");
+        std::fs::write(&path, b"{\"torn\": ").expect("write corrupt history");
+        match quarantine_corrupt_history(&path) {
+            QuarantineOutcome::Quarantined(target) => {
+                assert_eq!(
+                    target,
+                    root.join("history.json.corrupt"),
+                    "the outcome names the quarantine path"
+                );
+                assert!(target.exists(), "verified success means the target exists");
+                assert!(!path.exists(), "verified success means the source moved");
+                assert_eq!(
+                    std::fs::read(&target).unwrap(),
+                    b"{\"torn\": ",
+                    "the quarantined bytes are the corrupt bytes"
+                );
+            }
+            other => panic!("a quarantinable file must report success: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quarantine_rename_failure_is_refused_with_source_target_and_errno() {
+        // rm-2059 (cycle 4, run 5712cb41): the old arm swallowed the
+        // rename result (`let _ =`) and printed "quarantined as …"
+        // unconditionally — the caller then returned an empty map and
+        // the NEXT save overwrote the still-corrupt bytes. A rename
+        // that cannot happen must be refused loudly, naming source,
+        // target and the errno. Pinned at the seam with a source that
+        // cannot be renamed (ENOENT): the cheapest deterministic
+        // failure that needs no privilege games (a read-only parent
+        // would silently pass under root).
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-refuse-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let absent = root.join("history.json");
+        match quarantine_corrupt_history(&absent) {
+            QuarantineOutcome::Refused {
+                source,
+                target,
+                reason,
+            } => {
+                assert_eq!(source, absent, "the refusal names the untouched source");
+                assert_eq!(
+                    target,
+                    root.join("history.json.corrupt"),
+                    "the refusal names the intended target"
+                );
+                assert!(
+                    reason.contains("os error"),
+                    "the refusal carries the errno text: {reason}"
+                );
+            }
+            other => panic!("a rename that cannot happen must be refused: {other:?}"),
+        }
+        assert!(
+            !root.join("history.json.corrupt").exists(),
+            "a failed quarantine must leave nothing behind"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quarantine_generation_cap_exhaustion_refuses_instead_of_clobbering() {
+        // rm-2059 (cycle 4, run 5712cb41): with every generation up to
+        // the rm-703 bound already on disk, the old loop fell through
+        // and renamed onto `.corrupt.10000` — clobbering a prior
+        // quarantine generation. The bound must refuse loudly instead,
+        // leaving both the live file and every generation untouched.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-cap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("history.json");
+        std::fs::write(&path, b"{\"live\": ").expect("write live corrupt history");
+        std::fs::write(root.join("history.json.corrupt"), b"gen0").expect("seed gen0");
+        for generation in 1..=10_000u32 {
+            std::fs::write(
+                root.join(format!("history.json.corrupt.{generation}")),
+                b"x",
+            )
+            .expect("seed generation");
+        }
+        match quarantine_corrupt_history(&path) {
+            QuarantineOutcome::Refused { target, reason, .. } => {
+                assert_eq!(
+                    target,
+                    root.join("history.json.corrupt.10000"),
+                    "the refusal names the slot that would have been clobbered"
+                );
+                assert!(
+                    reason.contains("refusing to overwrite"),
+                    "the refusal says what it protected: {reason}"
+                );
+            }
+            other => panic!("an exhausted bound must refuse, not clobber: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(root.join("history.json.corrupt.10000")).unwrap(),
+            b"x",
+            "the newest existing generation must survive un-clobbered"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"live\": ",
+            "the still-corrupt live file must be left untouched"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
