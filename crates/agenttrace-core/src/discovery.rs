@@ -1088,13 +1088,15 @@ pub(crate) fn find_session_files_cached(
     retain_single_cline_session_per_id(&mut all);
     // rm-1886: content dedup at admission — a byte-identical journal
     // at a second path re-emits the same events and double-banks every
-    // aggregate it feeds. First-seen survivor wins (deterministic: the
-    // walk yields sorted per-directory files, roots in registration
-    // order); a file whose bytes cannot be read is KEPT — the parse
-    // lane owns unreadable files and discloses them, dedup must not
-    // silently drop what it cannot verify. Unreadable-file stance
-    // keeps this pass observable: suppressed copies are counted and
-    // the first pairs named.
+    // aggregate it feeds. The lexicographically-first path survives
+    // (deterministic under any walk order: collect_session_files_cached
+    // feeds this loop newest-first via sort_paths_by_cache, so a
+    // first-seen rule would hand the survivor to whichever copy's mtime
+    // won — the full-workspace flake of 2026-10-22); a file whose bytes
+    // cannot be read is KEPT — the parse lane owns unreadable files and
+    // discloses them, dedup must not silently drop what it cannot
+    // verify. Unreadable-file stance keeps this pass observable:
+    // suppressed copies are counted and the first pairs named.
     let mut deduped: Vec<PathBuf> = Vec::with_capacity(all.len());
     let mut signatures: HashMap<(i64, u64), PathBuf> = HashMap::new();
     for path in all {
@@ -1119,12 +1121,29 @@ pub(crate) fn find_session_files_cached(
             continue;
         };
         match signatures.entry(signature) {
-            std::collections::hash_map::Entry::Occupied(survivor) => {
+            std::collections::hash_map::Entry::Occupied(mut survivor) => {
                 suppressed.duplicate_session_files += 1;
+                // Deterministic survivor: byte-identical copies must
+                // not inherit their winner from walk order —
+                // sort_paths_by_cache walks newest-first, so a
+                // strictly newer copy would silently flip the choice
+                // (the flake the full-workspace gate surfaced
+                // 2026-10-22). The lexicographically-first path
+                // survives; the other side of the pair is the
+                // suppressed copy.
+                let (keep, drop_path) = if path < *survivor.get() {
+                    let previous = survivor.insert(path.clone());
+                    if let Some(slot) = deduped.iter_mut().find(|p| **p == previous) {
+                        *slot = path.clone();
+                    }
+                    (path, previous)
+                } else {
+                    (survivor.get().clone(), path)
+                };
                 if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
                     suppressed
                         .duplicate_session_file_pairs
-                        .push((survivor.get().clone(), path));
+                        .push((keep, drop_path));
                 }
             }
             std::collections::hash_map::Entry::Vacant(slot) => {

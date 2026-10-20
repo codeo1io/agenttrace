@@ -3505,6 +3505,25 @@ fn count_honesty_disclosures_in_cli_lanes() {
     let journal = pi_journal("0.0038");
     write("alpha/a.jsonl", &journal);
     let beta = write("beta/b.jsonl", &journal);
+    // Pin divergent mtimes so the copy is STRICTLY newer than the
+    // original: the dedup survivor must stay deterministic even
+    // though sort_paths_by_cache walks newest-first. Unpinned, the
+    // two writes only tie when they land inside one clock tick —
+    // under parallel-suite load they straddle one and the survivor
+    // flips (the flake the full-workspace gate surfaced 2026-10-22).
+    {
+        use std::time::Duration;
+        let pin = |rel: &str, ago_secs: u64| {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(sessions.join(rel))
+                .unwrap_or_else(|e| panic!("open {rel} for mtime pin: {e}"));
+            file.set_modified(std::time::SystemTime::now() - Duration::from_secs(ago_secs))
+                .unwrap_or_else(|e| panic!("pin {rel} mtime: {e}"));
+        };
+        pin("alpha/a.jsonl", 2);
+        pin("beta/b.jsonl", 1);
+    }
     // A pi-subagents artifact mirror under the path segment — child
     // spend the parent owns; skipped, never banked.
     write(

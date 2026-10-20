@@ -71,10 +71,41 @@ pub(crate) fn resolve_user_cache_dir(
     std::env::temp_dir()
 }
 
+/// Home-candidate ladder for the user-root resolutions (rm-205):
+/// `$HOME` wins cross-platform; on Windows a missing `$HOME` falls
+/// back to `%USERPROFILE%` so cache and config roots resolve on
+/// hosts that never set POSIX env vars. `%USERPROFILE%` is consulted
+/// ONLY under `windows` — off Windows it is never read, and a
+/// set-but-empty value is unset-equivalent (the rm-248 convention).
+/// Pure over its inputs like the resolve cores (the rm-683 pattern)
+/// so the precedence is unit-testable without mutating (unsafe)
+/// globals; the agenttrace-cli `config.rs` twin carries the same
+/// rules for the config root.
+fn usable_home_for_platform(
+    env_home: Option<&OsStr>,
+    env_userprofile: Option<&OsStr>,
+    windows: bool,
+) -> Option<std::ffi::OsString> {
+    if let Some(home) = env_home.filter(|value| !value.is_empty()) {
+        return Some(home.to_os_string());
+    }
+    if windows {
+        if let Some(userprofile) = env_userprofile.filter(|value| !value.is_empty()) {
+            return Some(userprofile.to_os_string());
+        }
+    }
+    None
+}
+
 /// The environment-reading wrapper every cache consumer calls.
 pub(crate) fn user_cache_dir() -> PathBuf {
     resolve_user_cache_dir(
-        std::env::var_os("HOME").as_deref(),
+        usable_home_for_platform(
+            std::env::var_os("HOME").as_deref(),
+            std::env::var_os("USERPROFILE").as_deref(),
+            cfg!(windows),
+        )
+        .as_deref(),
         std::env::var_os("XDG_CACHE_HOME").as_deref(),
         cfg!(target_os = "macos"),
     )
@@ -305,5 +336,48 @@ mod tests {
             "exactly one shared resolver definition may exist (this module); \
              the census found {definitions} across crates/"
         );
+    }
+
+    #[test]
+    fn user_cache_home_ladder_honors_userprofile_on_windows() {
+        // rm-205 acceptance on the pure seams — no cfg gate, no env
+        // mutation, so the row runs on every OS the test lane has.
+        // The through-ladder row uses a POSIX-absolute candidate
+        // because the shared resolver's rm-248 guard judges
+        // absoluteness on the HOST OS (a `C:\…` path is relative
+        // from Linux's point of view); the ladder itself is agnostic.
+        let up = OsStr::new("/up-home");
+        let home = OsStr::new("/home/at-test");
+        // $HOME wins cross-platform, even with USERPROFILE set.
+        assert_eq!(
+            usable_home_for_platform(Some(home), Some(up), true),
+            Some(home.to_os_string())
+        );
+        // Windows + no $HOME → USERPROFILE is the home candidate …
+        assert_eq!(
+            usable_home_for_platform(None, Some(up), true),
+            Some(up.to_os_string())
+        );
+        // … and it feeds the shared ladder itself.
+        assert_eq!(
+            resolve_user_cache_dir(
+                usable_home_for_platform(None, Some(up), true).as_deref(),
+                None,
+                false,
+            ),
+            PathBuf::from(up).join(".cache")
+        );
+        // USERPROFILE is never consulted off Windows.
+        assert_eq!(usable_home_for_platform(None, Some(up), false), None);
+        // Set-but-empty values stay unset-equivalent (rm-248).
+        assert_eq!(
+            usable_home_for_platform(Some(OsStr::new("")), Some(up), true),
+            Some(up.to_os_string())
+        );
+        assert_eq!(
+            usable_home_for_platform(None, Some(OsStr::new("")), true),
+            None
+        );
+        assert_eq!(usable_home_for_platform(None, None, true), None);
     }
 }

@@ -1026,6 +1026,22 @@
 
 ### Fixed
 
+- Dedup survivor determinism (run a0cc78e9 cycle 2, full-suite gate): the
+  content-dedup pass now keeps the lexicographically-first path when
+  byte-identical journals appear at multiple paths — first-seen selection
+  inherited the walk's newest-first mtime order (`sort_paths_by_cache`), so
+  a strictly newer copy silently flipped which path survived, and which the
+  audit named as the suppressed duplicate, run to run. Disclosure pair
+  naming is now stable regardless of filesystem mtimes.
+- Windows home-ladder truth (rm-205, run a0cc78e9 cycle 2, batch "Windows
+  home-ladder truth"): `user_config_path()` and `user_cache_dir()` now fall
+  back to `%USERPROFILE%` when `$HOME` is absent on Windows, so the user
+  config and cache roots resolve on hosts that never set POSIX env vars —
+  previously those hosts got no user config discovered and a temp-dir cache.
+  `$HOME` still wins cross-platform, `%USERPROFILE%` is never consulted off
+  Windows, set-but-empty values stay unset-equivalent, and the shared
+  resolver cores are byte-identical (pure per-crate ladders, unit-tested on
+  every OS).
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch

@@ -90,7 +90,12 @@ const SUPPORTED_KEYS: &str = "history_dir, pricing_file, weekly_budget_usd, sess
 pub fn user_config_path() -> Option<PathBuf> {
     resolve_user_config_path(
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+        usable_home_for_platform(
+            std::env::var_os("HOME").as_deref(),
+            std::env::var_os("USERPROFILE").as_deref(),
+            cfg!(windows),
+        )
+        .as_deref(),
     )
 }
 
@@ -113,6 +118,32 @@ fn resolve_user_config_path(
                 .map(|home| PathBuf::from(home).join(".config"))
         })?;
     Some(base.join("agenttrace").join("config.toml"))
+}
+
+/// Home-candidate ladder for the user-root resolutions (rm-205):
+/// `$HOME` wins cross-platform; on Windows a missing `$HOME` falls
+/// back to `%USERPROFILE%` so the config root resolves on hosts
+/// that never set POSIX env vars. `%USERPROFILE%` is consulted ONLY
+/// under `windows` — off Windows it is never read — and a
+/// set-but-empty value is unset-equivalent (the rm-248 convention).
+/// Pure over its inputs like [`resolve_user_config_path`] so the
+/// precedence is unit-testable without mutating (unsafe) globals;
+/// the agenttrace-core `cache_dir.rs` twin carries the same rules
+/// for the cache root.
+fn usable_home_for_platform(
+    env_home: Option<&std::ffi::OsStr>,
+    env_userprofile: Option<&std::ffi::OsStr>,
+    windows: bool,
+) -> Option<std::ffi::OsString> {
+    if let Some(home) = env_home.filter(|value| !value.is_empty()) {
+        return Some(home.to_os_string());
+    }
+    if windows {
+        if let Some(userprofile) = env_userprofile.filter(|value| !value.is_empty()) {
+            return Some(userprofile.to_os_string());
+        }
+    }
+    None
 }
 
 /// The project-level configuration path: `./.agenttrace/config.toml`
@@ -683,6 +714,45 @@ mod tests {
         for (xdg, home, expected) in cases {
             assert_eq!(&resolve_user_config_path(*xdg, *home), expected);
         }
+    }
+
+    #[test]
+    fn user_config_path_honors_userprofile_under_windows() {
+        // rm-205 acceptance on the pure seams — Windows is injected
+        // as a parameter, not a cfg gate, so the row runs on every
+        // OS the test lane has, with no env mutation.
+        use std::ffi::{OsStr, OsString};
+        let up = OsStr::new("C:\\Users\\at-test");
+        // USERPROFILE set, HOME unset → the config root resolves
+        // under USERPROFILE (a Windows host that never set $HOME
+        // previously got NO user config at all).
+        let home = usable_home_for_platform(None, Some(up), true);
+        assert_eq!(home, Some(OsString::from(up)));
+        assert_eq!(
+            resolve_user_config_path(None, home.as_deref()),
+            Some(
+                PathBuf::from(up)
+                    .join(".config")
+                    .join("agenttrace")
+                    .join("config.toml")
+            )
+        );
+        // $HOME still wins when both are set (cross-platform
+        // precedence — USERPROFILE never overrides a usable HOME).
+        let home = usable_home_for_platform(Some(OsStr::new("/home/at-test")), Some(up), true);
+        assert_eq!(home, Some(OsString::from("/home/at-test")));
+        // Off Windows USERPROFILE is never consulted.
+        assert_eq!(usable_home_for_platform(None, Some(up), false), None);
+        assert_eq!(resolve_user_config_path(None, None), None);
+        // Set-but-empty values are unset-equivalent (rm-248).
+        assert_eq!(
+            usable_home_for_platform(Some(OsStr::new("")), Some(up), true),
+            Some(OsString::from(up))
+        );
+        assert_eq!(
+            usable_home_for_platform(None, Some(OsStr::new("")), true),
+            None
+        );
     }
 
     #[test]
