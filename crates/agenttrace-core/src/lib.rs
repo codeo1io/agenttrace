@@ -91,7 +91,7 @@ pub use search::{
     report_search_text_detailed, search_sessions, search_sessions_detailed, SearchReport,
     TranscriptScanSummary, TRANSCRIPT_SCAN_FILE_BYTE_CAP, TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
 };
-pub use session_cache::{
+pub use session_cache::{record_output_path, OutputsRegistry,
     cached_session, clear_session_cache, effective_session_cache_entries, load_cached_sessions,
     load_cached_sessions_from_cache, load_session_cache, save_session_cache,
     session_cache_entries_source, session_cache_path, store_session, SessionCache,

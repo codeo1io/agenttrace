@@ -1583,6 +1583,165 @@ pub fn session_cache_path() -> PathBuf {
     user_cache_dir().join("agenttrace").join("sessions.json")
 }
 
+/// rm-2208 (run 34e63d75 cycle 4, "local-state trust"): journal of
+/// every path agenttrace itself wrote through an `-o` target. Discovery
+/// consults it so the tool's own reports can never re-enter the corpus
+/// as permanent parse failures (the assess F1 loop: `--overview -o
+/// overview.json` inside a scanned dir made every later scan report
+/// `discovered N+1 / parsed N / skipped 1` with a sticky `failed:`
+/// entry in `--doctor`). One absolute path per line; torn tails from a
+/// concurrent appender are skipped like any other journal. Recognition
+/// is by exact absolute path — a file moved or copied elsewhere is not
+/// recognized (it then behaves as any foreign file and fails
+/// disclosure as before). Cleared with the rest of the cache by
+/// `--clear-cache` via `cache_artifact_paths`.
+pub fn outputs_registry_path() -> PathBuf {
+    session_cache_path()
+        .parent()
+        .map(|dir| dir.join("outputs.jsonl"))
+        .unwrap_or_else(|| PathBuf::from("outputs.jsonl"))
+}
+
+/// Read-side view of the outputs registry (rm-2208). Loaded once per
+/// scan; membership is canonicalized on both sides so symlinked
+/// session dirs still match the path that was recorded.
+#[derive(Debug, Default)]
+pub struct OutputsRegistry {
+    known: BTreeSet<PathBuf>,
+}
+
+impl OutputsRegistry {
+    /// Registry rooted beside an explicit `sessions.json` — the same
+    /// directory the discovery cache (and therefore the writer side,
+    /// `record_output_path`) uses. Missing or unreadable file yields
+    /// an empty registry (no protection; behavior is the pre-rm-2208
+    /// disclosure), never an error.
+    pub fn from_cache_path(sessions_json: &Path) -> OutputsRegistry {
+        let registry_path = sessions_json
+            .parent()
+            .map(|dir| dir.join("outputs.jsonl"))
+            .unwrap_or_else(|| PathBuf::from("outputs.jsonl"));
+        OutputsRegistry::from_file(&registry_path)
+    }
+
+    /// Registry rooted beside an explicit cache directory (doctor
+    /// walks hand the directory, not the store path).
+    pub fn from_cache_dir(cache_dir: &Path) -> OutputsRegistry {
+        OutputsRegistry::from_file(&cache_dir.join("outputs.jsonl"))
+    }
+
+    fn from_file(path: &Path) -> OutputsRegistry {
+        let mut known = BTreeSet::new();
+        let Ok(raw) = fs::read_to_string(path) else {
+            return OutputsRegistry { known };
+        };
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Torn tail from a concurrent appender: skip like the
+            // session journals do, never fail the scan for it.
+            let Ok(absolute) = fs::canonicalize(line) else {
+                known.insert(PathBuf::from(line));
+                continue;
+            };
+            known.insert(absolute);
+        }
+        OutputsRegistry { known }
+    }
+
+    /// True when `path` is a file agenttrace itself wrote (rm-2208).
+    pub fn contains(&self, path: &Path) -> bool {
+        if let Ok(absolute) = fs::canonicalize(path) {
+            if self.known.contains(&absolute) {
+                return true;
+            }
+        }
+        self.known.contains(path)
+    }
+
+    /// Drop recorded output files from a discovery candidate list,
+    /// returning how many were dropped (the disclosed
+    /// `self_output_skipped` counter — skipped, not zero).
+    pub fn retain_session_files(&self, files: &mut Vec<PathBuf>) -> usize {
+        let before = files.len();
+        files.retain(|candidate| !self.contains(candidate));
+        before - files.len()
+    }
+}
+
+/// Write-side half of the outputs registry (rm-2208): called by the
+/// CLI for every regular-file `-o` target after a successful write.
+/// Appends are deduplicated per process; the file is compacted back to
+/// its unique set when it exceeds the compaction threshold so a
+/// long-lived cache cannot grow a line per historical `-o`. Never
+/// fails the write: a registry that cannot be banked simply does not
+/// protect that path.
+pub fn record_output_path(path: &Path) {
+    record_output_path_at(&outputs_registry_path(), path);
+}
+
+/// In-process dedup state for `record_output_path` so repeated writes
+/// to the same target (the common `--overview -o overview.json`
+/// rerun) append once per process.
+fn recorded_this_process() -> &'static std::sync::Mutex<BTreeSet<PathBuf>> {
+    static RECORDED: std::sync::OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    RECORDED.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+const OUTPUTS_REGISTRY_COMPACTION_LINES: usize = 10_000;
+
+fn record_output_path_at(registry_path: &Path, path: &Path) {
+    let absolute = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut recorded = match recorded_this_process().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !recorded.insert(absolute.clone()) {
+        return;
+    }
+    let existing = OutputsRegistry::from_file(registry_path);
+    if existing.known.contains(&absolute) {
+        return;
+    }
+    let line = format!("{}\n", absolute.display());
+    if let Some(dir) = registry_path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let append = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(registry_path);
+    match append {
+        Ok(mut file) => {
+            use std::io::Write;
+            if file.write_all(line.as_bytes()).is_err() {
+                return;
+            }
+        }
+        Err(_) => return,
+    }
+    // Compaction guard: rewrite the unique set when the journal outgrows
+    // its distinct-path count by the threshold (stale entries for paths
+    // agenttrace no longer writes keep accumulating otherwise).
+    if let Ok(raw) = fs::read_to_string(registry_path) {
+        let lines = raw.lines().filter(|l| !l.trim().is_empty()).count();
+        if lines > existing.known.len() + OUTPUTS_REGISTRY_COMPACTION_LINES {
+            let mut compacted = String::new();
+            for path in existing
+                .known
+                .iter()
+                .chain(std::iter::once(&absolute))
+            {
+                compacted.push_str(&format!("{}\n", path.display()));
+            }
+            let _ = fs::write(registry_path, compacted);
+        }
+    }
+}
+
 /// Every at-rest artifact `--clear-cache` removes (rm-086), built
 /// from the same constructors that write the files: the parsed-metrics
 /// journal, the Hermes and OpenCode SQLite snapshots, the statusline
@@ -1598,6 +1757,10 @@ pub fn session_cache_path() -> PathBuf {
 pub(crate) fn cache_artifact_paths() -> Vec<PathBuf> {
     vec![
         session_cache_path(),
+        // rm-2208 outputs registry (see `outputs_registry_path`): paths
+        // only, no session data; swept with the rest so a cleared cache
+        // fully forgets the tool's own write history.
+        outputs_registry_path(),
         // Advisory lock sibling of the store (see `CacheFileLock`):
         // registered so `--clear-cache` sweeps it with the rest. It is
         // empty — it carries no session data.
@@ -2445,6 +2608,13 @@ pub fn load_cached_sessions_from_cache(
 }
 
 impl SessionCache {
+    /// rm-2208: read-side outputs registry rooted beside this cache's
+    /// `sessions.json` — the same directory `record_output_path`
+    /// appends to, so discovery and the CLI writer agree on one
+    /// journal without either side re-reading the environment.
+    pub(crate) fn outputs_registry(&self) -> OutputsRegistry {
+        OutputsRegistry::from_cache_path(&self.path)
+    }
     pub fn entry_count(&self) -> usize {
         let mut count = self.raw_entries.len();
         for path in self.entries.keys() {

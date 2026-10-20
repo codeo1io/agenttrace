@@ -1570,6 +1570,16 @@ fn attach_admission_disclosures(
             serde_json::json!(report.subagent_artifact_files),
         );
     }
+    // rm-2208 (run 34e63d75 cycle 4): own outputs dropped from the
+    // candidate set are disclosed — skipped, not zero — so
+    // `discovered`/`parsed` remain honest when a report is written
+    // inside a scanned tree.
+    if report.self_output_skipped > 0 {
+        map.insert(
+            "self_output_skipped".to_string(),
+            serde_json::json!(report.self_output_skipped),
+        );
+    }
     if report.duplicate_session_files > 0 {
         map.insert(
             "duplicate_session_files".to_string(),
@@ -2716,6 +2726,12 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
     // and the victim behind it is never touched.
     write_private_exclusive(target, content)
         .map_err(|error| anyhow::anyhow!("writing report output file: {error}"))?;
+    // rm-2208 (run 34e63d75 cycle 4): bank the successful write in the
+    // outputs registry so discovery (both the load lanes and the
+    // doctor walk) never re-admits this file as a session candidate
+    // (assess F1 loop). Path-only journal beside sessions.json; swept
+    // by --clear-cache; never fails the write it protects.
+    agenttrace_core::record_output_path(target);
     eprintln!("Saved: {}", target.display());
     Ok(())
 }

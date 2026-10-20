@@ -72,7 +72,11 @@ pub struct LoadReport {
     /// capped at five, naming the paths so an operator can tell a
     /// copy from a coincidence.
     pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
-    /// rm-451 walk-lane arm: opencode session info docs skipped because
+    /// rm-2208 (run 34e63d75 cycle 4): candidate files dropped because
+    /// they are agenttrace's own written outputs (outputs registry),
+    /// not sessions — disclosed so `discovered` and `parsed` stay
+    /// honest when a report is written inside a scanned tree.
+    pub self_output_skipped: usize,
     /// they exceed `OPENCODE_INFO_DOC_READ_CAP_BYTES` (rm-212 admits them
     /// by file-kind). The skip is disclosed here, never silent, and the
     /// transcript stays aggregated — no fork verdict is derivable without
@@ -735,6 +739,9 @@ pub fn load_sessions_with_progress_from_cache_mode(
     let subagent_artifact_files = suppressed.subagent_artifact_files;
     let duplicate_session_files = suppressed.duplicate_session_files;
     let duplicate_session_file_pairs = suppressed.duplicate_session_file_pairs;
+    // rm-2208: own-output files never entered the candidate list —
+    // carry the disclosed count to the LoadReport verbatim.
+    let self_output_skipped = suppressed.self_output_skipped;
     if dir.is_none() {
         let (sqlite_sessions, ingest) =
             crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
@@ -823,6 +830,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         subagent_artifact_files,
         duplicate_session_files,
         duplicate_session_file_pairs,
+        self_output_skipped,
         opencode_info_docs_skipped_over_cap,
         parse_failures,
         first_parse_failure,
@@ -897,6 +905,19 @@ pub struct SuppressedSessions {
     /// capped at [`MAX_DUPLICATE_PAIR_SAMPLES`]; the full count rides
     /// `duplicate_session_files`.
     pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-2208 (run 34e63d75 cycle 4, "local-state trust"): discovery
+    /// candidates dropped because they are files agenttrace itself
+    /// wrote through an `-o` target (outputs registry,
+    /// `session_cache::OutputsRegistry`). Unlike the aggregation
+    /// suppressions above this fires in BOTH lanes — an own-output
+    /// file is not a session in any lane, so the explicit `-d`
+    /// inspection lane drops it too; the "`-d` keeps every file"
+    /// stance (rm-548/1886/1887 notes below at the call site) is
+    /// about session copies, never about the tool's own reports. The
+    /// skip is disclosed as `self_output_skipped`, never silent —
+    /// and it removes the permanent `failed:` parse entry the
+    /// assess F1 PoC planted in `--doctor`.
+    pub self_output_skipped: usize,
 }
 
 /// rm-1886: cap on the named duplicate pairs carried for disclosure —
@@ -989,6 +1010,9 @@ pub(crate) fn find_session_files_cached(
     cache: &mut SessionCache,
     skip_sqlite_backed: bool,
 ) -> (Vec<PathBuf>, SuppressedSessions, usize) {
+    // rm-2208: own-output files are not sessions in any lane — both
+    // return paths below drop them with a disclosed counter.
+    let outputs_registry = cache.outputs_registry();
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
             return (vec![dir.to_path_buf()], SuppressedSessions::default(), 0);
@@ -1000,11 +1024,14 @@ pub(crate) fn find_session_files_cached(
         // mirrors: `-d` is the inspection lane. rm-451 keeps the
         // over-cap counter zero here too — an explicit `-d` probe reads
         // the doc through the parse lane, which owns its own read caps.
-        return (
-            collect_session_files_cached(dir, cache),
-            SuppressedSessions::default(),
-            0,
-        );
+        // rm-2208 carve-out: agenttrace's own `-o` outputs are the one
+        // class the inspection lane still drops — a written report is
+        // not an inspectable session in any sense, and admitting it
+        // manufactures a permanent parse failure (assess F1).
+        let mut files = collect_session_files_cached(dir, cache);
+        let mut suppressed = SuppressedSessions::default();
+        suppressed.self_output_skipped = outputs_registry.retain_session_files(&mut files);
+        return (files, suppressed, 0);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
@@ -1133,6 +1160,8 @@ pub(crate) fn find_session_files_cached(
             }
         }
     }
+    let self_output_skipped = outputs_registry.retain_session_files(&mut deduped);
+    suppressed.self_output_skipped = self_output_skipped;
     (
         sort_paths_by_cache(deduped, cache),
         suppressed,

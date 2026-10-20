@@ -14,6 +14,12 @@
 //! layer that sets a key wins. `--doctor` discloses every layer that
 //! was found and the winning source of each knob.
 //!
+//! rm-2210: path values (`history_dir`, `pricing_file`) from any
+//! winning layer accept `~` and `~/…`, expanded against a usable
+//! `$HOME` (set, non-empty, absolute — the same rule core's
+//! cache_dir applies); other tilde-leading forms are rejected loudly
+//! naming key, value, and supported forms.
+//!
 //! The file is parsed with a deliberate scalar subset of TOML syntax —
 //! `key = value` lines with quoted or bare scalars and `#` comments.
 //! Tables, arrays, and multi-line values are rejected loudly rather
@@ -29,6 +35,7 @@
 //! binary dependency-surface unchanged and every deviation loud.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 
 use anyhow::{bail, Context};
 
@@ -332,6 +339,77 @@ pub fn resolve(args: &crate::Args) -> anyhow::Result<ResolvedConfig> {
     resolve_with_paths(args, user_config_path().as_deref(), &project_config_path())
 }
 
+/// rm-2210 (run 34e63d75 cycle 4, "local-state trust"): apply tilde
+/// expansion to a winning path knob from ANY layer (config file, CLI
+/// flag) before it reaches `ResolvedConfig`. Before this, a config
+/// like `history_dir = "~/agenttrace/history"` was taken LITERALLY:
+/// a directory named `~` was created next to the CWD (silent
+/// wrong-place data, assess F3 PoC) while the tool reported the
+/// literal `./~` path as if it were the user's home. DECISION (the
+/// row's recorded decision): EXPAND `~` and `~/…` against a usable
+/// `$HOME`, mirroring the rm-248 usable-home rule core's cache_dir
+/// applies (set, non-empty, absolute); every other tilde-leading
+/// form (`~user`, `~name/…`) is refused LOUDLY naming the key, the
+/// value, and the supported forms — std-lib Rust cannot portably
+/// resolve another user's home, and silently writing `./~user/…`
+/// is exactly the data-misplacement this row exists to end.
+fn expand_layered_path(
+    key: &'static str,
+    value: Option<PathBuf>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    Ok(Some(expand_config_path(key, &value, std::env::var_os("HOME").as_deref())?))
+}
+
+/// Pure, env-free core of the rm-2210 expansion so the precedence
+/// matrix and both arms (`~`/`~/` expand, `~user` rejects) are
+/// testable without mutating the environment.
+pub fn expand_config_path(
+    key: &'static str,
+    value: &Path,
+    home: Option<&OsStr>,
+) -> anyhow::Result<PathBuf> {
+    let Some(text) = value.to_str() else {
+        // Non-UTF-8 paths keep today's behavior: passed through
+        // untouched (they cannot start with a tilde byte anyway).
+        return Ok(value.to_path_buf());
+    };
+    if !text.starts_with('~') {
+        return Ok(value.to_path_buf());
+    }
+    let usable_home = home
+        .filter(|value| !value.is_empty())
+        .filter(|value| Path::new(value).is_absolute());
+    if text == "~" {
+        let Some(home) = usable_home else {
+            anyhow::bail!(
+                "config key {key}: value \"~\" needs a usable $HOME \
+                 (set, non-empty, absolute) to expand; got none — use an \
+                 absolute path instead"
+            );
+        };
+        return Ok(PathBuf::from(home));
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        let Some(home) = usable_home else {
+            anyhow::bail!(
+                "config key {key}: value \"{text}\" needs a usable $HOME \
+                 (set, non-empty, absolute) to expand; got none — use an \
+                 absolute path instead"
+            );
+        };
+        return Ok(PathBuf::from(home).join(rest));
+    }
+    anyhow::bail!(
+        "config key {key}: value \"{text}\" starts with '~' but is not a \
+         supported form — only '~' and '~/…' (relative to $HOME) are \
+         supported; '~user' homes cannot be resolved portably. Use an \
+         absolute path instead"
+    )
+}
+
 /// The layer-resolution core over explicit paths, so the precedence
 /// matrix is testable without mutating the process environment or
 /// working directory (rm-384's test matrix; the fifth level — the
@@ -390,14 +468,18 @@ pub fn resolve_with_paths(
     }
 
     // CLI flags sit above every file layer.
-    let history_dir = args
-        .history_dir
-        .clone()
-        .or_else(|| merged.history_dir.clone());
-    let pricing_file = args
-        .pricing_file
-        .clone()
-        .or_else(|| merged.pricing_file.clone());
+    let history_dir = expand_layered_path(
+        "history_dir",
+        args.history_dir
+            .clone()
+            .or_else(|| merged.history_dir.clone()),
+    )?;
+    let pricing_file = expand_layered_path(
+        "pricing_file",
+        args.pricing_file
+            .clone()
+            .or_else(|| merged.pricing_file.clone()),
+    )?;
     let weekly_budget = args.weekly_budget.or(merged.weekly_budget_usd);
     let session_cache_entries = merged.session_cache_entries;
 

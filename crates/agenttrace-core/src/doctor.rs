@@ -1074,6 +1074,20 @@ fn doctor_directories(
         );
         return Vec::new();
     }
+
+    // rm-2208 (run 34e63d75 cycle 4): agenttrace's own `-o` outputs are
+    // not sessions. Drop them before any dir report is built, or a
+    // report written inside a scanned tree keeps a permanent `failed:`
+    // entry (assess F1 PoC: `--overview -o overview.json` in the scan
+    // dir, then `--doctor`). Discovery discloses the same drop as
+    // `self_output_skipped`; here the file never enters a dir report,
+    // so `failed` stays derived from honest candidates only.
+    let outputs_registry = crate::session_cache::OutputsRegistry::from_cache_path(
+        &crate::session_cache::session_cache_path(),
+    );
+    let mut owned_files = files.to_vec();
+    outputs_registry.retain_session_files(&mut owned_files);
+    let files: &[PathBuf] = &owned_files;
     // rm-367(c): stderr progress before the first parse, so a slow
     // scan is diagnosable live (stage (c) of the row). Terminal-gated:
     // a captured/piped stderr stays machine-readable — the CLI's
