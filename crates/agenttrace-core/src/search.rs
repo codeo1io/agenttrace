@@ -32,6 +32,10 @@ pub struct TranscriptScanSummary {
     pub skipped_oversized: usize,
     pub skipped_non_file: usize,
     pub skipped_budget: usize,
+    /// rm-1872: zstd frames the shared decoder refused — counted in
+    /// their own arm (bomb/cap refusals, corrupt frames, trailing
+    /// garbage) so the summary can say what the lane could not read.
+    pub skipped_zstd_failed: usize,
     pub file_byte_cap: u64,
     pub total_byte_budget: u64,
 }
@@ -47,6 +51,7 @@ impl TranscriptScanSummary {
             skipped_oversized: 0,
             skipped_non_file: 0,
             skipped_budget: 0,
+            skipped_zstd_failed: 0,
             file_byte_cap,
             total_byte_budget,
         }
@@ -68,6 +73,7 @@ impl TranscriptScanSummary {
             ("over byte cap", self.skipped_oversized),
             ("non-file", self.skipped_non_file),
             ("read budget exhausted", self.skipped_budget),
+            ("zstd decode failed", self.skipped_zstd_failed),
         ] {
             if count > 0 {
                 parts.push(format!("{count} skipped: {label}"));
@@ -350,6 +356,7 @@ fn write_transcript_summary_json(out: &mut String, scan: &TranscriptScanSummary)
         ("skipped_oversized", scan.skipped_oversized.to_string()),
         ("skipped_non_file", scan.skipped_non_file.to_string()),
         ("skipped_budget", scan.skipped_budget.to_string()),
+        ("skipped_zstd_failed", scan.skipped_zstd_failed.to_string()),
         ("file_byte_cap", scan.file_byte_cap.to_string()),
         ("total_byte_budget", scan.total_byte_budget.to_string()),
     ];
@@ -554,6 +561,54 @@ fn transcript_evidence(
         return (Vec::new(), "skipped: unreadable".to_string());
     }
     let read = bytes.len() as u64;
+
+    // rm-1872: Codex ≥0.152 rollouts are zstd frames under a plain
+    // `.jsonl` NAME (upstream PR #41357), so admission is on CONTENT
+    // — the magic — never on a suffix. The decode rides the SAME
+    // bounded lane the parser runs (`decode_zstd_rollout_bounded`:
+    // one cap, one multi-frame truth, one refusal wording), so
+    // searching and parsing always see identical bytes. Budget
+    // honesty: the charge is the max of compressed/decoded — the
+    // decode is the expensive act — and `scanned_bytes` records the
+    // decoded size, the corpus actually searched. A refusal is never
+    // fatal: the metadata lanes above keep working verbatim.
+    if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        match crate::parser::decode_zstd_rollout_bounded(bytes, path) {
+            Ok(decoded) => {
+                let decoded_len = decoded.len() as u64;
+                let charge = decoded_len.max(read);
+                if charge > *budget_left {
+                    scan.skipped_budget += 1;
+                    // The read itself happened; keep it charged.
+                    *budget_left -= read;
+                    return (
+                        Vec::new(),
+                        format!("skipped: decoded {decoded_len} bytes over read budget"),
+                    );
+                }
+                *budget_left -= charge;
+                scan.scanned_files += 1;
+                scan.scanned_bytes += decoded_len;
+                let content = String::from_utf8_lossy(&decoded);
+                let mut out = Vec::new();
+                for line in content.lines() {
+                    if out.len() >= TRANSCRIPT_MATCHES_PER_SESSION {
+                        break;
+                    }
+                    if let Some(snippet) = snippet_around(line, query, 96) {
+                        out.push(format!("transcript: {snippet}"));
+                    }
+                }
+                return (out, format!("scanned zstd ({read} -> {decoded_len} bytes)"));
+            }
+            Err(_) => {
+                scan.skipped_zstd_failed += 1;
+                *budget_left -= read;
+                return (Vec::new(), "skipped: zstd decode failed".to_string());
+            }
+        }
+    }
+
     *budget_left -= read;
     scan.scanned_files += 1;
     scan.scanned_bytes += read;
@@ -822,5 +877,117 @@ mod tests {
             transcript_scan: "scanned (0 bytes)".to_string(),
         }]);
         assert!(json.contains("\"=2+5|cmd\""));
+    }
+
+    /// rm-1872 (cycle-2 run 0ab88ff2 stretch; assess 3232e602 —
+    /// `--search` was zstd-blind): Codex ≥0.152 stores rollouts as
+    /// zstd frames under a plain `.jsonl` NAME (upstream PR #41357;
+    /// the vendored fixture keeps that shape), so the search lane
+    /// must admit on CONTENT, never on a `.zst` suffix. Before this
+    /// arm the re-read happily scanned the opaque compressed bytes,
+    /// the needle could never match, and the row still claimed
+    /// `scanned (N bytes)` — a body query silently returned nothing
+    /// for exactly the journals most likely to hold it. The bounded
+    /// decode is the SAME lane the parser runs
+    /// (`decode_zstd_rollout_bounded`, one cap, one multi-frame
+    /// truth), so parsing and searching always see the same bytes.
+    #[test]
+    fn zstd_rollout_transcripts_are_decoded_and_searched_not_opaque() {
+        let zst = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-zstd/rollout.jsonl"
+        );
+        let head = std::fs::read(zst).expect("vendored zstd fixture");
+        assert_eq!(
+            &head[..4],
+            &[0x28, 0xB5, 0x2F, 0xFD],
+            "fixture guard: the corpus really is a zstd frame under a .jsonl name"
+        );
+
+        let mut scan = TranscriptScanSummary::new(
+            TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+            TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+        );
+        let mut budget = TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET;
+        let (evidence, row) = transcript_evidence(
+            zst,
+            "cliproxyapi",
+            TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+            &mut budget,
+            &mut scan,
+        );
+        assert!(
+            row.starts_with("scanned zstd ("),
+            "the row must disclose the decode and both sizes: {row}"
+        );
+        assert!(
+            row.contains("->"),
+            "the disclosure carries compressed -> decoded: {row}"
+        );
+        assert!(
+            !evidence.is_empty(),
+            "the needle lives INSIDE the frame — the decoded body must be searched"
+        );
+        assert!(
+            evidence[0].to_ascii_lowercase().contains("cliproxyapi"),
+            "the evidence snippet is the decoded hit: {:?}",
+            evidence[0]
+        );
+        assert_eq!(scan.scanned_files, 1);
+        assert_eq!(scan.skipped_zstd_failed, 0);
+        assert_eq!(scan.skipped_budget, 0);
+        assert!(
+            scan.scanned_bytes > head.len() as u64,
+            "scanned_bytes charges the DECODED size ({}), not the compressed size ({})",
+            scan.scanned_bytes,
+            head.len()
+        );
+        assert!(
+            budget < TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+            "the decode spends real budget"
+        );
+    }
+
+    /// rm-1872: a frame the shared decoder refuses — here the vendored
+    /// bomb, which would decompress past the 64 MiB cap — is counted
+    /// in its own census arm and disclosed per-row, NEVER fatal: the
+    /// metadata lanes keep working verbatim around the corpse.
+    #[test]
+    fn zstd_decode_refusals_are_counted_and_disclosed_never_fatal() {
+        let bomb = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-zstd/rollout-bomb.jsonl"
+        );
+        let head = std::fs::read(bomb).expect("vendored bomb fixture");
+        assert_eq!(&head[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+
+        let mut scan = TranscriptScanSummary::new(
+            TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+            TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+        );
+        let mut budget = TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET;
+        let (evidence, row) = transcript_evidence(
+            bomb,
+            "anything",
+            TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+            &mut budget,
+            &mut scan,
+        );
+        assert!(
+            evidence.is_empty(),
+            "a refused decode contributes no evidence"
+        );
+        assert_eq!(
+            row, "skipped: zstd decode failed",
+            "the row carries the disclosed skip: {row}"
+        );
+        assert_eq!(scan.skipped_zstd_failed, 1, "own census arm");
+        assert_eq!(scan.scanned_files, 0);
+        assert_eq!(scan.scanned_bytes, 0);
+        let summary = scan.describe().expect("one file was considered");
+        assert!(
+            summary.contains("1 skipped: zstd decode failed"),
+            "the text-report tail discloses the arm: {summary}"
+        );
     }
 }

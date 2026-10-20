@@ -64,6 +64,27 @@ pub struct SessionCsvRow {
     pub parent_session: String,
 }
 
+/// rm-1500 residual (cycle-2, run 0ab88ff2; assess 3232e602 F1
+/// family): the cost cell for the delimited machine lanes. A
+/// non-finite `cost_estimated`/`subagent_cost` (poisoned pricing
+/// input, a NaN REAL read back from a sqlite lane) must never ride a
+/// statement as a literal `inf`/`NaN` cell — a literal there is at
+/// best a spreadsheet import error and at worst a dropped row that
+/// reads as clean zero-spend after the consumer's coercion. The JSON
+/// lanes serialize the raw f64 and serde_json renders non-finite as
+/// `null` (the insights.rs contract), so the delimited lanes emit the
+/// same disclosed marker: `null` — machine-greppable, never parsed as
+/// a number, and not a spreadsheet formula introducer (rm-540's guard
+/// passes it through bare). Finite values are byte-identical to the
+/// historical `{:.4}` render, so every finite corpus ships unchanged.
+pub(crate) fn format_cost_cell(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.4}")
+    } else {
+        "null".to_string()
+    }
+}
+
 pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
     let mut out = table(
         "sessions",
@@ -90,13 +111,13 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             &row.data,
             &row.source,
             &row.model,
-            &format!("{:.4}", row.cost),
+            &format_cost_cell(row.cost),
             &row.tokens.to_string(),
             &row.fail.to_string(),
             &row.anomalies.to_string(),
             &row.zero_usage_events.to_string(),
             &row.subagents.to_string(),
-            &format!("{:.4}", row.subagent_cost),
+            &format_cost_cell(row.subagent_cost),
             &row.parent_session,
         ]));
     }
@@ -132,7 +153,11 @@ pub fn overview_csv(overview: &Overview) -> String {
         &overview.healthy.to_string(),
         &overview.warning.to_string(),
         &overview.critical.to_string(),
-        &format!("{:.4}", overview.total_cost),
+        // The summary/group cells are fold-gated today (compute_overview
+        // skips non-finite members while counting them into
+        // `non_finite_costs`); the rm-1500 render boundary holds the line
+        // here anyway — a fold regression still never ships a literal.
+        &format_cost_cell(overview.total_cost),
     ]));
     for (name, rows) in [
         // rm-895 policy: the csv surface is a MACHINE surface — these
@@ -154,7 +179,7 @@ pub fn overview_csv(overview: &Overview) -> String {
             out.push_str(&csv_row(&[
                 group,
                 &entry.sessions.to_string(),
-                &format!("{:.4}", entry.cost),
+                &format_cost_cell(entry.cost),
             ]));
         }
     }
@@ -167,7 +192,7 @@ pub fn overview_csv(overview: &Overview) -> String {
             out.push_str(&csv_row(&[
                 task_type,
                 &entry.sessions.to_string(),
-                &format!("{:.4}", entry.cost),
+                &format_cost_cell(entry.cost),
                 &entry.tokens_input.to_string(),
                 &entry.tokens_output.to_string(),
             ]));
@@ -408,6 +433,83 @@ mod tests {
             "\"fix the \"\"bug\"\", today\",98,green,claude_code,claude-sonnet-4-5,1.2500,900,0,0,2,1,0.5000,/p/proj/abc.jsonl"
         );
         assert!(out.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn sessions_csv_non_finite_cost_cells_render_the_null_marker() {
+        // rm-1500 residual (cycle-2, run 0ab88ff2; assess 3232e602 —
+        // the csv cost cell read `inf`): the statement must carry a
+        // disclosed marker, never a literal `inf`/`NaN` cell. Parity:
+        // serde_json renders the same non-finite f64 as `null` on the
+        // json lane, so `null` is the machine-lane vocabulary too.
+        let row = SessionCsvRow {
+            session: "poisoned".to_string(),
+            health: 100,
+            data: "unknown".to_string(),
+            source: "claude-code".to_string(),
+            model: "claude-sonnet".to_string(),
+            cost: f64::NAN,
+            tokens: 1_000,
+            fail: 0,
+            anomalies: 0,
+            zero_usage_events: 0,
+            subagents: 0,
+            subagent_cost: f64::INFINITY,
+            parent_session: String::new(),
+        };
+        let out = sessions_csv(&[row]);
+        let data = out.split("\r\n").nth(2).expect("data row");
+        let cells: Vec<&str> = data.split(',').collect();
+        assert_eq!(cells[5], "null", "cost cell carries the marker: {data}");
+        assert_eq!(cells[11], "null", "subagent_cost cell likewise: {data}");
+        assert!(
+            !data.contains("inf") && !data.contains("NaN"),
+            "no literal non-finite spelling may ride the row: {data}"
+        );
+    }
+
+    #[test]
+    fn overview_csv_non_finite_cost_cells_render_the_null_marker() {
+        // The aggregate folds are gated today (compute_overview skips
+        // non-finite members while counting them into
+        // `non_finite_costs` — cost_non_finite_contract.rs pins it), so
+        // these cells cannot be non-finite from a real corpus. The
+        // render boundary holds the line anyway: if a future fold
+        // regresses, the statement still never ships a literal
+        // `inf` cell.
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert(
+            "poisoned-model".to_string(),
+            agenttrace_core::GroupOverview {
+                sessions: 1,
+                cost: f64::NEG_INFINITY,
+            },
+        );
+        let overview = Overview {
+            total_sessions: 1,
+            total_cost: f64::NAN,
+            non_finite_costs: 1,
+            by_model: groups,
+            ..Overview::default()
+        };
+        let out = overview_csv(&overview);
+        let summary = out.split("\r\n").nth(2).expect("summary data row");
+        assert_eq!(
+            summary, "1,0,0,0,null",
+            "total_cost renders the marker: {summary}"
+        );
+        let group_row = out
+            .split("\r\n")
+            .find(|l| l.starts_with("poisoned-model,"))
+            .expect("group row");
+        assert_eq!(
+            group_row, "poisoned-model,1,null",
+            "group cost renders the marker: {group_row}"
+        );
+        assert!(
+            !out.contains("inf") && !out.contains("NaN"),
+            "no literal non-finite spelling anywhere in the overview csv"
+        );
     }
 
     #[test]

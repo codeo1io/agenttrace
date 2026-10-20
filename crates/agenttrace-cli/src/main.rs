@@ -3018,19 +3018,24 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
         // one session's spawned work stays visible without double
         // counting — the columns are internally derived (not
         // transcript-derived), so no sanitization is owed here.
+        // rm-1500 residual: the delimited table lanes render a
+        // non-finite cost as the disclosed `null` marker — the same
+        // vocabulary serde_json emits for the raw f64 on the json
+        // lane — never a literal `inf`/`NaN` cell (assess 3232e602
+        // PoC: the tsv cost cell read `inf`).
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{:.4}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             csv_export::guard_formula(&sanitize_line_segment(&session.name)),
             session.health,
             session_capability(session),
             csv_export::guard_formula(&sanitize_line_segment(&session.metrics.source_tool)),
             csv_export::guard_formula(&sanitize_line_segment(&session.metrics.model_used)),
-            session.metrics.cost_estimated,
+            csv_export::format_cost_cell(session.metrics.cost_estimated),
             total_tokens(session),
             session.metrics.tool_calls_fail,
             session.anomalies.len(),
             session.metrics.subagent_count,
-            session.metrics.subagent_cost
+            csv_export::format_cost_cell(session.metrics.subagent_cost)
         )
     }));
     lines.join("\n")
@@ -3957,6 +3962,83 @@ mod tests {
                 "both spellings render the TSV header: {via_tsv:?}"
             );
         }
+    }
+
+    #[test]
+    fn session_list_non_finite_costs_render_null_marker_not_literal_inf() {
+        // rm-1500 residual (cycle-2, run 0ab88ff2; assess 3232e602 F1
+        // family — the csv/tsv cost cell read `inf` on the PoC corpus):
+        // a session whose cost_estimated or subagent_cost is non-finite
+        // (poisoned pricing input, a NaN REAL read back from a sqlite
+        // lane) must never ride the delimited table lanes as a literal
+        // `inf`/`NaN` cell — a literal there is at best a spreadsheet
+        // import error and at worst a dropped row that reads as clean
+        // zero-spend after the consumer's coercion. The JSON lane
+        // serializes the raw f64 and serde_json renders non-finite as
+        // `null` (insights.rs:198-201 contract), so the table lanes emit
+        // the same disclosed marker. Finite values stay byte-identical
+        // to the historical `{:.4}` render.
+        let poisoned = Session {
+            name: "poisoned".to_string(),
+            path: "/tmp/poisoned.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics {
+                cost_estimated: f64::NAN,
+                subagent_cost: f64::INFINITY,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics::default(),
+        };
+
+        let tsv = render_session_list(std::slice::from_ref(&poisoned), "tsv", 20);
+        let row = tsv.lines().nth(1).expect("tsv data row");
+        let cells: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cells[5], "null", "COST carries the disclosed marker: {row}");
+        assert_eq!(
+            cells[10], "null",
+            "SUBAGENT_COST carries the same marker: {row}"
+        );
+        assert!(
+            !row.contains("NaN") && !row.contains("inf"),
+            "no literal non-finite spelling may ride the row: {row}"
+        );
+
+        // rm-937 parity, marker included: one renderer, so the default
+        // `text` spelling stays byte-identical to `-f tsv`.
+        let text = render_session_list(std::slice::from_ref(&poisoned), "text", 20);
+        assert_eq!(text, tsv, "the text lane is the tsv lane, marker included");
+
+        let csv = render_session_list(std::slice::from_ref(&poisoned), "csv", 20);
+        let csv_row = csv.split("\r\n").nth(2).expect("csv data row");
+        let csv_cells: Vec<&str> = csv_row.split(',').collect();
+        assert_eq!(csv_cells[5], "null", "csv COST cell: {csv_row}");
+        assert_eq!(csv_cells[11], "null", "csv SUBAGENT_COST cell: {csv_row}");
+        assert!(
+            !csv_row.contains("inf") && !csv_row.contains("NaN"),
+            "no literal non-finite spelling may ride the csv row: {csv_row}"
+        );
+
+        // Finite parity in the same breath: the historical numeric
+        // bytes are unchanged — the marker is only for the non-finite
+        // family (zero drift on every finite corpus).
+        let mut finite = poisoned.clone();
+        finite.name = "finite".to_string();
+        finite.metrics = Metrics {
+            cost_estimated: 0.0105,
+            subagent_cost: 0.0053,
+            ..Metrics::default()
+        };
+        let tsv = render_session_list(&[finite], "tsv", 20);
+        let row = tsv.lines().nth(1).expect("tsv data row");
+        let cells: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cells[5], "0.0105", "finite COST keeps its bytes: {row}");
+        assert_eq!(cells[10], "0.0053", "finite SUBAGENT_COST keeps its bytes");
     }
 
     #[test]

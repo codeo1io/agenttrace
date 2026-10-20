@@ -1471,12 +1471,19 @@ struct AntigravityModelId {
 
 /// rm-1864: numeric model ids observed in the wild and their proven
 /// model names. 1417 → gemini-4-argon is ccusage v20.0.34's first-party
-/// mapping (PR #1894, 2026-10-15); further ids arrive weekly (ccusage
-/// #1897 reports 1277/1050 unmapped). The map fixes IDENTITY only —
-/// pricing still rides the catalog's normal lookup, so a mapped id whose
-/// model is absent from the catalog degrades through the disclosed
-/// unknown-model path rather than this table inventing a price.
-const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[(1417, "gemini-4-argon")];
+/// mapping (PR #1894, 2026-10-15). 1050 → gemini-3.1-flash-lite is the
+/// cycle-2 rm-925 arm (run 0ab88ff2): ccusage landed the mapping
+/// 2026-10-18 (PR #1902, in v20.0.36's parser) and the bundled catalog
+/// already prices flash-lite, so the map flips those sessions from the
+/// disclosed unpriced path to priced with the existing rates. Further
+/// ids arrive weekly (ccusage #1897 reports 1277 unmapped; 1418/1419
+/// are argon-family spellings left to the snapshot-refresh lane, not
+/// this table). The map fixes IDENTITY only — pricing still rides the
+/// catalog's normal lookup, so a mapped id whose model is absent from
+/// the catalog degrades through the disclosed unknown-model path
+/// rather than this table inventing a price.
+const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] =
+    &[(1417, "gemini-4-argon"), (1050, "gemini-3.1-flash-lite")];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
 /// number, but the float spelling stringifies as `"1417.0"` — the
@@ -11313,6 +11320,73 @@ mod tests {
                 .disclosure_counters
                 .get("antigravity_model:multi_model_last_wins"),
             Some(&2)
+        );
+    }
+
+    #[test]
+    fn antigravity_numeric_1050_maps_to_gemini_flash_lite_and_prices() {
+        // rm-925 arm (cycle-2, run 0ab88ff2): ccusage's first-party
+        // 1050 → gemini-3.1-flash-lite mapping (2026-10-18, PR #1902;
+        // present in ccusage v20.0.36's parser). Pre-fix a 1050 corpus
+        // attributed to the raw stringified id, which the bundled
+        // catalog does not price — the session rode the disclosed
+        // unpriced/unknown path. The map fixes IDENTITY only; the
+        // flash-lite catalog row already carries bundled rates, so the
+        // very same corpus flips to priced. 1418/1419 stay OUT of this
+        // map on purpose: they are argon-family spellings whose pricing
+        // rides the snapshot-refresh lane, not a mapping fix.
+        let raw = serde_json::json!({
+            "trajectoryId": "33333333-4444-5555-6666-777777777777",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-18T10:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Flash-lite generation.",
+                        "usageStats": {
+                            "inputTokens": 21,
+                            "outputTokens": 9,
+                            "cacheReadInputTokens": 4
+                        },
+                        "modelConfigId": 1050
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session = parse_raw_session("id-1050", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "gemini-3.1-flash-lite",
+            "the ccusage-#1902 proven mapping attributes the model name"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+            "a mapped numeric id is still disclosed as a numeric sighting"
+        );
+        assert!(
+            !session
+                .metrics
+                .disclosure_counters
+                .contains_key("antigravity_model:multi_model_last_wins"),
+            "one numeric id across the corpus is not multi-model"
+        );
+        assert_eq!(session.metrics.tokens_input, 21);
+        assert_eq!(session.metrics.tokens_output, 9);
+        assert_eq!(session.metrics.tokens_cache_r, 4);
+        // The pricing flip — the same priced/fallback/unpriced triage
+        // governance.rs runs per session:
+        assert!(
+            crate::pricing::has_specific_price(&session.metrics.model_used),
+            "the mapped model must resolve in the bundled catalog"
+        );
+        assert!(
+            !crate::pricing::has_specific_price("1050"),
+            "control: the raw stringified id must NOT price — the map is what flips the session"
         );
     }
 
