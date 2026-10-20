@@ -1,6 +1,6 @@
 use crate::{
     detect_anomalies, health_score, token_cost, Metrics, Session, SessionFileDiff,
-    SummaryDiffDivergence,
+    SummaryColumnUnreadable, SummaryDiffDivergence,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -81,6 +81,12 @@ struct SqliteSessionAgg {
     /// decode — disclosed on Metrics, never a hard error and never a
     /// silently re-derived value.
     summary_diffs_dropped: u32,
+    /// rm-1926 (run 9d3b927c cycle 1): `summary_additions` /
+    /// `summary_deletions` columns that are schema-present but
+    /// unreadable on this row (NULL / BLOB / non-numeric TEXT
+    /// storage) — the cross-check against `summary_diffs` discloses
+    /// them instead of silently skipping the row.
+    summary_unreadable: Vec<SummaryColumnUnreadable>,
     source_tool: String,
     path: String,
     cwd: String,
@@ -128,6 +134,13 @@ pub struct SqliteIngestReport {
     /// never presented as complete ones, and the truncated pass never
     /// writes a snapshot (see `SqliteFileFailures::is_clean`).
     pub partial_dbs: Vec<SqlitePartialDb>,
+    /// rm-1927: stores carrying the v2 schema shape (no v1 `session`
+    /// table, a session-store-shaped table present) are disclosed as
+    /// a named unhandled format here — counted separately from
+    /// `unreadable` (corrupt) and from absent files (legitimately
+    /// session-less): a v2-only store used to classify as a silent
+    /// zero (zero sessions, zero disclosures).
+    pub unhandled_v2_stores: Vec<SqliteV2Store>,
 }
 
 /// rm-607: a sibling sqlite database whose sessions were fully or
@@ -145,6 +158,23 @@ pub struct SqliteDuplicateDb {
 pub struct SqlitePartialDb {
     pub path: String,
     pub sessions_kept: usize,
+}
+
+/// rm-1927 (run 9d3b927c cycle 1): one discovered opencode store that
+/// carries the v2 schema SHAPE — a session-store column signature
+/// under a table other than the v1 `session` (the dev dist-tag's
+/// `session_v2` today) — which this reader does not ingest yet.
+/// Distinct from `SqliteUnreadableDb`: a healthy known format, not
+/// corruption; disclosing it under "unreadable" would misreport a
+/// clean upstream store as broken.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SqliteV2Store {
+    pub path: PathBuf,
+    /// The table the shape probe matched — matched by column
+    /// signature, not by name (rm-507 discipline), so an upstream
+    /// rename keeps the disclosure truthful.
+    pub table: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -186,6 +216,16 @@ impl SqliteIngestReport {
                 reason,
             });
         }
+        // rm-1927: the unhandled-format class reaches the report
+        // through the same absorb — doctor and the CLI read it off
+        // `unhandled_v2_stores`, never off `unreadable`.
+        if let Some(reason) = failures.unhandled_format {
+            self.unhandled_v2_stores.push(SqliteV2Store {
+                path: path.to_path_buf(),
+                table: failures.unhandled_table.unwrap_or_default(),
+                reason,
+            });
+        }
         if failures.dropped > 0 {
             self.dropped_rows.push(SqliteDroppedRows {
                 path: path.to_path_buf(),
@@ -203,6 +243,14 @@ impl SqliteIngestReport {
 #[derive(Debug, Default, Clone)]
 struct SqliteFileFailures {
     unreadable: Option<String>,
+    /// rm-1927: the file is a healthy store in a format this reader
+    /// does not ingest (v2 schema shape). Carried separately from
+    /// `unreadable` so the doctor census counts its own class, and so
+    /// `is_clean` stays false — an unhandled store must never bank a
+    /// session-less snapshot that would mask the disclosure on the
+    /// warm path.
+    unhandled_format: Option<String>,
+    unhandled_table: Option<String>,
     dropped: usize,
     dropped_sample: Option<String>,
     /// rm-367(b): set when the pass was cut short by the scan budget
@@ -240,6 +288,10 @@ impl SqliteFileFailures {
         if self.unreadable.is_none() {
             self.unreadable = other.unreadable;
         }
+        if self.unhandled_format.is_none() {
+            self.unhandled_format = other.unhandled_format;
+            self.unhandled_table = other.unhandled_table;
+        }
         self.dropped += other.dropped;
         if self.dropped_sample.is_none() {
             self.dropped_sample = other.dropped_sample;
@@ -248,7 +300,10 @@ impl SqliteFileFailures {
     }
 
     fn is_clean(&self) -> bool {
-        self.unreadable.is_none() && self.dropped == 0 && !self.budget_exhausted
+        self.unreadable.is_none()
+            && self.unhandled_format.is_none()
+            && self.dropped == 0
+            && !self.budget_exhausted
     }
 }
 
@@ -1007,6 +1062,24 @@ fn opencode_sqlite_session_rows(
             // database", P12/P14).
             if !error.to_string().contains("no such table") {
                 failures.unreadable = Some(error.to_string());
+                return (HashMap::new(), failures, 0);
+            }
+            // rm-1927: session-less by NAME is not session-less by
+            // SCHEMA. A store whose tables carry the opencode
+            // session-store column signature under another name (the
+            // dev dist-tag's `session_v2` DDL today) used to classify
+            // as session-less — zero sessions, zero disclosures, a
+            // silent zero that reads as "nothing happened here"
+            // instead of "format not handled". The shape probe keys
+            // on the column signature, not the table name (rm-507),
+            // and a hit is disclosed as a named unhandled format. A
+            // database with neither shape stays legitimately
+            // session-less (a foreign sqlite file inside the glob).
+            if let Some(table) = opencode_v2_shaped_table(db) {
+                failures.unhandled_format = Some(format!(
+                    "opencode v2 store: ingest not implemented (found `{table}`; v1 `session` table absent)"
+                ));
+                failures.unhandled_table = Some(table);
             }
             return (HashMap::new(), failures, 0);
         }
@@ -1014,6 +1087,27 @@ fn opencode_sqlite_session_rows(
     let since_millis = since.map(|value| value.timestamp_millis());
     let rows = match stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
+        // rm-1926: computed before the struct literal so the reasons
+        // can read the raw storage class. Only schema-present
+        // columns participate: an absent column is the 1.x schema
+        // (the null-padded SELECT reads None), not a broken v2 write.
+        let summary_unreadable = {
+            let additions: Option<rusqlite::types::Value> = row.get(13)?;
+            let deletions: Option<rusqlite::types::Value> = row.get(14)?;
+            let mut unreadable = Vec::new();
+            for (column, present, value) in [
+                ("summary_additions", summary_columns[0].1, &additions),
+                ("summary_deletions", summary_columns[1].1, &deletions),
+            ] {
+                if let Some(reason) = sqlite_i64_unreadable_reason(value.as_ref(), present) {
+                    unreadable.push(SummaryColumnUnreadable {
+                        column: column.to_string(),
+                        reason: reason.to_string(),
+                    });
+                }
+            }
+            unreadable
+        };
         // rm-1509: decode the v2 per-file list before building the
         // aggregate — one session row maps to one aggregate, so the
         // drop count lands per-session by construction. A payload
@@ -1066,6 +1160,11 @@ fn opencode_sqlite_session_rows(
                 summary_additions: sqlite_value_as_i64(row.get(13)?),
                 summary_deletions: sqlite_value_as_i64(row.get(14)?),
                 summary_files: sqlite_value_as_i64(row.get(15)?),
+                // rm-1926: present-but-unreadable `summary_*` integers
+                // are disclosed, not silently skipped — the cross-check
+                // comparing per-file sums against these columns must
+                // say WHY it cannot run.
+                summary_unreadable,
                 // rm-1509: `summary_diffs` — index 16 is always
                 // valid: the SELECT null-pads when the column is
                 // absent, so 1.x stores read `None` and parse
@@ -1522,6 +1621,21 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     // rm-1509: per-file sums vs the integer columns, computed before
     // the aggregate is partially moved into the Metrics literal below.
     let summary_diffs_divergence = summary_diffs_divergence(&agg);
+    // rm-1926: a row with a decoded payload but unreadable integers
+    // discloses WHY the cross-check cannot run instead of silently
+    // skipping it — `summary_diffs_divergence`'s early-`?` seam read
+    // missing integers as "nothing to compare", hiding exactly the
+    // writer defect the cross-check exists to catch.
+    let summary_cross_check_unreadable =
+        if agg.summary_diffs.is_some() && !agg.summary_unreadable.is_empty() {
+            Some(agg.summary_unreadable.clone())
+        } else {
+            None
+        };
+    // rm-1926: the unreadable-column count, hoisted before the
+    // Metrics literal takes ownership — see the counter bump below.
+    let summary_cross_check_unreadable_count =
+        summary_cross_check_unreadable.as_ref().map_or(0, Vec::len);
     let mut models = agg.models;
     if models.is_empty() && !agg.model.is_empty() {
         models.insert(agg.model.clone());
@@ -1582,6 +1696,7 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         summary_diffs: agg.summary_diffs,
         summary_diffs_dropped: agg.summary_diffs_dropped,
         summary_diffs_divergence,
+        summary_cross_check_unreadable,
         provenance: crate::MetricProvenance {
             naming: String::new(),
             tokens: if agg.stored_totals_applied {
@@ -1639,6 +1754,17 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         None if placeholder_title || agg.title.is_empty() => agg.id.clone(),
         None => agg.title.clone(),
     };
+    // rm-1926: the unreadable cross-check is a disclosure-counter
+    // event like `opencode_summary_dropped` — the doctor census and
+    // diagnostics fold read it off the counters, so warm and cold
+    // paths disclose identically (snapshot schema 14 round-trips it).
+    if summary_cross_check_unreadable_count > 0 {
+        metrics
+            .disclosure_counters
+            .entry("opencode_summary_cross_check_unreadable".to_string())
+            .and_modify(|count| *count += summary_cross_check_unreadable_count)
+            .or_insert(summary_cross_check_unreadable_count);
+    }
     metrics.provenance.naming = if placeholder_title {
         "provider:placeholder"
     } else if !agg.title.is_empty() {
@@ -1736,6 +1862,78 @@ fn sqlite_value_as_i64(value: Option<rusqlite::types::Value>) -> Option<i64> {
         Some(SqliteValue::Text(text)) => text.parse::<i64>().ok(),
         _ => None,
     }
+}
+
+/// rm-1926 (run 9d3b927c cycle 1): WHY a schema-present `summary_*`
+/// integer failed to read — SQL NULL storage, BLOB storage, or
+/// non-numeric TEXT (SQLite columns are dynamically typed; INTEGER
+/// affinity coerces what it can, the rest survives in its written
+/// storage class). `None` when the value reads fine or the column is
+/// absent: an absent column is the 1.x schema behind the
+/// null-padding probe, not a broken v2 write, and 1.x rows keep
+/// parsing byte-identically.
+fn sqlite_i64_unreadable_reason(
+    value: Option<&rusqlite::types::Value>,
+    column_present: bool,
+) -> Option<&'static str> {
+    if !column_present {
+        return None;
+    }
+    let value = match value {
+        // SQL NULL: `row.get::<_, Option<Value>>` yields None —
+        // present (the schema has the column) but unreadable.
+        None => return Some("stored as NULL"),
+        Some(value) => value,
+    };
+    if sqlite_value_as_i64(Some(value.clone())).is_some() {
+        return None;
+    }
+    Some(match value {
+        rusqlite::types::Value::Blob(_) => "stored as BLOB",
+        rusqlite::types::Value::Text(_) => "non-numeric text",
+        _ => "unreadable storage class",
+    })
+}
+
+/// rm-1927 (run 9d3b927c cycle 1): does this database contain an
+/// opencode session-store-shaped table under a non-v1 name? Keys on
+/// the column SHAPE — `id`, `time_created`, `time_updated`,
+/// `directory`, the signature shared by the v1 `session` table and
+/// the dev-branch `session_v2` DDL
+/// (anomalyco/opencode@dev packages/core/src/database/schema.gen.ts)
+/// — not on the table name (rm-507 discipline), so an upstream rename
+/// keeps the disclosure truthful. Reached only on the
+/// no-`session`-table path, so the pragma walk costs nothing on
+/// healthy v1 stores.
+fn opencode_v2_shaped_table(db: &Connection) -> Option<String> {
+    let names = db
+        .prepare("select name from sqlite_master where type = 'table' and name not like 'sqlite_%'")
+        .and_then(|mut stmt| {
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(names)
+        })
+        .ok()?;
+    for name in names {
+        let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+        let columns = db
+            .prepare(&format!("pragma table_info({quoted})"))
+            .and_then(|mut stmt| {
+                let columns = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(columns)
+            })
+            .unwrap_or_default();
+        if ["id", "time_created", "time_updated", "directory"]
+            .iter()
+            .all(|needed| columns.iter().any(|column| column == needed))
+        {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// rm-791: lenient TEXT reader for the opencode `parent_id` column —

@@ -45,6 +45,9 @@ enum LoadMessage {
     // large_enum_variant threshold for this channel message — the
     // one-shot completion payload is boxed (the hot path is Progress;
     // the allocation fires once per load, never per progress tick).
+    // rm-1927 (run 9d3b927c cycle 1) grows the same ingest report
+    // again (`unhandled_v2_stores`) and rides the same box — the
+    // report will keep growing as disclosure classes are added.
     Complete(Box<anyhow::Result<(bool, LoadReport)>>),
 }
 

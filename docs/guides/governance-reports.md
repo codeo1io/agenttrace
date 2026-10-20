@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 72 and the SQLite snapshot is schema 13; the
+The session cache is schema 72 and the SQLite snapshot is schema 14; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -544,7 +544,17 @@ by-agent rollup collapses back onto the source-tool bucket) while a
 fresh parse of the same database splits it, so every older snapshot
 regenerates once, in place (rm-991, run b5affead cycle 2; the JSONL
 session cache moved for the same reason — 62 → 63 at this integration,
-the run's 60 → 61 mint re-based onto the advanced ceiling). Older versions are discarded and
+the run's 60 → 61 mint re-based onto the advanced ceiling), and to 14 when
+the sqlite lane began disclosing PRESENT-but-unreadable `summary_*`
+integers beside a decoded `summary_diffs` payload (NULL/BLOB/non-numeric
+TEXT storage — the cross-check that silently skipped those rows now emits
+`summary_cross_check_unreadable`) and the store probe learned the v2
+schema shape (`session_v2` column signature, no v1 `session` table) as a
+named unhandled format instead of classifying it session-less — a v13
+snapshot banked before either change replays the same database with no
+unreadable disclosure on an unchanged (size, mtime) fingerprint, so one
+regeneration per database retires the stale entry (rm-1926/rm-1927, run
+9d3b927c cycle 1; rm-230 convention). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
 pruned the next time the cache loads, and the JSONL-backed session cache is

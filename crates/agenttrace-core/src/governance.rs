@@ -1233,6 +1233,12 @@ pub fn context_trends(sessions: &[Session]) -> ContextTrend {
     }
 }
 
+/// Review fix b1602265 F5: cap on rendered per-file path segments in
+/// a delivery-evidence line — the line must stay bounded in entry
+/// count however bloated a hostile `summary_diffs` payload is; the
+/// counts line above it keeps the true file total.
+const WRITER_PATHS_EVIDENCE_CAP: usize = 20;
+
 pub fn delivery_evidence(sessions: &[Session]) -> DeliveryEvidence {
     delivery_evidence_inner(sessions, false)
 }
@@ -1338,6 +1344,40 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
                 additions,
                 deletions
             ));
+            // rm-1926 (c) / rm-1509 residual (run 9d3b927c cycle 1):
+            // the module comment promises counts AND paths, but the
+            // render carried counts only — the operator could not see
+            // WHICH files the writer claimed. Paths render beside the
+            // counts, per-file, saturating per-entry like the sums
+            // above; a payload entry without a file renders
+            // `<unnamed>` rather than vanishing.
+            // Review fix b1602265 F5: the paths line rendered one
+            // segment per payload entry with no bound — a hostile
+            // summary_diffs row amplified straight into report
+            // output. Render at most WRITER_PATHS_EVIDENCE_CAP
+            // segments and elide the rest by count; the counts line
+            // above still carries the true file total and the sums
+            // saturate exactly as before.
+            let mut path_segments: Vec<String> = diffs
+                .iter()
+                .take(WRITER_PATHS_EVIDENCE_CAP)
+                .map(|diff| {
+                    format!(
+                        "{} (+{}/-{})",
+                        diff.file.as_deref().unwrap_or("<unnamed>"),
+                        diff.additions,
+                        diff.deletions
+                    )
+                })
+                .collect();
+            let elided_paths = diffs.len().saturating_sub(WRITER_PATHS_EVIDENCE_CAP);
+            if elided_paths > 0 {
+                path_segments.push(format!("… and {elided_paths} more"));
+            }
+            evidence.push(format!(
+                "writer-reported per-file paths: {}",
+                path_segments.join(", ")
+            ));
         }
         if let Some(divergence) = &session.metrics.summary_diffs_divergence {
             evidence.push(format!(
@@ -1347,6 +1387,22 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
                 divergence.per_file_deletions,
                 divergence.summary_deletions
             ));
+        }
+        // rm-1926 (a): present-but-unreadable summary integers beside
+        // a decoded payload — the cross-check could not run, and the
+        // silence was indistinguishable from "payload agreed". One
+        // line per unreadable column, naming the column, the
+        // storage-class reason, and the STORE path (review fix
+        // b1602265 F3: acceptance (a) says "naming the store path +
+        // unreadable column" — with several opencode stores, the
+        // column alone cannot say which db holds the poisoned row).
+        if let Some(unreadable) = &session.metrics.summary_cross_check_unreadable {
+            for entry in unreadable {
+                evidence.push(format!(
+                    "cross-check not runnable: summary column unreadable — {} ({}) — store {}",
+                    entry.column, entry.reason, session.path
+                ));
+            }
         }
         match level {
             "strong" => summary.strong += 1,
@@ -2660,6 +2716,56 @@ mod tests {
                 i64::MAX
             ),
             "saturating sums must pin at i64::MAX, never overflow or wrap"
+        );
+    }
+
+    #[test]
+    fn delivery_evidence_caps_rendered_per_file_paths() {
+        // Review fix b1602265 F5: one evidence line must stay bounded
+        // in entry count. Before the fix this exact shape rendered 57
+        // path segments into a single evidence line — a hostile
+        // summary_diffs row amplifies straight into report output
+        // (the trusted-location unbounded-read class). The pinned
+        // expectation: the first WRITER_PATHS_EVIDENCE_CAP segments
+        // render, the tail elides BY COUNT, and the counts line above
+        // still reports the true file total with saturating sums.
+        let mut value = session("bloated");
+        value.metrics.summary_diffs = Some(
+            (0..57)
+                .map(|index| crate::SessionFileDiff {
+                    file: Some(format!("src/file-{index}.rs")),
+                    additions: 1,
+                    deletions: 0,
+                    status: None,
+                })
+                .collect(),
+        );
+        let report = delivery_evidence(&[value]);
+        let evidence = report.sessions[0].evidence.clone();
+        let paths_line = evidence
+            .iter()
+            .find(|line| line.contains("writer-reported per-file paths"))
+            .expect("per-file paths evidence line");
+        assert!(
+            paths_line.contains("src/file-0.rs") && paths_line.contains("src/file-19.rs"),
+            "the first WRITER_PATHS_EVIDENCE_CAP segments render: {paths_line}"
+        );
+        assert!(
+            !paths_line.contains("src/file-20.rs"),
+            "segments beyond the cap must elide: {paths_line}"
+        );
+        assert!(
+            paths_line.contains("and 37 more"),
+            "the elided tail is disclosed by count: {paths_line}"
+        );
+        let counts_line = evidence
+            .iter()
+            .find(|line| line.contains("writer-reported per-file diff summary"))
+            .expect("per-file counts evidence line");
+        assert_eq!(
+            counts_line.as_str(),
+            "writer-reported per-file diff summary: 57 files (+57/-0)",
+            "the counts line keeps the true total; only the paths render caps"
         );
     }
 

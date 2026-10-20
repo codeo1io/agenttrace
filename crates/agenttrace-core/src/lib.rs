@@ -46,7 +46,8 @@ pub use discovery::{
     KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
 };
 pub use doctor::{
-    build_doctor_report, doctor_report_text, render_doctor_report, DoctorDirReport, DoctorReport,
+    build_doctor_report, doctor_report_text, doctor_sqlite_directories, render_doctor_report,
+    DoctorDirReport, DoctorReport,
 };
 pub use governance::{
     context_trends, cost_audit, delivery_evidence, delivery_evidence_with_git, mcp_governance,
@@ -102,6 +103,7 @@ pub use sqlite_sessions::{
     load_sqlite_backed_sessions, load_sqlite_backed_sessions_reported,
     load_sqlite_backed_sessions_reported_bounded, skip_sqlite_backed_file_dir, SqliteDroppedRows,
     SqliteDuplicateDb, SqliteIngestReport, SqlitePartialDb, SqliteScanBudget, SqliteUnreadableDb,
+    SqliteV2Store,
 };
 pub use statusline::{
     correlated_prompt_ids, escape_spoofing_json, is_bidi_format_control,
@@ -552,6 +554,19 @@ pub struct SummaryDiffDivergence {
     pub summary_deletions: i64,
 }
 
+/// rm-1926 (cycle 1, run 9d3b927c): a `summary_*` integer column on an
+/// OpenCode v2 session row that is PRESENT but unreadable — SQL NULL
+/// storage, BLOB storage, or non-numeric TEXT — recorded beside a
+/// decoded `summary_diffs` payload so the per-file-vs-integer
+/// cross-check can disclose WHY it did not run instead of silently
+/// skipping the row (`summary_diffs_divergence`'s early-`?` seam read
+/// missing integers as "nothing to compare").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryColumnUnreadable {
+    pub column: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MetricProvenance {
@@ -652,6 +667,13 @@ pub struct Metrics {
     /// (same class as ccusage #1883: recorded vs derived totals).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_diffs_divergence: Option<SummaryDiffDivergence>,
+    /// rm-1926: `summary_additions` / `summary_deletions` integers that
+    /// are present but unreadable on a row that DOES carry a decoded
+    /// `summary_diffs` payload (no payload, no cross-check, no
+    /// disclosure). Serialized so warm sqlite snapshots keep
+    /// disclosing (snapshot schema 14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_cross_check_unreadable: Option<Vec<SummaryColumnUnreadable>>,
     pub source_tool: String,
     pub session_start: String,
     pub session_end: String,

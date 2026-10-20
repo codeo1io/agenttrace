@@ -1,6 +1,6 @@
 use crate::{
     cache_dir::user_cache_dir, Anomaly, Diagnostics, Metrics, Session, SessionFileDiff,
-    SummaryDiffDivergence, ToolWarning,
+    SummaryColumnUnreadable, SummaryDiffDivergence, ToolWarning,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -1046,7 +1046,19 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
 // trailing column, the fixed read indices the snapshot was built on
 // no longer describe the fresh parse. One regeneration per database
 // retires the stale entry (rm-230 convention).
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 13;
+// Bumped 13 -> 14 (run 9d3b927c cycle 1, rm-1926/rm-1927): the
+// sqlite lane now discloses PRESENT-but-unreadable `summary_*`
+// integers beside a decoded `summary_diffs` payload (NULL/BLOB/
+// non-numeric TEXT storage — the cross-check that silently skipped
+// those rows now emits `summary_cross_check_unreadable`), and the
+// store probe detects the v2 schema shape (`session_v2` column
+// signature, no v1 `session` table) as a named unhandled format
+// instead of classifying it session-less. A v13 snapshot banked
+// before either change replays the same database with no unreadable
+// disclosure on an unchanged (size, mtime) fingerprint — one
+// regeneration per database retires the stale entry (rm-230
+// convention).
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 14;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -1460,6 +1472,12 @@ struct GoMetrics {
     summary_diffs_dropped: u32,
     #[serde(default, rename = "SummaryDiffsDivergence")]
     summary_diffs_divergence: Option<SummaryDiffDivergence>,
+    /// rm-1926 (run 9d3b927c cycle 1): present-but-unreadable
+    /// `summary_*` integers beside a decoded payload — must survive
+    /// the snapshot round-trip or a warm cache re-silences exactly
+    /// the disclosure the fresh parse emits (snapshot schema 14).
+    #[serde(default, rename = "SummaryCrossCheckUnreadable")]
+    summary_cross_check_unreadable: Option<Vec<SummaryColumnUnreadable>>,
     #[serde(default, rename = "SourceTool")]
     source_tool: String,
     #[serde(default, rename = "SessionStart")]
@@ -3427,6 +3445,7 @@ impl GoMetrics {
             summary_diffs: metrics.summary_diffs.clone(),
             summary_diffs_dropped: metrics.summary_diffs_dropped,
             summary_diffs_divergence: metrics.summary_diffs_divergence,
+            summary_cross_check_unreadable: metrics.summary_cross_check_unreadable.clone(),
             source_tool: metrics.source_tool.clone(),
             session_start: metrics.session_start.clone(),
             session_end: metrics.session_end.clone(),
@@ -3485,6 +3504,7 @@ impl GoMetrics {
             summary_diffs: self.summary_diffs,
             summary_diffs_dropped: self.summary_diffs_dropped,
             summary_diffs_divergence: self.summary_diffs_divergence,
+            summary_cross_check_unreadable: self.summary_cross_check_unreadable,
             source_tool: self.source_tool,
             session_start: self.session_start,
             session_end: self.session_end,
@@ -3874,7 +3894,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_thirteen_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_fourteen_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -3922,6 +3942,15 @@ mod tests {
                     status: Some("modified".to_string()),
                 }]),
                 summary_diffs_dropped: 1,
+                // rm-1926 (cycle 1, run 9d3b927c): the unreadable
+                // cross-check disclosure is SOURCE DATA — a snapshot
+                // without it would re-silence exactly the rows the
+                // fresh parse discloses (the divergence the schema
+                // bump to 14 evicts).
+                summary_cross_check_unreadable: Some(vec![SummaryColumnUnreadable {
+                    column: "summary_additions".to_string(),
+                    reason: "stored as NULL".to_string(),
+                }]),
                 summary_diffs_divergence: Some(SummaryDiffDivergence {
                     per_file_additions: 120,
                     per_file_deletions: 8,
@@ -3948,6 +3977,13 @@ mod tests {
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
         let ledger_key = database.to_string_lossy().to_string();
+        // Version fourteen (rm-1926/rm-1927, cycle 1 of run 9d3b927c):
+        // present-but-unreadable `summary_*` integers beside a decoded
+        // payload began emitting `summary_cross_check_unreadable` — a
+        // snapshot without the field would replay those rows silent
+        // while a fresh parse of the same database discloses, so every
+        // older snapshot regenerates once, in place.
+        //
         // Version thirteen (rm-1509, cycle 2 of run b01c2b6a): the
         // opencode v2 `session.summary_diffs` per-file list joined
         // the snapshot payload beside the `summary_*` integers —
@@ -3982,7 +4018,7 @@ mod tests {
         // and the raw parent row id; v8 (rm-548/rm-734) — the opencode
         // fork-exclusion count plus the poison-gate eviction; v7
         // (rm-198) — hermes tool outcome semantics.
-        assert_eq!(doc["schema_version"], 13);
+        assert_eq!(doc["schema_version"], 14);
         assert_eq!(
             doc["entries"][ledger_key.as_str()]["sessions"][0]["Metrics"]["Provenance"]["Tokens"]
                 .as_str(),
@@ -3994,7 +4030,7 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema thirteen cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema fourteen cache hit");
         let (loaded, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
@@ -4025,6 +4061,14 @@ mod tests {
         assert_eq!(warm_diffs[0].file.as_deref(), Some("src/a.rs"));
         assert_eq!(warm_diffs[0].additions, 120);
         assert_eq!(loaded[0].metrics.summary_diffs_dropped, 1);
+        let warm_unreadable = loaded[0]
+            .metrics
+            .summary_cross_check_unreadable
+            .as_ref()
+            .expect("rm-1926: the unreadable cross-check disclosure rides");
+        assert_eq!(warm_unreadable.len(), 1);
+        assert_eq!(warm_unreadable[0].column, "summary_additions");
+        assert_eq!(warm_unreadable[0].reason, "stored as NULL");
         let warm_divergence = loaded[0]
             .metrics
             .summary_diffs_divergence
@@ -4040,10 +4084,10 @@ mod tests {
              nor erases it on a warm hit"
         );
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(12);
+        old["schema_version"] = serde_json::Value::from(13);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema twelve json"),
+            serde_json::to_vec(&old).expect("schema thirteen json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());

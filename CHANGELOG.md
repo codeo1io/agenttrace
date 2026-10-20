@@ -567,7 +567,8 @@
   cannot evict real sampled days from the window (pinned by test against
   the row's literal 12-25 PoC shape).
 
-- OpenCode v2 per-file delivery evidence — the `summary_diffs` column is consumed, disclosed, and divergence-checked (rm-1509, run b01c2b6a cycle 2, batch "advisory closure + OpenCode v2 delivery-evidence readiness"): opencode's staged v2 session schema adds a `summary_diffs` json column beside the landed `summary_additions`/`summary_deletions`/`summary_files` integers, carrying the per-file `FileDiff.LegacyInfo[]` list (`{file?, additions, deletions, status?}` — patch bodies deliberately not mirrored; delivery evidence reports counts and paths). The sqlite lane reads it behind the same column-presence probe as the rm-991 integers (fixed read indices unchanged — the new column pads to index 16 and null-pads for 1.x stores, which parse byte-identically), and `Metrics` gains `summary_diffs`, `summary_diffs_dropped`, and `summary_diffs_divergence`: a payload that is present but fails to decode — or sits in a non-TEXT storage class — is counted per session, never a hard error and never silently re-derived, and when the per-file sums disagree with the integer columns on the same row the divergence is disclosed on its own evidence line (`per-file diff sums diverge from the row's summary columns: +40 vs +500 additions, -4 vs -50 deletions`) instead of silently reconciled into either side — the same recorded-vs-derived failure class ccusage closed with #1883's float tolerance. A writer-reported non-empty list also surfaces as `writer-reported per-file diff summary: N files (+A/-D)` in `--delivery-evidence`; an explicitly empty list never flags divergence (absence is not disagreement), sums saturate so hostile i64::MAX payloads cannot overflow the disclosure arithmetic (review fix: the delivery-evidence per-file sums initially used a plain `.sum()` that panicked debug builds on exactly that hostile payload and wrapped negative in release — they now share the divergence check's saturating fold, pinned end-to-end by a hostile fixture, and a present-but-BLOB payload is counted as dropped rather than read as absent), and the session cache rung advances 64 -> 65 (shape-only: warm entries replay no per-file evidence) with the sqlite snapshot rung 12 -> 13. Pinned red-first by `crates/agenttrace-core/tests/opencode_summary_diffs.rs` against a synthetic v2-shape fixture (matched/divergent/malformed/empty rows + builder/worker agent split) with the rm-991 fixture kept as the 1.x byte-stability oracle; v2 is not on npm yet, so the contract ships readiness-before-corpus, the same posture as rm-991 and the gemini 0.63 chats lane.- Cline/Roo usage metrics carriers are consumed, not zeroed (rm-1430, run
+- OpenCode v2 per-file delivery evidence — the `summary_diffs` column is consumed, disclosed, and divergence-checked (rm-1509, run b01c2b6a cycle 2, batch "advisory closure + OpenCode v2 delivery-evidence readiness"): opencode's staged v2 session schema adds a `summary_diffs` json column beside the landed `summary_additions`/`summary_deletions`/`summary_files` integers, carrying the per-file `FileDiff.LegacyInfo[]` list (`{file?, additions, deletions, status?}` — patch bodies deliberately not mirrored; delivery evidence reports counts and paths). The sqlite lane reads it behind the same column-presence probe as the rm-991 integers (fixed read indices unchanged — the new column pads to index 16 and null-pads for 1.x stores, which parse byte-identically), and `Metrics` gains `summary_diffs`, `summary_diffs_dropped`, and `summary_diffs_divergence`: a payload that is present but fails to decode — or sits in a non-TEXT storage class — is counted per session, never a hard error and never silently re-derived, and when the per-file sums disagree with the integer columns on the same row the divergence is disclosed on its own evidence line (`per-file diff sums diverge from the row's summary columns: +40 vs +500 additions, -4 vs -50 deletions`) instead of silently reconciled into either side — the same recorded-vs-derived failure class ccusage closed with #1883's float tolerance. A writer-reported non-empty list also surfaces as `writer-reported per-file diff summary: N files (+A/-D)` in `--delivery-evidence`; an explicitly empty list never flags divergence (absence is not disagreement), sums saturate so hostile i64::MAX payloads cannot overflow the disclosure arithmetic (review fix: the delivery-evidence per-file sums initially used a plain `.sum()` that panicked debug builds on exactly that hostile payload and wrapped negative in release — they now share the divergence check's saturating fold, pinned end-to-end by a hostile fixture, and a present-but-BLOB payload is counted as dropped rather than read as absent), and the session cache rung advances 64 -> 65 (shape-only: warm entries replay no per-file evidence) with the sqlite snapshot rung 12 -> 13. Pinned red-first by `crates/agenttrace-core/tests/opencode_summary_diffs.rs` against a synthetic v2-shape fixture (matched/divergent/malformed/empty rows + builder/worker agent split) with the rm-991 fixture kept as the 1.x byte-stability oracle; v2 is not on npm yet, so the contract ships readiness-before-corpus, the same posture as rm-991 and the gemini 0.63 chats lane.
+- Cline/Roo usage metrics carriers are consumed, not zeroed (rm-1430, run
   a3f96656 cycle 3): Cline journals record per-response usage — as a say
   entry whose text is a JSON object (`cost`/`tokensIn`/`tokensOut`/
   `cacheReads`/`cacheWrites`) on the Roo task-dir store, and as a sibling
@@ -1025,6 +1026,56 @@
 
 ### Fixed
 
+- OpenCode store honesty: unreadable `summary_*` integers disclose instead of
+  silently cross-checking as absent, and v2-only stores are named unhandled
+  instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch
+  "OpenCode lane honesty + v2 readiness + changelog-gate hardening"): (a)
+  rm-1926 — the rm-1509 per-file-vs-integer cross-check read
+  `summary_additions`/`summary_deletions`/`summary_files` with column reads
+  whose NULL/BLOB/non-numeric-TEXT failure read as plain absence, so a
+  present-but-unreadable integer could silently suppress or fake the
+  divergence disclosure; each such column now produces a per-session
+  disclosure naming the store path and the unreadable column
+  (`summary_cross_check_unreadable` on `--doctor`/diagnostics with
+  per-file paths in governance), healthy rows are byte-identical, and the
+  sqlite snapshot rung moves 13 -> 14 (the session cache rung stays 72 —
+  the disclosure rides the snapshot/report lane; warm snapshots
+  regenerate once). Pinned red-first by `opencode_summary_unreadable.rs`
+  (7/0 — six at implement, the seventh the review b1602265 F3 pin
+  asserting the disclosure names the store path) with the rm-991/rm-1509
+  fixtures as the healthy oracle. (b)
+  rm-1927 — an opencode store carrying the v2 schema SHAPE (no v1
+  `session` table, a session-store column signature under another table —
+  the public @dev dist-tag's `session_v2` DDL) used to classify as a
+  silent zero: zero sessions, zero disclosures, the by-name probe's
+  missing-table error folded into "no sessions"; the shape probe
+  (`opencode_v2_shaped_table`, matched by column signature and not by
+  table name per the rm-507 discipline) now emits a named
+  `unhandled_format` disclosure carrying the store path, matched table
+  and reason — counted separately from `unreadable` (a healthy known
+  format is not corruption) and from absent files (legitimately
+  session-less). Pinned red-first by `opencode_v2_store.rs` (3/0) against
+  a fixture built from the upstream DDL. (c) rm-1928 — the changelog
+  structure gate now rejects `<<<<<<<`/`=======`/`>>>>>>>` fences BEFORE
+  any structural check (exactly seven `=` is the git separator shape;
+  markdown setext underlines stay legal), so the 2026-10-14 class of
+  fog — a half-merged CHANGELOG passing CI rc0 on committed fences —
+  is a standing red with named line numbers; pinned by the planted-defect
+  suite `changelog_structure_gate.rs` (6/0).
+
+  Integration seam (2026-10-21, conflict case be0b2688, landing the
+  conductor run 9d3b927c2844 cycle 1 — salvaged at d3ffc25a with its
+  roadmap band fog-swept — onto a wall that had since integrated runs
+  77ca5de0 / c0a02f64 / 91066ba0 / e40a66d3 past the run's base
+  e67d1233): both sides' disclosure machinery unions —
+  `SqliteIngestReport` carries BOTH the wall's rm-367(b) `partial_dbs`
+  (scan-budget truncation) and this run's `unhandled_v2_stores`,
+  `is_clean` composes unreadable/unhandled-format/dropped/budget-exhausted,
+  the TUI load channel keeps the wall's landed `Box<anyhow::Result<…>>`
+  shape with this run's growth rationale recorded beside it, and the
+  schema truth composes as wall cache 72 + snapshot 14 (the
+  landed-rung-keeps-numeral convention); the gate's Pass 3 (rm-1390
+  non-vacuous Unreleased) and the new fence pass land together.
 - Codex compressed rollouts are admitted by name, survive the compress/restore flip, and disclose their decode (rm-992, run d57c2e56 cycle 1, batch "Codex compressed-rollout truth: admit, decode, search, disclose"): stable Codex 0.162.x migrates cold rollouts under `~/.codex/sessions`/`~/.codex/archived_sessions` to `.jsonl.zst` names while writing compressed rollouts by default stays feature-flagged upstream (reader tolerance since ≥0.152 via #41357, merged 2026-10-13; #53732 rode the 0.163 alphas and the flag was still off at tag rust-v0.163.0, per this tree's own rm-1518 correction) — so compressed history is already on real users' disks, the wall ccusage hit same-class (#1888, fixed #1890) — but the session-file NAME gate kept `.jsonl`/`.json` only, so the migrated cold history was invisible BEFORE any content sniff: the assess PoC planted 4 compressed lanes and discovered 0, with `--doctor` disclosing nothing. `is_session_file_name` (discovery.rs) now admits exactly the `.jsonl.zst` sibling (bare `.zst` still excluded; the walkers are lane-agnostic so the suffix lands at the shared gate while the parser's magic probe stays the decider), and `parse_file` retries the compress/restore sibling on a NotFound — codex compresses by RENAMING (`x.jsonl` → `x.jsonl.zst`) and restores on demand, so a path handed over by an earlier walk can be gone at read time; with no pair the error still names the REQUESTED path (the encoding-fallback ccusage's codex reader ships). Every decode discloses: the parse carries a `zstd_rollout_decoded` counter on the session, flowing through the doctor's generic disclosure fold into the `--doctor` map and both renders. New fixture `rollout.jsonl.zst` (a byte-identical copy of the golden frame under the migrated name) separates admission-by-name from decode-by-content, and the parser/README comments keep the reconciled threshold truth (migration on stable 0.162.x; write flag off at 0.163.0 stable; main-head #54930 spreads zstd to app-server WebSockets). Pinned red-first in `discovery_contract.rs` (one-pass admit+decode: 1 of 1 file discovered, `codex_cli`, non-zero tokens, disclosed), `zstd_rollout_decode.rs` (sibling fallback in both directions; no-pair error names the requested path; a plain-sibling read is NOT a decode — no counter), and `doctor_honesty_contract.rs` (report map + json render carry the disclosure).
 
   Integration seam (2026-10-20, conflict case ae49eb7a, landing onto a
