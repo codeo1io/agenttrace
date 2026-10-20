@@ -4,6 +4,29 @@
 
 ### Added
 
+- Named-file admission bound (rm-451, run 737103b1d0ce cycle 4): every
+  session file — positional path, `-d` walk, or discovery — is read
+  whole at most 256 MiB, closing the last uncapped intake lane
+  (stdin/zstd/MCP were already bounded). A file past the bound is
+  refused loudly: the error names the byte count, the cap (derived,
+  never hand-written), and the override knob
+  `AGENTTRACE_FILE_ADMISSION_MAX_BYTES` (typo-tolerant like the stdin
+  knob). `--doctor` counts refused files in a new `skipped_admission`
+  bucket — never as parse failures — and the sessions walk files them
+  under the `over-admission-bound` census class.
+- Parse-failure census (rm-1968, run 737103b1d0ce cycle 4): the
+  sessions walk's parse-failure aggregate used to lump every cause
+  into one count and one first-error string. It now splits by class —
+  `directory`, `non-utf8`, `utf-16`, `nesting-depth`,
+  `over-admission-bound`, `decode-cap`, `unsupported-format`,
+  `unreadable` — with per-class counts and per-class first errors,
+  rendered in the CLI's advisory (deterministic order) and carried on
+  `LoadReport` for embedders. Deep nesting is no longer mislabeled:
+  a serde recursion-limit failure now reports its depth instead of
+  `unsupported session format`, and a `*.jsonl`-named directory is
+  disclosed as its own class rather than counted as an unparsable
+  session file.
+
 - Cline CLI envelope intake works on every production path, and its
   canonical store is auto-discovered (rm-1881 + rm-1882, run e30a8801
   cycle 1): the Cline CLI `.messages.json` envelope carries usage as

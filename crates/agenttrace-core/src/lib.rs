@@ -64,7 +64,7 @@ pub use insights::{
     SessionComparison, SourceScope, TimeRange, FUTURE_ADMISSION_GRACE_SECS,
 };
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
-pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
+pub use parser::{parse_file, parse_file_with_admission_cap, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
     cache_rate_census, catalog_identity, has_specific_price, list_pricing, lookup_context_window,
     lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source, pricing_source_for,

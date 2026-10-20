@@ -2195,23 +2195,44 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         // stories the user can act on: everything failed to parse, or
         // some parsed and the filters dropped them (failures still
         // disclosed so the blind spot never comes back).
+        // rm-1968 (run 737103b1d0ce cycle 4): BOTH no-sessions arms
+        // carry the per-class census, not just the single first error —
+        // an all-corrupt directory must say WHICH classes failed, not
+        // just whichever file happened to come first in discovery
+        // order (the same census the advisory renders below).
+        let census = parse_failure_census(&report);
         if let Some(first) = report
             .first_parse_failure
             .as_deref()
             .filter(|_| report.parse_failures > 0)
         {
             if report.parse_failures == report.discovered {
+                if census.is_empty() {
+                    bail!(
+                        "No sessions parsed: all {} discovered session files failed to parse (first: {})",
+                        report.discovered,
+                        first
+                    );
+                }
                 bail!(
-                    "No sessions parsed: all {} discovered session files failed to parse (first: {})",
+                    "No sessions parsed: all {} discovered session files failed to parse; {}",
+                    report.discovered,
+                    census
+                );
+            }
+            if census.is_empty() {
+                bail!(
+                    "No sessions match the requested filters ({} of {} discovered files failed to parse; first: {})",
+                    report.parse_failures,
                     report.discovered,
                     first
                 );
             }
             bail!(
-                "No sessions match the requested filters ({} of {} discovered files failed to parse; first: {})",
+                "No sessions match the requested filters ({} of {} discovered files failed to parse; {})",
                 report.parse_failures,
                 report.discovered,
-                first
+                census
             );
         }
         bail!("No sessions match the requested filters");
@@ -2266,6 +2287,26 @@ fn disclose_sqlite_ingest(ingest: &agenttrace_core::SqliteIngestReport) {
     }
 }
 
+/// rm-1968 (run 737103b1d0ce cycle 4): the per-class census string
+/// (`"class: N (first: …); …"`, class-sorted via the BTreeMap, empty
+/// when no class was recorded — the legacy single-bucket shape an
+/// embedder-built LoadReport can still produce). Shared by the stderr
+/// advisory and both no-sessions bail arms so the three aggregates
+/// can never drift apart.
+fn parse_failure_census(report: &LoadReport) -> String {
+    report
+        .parse_failure_classes
+        .iter()
+        .map(
+            |(class, count)| match report.parse_failure_first_by_class.get(class) {
+                Some(first) => format!("{class}: {count} (first: {first})"),
+                None => format!("{class}: {count}"),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// rm-835 residual arm: the stderr advisory text for a load that
 /// produced sessions while some discovered files failed to parse
 /// (None when every discovered file parsed). Kept as a pure function so
@@ -2275,10 +2316,18 @@ fn parse_failure_advisory(report: &LoadReport) -> Option<String> {
         return None;
     }
     report.first_parse_failure.as_deref().map(|first| {
-        format!(
-            "{} of {} discovered session files failed to parse; first: {first}",
-            report.parse_failures, report.discovered
-        )
+        let census = parse_failure_census(report);
+        if census.is_empty() {
+            format!(
+                "{} of {} discovered session files failed to parse; first: {first}",
+                report.parse_failures, report.discovered
+            )
+        } else {
+            format!(
+                "{} of {} discovered session files failed to parse; {census}",
+                report.parse_failures, report.discovered
+            )
+        }
     })
 }
 
@@ -5098,6 +5147,49 @@ mod tests {
         assert!(
             parse_failure_advisory(&report).is_none(),
             "no message means nothing to print"
+        );
+    }
+
+    #[test]
+    fn parse_failure_advisory_discloses_the_class_census() {
+        // rm-1968 (run 737103b1d0ce cycle 4): every failure class gets
+        // its own count and first error; classes render in census map
+        // order (deterministic across runs); a hand-built report with
+        // no census maps keeps the legacy single-first wording.
+        let mut report = agenttrace_core::LoadReport {
+            discovered: 4,
+            parse_failures: 3,
+            first_parse_failure: Some("first is superseded by the census".to_string()),
+            ..Default::default()
+        };
+        report.parse_failure_classes.insert("non-utf8".into(), 1);
+        report.parse_failure_first_by_class.insert(
+            "non-utf8".into(),
+            "read session file /x/bad.jsonl: not valid UTF-8".into(),
+        );
+        report
+            .parse_failure_classes
+            .insert("nesting-depth".into(), 2);
+        report
+            .parse_failure_first_by_class
+            .insert("nesting-depth".into(), "depth first".into());
+        let advisory = parse_failure_advisory(&report).expect("advisory for census");
+        assert!(
+            advisory.starts_with("3 of 4 discovered session files failed to parse; "),
+            "{advisory}"
+        );
+        assert!(
+            advisory.contains("nesting-depth: 2 (first: depth first)"),
+            "{advisory}"
+        );
+        assert!(
+            advisory
+                .contains("non-utf8: 1 (first: read session file /x/bad.jsonl: not valid UTF-8)"),
+            "{advisory}"
+        );
+        assert!(
+            advisory.contains("nesting-depth: 2 (first: depth first); non-utf8: 1"),
+            "{advisory}"
         );
     }
 

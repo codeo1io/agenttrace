@@ -3173,3 +3173,240 @@ fn cli_quota_view_reports_plan_windows_and_guards_its_lane() {
         String::from_utf8_lossy(&range.stderr)
     );
 }
+
+#[test]
+fn overview_parse_failure_census_discloses_classes() {
+    // rm-1968 (run 737103b1d0ce cycle 4, red-first): the parse-failure
+    // aggregate used to render ONE bucket + ONE first-string for every
+    // cause. The census must disclose per-class counts and per-class
+    // first errors, and a depth failure must not hide inside the
+    // "unsupported session format" bucket.
+    let root = std::env::temp_dir().join("agenttrace-rm1968-census");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("good.jsonl"),
+        concat!(
+            r#"{"type":"user","timestamp":"2026-10-17T10:00:00Z","message":{"content":"hi"}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("bad-utf8.jsonl"), b"\x80abc\n").unwrap();
+    let mut deep = String::from("{\"type\":\"user\",\"message\":{\"content\":");
+    for _ in 0..200 {
+        deep.push('{');
+        deep.push_str("\"x\":");
+    }
+    deep.push('1');
+    for _ in 0..200 {
+        deep.push('}');
+    }
+    deep.push_str("}}\n");
+    std::fs::write(root.join("deep.jsonl"), deep).unwrap();
+    // rm-1968 clause 3, exclusion arm: the walk RECURSES INTO a
+    // *.jsonl-named directory — it is never counted as a session file
+    // and never surfaces as a parse failure (the disclosure arm,
+    // `directory: N`, stays available to the cline-corrupt-dir lane
+    // and is pinned by the discovery unit test).
+    std::fs::create_dir_all(root.join("fake-dir.jsonl")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["-d", root.to_str().expect("tempdir path"), "--overview"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "one good file parsed; advisory must not be fatal: {:?}",
+        output
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("non-utf8: 1"),
+        "census must count the non-UTF-8 file: {stderr}"
+    );
+    assert!(
+        stderr.contains("nesting-depth: 1"),
+        "census must count the depth failure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("directory:"),
+        "a *.jsonl-named directory is excluded from the census, not counted: {stderr}"
+    );
+    assert!(
+        stderr.contains("first:"),
+        "census must keep per-class first errors: {stderr}"
+    );
+}
+
+#[test]
+fn over_admission_walk_lane_refuses_bounded_and_censused() {
+    // rm-451 (run 737103b1d0ce cycle 4, red-first) walk lane: an
+    // over-bound journal DISCOVERED by a -d walk must be refused
+    // before it is read whole — the process stays memory-bounded — and
+    // the no-sessions bail carries the rm-1968 per-class census, not
+    // just one first error. Pre-fix the same run read the whole 64 MiB
+    // journal into the heap before failing (assess measured a 60 MiB
+    // journal at 322 MiB peak RSS in one lane).
+    //
+    // Boundedness is asserted BASELINE-RELATIVE: one child on the same
+    // corpus minus the journal fixes the binary's own footprint, then
+    // the journal child must stay within half a journal of it. An
+    // absolute VmHWM threshold is host-load-flaky (observed live: the
+    // same binary peaked 26 MiB isolated but 74 MiB under a full
+    // parallel test suite — co-resident file-backed pages and allocator
+    // behavior on a loaded host — with the journal provably never
+    // resident, delta 2.5 MiB); the delta isolates the journal's own
+    // contribution, which is the thing rm-451 actually bounds. VmHWM
+    // is polled from /proc/<pid>/status while each child runs
+    // (/usr/bin/time -v is not installed on every host; the refusal
+    // and census assertions are the portable core).
+    let root = std::env::temp_dir().join("agenttrace-rm451-walk");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    use std::io::Read as _;
+    use std::process::Stdio;
+    fn run_and_peak(root: &std::path::Path) -> (bool, String, usize, bool) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .env("AGENTTRACE_FILE_ADMISSION_MAX_BYTES", "4194304")
+            .args(["-d", root.to_str().expect("tempdir path"), "--overview"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn agenttrace CLI");
+        let pid = child.id();
+        let mut peak_kib = 0usize;
+        let mut saw_proc = false;
+        // VmHWM resets only at execve: between fork and exec the child
+        // is still a copy of THIS test process, and a sample taken in
+        // that window would import our RSS, not the CLI's. Only count
+        // samples once /proc/<pid>/exe points at the exec'd binary.
+        let exe_canon = std::fs::canonicalize(env!("CARGO_BIN_EXE_agenttrace"));
+        let failed;
+        loop {
+            if let Some(status) = child.try_wait().expect("poll agenttrace CLI") {
+                failed = !status.success();
+                break;
+            }
+            if let Ok(status_text) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+                saw_proc = true;
+                let execed = matches!((&exe_canon, std::fs::read_link(format!("/proc/{pid}/exe"))),
+                    (Ok(want), Ok(have)) if have == *want);
+                if execed {
+                    for line in status_text.lines() {
+                        if let Some(rest) = line.strip_prefix("VmHWM:") {
+                            if let Ok(kib) = rest.trim().trim_end_matches(" kB").parse::<usize>() {
+                                peak_kib = peak_kib.max(kib);
+                            }
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut child = child;
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("stderr piped")
+            .read_to_string(&mut stderr)
+            .expect("read stderr");
+        let _ = child.wait();
+        (failed, stderr, peak_kib, saw_proc)
+    }
+
+    // Baseline child: same binary, same knob, empty corpus (the journal
+    // is planted only after — same lanes run, nothing parses either way).
+    let (baseline_failed, _baseline_stderr, baseline_kib, baseline_saw) = run_and_peak(&root);
+    assert!(
+        baseline_failed,
+        "empty corpus -> no sessions -> exit 1 (baseline lane sanity)"
+    );
+
+    // Chunked write: a single 64 MiB Vec would balloon THIS test
+    // process, and the fork-inheritance window above is only a
+    // belt-and-braces guard — the fixture must never inflate the
+    // measurement lane in the first place.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::File::create(root.join("huge.jsonl")).unwrap();
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..64 {
+            journal.write_all(&chunk).unwrap();
+        }
+    }
+    let (failed, stderr, peak_kib, saw_proc) = run_and_peak(&root);
+    assert!(
+        failed,
+        "every discovered file refused -> no sessions -> exit 1"
+    );
+    assert!(
+        stderr.contains("file admission bound"),
+        "refusal must name the bound: {stderr}"
+    );
+    assert!(
+        stderr.contains("4 MiB"),
+        "walk-lane refusal numeral must derive from the override cap: {stderr}"
+    );
+    assert!(
+        stderr.contains("over-admission-bound: 1"),
+        "no-sessions bail must carry the rm-1968 census: {stderr}"
+    );
+    // Boundedness: the whole 64 MiB journal is never resident — the
+    // journal child may not exceed the baseline child by half a
+    // journal. Only assertable where /proc exists (Linux); on such
+    // kernels the post-exec sampling MUST have engaged (a silent
+    // zero would quietly void the pin). The refusal and census
+    // assertions above are the portable core.
+    if saw_proc && baseline_saw {
+        assert!(
+            peak_kib > 0 && baseline_kib > 0,
+            "post-exec VmHWM sampling never engaged: peak={peak_kib} baseline={baseline_kib}"
+        );
+        assert!(
+            peak_kib < baseline_kib + 32 * 1024,
+            "peak RSS {peak_kib} KiB vs baseline {baseline_kib} KiB: the 64 MiB journal must never be resident"
+        );
+    }
+}
+
+#[test]
+fn over_admission_bound_file_refused_loud() {
+    // rm-451 (run 737103b1d0ce cycle 4, red-first): the plain-file lane
+    // used to read session files whole with no size gate while every
+    // sibling intake lane was capped. An over-bound file must be
+    // refused with the derived numeral and the override named, and the
+    // refusal must stay loud (single-file invocation -> no sessions ->
+    // exit 1), never a silent skip.
+    let root = std::env::temp_dir().join("agenttrace-rm451-loud");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("huge.jsonl");
+    std::fs::write(&path, vec![b'a'; 4096]).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("AGENTTRACE_FILE_ADMISSION_MAX_BYTES", "1024")
+        .args(["--overview", path.to_str().expect("tempdir path")])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        !output.status.success(),
+        "single refused file -> no sessions -> exit 1: {:?}",
+        output
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("file admission bound"),
+        "refusal must name the bound: {stderr}"
+    );
+    assert!(
+        stderr.contains("1024"),
+        "refusal numeral must derive from the effective cap: {stderr}"
+    );
+    assert!(
+        stderr.contains("AGENTTRACE_FILE_ADMISSION_MAX_BYTES"),
+        "refusal must name the override: {stderr}"
+    );
+}

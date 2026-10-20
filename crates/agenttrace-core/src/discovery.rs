@@ -29,6 +29,31 @@ pub struct LoadOptions {
     pub preserve_history: bool,
 }
 
+/// rm-1968 (run 737103b1d0ce cycle 4): map one parse failure onto a
+/// stable class name for the census. The classes are part of the CLI's
+/// user-visible advisory contract — extend, never rename.
+pub(crate) fn classify_parse_failure(path: &Path, failure: &str) -> &'static str {
+    if path.is_dir() {
+        "directory"
+    } else if failure.contains("file admission bound") {
+        "over-admission-bound"
+    } else if failure.contains("valid UTF-8") {
+        "non-utf8"
+    } else if failure.contains("UTF-16") {
+        "utf-16"
+    } else if failure.contains("recursion limit exceeded")
+        || failure.contains("nesting depth limit")
+    {
+        "nesting-depth"
+    } else if failure.contains("decode cap") || failure.contains("decode bound") {
+        "decode-cap"
+    } else if failure.contains("unsupported session format") {
+        "unsupported-format"
+    } else {
+        "unreadable"
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LoadReport {
     pub sessions: Vec<Session>,
@@ -66,6 +91,14 @@ pub struct LoadReport {
     /// `--overview -d dir -o dir/bad.jsonl` silently overwrites the
     /// unparseable input (a `.orig` twin is not a recovery path).
     pub parse_failure_paths: Vec<PathBuf>,
+    /// rm-1968 (run 737103b1d0ce cycle 4): per-class census of parse
+    /// failures, derived from the classifier — one bucket per cause
+    /// (non-utf8, nesting-depth, unsupported-format,
+    /// over-admission-bound, …) instead of a single aggregate.
+    pub parse_failure_classes: std::collections::BTreeMap<String, usize>,
+    /// rm-1968: the first observed failure string per class, so the
+    /// advisory can show a representative error for every cause.
+    pub parse_failure_first_by_class: std::collections::BTreeMap<String, String>,
     /// rm-799: subagent transcripts whose parent session is NOT part
     /// of the loaded corpus (orphaned children — moved transcripts,
     /// partial copies). They still render as standalone rows, but the
@@ -501,6 +534,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // rm-912: attempted-but-failed paths in discovery order, for the
     // CLI's -o membership check (see LoadReport::parse_failure_paths).
     let mut parse_failure_paths: Vec<PathBuf> = Vec::new();
+    // rm-1968: per-class census (single merge thread — no locking
+    // needed beyond the mpsc handoff the counters already use).
+    let mut parse_failure_classes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut parse_failure_first_by_class: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<Session>, Option<String>)>();
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -551,10 +590,19 @@ pub fn load_sessions_with_progress_from_cache_mode(
                     }
                     (None, _) => {
                         skipped += 1;
+                        // rm-1968: classify BEFORE the rm-835 first-failure
+                        // assignment consumes the string — every cause
+                        // gets its own bucket, not just the first.
+                        let failure_text = failure.unwrap_or_else(|| "unreadable".to_string());
+                        let class = classify_parse_failure(&files[next], &failure_text);
+                        *parse_failure_classes.entry(class.to_string()).or_insert(0) += 1;
+                        parse_failure_first_by_class
+                            .entry(class.to_string())
+                            .or_insert_with(|| failure_text.clone());
                         // rm-835: keep the first failure's parser message
                         // (discovery order) for the LoadReport.
                         if first_parse_failure.is_none() {
-                            first_parse_failure = failure;
+                            first_parse_failure = Some(failure_text);
                         }
                         // rm-912: the loader ATTEMPTED this path — it
                         // joins the -o refusal set even though no
@@ -681,6 +729,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
+        parse_failure_classes,
+        parse_failure_first_by_class,
         unlinked_subagents,
         future_excluded_sessions,
     }
@@ -1616,5 +1666,57 @@ fn report_load_progress(
             cache_hits,
             session: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod rm1968_classify_tests {
+    use super::classify_parse_failure;
+    use std::path::Path;
+
+    // rm-1968 (run 737103b1d0ce cycle 4): the census classes are
+    // user-visible — pin the mapping so renames cannot slip in.
+    #[test]
+    fn covers_every_class() {
+        let file = Path::new("/x/a.jsonl");
+        assert_eq!(classify_parse_failure(file, "whatever"), "unreadable");
+        // The directory arm keys on the path's real filesystem kind
+        // (walk-time paths always exist), so the fixture must be a real
+        // directory — a made-up path would silently classify as
+        // "unreadable" and pin nothing.
+        let dir = std::env::temp_dir().join(format!("rm1968-classify-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create classify dir fixture");
+        assert_eq!(classify_parse_failure(&dir, "anything"), "directory");
+        assert_eq!(
+            classify_parse_failure(
+                file,
+                "session file /x/a.jsonl is at least 5 bytes, past the 4 bytes file admission bound (override via AGENTTRACE_FILE_ADMISSION_MAX_BYTES)"
+            ),
+            "over-admission-bound"
+        );
+        assert_eq!(
+            classify_parse_failure(file, "stream did not contain valid UTF-8"),
+            "non-utf8"
+        );
+        assert_eq!(
+            classify_parse_failure(file, "file is UTF-16 encoded"),
+            "utf-16"
+        );
+        assert_eq!(
+            classify_parse_failure(file, "recursion limit exceeded at line 1 column 300"),
+            "nesting-depth"
+        );
+        assert_eq!(
+            classify_parse_failure(file, "session file exceeds the parser nesting depth limit"),
+            "nesting-depth"
+        );
+        assert_eq!(
+            classify_parse_failure(file, "decode cap exceeded"),
+            "decode-cap"
+        );
+        assert_eq!(
+            classify_parse_failure(file, "read session file: permission denied"),
+            "unreadable"
+        );
     }
 }

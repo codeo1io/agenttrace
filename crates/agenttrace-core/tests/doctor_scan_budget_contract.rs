@@ -56,6 +56,7 @@ fn with_home_and_budget(home: &Path, budget: &[(&str, &str)], f: impl FnOnce()) 
         "AGENTTRACE_DOCTOR_ROOT_MAX_BYTES",
         "AGENTTRACE_DOCTOR_DB_BUDGET_MS",
         "AGENTTRACE_DOCTOR_SQLITE_TOTAL_BUDGET_MS",
+        "AGENTTRACE_FILE_ADMISSION_MAX_BYTES",
     ];
     let result = {
         let _guard = lock_env();
@@ -126,8 +127,11 @@ fn zero_root_budget_truncates_with_honest_partial_counts() {
             .expect("the planted project row is walked");
         assert_eq!(row.skipped_budget, 2, "zero budget must skip both files");
         assert_eq!(row.failed, 0, "budget skips must never count as failures");
-        assert_eq!(row.parsed + row.failed + row.cache_hits + row.skipped_budget + row.skipped_size, row.files,
-            "honest-count identity: every file is parsed, failed, cached, budget-skipped, or size-skipped");
+        // rm-451 (run 737103b1d0ce cycle 4): the identity now carries
+        // the admission-bound arm too — every file is parsed, failed,
+        // cached, budget-skipped, size-skipped, or admission-skipped.
+        assert_eq!(row.parsed + row.failed + row.cache_hits + row.skipped_budget + row.skipped_size + row.skipped_admission, row.files,
+            "honest-count identity: every file is parsed, failed, cached, budget-skipped, size-skipped, or admission-skipped");
         let partial = report
             .scan_partial
             .as_ref()
@@ -169,11 +173,15 @@ fn default_budget_parses_everything_and_adds_no_json_keys() {
             2,
             "both files parse under defaults"
         );
-        assert_eq!(row.skipped_budget + row.skipped_size, 0);
+        assert_eq!(
+            row.skipped_budget + row.skipped_size + row.skipped_admission,
+            0
+        );
         assert!(report.scan_partial.is_none());
         let json = serde_json::to_string(&report).expect("serialize");
         assert!(!json.contains("skipped_budget"));
         assert!(!json.contains("skipped_size"));
+        assert!(!json.contains("skipped_admission"));
         assert!(!json.contains("scan_partial"));
     });
 }
@@ -311,5 +319,54 @@ fn demo_report_stays_fully_unbounded_and_keyless() {
         assert!(!json.contains("scan_partial"));
         assert!(!json.contains("skipped_budget"));
         assert!(!json.contains("skipped_size"));
+        assert!(!json.contains("skipped_admission"));
     });
+}
+
+#[test]
+fn admission_bound_skips_are_disclosed_not_failed() {
+    // rm-451 (run 737103b1d0ce cycle 4): a journal past the file
+    // admission bound is admission-SKIPPED by the doctor — never a
+    // parse failure, never parsed — and the disclosure rides the same
+    // scan_partial surface as the budget/size arms
+    // (files_skipped_admission), serialized only when non-zero.
+    let home = temp_home("admission");
+    let corpus = planted_two_file_corpus("admission");
+    // One hostile journal past the 1 KiB override, planted in the SAME
+    // project directory as the two in-bound sessions.
+    let project = corpus.join("projects").join("home-agent-budget");
+    std::fs::write(project.join("hulk.jsonl"), vec![b'x'; 4096]).expect("plant hostile journal");
+    with_home_and_budget(
+        &home,
+        &[("AGENTTRACE_FILE_ADMISSION_MAX_BYTES", "1024")],
+        || {
+            let report = build_doctor_report(Some(&corpus), false);
+            let row = report
+                .directories
+                .iter()
+                .find(|d| d.files >= 3)
+                .expect("the planted project row is walked");
+            assert_eq!(row.files, 3, "the hostile journal is discovered");
+            assert_eq!(
+                row.skipped_admission, 1,
+                "the over-bound journal is admission-skipped"
+            );
+            assert_eq!(row.failed, 0, "admission skips are never failures");
+            assert_eq!(
+                row.parsed + row.cache_hits,
+                2,
+                "the in-bound sessions still parse"
+            );
+            let partial = report
+                .scan_partial
+                .as_ref()
+                .expect("scan_partial disclosure");
+            assert_eq!(partial.files_skipped_admission, 1);
+            let json = serde_json::to_string(&report).expect("serialize");
+            assert!(
+                json.contains("skipped_admission"),
+                "the disclosure serializes: {json}"
+            );
+        },
+    );
 }

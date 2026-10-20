@@ -335,6 +335,18 @@ the process until the allocator dies, and `AGENTTRACE_STDIN_CAP_BYTES`
 raises or lowers the cap (an unparseable or non-positive value falls back
 to the default rather than failing the run over a typo'd knob).
 
+### Named files carry the same admission bound
+
+Every named session file — a positional path or anything the discovery
+walk admits — is read whole at most 256 MiB (rm-451): a file past the
+bound is refused with an error that names the byte count, the cap, and
+the override knob, instead of sizing the whole process to one hostile
+journal. `AGENTTRACE_FILE_ADMISSION_MAX_BYTES` raises or lowers the cap
+with the same typo tolerance as the stdin knob. `--doctor` counts
+refused files in its own `skipped_admission` bucket (never as parse
+failures), and the sessions walk files them under the
+`over-admission-bound` class of its parse-failure census.
+
 ### Compressed (zstd) Codex rollouts
 
 Codex stores rollout transcripts as zstd frames: the file keeps its
