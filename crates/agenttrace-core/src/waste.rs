@@ -62,6 +62,11 @@ pub struct WasteReport {
     /// allocated from. Per-tool "cost" is an allocated share, never
     /// measured per-tool spend (rm-004).
     session_cost: f64,
+    /// rm-1500 residual (run e40a66d3 cycle 6): set when the bloat arm
+    /// would have added waste money on a non-finite cost estimate and
+    /// the session was excluded instead. Serialized only when set —
+    /// zero output-byte drift on healthy sessions.
+    non_finite_cost_sessions: Option<usize>,
     summary: String,
     top_actions: Vec<String>,
 }
@@ -116,8 +121,16 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
     };
     let loop_percent = loop_waste_percent(raw_loop_cost, cost_estimated);
     let mut total_wasted = cache.wasted_cost + loop_cost;
+    // rm-1500 residual (run e40a66d3 cycle 6): the bloat arm used to
+    // add `cost_estimated * 0.05` unguarded — a poisoned estimate
+    // made the whole waste total NaN. Skip-while-disclosing instead.
+    let mut non_finite_cost_sessions: Option<usize> = None;
     if bloat.bloat_score > 50 {
-        total_wasted += cost_estimated * 0.05;
+        if session.metrics.cost_estimated.is_finite() {
+            total_wasted += session.metrics.cost_estimated * 0.05;
+        } else {
+            non_finite_cost_sessions = Some(1);
+        }
     }
 
     let mut score = match cache.rating {
@@ -225,6 +238,14 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         top_actions.push("session running optimally".to_string());
     }
 
+    // rm-1500 residual: the text summary discloses the exclusion too,
+    // not just the JSON machine field.
+    let summary = if non_finite_cost_sessions.is_some() {
+        format!("{summary} Non-finite cost estimate excluded from the waste total.")
+    } else {
+        summary
+    };
+
     WasteReport {
         cache,
         bloat,
@@ -235,6 +256,7 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         loop_percent,
         loop_cost_basis: loop_basis,
         session_cost: session.metrics.cost_estimated.max(0.0),
+        non_finite_cost_sessions,
         summary,
         top_actions,
     }
@@ -260,7 +282,7 @@ pub fn render_waste_report_with_language(session: &Session, language: ReportLang
 /// caveat: it is a share of the session estimate, not measured
 /// per-tool spend.
 pub fn waste_report_json(report: &WasteReport) -> String {
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "schema": "agenttrace.waste.v1",
         "waste_score": report.waste_score,
         "waste_level": report.waste_level,
@@ -316,6 +338,13 @@ pub fn waste_report_json(report: &WasteReport) -> String {
         "summary": report.summary,
         "top_actions": report.top_actions,
     });
+    // rm-1500 residual (run e40a66d3 cycle 6): inserted only when a
+    // session was excluded from the waste total for a non-finite
+    // cost estimate — absent (not null, not zero) when healthy, so
+    // healthy reports keep byte-identical output.
+    if let Some(count) = report.non_finite_cost_sessions {
+        payload["non_finite_cost_sessions"] = serde_json::json!(count);
+    }
     serde_json::to_string_pretty(&payload).expect("waste report serializes")
 }
 
@@ -807,6 +836,57 @@ mod tests {
         assert_eq!(
             report.loop_percent, 0.0,
             "NaN loop_cost must clamp to 0% loop waste"
+        );
+    }
+
+    #[test]
+    fn bloated_session_with_non_finite_cost_skips_and_discloses() {
+        // rm-1500 residual (run e40a66d3 cycle 6, assess 3483a6c6 F3):
+        // the bloat>50 arm folded `cost_estimated * 0.05` unguarded —
+        // a poisoned estimate NaN-poisoned total_wasted. It must
+        // skip-while-counting like every other money fold, disclose
+        // in JSON and text.
+        use std::collections::BTreeMap;
+        let session = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "poisoned-bloat".to_string(),
+            path: "/tmp/poisoned-bloat.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                assistant_turns: 10,
+                cost_estimated: f64::NAN,
+                tool_calls_total: 40,
+                tool_usage: BTreeMap::from([("read".to_string(), 30), ("write".to_string(), 10)]),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let report = compute_waste_report(&session);
+        assert!(
+            report.bloat.bloat_score > 50,
+            "fixture must reach the bloat arm (score {})",
+            report.bloat.bloat_score
+        );
+        assert!(
+            report.total_wasted.is_finite(),
+            "total_wasted must never read NaN, got {}",
+            report.total_wasted
+        );
+        assert_eq!(report.non_finite_cost_sessions, Some(1));
+        let json = waste_report_json(&report);
+        assert!(
+            json.contains("non_finite_cost_sessions"),
+            "JSON must disclose the exclusion: {json}"
+        );
+        let text = waste_report_text(&report, crate::reports::ReportLanguage::En);
+        assert!(
+            text.contains("Non-finite cost estimate excluded"),
+            "text lane must disclose the exclusion: {text}"
         );
     }
 

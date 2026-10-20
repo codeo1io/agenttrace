@@ -177,3 +177,75 @@ fn overview_render_lanes_disclose_the_excluded_cost_sessions() {
             ..(json.find("\"summary\"").map(|i| i + 400).unwrap_or(400)).min(json.len())]
     );
 }
+
+#[test]
+fn non_finite_cost_is_excluded_from_cost_audit_rows_and_disclosed() {
+    // rm-1500 residual (run e40a66d3 cycle 6, assess 3483a6c6 F2):
+    // governance's per-model fold skipped nothing — a poisoned session
+    // NaN-poisoned `stored_estimated_cost_usd` (and the context
+    // aggregate's dollars). Rows must skip-while-counting instead.
+    let sessions = sessions_with_one_poisoned_cost();
+    let audit = agenttrace_core::cost_audit(&sessions);
+    assert!(
+        audit.total_estimated_cost.is_finite(),
+        "audit total must never read NaN"
+    );
+    let poisoned_rows: Vec<_> = audit
+        .by_provider_model
+        .iter()
+        .filter(|row| row.non_finite_sessions.unwrap_or(0) > 0)
+        .collect();
+    assert_eq!(
+        poisoned_rows.len(),
+        1,
+        "exactly one row carries the exclusion count"
+    );
+    for row in &audit.by_provider_model {
+        assert!(
+            row.stored_estimated_cost_usd.is_finite(),
+            "row {} must stay finite, got {}",
+            row.model,
+            row.stored_estimated_cost_usd
+        );
+    }
+    // Serialized: the field is absent on healthy rows, present on the
+    // poisoned one — zero output-byte drift for clean corpora.
+    let value = serde_json::to_value(&audit).expect("serializable");
+    for row in value["by_provider_model"].as_array().expect("rows array") {
+        let expect_present = row["non_finite_sessions"].as_u64().unwrap_or(0) > 0;
+        assert_eq!(
+            row.as_object()
+                .expect("row object")
+                .contains_key("non_finite_sessions"),
+            expect_present,
+            "non_finite_sessions present only on the poisoned row"
+        );
+    }
+}
+
+#[test]
+fn non_finite_cost_is_excluded_from_context_trend_dollars_and_disclosed() {
+    // rm-1500 residual (assess 3483a6c6 F2b): the context aggregate's
+    // `cost` fed `output_cost_per_million_tokens` without a guard.
+    let sessions = sessions_with_one_poisoned_cost();
+    let trend = agenttrace_core::context_trends(&sessions);
+    assert!(
+        trend.totals.output_cost_per_million_tokens.is_finite(),
+        "totals must stay finite"
+    );
+    assert_eq!(
+        trend.totals.non_finite_cost_sessions,
+        Some(1),
+        "totals disclose the exclusion"
+    );
+    for project in &trend.projects {
+        assert!(
+            project.output_cost_per_million_tokens.is_finite(),
+            "project {} must stay finite",
+            project.project
+        );
+        if project.non_finite_cost_sessions.is_some() {
+            assert_eq!(project.non_finite_cost_sessions, Some(1));
+        }
+    }
+}

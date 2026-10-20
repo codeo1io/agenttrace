@@ -1011,6 +1011,18 @@
   census row with a recommendation. In-grace clock-skew tolerance is pinned by
   test and healthy corpora render zero-count clean.
 
+- The codex multiagent replay reconcile outcome is disclosed on stderr (rm-1956 residual, run
+  e40a66d301874cba8da57356d7efefe7 cycle 6, batch "hostile-input truth II"): both
+  corpus-assembly lanes computed `reconcile_codex_multiagent_replays` and discarded the
+  aggregate — only the TUI consumed `children_adjusted`, so every skip class was invisible on
+  the CLI. Both lanes (`load_sessions_report` and the explicit positional lane) now print one
+  `agenttrace: warning:` line naming every skip class with counts (families skipped for missing
+  `task_started` evidence, children skipped for upstream-recorded cost, children skipped below
+  the parent baseline, rollouts unreadable at reconcile, rollouts over the read cap). The line
+  is absent when every counter is zero, so a healthy corpus keeps its exact historical stderr
+  bytes. Pinned by `codex_replay::disclosure_tests` (zero-when-zero byte pin, every-class
+  naming, singular/plural grammar).
+
 ### Fixed
 
 - Codex compressed rollouts are admitted by name, survive the compress/restore flip, and disclose their decode (rm-992, run d57c2e56 cycle 1, batch "Codex compressed-rollout truth: admit, decode, search, disclose"): stable Codex 0.162.x migrates cold rollouts under `~/.codex/sessions`/`~/.codex/archived_sessions` to `.jsonl.zst` names while writing compressed rollouts by default stays feature-flagged upstream (reader tolerance since ≥0.152 via #41357, merged 2026-10-13; #53732 rode the 0.163 alphas and the flag was still off at tag rust-v0.163.0, per this tree's own rm-1518 correction) — so compressed history is already on real users' disks, the wall ccusage hit same-class (#1888, fixed #1890) — but the session-file NAME gate kept `.jsonl`/`.json` only, so the migrated cold history was invisible BEFORE any content sniff: the assess PoC planted 4 compressed lanes and discovered 0, with `--doctor` disclosing nothing. `is_session_file_name` (discovery.rs) now admits exactly the `.jsonl.zst` sibling (bare `.zst` still excluded; the walkers are lane-agnostic so the suffix lands at the shared gate while the parser's magic probe stays the decider), and `parse_file` retries the compress/restore sibling on a NotFound — codex compresses by RENAMING (`x.jsonl` → `x.jsonl.zst`) and restores on demand, so a path handed over by an earlier walk can be gone at read time; with no pair the error still names the REQUESTED path (the encoding-fallback ccusage's codex reader ships). Every decode discloses: the parse carries a `zstd_rollout_decoded` counter on the session, flowing through the doctor's generic disclosure fold into the `--doctor` map and both renders. New fixture `rollout.jsonl.zst` (a byte-identical copy of the golden frame under the migrated name) separates admission-by-name from decode-by-content, and the parser/README comments keep the reconciled threshold truth (migration on stable 0.162.x; write flag off at 0.163.0 stable; main-head #54930 spreads zstd to app-server WebSockets). Pinned red-first in `discovery_contract.rs` (one-pass admit+decode: 1 of 1 file discovered, `codex_cli`, non-zero tokens, disclosed), `zstd_rollout_decode.rs` (sibling fallback in both directions; no-pair error names the requested path; a plain-sibling read is NOT a decode — no counter), and `doctor_honesty_contract.rs` (report map + json render carry the disclosure).
@@ -2009,6 +2021,39 @@
 - Pre-epoch (negative) millisecond timestamps no longer render as empty strings (rm-1501, run e4725315 cycle 1, batch "cost-time truth"): `timestamp_millis`/`timestamp_millis_nanos` divided with truncating `/`/`%` and wrapped the negative remainder through `as u32`, so `chrono::DateTime::from_timestamp` returned `None` for every pre-1970 instant and the renderer fell back to `""` — a −1 ms event (a plausible client-clock skew artifact) vanished from time-sorted views. Both arms now use `div_euclid`/`rem_euclid`, so −1 ms renders `1969-12-31T23:59:59.999Z` and post-epoch rendering is byte-identical (pinned). Red-first in `parser::rm_1501_tests`.
 - regional model ids bill and attribute from their own snapshot row (rm-1053, cycle 5): catalog key normalization collapsed every region of a model family onto one key (first-sorted winner priced them all — a `us-gov.anthropic.…` session rendered $19.80 while its snapshot row says $21.60, cycle-5 assess PoC F2), and the provider path normalized the id a second time — normalize(normalize(x)) ≠ normalize(x) on dated+versioned ids — so it printed `anthropic` while pricing from a `bedrock_converse` row. Three coupled fixes, all in `agenttrace-core`'s pricing module: (1) suffix stripping runs to a fixed point, so normalization is idempotent by construction (pinned across every key the bundled snapshot ships); (2) qualified rows (region prefix, vendor path, `@`-dated) are ALSO retained at load time under their raw ids, while winner selection for normalized keys is untouched — catalog grows 1,529 → 4,441 priced keys, deprecation census 61 → 215 (svg card goldens regenerated deliberately with `UPDATE_CARD_GOLDEN=1`); (3) the provider and pricing-source paths resolve ids exactly like the rate path (one raw-first alias pass), so the printed provider and the billed rate always cite the same catalog row. Integration corpus: `tests/pricing_region_truth.rs` over `fixtures/rm-1053-region-family/` (us/eu/us-gov/global/bare — $19.80/$19.80/$21.60/$18.00/$18.00, `by_provider` = bedrock_converse×4 + bedrock×1, never `anthropic`).
 - the local release battery clamps incremental compilation (rm-1408, cycle 5): `scripts/ci/check-rust-release-local.sh` now exports `CARGO_INCREMENTAL=0` after the `cd "$repo_root"`, so an ambient `CARGO_INCREMENTAL=1` from the caller's dev shell can no longer make the gate recompile against poisoned fingerprints or leave 200MB+ of `incremental/` state inside a shared `CARGO_TARGET_DIR` (measured: 260 files/222MB with the ambient value on a focused test, 0 files with the gate's export). The export applies to every cargo invocation the battery makes and inherits into the child gates; verified with a cargo shim that logged `CARGO_INCREMENTAL=0` for all five gate invocations run under an ambient `CARGO_INCREMENTAL=1`.
+- `--quota` no longer panics on a past-extreme event timestamp (rm-2031, run e40a66d301874cba8da57356d7efefe7 cycle 6, batch "hostile-input truth II"): `quota_window` computed the window start with a plain `cutoff - span`, so a hostile journal whose event anchor sits at the chrono floor (`-262143-01-01T00:00:00`, the preserved 94-byte PoC now shipped as `tests/fixtures/quota-past-extreme-timestamp.jsonl`) overflowed the subtraction (`DateTime - TimeDelta overflowed`, exit 101 out of a report lane on a 94-byte input). The window start now saturates at `DateTime::<Utc>::MIN_UTC` via `checked_sub_signed`, so the window renders instead of crashing. Pinned red-first by `tests/quota_extreme_timestamp_contract.rs` (the real parse path over the PoC corpus — under the composed rm-2013 admission the row is disclosed unplaced with a null cutoff, serializable JSON) and the `quota_extreme_event_timestamps_never_panic` unit pin over both range extremes AND both belts (rm-2013 admission plus a directly-placed floor anchor that still reaches the `checked_sub_signed` saturation).
+
+  Integration seam (2026-10-21, conflict case 77e1fa9a, landing onto a
+  wall that had since integrated run 91066ba0's rm-2013 hostile-timestamp
+  arm): rm-2013 closes this panic by construction — 4-digit-year
+  admission at the single `parse_ts_form` seam, so the corpus census now
+  discloses a past-extreme anchor unplaced before `--quota` ever runs —
+  and this saturation arm is the same victim's second belt
+  (`checked_sub_signed` saturating at `MIN_UTC`); both land, the PoC
+  fixture and `quota_extreme_timestamp_contract` ride from this run, and
+  the fog rm-1957-class quota-panic claims reconcile by title here.
+  Review follow-up (2026-10-21, conflict case 76618454): with admission
+  refusing both extremes, neither pin still exercised the saturation
+  branch — the unit pin now places a floor anchor directly (the one
+  remaining route to the subtraction) and the contract pin asserts the
+  unplaced disclosure instead of a vacuously-conditional window.
+- Four remaining money folds skip-while-counting on non-finite costs (rm-1500 residuals, run e40a66d301874cba8da57356d7efefe7 cycle 6): the cycle-1 rm-1500 sweep guarded the overview, insights and statusline folds, but `cost_audit`'s per-model rows and corpus `stored_estimated_cost_usd`, `context_trends`' dollar basis (`output_cost_per_million_tokens`, totals and per-project), the waste report's bloat>50 arm (`cost_estimated * 0.05` NaN-poisoned `total_wasted`), and the CSV export's money cells (`format!("{:.4}", …)` wrote a bare `NaN`/`inf` token into machine-parsed columns) still accumulated or rendered poisoned values unchecked. All four now follow the established vocabulary: audit rows gain `non_finite_sessions` (serialized only when nonzero, named in the rendered pricing note), context totals and projects gain `non_finite_cost_sessions`, the waste report gains `non_finite_cost_sessions` (JSON key inserted only when set) plus a text-summary sentence, and CSV money cells render `n/a` for non-finite values while healthy values keep their exact four-decimal bytes. Pinned by `cost_non_finite_contract` (audit + context-trend arms) and the waste/CSV unit tests.
+
+  Integration seam (2026-10-21, conflict case 77e1fa9a, landing onto a
+  wall that had since integrated the cycle-5 rm-1500 gates (run
+  e4209f0c's own silent 0.0-contribution forms) plus rm-1574's by_model
+  pricing_basis CSV column): the four folds keep this run's
+  skip-while-counting forms at every seam — numerically identical to the
+  wall's forms on finite inputs, so healthy output bytes stay put, and
+  the exclusions are now visible instead of silent. The waste bloat>50
+  arm keeps the wall's gated `cost_estimated`/`loop_cost` locals for the
+  cache+loop basis and loop_percent while the bloat addend itself
+  excludes-and-discloses, and the by_model CSV rows carry BOTH intents —
+  the 4th `pricing_basis` cell (additive, first-three-cells-stable) and
+  the `n/a` money marker — pinned green together by
+  `overview_csv_by_model_carries_pricing_basis_column` and
+  `sessions_csv_poisoned_cost_renders_na_not_bare_nan`.
+- The codex multiagent reconcile re-scan no longer reads rollouts whole (rm-451 residual, run e40a66d301874cba8da57356d7efefe7 cycle 6): `scan_rollout` re-read each rollout with unbounded `std::fs::read` at reconcile time — a rollout over the parse lane's `FILE_READ_CAP_BYTES` was slurped into memory only to be refused later at parse. The scan now goes through the same bounded reader as the parse lane (`read_session_file_bounded`, metadata fast-path plus the stat/read re-guard), an over-cap rollout is refused before any read, and the skip is disclosed per-session as `codex_multiagent_reconcile_skipped_over_read_cap` plus the corpus `rollouts_over_cap` stat carried on the new stderr disclosure line (conservative as everywhere: the session keeps its inline turns, over-billed never erased). Pinned by `over_cap_rollout_discloses_reconcile_skip_without_reading_it` (sparse `set_len` past the cap).
 
 ### Changed
 

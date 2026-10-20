@@ -3198,7 +3198,14 @@ fn quota_window(
     cutoff: DateTime<Utc>,
     span: chrono::Duration,
 ) -> QuotaWindow {
-    let start = cutoff - span;
+    // rm-2031 (run e40a66d3 cycle 6): a past-extreme event timestamp
+    // puts `cutoff` at the very floor of the chrono range and the plain
+    // subtraction overflowed (`DateTime - TimeDelta overflowed`, a panic
+    // on a 94-byte hostile journal). Saturate at MIN_UTC instead: the
+    // window starts at the floor and renders — never crashes the lane.
+    let start = cutoff
+        .checked_sub_signed(span)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
     let mut spend_usd = 0.0;
     let mut sessions_contributing = 0;
     for session in sessions {
@@ -5463,6 +5470,58 @@ mod quota_tests {
             text.contains("no session carries placeable time"),
             "fully future corpus renders the undefined-cutoff lane: {text}"
         );
+    }
+
+    #[test]
+    fn quota_extreme_event_timestamps_never_panic() {
+        // rm-2031 (run e40a66d3 cycle 6; red-first at f0649493: a
+        // past-extreme event anchor put `cutoff` at the chrono floor and
+        // `cutoff - span` panicked `DateTime - TimeDelta overflowed`
+        // on a 94-byte journal). COMPOSED (2026-10-21, conflict case
+        // 76618454) with rm-2013 (run 91066ba0 cycle 2, landed on the
+        // wall in parallel): the wall's 4-digit-year admission bound at
+        // `parse_ts_form` now refuses both expanded-year extremes, so
+        // a hostile journal never reaches the window arithmetic through
+        // the parse lane — arm 1 pins that admission (unplaceable,
+        // disclosed, renders), and arm 2 pins the rm-2031 saturation
+        // itself by placing floor/ceiling anchors DIRECTLY, the one
+        // route that still reaches `quota_window`'s subtraction:
+        // `checked_sub_signed` must saturate at MIN_UTC — the lane
+        // never crashes on either belt.
+        for stamp in ["-262143-01-01T00:00:00", "+262143-12-31T23:59:59.999"] {
+            assert!(
+                parse_ts(stamp).is_none(),
+                "rm-2013 admission: {stamp} must be unplaceable, never billed"
+            );
+            let sessions = vec![quota_session(stamp, &[], 1.0)];
+            let report = quota_report(&sessions);
+            // The window (if any) renders finite money, never a panic —
+            // and the JSON itself stays serializable.
+            let text = serde_json::to_string(&report).expect("quota JSON renders");
+            assert!(!text.is_empty());
+        }
+        for anchor in [
+            chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+        ] {
+            let mut session = quota_session("extreme-anchor", &[], 1.0);
+            session.metrics.timestamps = vec![anchor];
+            let report = quota_report(std::slice::from_ref(&session));
+            // The floor anchor drives `cutoff` to MIN_UTC, so the
+            // window start saturates and finite money renders; the
+            // ceiling anchor is discarded by the rm-1402 clock-skew
+            // guard and renders the null-cutoff corpus. Both spans,
+            // never a panic, never a non-finite spend.
+            for window in ["five_hour", "weekly"] {
+                if let Some(node) = report.get(window) {
+                    if let Some(spend) = node.get("spend_usd").and_then(|v| v.as_f64()) {
+                        assert!(spend.is_finite(), "{window} spend finite, got {spend}");
+                    }
+                }
+            }
+            let text = serde_json::to_string(&report).expect("quota JSON renders");
+            assert!(!text.is_empty());
+        }
     }
 
     #[test]
