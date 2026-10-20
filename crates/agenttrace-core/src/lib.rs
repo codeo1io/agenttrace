@@ -2026,14 +2026,37 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     let catalog_cache_r = metrics
         .tokens_cache_r
         .saturating_sub(upstream_priced_cache_r);
+    // rm-2018: reasoning tokens ride the output bucket (the parser
+    // folds them into `tokens_output` — Sibling keys ADD the span,
+    // Subset keys report it inside), so a catalog row that publishes
+    // a distinct reasoning rate (`output_cost_per_reasoning_token`;
+    // dashscope qwen-turbo 5e-07 against plain output 2e-07) bills the
+    // reasoning span at THAT rate — a 2.5× distinction the flat
+    // output term could not express. Rows without the field split
+    // nothing: `reasoning_split` returns the identity and the term
+    // order below stays byte-identical for them.
+    let catalog_output = metrics.tokens_output.saturating_sub(upstream_priced_output);
+    let (catalog_plain_output, catalog_reasoning, catalog_reasoning_rate) =
+        catalog_price.reasoning_split(catalog_output, metrics.tokens_reasoning);
     let catalog_cost = round4(
         metrics.tokens_input.saturating_sub(upstream_priced_input) as f64 / 1e6
             * catalog_price.input
-            + metrics.tokens_output.saturating_sub(upstream_priced_output) as f64 / 1e6
-                * catalog_price.output
+            + catalog_plain_output as f64 / 1e6 * catalog_price.output
+            + catalog_reasoning as f64 / 1e6
+                * catalog_reasoning_rate.unwrap_or(catalog_price.output)
             + catalog_cache_w as f64 / 1e6 * catalog_cw
             + catalog_cache_r as f64 / 1e6 * catalog_cr,
     );
+    // rm-2018: billing thinking tokens at a distinct published rate
+    // is a billing decision, not a guess — count it on the session's
+    // non-loss disclosure channel (the rm-1508 fallback pattern) so
+    // the governance census and the data-health fold surface it.
+    if catalog_reasoning > 0 {
+        *metrics
+            .disclosure_counters
+            .entry("reasoning_rate_applied".to_string())
+            .or_insert(0) += 1;
+    }
     // rm-1508: the fallback is a disclosure, not a guess — count it on
     // the session's non-loss disclosure channel so the governance
     // census and the data-health fold surface it.
@@ -2129,17 +2152,31 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         // not suppressed counterfactuals.
         let (suppressed_cw, _) = suppressed_price.cache_write_billed();
         let (suppressed_cr, _) = suppressed_price.cache_read_billed();
-        let suppressed_estimate =
-            event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64 / 1e6
-                * suppressed_price.input
-                + event
+        // rm-2018: same contract for the distinct reasoning rate — the
+        // counterfactual bills the reasoning span at the rate the
+        // vendor would bill it at, still without firing the disclosure
+        // counter (a suppressed estimate is not a billed estimate).
+        let (suppressed_plain_output, suppressed_reasoning, suppressed_reasoning_rate) =
+            suppressed_price.reasoning_split(
+                event
                     .usage
                     .get("output_tokens")
                     .copied()
                     .unwrap_or(0)
-                    .max(0) as f64
-                    / 1e6
-                    * suppressed_price.output
+                    .max(0),
+                event
+                    .usage
+                    .get("reasoning_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0),
+            );
+        let suppressed_estimate =
+            event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64 / 1e6
+                * suppressed_price.input
+                + suppressed_plain_output as f64 / 1e6 * suppressed_price.output
+                + suppressed_reasoning as f64 / 1e6
+                    * suppressed_reasoning_rate.unwrap_or(suppressed_price.output)
                 + event
                     .usage
                     .get("cache_creation_input_tokens")
@@ -2259,17 +2296,38 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     .entry("cache_rate_fallback".to_string())
                     .or_insert(0) += 1;
             }
+            // rm-2018: per-block pricing bills the reasoning span at
+            // the block's own row's distinct reasoning rate when it
+            // publishes one — the split mirrors the session-rate lane
+            // so a multi-model session prices every producer's
+            // thinking at its own rate. Billed (not counterfactual),
+            // so the application fires the disclosure counter.
+            let (block_plain_output, block_reasoning, block_reasoning_rate) = block_price
+                .reasoning_split(
+                    event
+                        .usage
+                        .get("output_tokens")
+                        .copied()
+                        .unwrap_or(0)
+                        .max(0),
+                    event
+                        .usage
+                        .get("reasoning_tokens")
+                        .copied()
+                        .unwrap_or(0)
+                        .max(0),
+                );
+            if block_reasoning > 0 {
+                *metrics
+                    .disclosure_counters
+                    .entry("reasoning_rate_applied".to_string())
+                    .or_insert(0) += 1;
+            }
             let block_cost = event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64
                 / 1e6
                 * block_price.input
-                + event
-                    .usage
-                    .get("output_tokens")
-                    .copied()
-                    .unwrap_or(0)
-                    .max(0) as f64
-                    / 1e6
-                    * block_price.output
+                + block_plain_output as f64 / 1e6 * block_price.output
+                + block_reasoning as f64 / 1e6 * block_reasoning_rate.unwrap_or(block_price.output)
                 + block_cache_w as f64 / 1e6 * block_cw
                 + block_cache_r as f64 / 1e6 * block_cr;
             per_block_cost += block_cost;

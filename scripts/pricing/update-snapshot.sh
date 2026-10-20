@@ -92,11 +92,19 @@ import sys
 
 src, dst, date, drops_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
+# The refresh REPORT's rate-mutation basis. The drift gate's COST_FIELDS
+# (scripts/pricing/drift-check.sh) mirrors this list; review fix 2026-10-20
+# (independent-review F1) added output_cost_per_reasoning_token here so a
+# reasoning-only rate movement counts as rate-mutated in the printed delta
+# (and lands in the ROADMAP rm-176 append) instead of reporting
+# "0 rate-mutated" on a refresh that repriced the warm-cache world's
+# thinking spans. What gets WRITTEN is decided by trim(), not this list.
 RATE_FIELDS = (
     "input_cost_per_token",
     "output_cost_per_token",
     "cache_creation_input_token_cost",
     "cache_read_input_token_cost",
+    "output_cost_per_reasoning_token",
 )
 
 
@@ -200,6 +208,23 @@ def trim(data):
             ultrafast = value.get(ultrafast_field)
             if isinstance(ultrafast, (int, float)) and ultrafast > 0:
                 entry[ultrafast_field] = ultrafast
+        # rm-2018: the distinct reasoning/thinking-token output rate
+        # rides along when the source publishes one (LiteLLM
+        # `output_cost_per_reasoning_token`, 72 rows in the 2026-10-18
+        # catalog — dashscope qwen-turbo 5e-07 against a plain output
+        # 2e-07). Absent/boolean/non-finite/negative values are omitted;
+        # an explicit 0 is a published free-thinking rate and STAYS (the
+        # rm-1508 absence-vs-published-$0 discipline, carried into this
+        # field) — mirroring the Rust ingest's filter in convert_litellm
+        # so a refreshed bundle and a from-source parse agree byte for
+        # byte on the field.
+        reasoning_rate = value.get("output_cost_per_reasoning_token")
+        if (
+            isinstance(reasoning_rate, (int, float))
+            and not isinstance(reasoning_rate, bool)
+            and 0 <= reasoning_rate < float("inf")
+        ):
+            entry["output_cost_per_reasoning_token"] = reasoning_rate
         keep[key] = entry
     return keep
 

@@ -241,7 +241,19 @@ fn current_cost_estimate(
     };
     let mut components = PriceBreakdown {
         input: round4(tokens.input.saturating_sub(recorded.input) as f64 / 1e6 * rate.input),
-        output: round4(tokens.output.saturating_sub(recorded.output) as f64 / 1e6 * rate.output),
+        // rm-2018: the recompute must bill the reasoning span at the
+        // same distinct rate the stored estimate did — an unsplit
+        // recompute prices thinking at the plain output rate and flags
+        // a false drift on every rm-2018-priced session. The span
+        // rides the (recorded-adjusted) output bucket, exactly as in
+        // `analyze`'s session-rate arm.
+        output: round4({
+            let recompute_output = tokens.output.saturating_sub(recorded.output);
+            let (plain, reasoning, reasoning_rate) =
+                rate.reasoning_split(recompute_output, tokens.reasoning);
+            plain as f64 / 1e6 * rate.output
+                + reasoning as f64 / 1e6 * reasoning_rate.unwrap_or(rate.output)
+        }),
         cache_write: round4(
             tokens.cache_write.saturating_sub(recorded.cache_write) as f64 / 1e6 * cw_billed,
         ),
@@ -2252,6 +2264,51 @@ mod tests {
         assert_eq!(row.estimated_cost_usd, Some(12.0));
         assert_eq!(audit.current_estimated_cost_usd, Some(12.0));
         assert!(row.pricing_source.contains("service_tier: flex"));
+    }
+
+    #[test]
+    fn audit_reprices_reasoning_priced_sessions_at_the_published_rate() {
+        // rm-2018 (independent-review F6b: the governance-mirror claim,
+        // now tested): the "current rates" recompute must bill the
+        // reasoning span at the row's distinct published rate, exactly
+        // as the stored estimate did — an unsplit recompute prices
+        // thinking at the plain output rate and flags a false drift on
+        // every reasoning-priced session. The flagship bundled row:
+        // dashscope/qwen-turbo at 0.05/0.2/0.5 per-Mtok — 1M in + 1M
+        // out with 400k thinking stores 0.05 + 0.2*0.6 + 0.5*0.4 =
+        // $0.37; the unsplit recompute would claim $0.25 "today" and
+        // false-flag drift.
+        let mut qwen = session("qwen");
+        qwen.metrics.model_used = "dashscope/qwen-turbo".to_string();
+        qwen.metrics.source_tool = "pi".to_string();
+        qwen.metrics.tokens_input = 1_000_000;
+        qwen.metrics.tokens_output = 1_000_000;
+        qwen.metrics.tokens_reasoning = 400_000;
+        qwen.metrics.cost_estimated = 0.37;
+
+        let audit = session_cost_audit(&qwen);
+        assert_eq!(audit.stored_estimated_cost_usd, 0.37);
+        let rates = audit
+            .rates_per_million_usd
+            .as_ref()
+            .expect("the audit exposes the priced rate row");
+        assert!(
+            (rates.output - 0.2).abs() < 1e-9,
+            "the plain output rate renders at its per-Mtok value, got {}",
+            rates.output
+        );
+        let current = audit
+            .estimated_cost_usd
+            .expect("a single-tier reasoning-priced session re-prices on one rate row");
+        assert!(
+            (current - 0.37).abs() < 1e-6,
+            "the recompute must mirror the stored basis (plain 0.6M@0.2 + thinking 0.4M@0.5), got {current}"
+        );
+        assert!(
+            !audit.pricing_note.contains("recalculate a different total"),
+            "a split-aware recompute must not flag drift against the reasoning-priced store: {}",
+            audit.pricing_note
+        );
     }
 
     #[test]

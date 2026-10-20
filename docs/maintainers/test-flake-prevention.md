@@ -213,3 +213,25 @@ authority. Numbered 11 at mint: sibling run 5c144613's unlanded band
 every `.git` ancestor; pristine-base triage) — theirs keep 9–10 at any
 fold where both land, this stays 11 (the Rule 7→8 renumber precedent).
 
+## Rule 12 — salvage restores content, not mtimes: rebuild before trusting cargo --list on an adopted tree (2026-10-20)
+
+Run e56e9e18 cycle-2 implement forensics: the conductor-salvage commit
+f6a74891 restored `session_cache.rs` content (lock-liveness fix + two new
+tests, verified present in the file) while the file's mtime stayed at the
+ORIGINAL edit time (2026-10-18 17:01) and the previously built test binary
+was newer (2026-10-19 17:25) — so cargo's mtime-based freshness check
+considered everything up to date and `cargo test --lib -- --list` served a
+STALE binary listing 479 tests with ZERO matches for the newly added
+`lock_liveness_*` tests, on a tree that verifiably contains them. The wrong
+conclusion ("the tests aren't in this tree / the salvage is incomplete") is
+exactly one `--list` away. Same family as Rule 11 (evidence describing a
+past tree) but inverted: here the BUILD CACHE lies about the CURRENT tree.
+Rule: on any adopted/salvaged/restored tree (content changed without
+mtimes moving, or provenance uncertain), `touch` the touched sources and
+force a rebuild BEFORE trusting `--list`, test counts, or "test not found"
+conclusions — then require the expected new test names to appear in the
+listing before running them. Counts moved 479→463 and both new tests
+appeared only after the forced rebuild. Provenance: implement envelope
+e155fd28 (attempt 8564ed26 forensics, the `--list` trap + post-touch
+verification), compound 362afb47.
+

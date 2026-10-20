@@ -69,6 +69,21 @@ pub struct Price {
     /// $0 and bills as $0 (rm-1508).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cr: Option<f64>,
+    /// rm-2018: the distinct per-token rate a vendor publishes for
+    /// reasoning/thinking tokens (LiteLLM
+    /// `output_cost_per_reasoning_token` — 72 live rows on 2026-10-18;
+    /// dashscope qwen-turbo publishes 5e-07 against a plain output
+    /// rate of 2e-07, a 2.5× distinction the flat output term cannot
+    /// express). `None` = no distinct published rate: reasoning tokens
+    /// ride the output bucket and bill at the plain output rate,
+    /// byte-identical to pre-rm-2018 pricing. `Some(0.0)` is a
+    /// published free-thinking rate (the rm-1508 absence-vs-published
+    /// discipline, carried into this field). When `Some`, the
+    /// reasoning span bills at this rate instead
+    /// ([`Price::reasoning_split`]) and the application is disclosed
+    /// via the `reasoning_rate_applied` disclosure counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_reasoning: Option<f64>,
     /// Vendor context window in input tokens (LiteLLM
     /// `max_input_tokens`), when the catalog entry carries one (rm-231).
     /// Absent on override files and pre-2026-10 snapshots; `skip`
@@ -144,6 +159,31 @@ impl Price {
             None => (self.input * CACHE_WRITE_FALLBACK_MULTIPLE, true),
         }
     }
+
+    /// rm-2018: split the output bucket for billing when the catalog
+    /// row publishes a distinct reasoning rate. Reasoning tokens ride
+    /// the output bucket (parser `ReasoningKeySemantics`: Sibling keys
+    /// ADD the span to the reported output, Subset keys report it
+    /// inside), so the split moves `min(reasoning, output_bucket)`
+    /// tokens from the plain-output term to the reasoning term.
+    /// Returns `(plain_output_tokens, reasoning_tokens, reasoning_rate)`;
+    /// with no published distinct rate — or no reasoning tokens to
+    /// bill — the split is the identity `(output_bucket, 0, None)` and
+    /// the caller's term order stays byte-identical to pre-rm-2018
+    /// pricing. A non-finite or negative stored rate reads as absent
+    /// (ingest filters those; this is the belt to that suspenders) so
+    /// a hostile catalog cannot poison the estimate.
+    pub fn reasoning_split(&self, output_bucket: i64, reasoning: i64) -> (i64, i64, Option<f64>) {
+        let rate = match self.output_reasoning {
+            Some(rate) if rate.is_finite() && rate >= 0.0 => rate,
+            _ => return (output_bucket, 0, None),
+        };
+        if reasoning <= 0 || output_bucket <= 0 {
+            return (output_bucket, 0, None);
+        }
+        let span = reasoning.min(output_bucket);
+        (output_bucket - span, span, Some(rate))
+    }
 }
 
 /// rm-1508: whether pricing cache tokens at `price` bills any
@@ -188,6 +228,15 @@ struct LiteLlmModel {
     cache_write_cost: Option<f64>,
     #[serde(default, rename = "cache_read_input_token_cost")]
     cache_read_cost: Option<f64>,
+    // rm-2018: the distinct reasoning/thinking-token output rate
+    // (LiteLLM `output_cost_per_reasoning_token`, 72 live rows on
+    // 2026-10-18 — dashscope qwen-turbo 5e-07 against a plain output
+    // 2e-07). Option-typed so a row that publishes none stays `None`
+    // and reasoning bills at the plain output rate; an explicit `0` is
+    // a published free-thinking rate (the rm-1508 distinction,
+    // carried into this field).
+    #[serde(default, rename = "output_cost_per_reasoning_token")]
+    output_reasoning_cost: Option<f64>,
     #[serde(default)]
     mode: String,
     #[serde(default, rename = "litellm_provider")]
@@ -703,8 +752,9 @@ pub fn catalog_identity() -> &'static str {
 }
 
 /// Digest of every catalog fact that can change a cost or an
-/// attribution: rate values (standard AND flex, rm-610), context
-/// windows, deprecation dates, alias rows, and provider labels
+/// attribution: rate values (standard AND flex, rm-610), the distinct
+/// reasoning-token rate (rm-2018), context windows, deprecation
+/// dates, alias rows, and provider labels
 /// (rm-613). Only `source` and `reference_date` are excluded — they
 /// describe where the data came from, not what it prices. The session
 /// cache freshness key consumes this: a rate-identical provider flip
@@ -732,6 +782,23 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
             if let Some(value) = slot {
                 hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
             }
+        }
+        // rm-2018: a gained or changed distinct reasoning rate changes
+        // what a reasoning-bearing turn bills at, so it must reprice
+        // cached sessions exactly like a standard rate change. Without
+        // this fold the bundle's field-add (63 rows) would leave every
+        // pre-rm-2018 warm entry "fresh" while still serving unsplit
+        // costs — the rm-485 unchanged-digest class rm-1511 had to
+        // solve with a schema rung. Flag byte first, so an absent
+        // (plain-output-priced) slot never collides with a published
+        // one, including the published free-thinking $0. Folding it
+        // changes the identity for every catalog (one-time
+        // warm-cache invalidation), the same one-time cost rm-1508's
+        // slot flag bytes paid — which is the point: the repricing
+        // runs.
+        hash = fnv1a(&[price.output_reasoning.is_some() as u8], hash);
+        if let Some(value) = price.output_reasoning {
+            hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
         }
         hash = fnv1a(&price.max_input_tokens.unwrap_or(0).to_le_bytes(), hash);
         hash = fnv1a(
@@ -1913,6 +1980,16 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             // never a silent $0.
             cw: model.cache_write_cost.map(|rate| rate * 1e6),
             cr: model.cache_read_cost.map(|rate| rate * 1e6),
+            // rm-2018: the distinct reasoning-token rate rides along
+            // when the source publishes one, scaled like the standard
+            // rates; non-finite/negative values normalize to absent so
+            // a hostile catalog cannot poison the estimate. An
+            // explicit 0 survives as Some(0.0) — a published
+            // free-thinking rate (the rm-1508 discipline).
+            output_reasoning: model
+                .output_reasoning_cost
+                .filter(|rate| rate.is_finite() && *rate >= 0.0)
+                .map(|rate| rate * 1e6),
             // Vendor context window and deprecation date ride along
             // when the source carries them (rm-231 / rm-419); zero or
             // empty values normalize to absent.
@@ -4618,6 +4695,48 @@ mod tests {
         assert_ne!(
             base, provider_flip,
             "a rate-identical provider flip changes attribution and must change the digest (rm-613)"
+        );
+    }
+
+    #[test]
+    fn catalog_identity_covers_reasoning_rate_slots() {
+        // rm-2018: a gained or changed distinct reasoning rate changes
+        // what a reasoning-bearing turn bills at, so it must reprice
+        // cached sessions exactly like a rate change — and a published
+        // free-thinking $0 must never collide with absence (the
+        // rm-1508 flag-byte discipline carried into this slot).
+        fn catalog_with(output_reasoning: Option<f64>) -> PricingCatalog {
+            PricingCatalog {
+                entries: BTreeMap::from([(
+                    "m".to_string(),
+                    Price {
+                        input: 1.0,
+                        output: 2.0,
+                        output_reasoning,
+                        ..Price::default()
+                    },
+                )]),
+                aliases: BTreeMap::new(),
+                source: "test".to_string(),
+                providers: BTreeMap::new(),
+                reference_date: None,
+            }
+        }
+        let base = catalog_identity_of(&catalog_with(None));
+        let gained = catalog_identity_of(&catalog_with(Some(50.0)));
+        let changed = catalog_identity_of(&catalog_with(Some(51.0)));
+        let free = catalog_identity_of(&catalog_with(Some(0.0)));
+        assert_ne!(
+            base, gained,
+            "gaining a distinct reasoning rate must reprice the cache"
+        );
+        assert_ne!(
+            gained, changed,
+            "a reasoning-rate value change must reprice the cache"
+        );
+        assert_ne!(
+            base, free,
+            "a published free-thinking $0 must differ from absence"
         );
     }
 

@@ -39,7 +39,7 @@
 #   ... --bundle F.json --pricing-rs F.rs          # overrides for red-arm testing
 #   ... --json                                     # emit the machine report on stdout (summary goes to stderr
 #                                                  #   then — stdout is PURE JSON; review-2 fix F2)
-#   scripts/pricing/drift-check.sh --selftest      # eight embedded offline arms, rc 0 iff all pass
+#   scripts/pricing/drift-check.sh --selftest      # nine embedded offline arms, rc 0 iff all pass
 
 set -euo pipefail
 
@@ -114,11 +114,20 @@ def kept(catalog):
 
 # Field-comparison rule: drift is only meaningful on the fields the builder actually PINS
 # (update-snapshot.sh writes input/output per-token costs, cache_creation/cache_read costs, mode,
-# litellm_provider, max_input_tokens when int>0, deprecation_date when set). Comparing anything
-# else (e.g. max_output_tokens, which the builder drops) produced 2,802 phantom diffs — diagnosed
-# 2026-10-05 against the real bundle; see the cycle-1 record.
+# litellm_provider, max_input_tokens when int>0, deprecation_date when set, and — since rm-2018 —
+# output_cost_per_reasoning_token when the source publishes a finite non-negative one). Comparing
+# anything else (e.g. max_output_tokens, which the builder drops) produced 2,802 phantom diffs —
+# diagnosed 2026-10-05 against the real bundle; see the cycle-1 record.
+# Review fix 2026-10-20 (independent-review F1, rm-2018 leg (b) "drift basis extended"): the
+# distinct reasoning rate joined COST_FIELDS below. The builder's trim() pins it on every refresh
+# (63 rows in the 2026-10-18 basis), so a live rate change or an upstream field-drop on any
+# carrying row is money movement this gate must surface as rate_changed — pre-fix both were
+# invisible and flowed silently into the next weekly refresh. An absent live value reads 0.0
+# against a pinned rate, mirroring trim()'s omit-when-absent, so rows that publish no reasoning
+# rate stay parity on both sides (no false drift).
 COST_FIELDS = ["input_cost_per_token", "output_cost_per_token",
-               "cache_creation_input_token_cost", "cache_read_input_token_cost"]
+               "cache_creation_input_token_cost", "cache_read_input_token_cost",
+               "output_cost_per_reasoning_token"]
 
 try:
     live_kept, bundle_kept = kept(live), kept(bundle)
@@ -169,7 +178,7 @@ print(f"  bundled: {len(bundle_kept)} costed-chat models, _snapshot.date={bundle
 print(f"  live   : {len(live_kept)} costed-chat models", file=out)
 print(f"  new-costed: {len(new_costed)}{' — ' + sample(new_costed) if new_costed else ''}", file=out)
 print(f"  retired   : {len(retired)}{' — ' + sample(retired) if retired else ''} (removal_guard={'SET' if removal_guard else 'clear'})", file=out)
-print(f"  rate-changed: {len(rate_changed)}{' — ' + sample(rate_changed) if rate_changed else ''} (4 cost fields incl. cache)", file=out)
+print(f"  rate-changed: {len(rate_changed)}{' — ' + sample(rate_changed) if rate_changed else ''} (5 cost fields incl. cache + reasoning)", file=out)
 print(f"  deprecation-new: {len(deprecation_new)}{' — ' + sample(deprecation_new) if deprecation_new else ''}", file=out)
 print(f"  context-window-changed (max_input only, informational): {len(context_changed)}{' — ' + sample(context_changed) if context_changed else ''}", file=out)
 print(f"  provider-changed (informational): {len(provider_changed)}{' — ' + sample(provider_changed) if provider_changed else ''}", file=out)
@@ -231,7 +240,7 @@ run_check() { # resolves inputs, fetches live if needed, dispatches analyze; ret
   return "$rc"
 }
 
-self_test() { # eight embedded offline arms; rc 0 iff all pass (fixtures never touch the repo)
+self_test() { # nine embedded offline arms; rc 0 iff all pass (fixtures never touch the repo)
   local t rc ok=0
   t="$(mktemp -d -t drift-selftest.XXXXXX)"
   trap 'rm -rf "$t"' RETURN
@@ -372,6 +381,42 @@ PY
     echo "  arm 8 rm-903 wildcard ..... PASS (glob row = parity rc 0; concrete commitment key still new-costed rc 1)"
   else echo "  arm 8 rm-903 wildcard ..... FAIL (parity sub-arm e=$e, commitment sub-arm f=$f)"; sed -n '1,8p' "$t/out8a.txt"; sed -n '1,12p' "$t/out8b.txt"; ok=1; fi
 
+  # Arm 9 — reasoning-rate visibility (review fix 2026-10-20, independent-review F1 /
+  # rm-2018 acceptance leg (b) "drift basis extended"): the distinct thinking-token rate
+  # output_cost_per_reasoning_token participates in rate_changed exactly like the four legacy
+  # cost fields — the builder's trim() pins it on every refresh, so live movement on it is
+  # actionable drift, not something the next weekly refresh absorbs silently. Sub-arm (a): a
+  # live rate flip on the field ALONE (2e-06 -> 5e-06, every legacy field identical) must be
+  # rc 1 with rate_changed 1 (pre-fix proven red: rc 0, invisible). Sub-arm (b): an upstream
+  # field-DROP — live stops publishing the rate the bundle pins — reads absent-as-0.0 and is
+  # equally actionable. Sub-arm (c): publishing the same rate on both sides stays parity (and
+  # field-less rows are arms 1-8's standing parity case), so extending the basis manufactures
+  # no phantom drift.
+  python3 - "$t" <<'PY'
+import json, sys
+t = sys.argv[1]
+bundle = json.load(open(f"{t}/base.json"))
+bundle["model-a"]["output_cost_per_reasoning_token"] = 2e-06
+json.dump(bundle, open(f"{t}/bundle-reasoning.json", "w"))
+flip = json.loads(json.dumps(bundle))
+flip["model-a"]["output_cost_per_reasoning_token"] = 5e-06
+json.dump(flip, open(f"{t}/live-flip.json", "w"))
+drop = json.loads(json.dumps(bundle))
+del drop["model-a"]["output_cost_per_reasoning_token"]
+json.dump(drop, open(f"{t}/live-drop.json", "w"))
+json.dump(bundle, open(f"{t}/live-parity-reasoning.json", "w"))
+PY
+  local g=0 h=0 i=0
+  rc=0; "$0" --live "$t/live-flip.json" --bundle "$t/bundle-reasoning.json" --pricing-rs "$t/pricing.rs" --json > "$t/out9a.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 1 ] && grep -q '"rate_changed": 1' "$t/out9a.txt" && grep -q '"new_costed": 0' "$t/out9a.txt" && g=1
+  rc=0; "$0" --live "$t/live-drop.json" --bundle "$t/bundle-reasoning.json" --pricing-rs "$t/pricing.rs" --json > "$t/out9b.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 1 ] && grep -q '"rate_changed": 1' "$t/out9b.txt" && grep -q '"retired": 0' "$t/out9b.txt" && h=1
+  rc=0; "$0" --live "$t/live-parity-reasoning.json" --bundle "$t/bundle-reasoning.json" --pricing-rs "$t/pricing.rs" > "$t/out9c.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] && grep -q 'rate-changed: 0' "$t/out9c.txt" && i=1
+  if [ "$g" -eq 1 ] && [ "$h" -eq 1 ] && [ "$i" -eq 1 ]; then
+    echo "  arm 9 reasoning rate ....... PASS (value flip -> rc 1; field drop -> rc 1; parity holds rc 0)"
+  else echo "  arm 9 reasoning rate ....... FAIL (flip g=$g, drop h=$h, parity i=$i)"; sed -n '1,10p' "$t/out9a.txt"; sed -n '1,10p' "$t/out9b.txt"; ok=1; fi
+
   # Control — the keep-filter basis itself: non-chat and uncosted rows never count either side.
   if grep -q 'costed-chat models' "$t/out1.txt"; then
     echo "  control keep-filter ...... PASS (basis line present)"
@@ -381,7 +426,7 @@ PY
 }
 
 if [ "$selftest" -eq 1 ]; then
-  echo "drift-check --selftest (eight offline arms, no network)"
+  echo "drift-check --selftest (nine offline arms, no network)"
   self_test
   rc=$?
   [ "$rc" -eq 0 ] && echo "selftest: ALL ARMS PASS" || echo "selftest: FAILURES PRESENT"

@@ -94,3 +94,52 @@ fn cache_rate_census_body() {
         census.models
     );
 }
+
+/// rm-2018 (run e56e9e18, cycle 2 batch "state-and-money hardening"):
+/// the reasoning-rate field-add pin. 63 bundle rows publish
+/// `output_cost_per_reasoning_token`, added basis-preservingly to the
+/// 2026-10-08 bundle from the live 2026-10-19 LiteLLM catalog (the
+/// bundle's own basis predates the field's extraction — the implement
+/// dossier records the reconciliation flag for the next sanctioned
+/// refresh). The flagship golden is dashscope qwen-turbo's 2.5×
+/// distinction: reasoning 5e-07 against plain output 2e-07 per token,
+/// the exact rate pair `reasoning_rate_truth_contract.rs` bills the
+/// reasoning span at. This arm reads the bundle FILE directly (like
+/// the wildcard arm) and needs no isolation guard; the count pin
+/// makes any future movement conscious — a sanctioned refresh
+/// re-derives the field from its own live basis and must move this
+/// pin deliberately, not silently.
+#[test]
+fn vendored_pricing_bundle_reasoning_rate_rows_are_pinned() {
+    let raw = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/pricing_snapshot.json"
+    ));
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).expect("vendored pricing snapshot must parse");
+    let carrying: Vec<&str> = parsed
+        .as_object()
+        .expect("pricing snapshot is a JSON object keyed by model name")
+        .iter()
+        .filter(|(key, _)| key.as_str() != "_snapshot")
+        .filter(|(_, row)| row.get("output_cost_per_reasoning_token").is_some())
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(
+        carrying.len(),
+        63,
+        "bundle rows publishing a distinct reasoning rate moved — a refresh must update \
+         this pin consciously (rm-2018): {carrying:?}"
+    );
+    assert!(
+        carrying.contains(&"dashscope/qwen-turbo"),
+        "the qwen-turbo golden row must carry the field"
+    );
+    let qwen = &parsed["dashscope/qwen-turbo"];
+    assert_eq!(qwen["output_cost_per_token"], serde_json::json!(2e-07));
+    assert_eq!(
+        qwen["output_cost_per_reasoning_token"],
+        serde_json::json!(5e-07),
+        "qwen-turbo's reasoning span bills 2.5× its plain output rate — the rm-2018 golden"
+    );
+}
