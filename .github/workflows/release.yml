@@ -55,11 +55,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux targets cross-compile the arm64 build on ubuntu
-          - os: ubuntu-latest
+          # Linux targets cross-compile the arm64 build on ubuntu.
+          # Pinned to 22.04 (glibc 2.35 floor): ubuntu-latest is 24.04
+          # (glibc 2.39), and 2.39-linked assets die on 22.04 hosts
+          # ("GLIBC_2.39 not found", the v0.8.1 incident). The glibc
+          # floor the smoke gate enforces applies to SHIPPED assets
+          # first — ci.yml's smoke job mirrors this pin.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset: agenttrace-linux-amd64
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             asset: agenttrace-linux-arm64
           # Darwin targets need the Apple SDK — build natively on macOS runners

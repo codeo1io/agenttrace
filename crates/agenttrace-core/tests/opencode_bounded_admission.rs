@@ -240,6 +240,7 @@ fn write_containment_session(root: &Path, file_stem: &str, id: &str) -> PathBuf 
 }
 
 #[test]
+#[cfg(unix)]
 fn absolute_session_id_is_rejected_with_disclosure_and_no_escape() {
     let parent = std::env::temp_dir().join(format!("at_rm1870_abs_{}", std::process::id()));
     let _ = fs::remove_dir_all(&parent);
@@ -271,6 +272,7 @@ fn absolute_session_id_is_rejected_with_disclosure_and_no_escape() {
 }
 
 #[test]
+#[cfg(unix)]
 fn dotdot_session_id_cannot_hop_out_of_the_storage_root() {
     let parent = std::env::temp_dir().join(format!("at_rm1870_dd_{}", std::process::id()));
     let _ = fs::remove_dir_all(&parent);

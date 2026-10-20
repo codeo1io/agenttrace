@@ -4995,6 +4995,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn write_output_refuses_special_files_instead_of_materializing_them() {
         // rm-250 residual (cycle 1): a fifo destination is refused with
         // a disclosed reason (the assess PoC showed "Saved:" rc0 while

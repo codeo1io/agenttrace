@@ -871,6 +871,7 @@ fn statusline_host_mode_never_fails_the_host() {
 }
 
 #[test]
+#[cfg(target_os = "linux")] // /dev/full exists only on Linux; macOS lacks it (ENOENT)
 fn statusline_host_mode_survives_stdout_write_failure() {
     // Review F2 (cycle 7): the host contract is exit 0 for any input —
     // and for any stdout condition. A host whose pipe is closed or whose
@@ -2657,6 +2658,7 @@ fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
 }
 
 #[test]
+#[cfg(target_os = "linux")] // /dev/full (ENOSPC) exists only on Linux
 fn error_stderr_carries_the_anyhow_cause_chain() {
     // rm-610: the top-level handler printed `Error: {err}`, and
     // anyhow's Display shows only the outermost context layer — so
@@ -3503,8 +3505,27 @@ fn count_honesty_disclosures_in_cli_lanes() {
     // One real journal banked twice: byte-identical copies at two
     // paths (alpha survives, beta is the disclosed copy).
     let journal = pi_journal("0.0038");
-    write("alpha/a.jsonl", &journal);
+    let alpha = write("alpha/a.jsonl", &journal);
     let beta = write("beta/b.jsonl", &journal);
+    // Byte-identical duplicates: discovery admits the first copy in walk
+    // order and suppresses the other, so WHICH path survives is not a
+    // promised contract (rm-2232 owns survivor determinism). Pin distinct
+    // mtimes so no same-tick ambiguity leaks into the downstream mod-time
+    // sort, and assert the pair RELATIONSHIP: exactly these two copies,
+    // rendered `survivor <- suppressed`.
+    let now = std::time::SystemTime::now();
+    let pin_mtime = |path: &std::path::Path, mtime: std::time::SystemTime| {
+        use std::fs::FileTimes;
+        std::fs::File::options()
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .expect("open journal for mtime pin")
+            .set_times(FileTimes::new().set_modified(mtime))
+            .expect("pin journal mtime");
+    };
+    pin_mtime(&alpha, now - std::time::Duration::from_secs(120));
+    pin_mtime(&beta, now - std::time::Duration::from_secs(60));
     // A pi-subagents artifact mirror under the path segment — child
     // spend the parent owns; skipped, never banked.
     write(
@@ -3547,9 +3568,9 @@ fn count_honesty_disclosures_in_cli_lanes() {
     assert!(
         pair.contains("a.jsonl")
             && pair.contains("beta")
-            && pair.contains("<-")
-            && pair.ends_with(beta.file_name().expect("name").to_string_lossy().as_ref()),
-        "the pair names survivor <- suppressed: {pair}"
+            && pair.contains(" <- ")
+            && pair.split(" <- ").count() == 2,
+        "the pair names the survivor and the suppressed copy (`survivor <- suppressed`): {pair}"
     );
     assert_eq!(
         value["recorded_costs_negative_rejected"], 1,

@@ -29,11 +29,31 @@ if (-not $InstallDir) { $InstallDir = "$env:LOCALAPPDATA\agenttrace" }
 $REPO = "luoyuctl/agenttrace"
 $BIN = "agenttrace.exe"
 
-# Detect architecture
-$ARCH = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
-    "X64"   { "amd64" }
-    "Arm64" { "arm64" }
-    default { throw "Unsupported architecture: $_" }
+# Detect architecture. RuntimeInformation is the primary signal, but in
+# interactive Windows PowerShell 5.1 sessions PSReadLine 2.0.0 can shadow
+# the type load (upstream #314: iex installs died there), so fall back to
+# the PROCESSOR_ARCHITEW6432 / PROCESSOR_ARCHITECTURE environment strings —
+# W6432 first, because it carries the REAL machine arch when a 32-bit
+# PowerShell runs on 64-bit Windows. Unknown arch fails closed.
+$ARCH = $null
+try {
+    switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
+        "X64"   { $ARCH = "amd64" }
+        "Arm64" { $ARCH = "arm64" }
+        default { }
+    }
+} catch { }
+if (-not $ARCH) {
+    $envArch = "${env:PROCESSOR_ARCHITEW6432}"
+    if (-not $envArch) { $envArch = "${env:PROCESSOR_ARCHITECTURE}" }
+    switch ($envArch) {
+        "AMD64" { $ARCH = "amd64" }
+        "ARM64" { $ARCH = "arm64" }
+        default { }
+    }
+}
+if (-not $ARCH) {
+    throw "Unsupported architecture: ${env:PROCESSOR_ARCHITEW6432}/${env:PROCESSOR_ARCHITECTURE} (RuntimeInformation unavailable)"
 }
 
 $Pinned = $Version -ne "latest"
