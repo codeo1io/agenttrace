@@ -213,3 +213,26 @@ authority. Numbered 11 at mint: sibling run 5c144613's unlanded band
 every `.git` ancestor; pristine-base triage) — theirs keep 9–10 at any
 fold where both land, this stays 11 (the Rule 7→8 renumber precedent).
 
+## Rule 12 — A single red inside an otherwise-green parallel suite is a
+fleet-load flake until proven otherwise (2026-10-19)
+
+Run 9cc1462150 cycle-4 targeted-tests: the full parallel
+`cargo test -p agenttrace-core --lib` in a lane-private target dir
+returned 466/1 — `statusline::tests::journal_appends_survive_parallel_compaction`
+(statusline.rs:4870) failed once with 37G free on `/` while the sibling
+conductor fleet ran. The rm-2076 batch touches no statusline path
+(lib.rs/subagents.rs/history.rs + one new contract test). The test
+passed twice isolated, and the full parallel suite went 467/0 on rerun
+with zero code change — a transient, load-coupled red.
+
+Rule: when exactly one test in a large parallel suite goes red and the
+diff provably touches no code on that path, do NOT diagnose through
+the batch — rerun the test isolated (twice), then the full suite once.
+Classify as an infra flake only when all three pass, and record the
+signature here so the next occurrence is recognized on sight.
+Signatures so far: `count_honesty_disclosures_in_cli_lanes` (Rules
+4/10 family, disk-pressure window) and `journal_appends_survive_parallel_compaction`
+(sibling fleet load at 37G free, 2026-10-19). A flake that survives
+the three-rerun protocol is Rule 10 territory: rerun the pristine
+wall before believing the batch broke it.
+

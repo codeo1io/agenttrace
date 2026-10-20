@@ -45,10 +45,73 @@
 //! history merge for live rows.
 
 use crate::discovery::{same_file_identity, SameFileIdentity};
-use crate::{total_tokens, Session};
-use std::collections::HashMap;
+use crate::{total_tokens, AgentBreakdown, Metrics, Session};
+use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
 use std::path::Path;
+
+/// rm-2076: fold one lane's metrics into a per-type breakdown row on
+/// its parent. Mirrors the rollup discipline exactly — tokens
+/// saturate per class and non-finite costs are skipped (rm-1500) — so
+/// Σ rows equals the `subagent_*` ledger by construction. The label
+/// is the lane's `agent_name` when the source carries one, else the
+/// fallback ("main" for the session's own lane, "subagent" for a
+/// linked child).
+fn add_breakdown_row(
+    rows: &mut BTreeMap<String, AgentBreakdown>,
+    metrics: &Metrics,
+    fallback_label: &str,
+) {
+    let label = if metrics.agent_name.is_empty() {
+        fallback_label
+    } else {
+        metrics.agent_name.as_str()
+    };
+    let slot = rows.entry(label.to_string()).or_insert_with(|| {
+        // The row carries its own label: the map key is lost at
+        // `into_values()` time, and an unlabeled row would be
+        // indistinguishable from an empty-string agent name.
+        AgentBreakdown {
+            agent: label.to_string(),
+            ..AgentBreakdown::default()
+        }
+    });
+    slot.duration_sec += metrics.duration_sec;
+    slot.tokens_cache_r = slot.tokens_cache_r.saturating_add(metrics.tokens_cache_r);
+    slot.tokens_cache_w = slot.tokens_cache_w.saturating_add(metrics.tokens_cache_w);
+    slot.tokens_regular = slot
+        .tokens_regular
+        .saturating_add(metrics.tokens_input.saturating_add(metrics.tokens_output));
+    if metrics.cost_estimated.is_finite() {
+        slot.cost_usd += metrics.cost_estimated;
+    }
+}
+
+/// rm-2076: seal each linked parent's rows — the session's own lane
+/// ("main", or its `agent_name`) folded in through the same merge so
+/// a type collision with a child lands in one bucket, then the own
+/// row ordered first and the rest in sorted type order for a
+/// deterministic array. Parents with no linked children keep the
+/// empty field (JSON-skipped, rm-232).
+fn finalize_agent_breakdowns(
+    sessions: &mut [Session],
+    rows: HashMap<usize, BTreeMap<String, AgentBreakdown>>,
+) {
+    for (parent, mut children) in rows {
+        let own_label = if sessions[parent].metrics.agent_name.is_empty() {
+            "main".to_string()
+        } else {
+            sessions[parent].metrics.agent_name.clone()
+        };
+        add_breakdown_row(&mut children, &sessions[parent].metrics, &own_label);
+        let mut ordered = Vec::with_capacity(children.len());
+        if let Some(own) = children.remove(&own_label) {
+            ordered.push(own);
+        }
+        ordered.extend(children.into_values());
+        sessions[parent].metrics.agent_breakdowns = ordered;
+    }
+}
 
 /// Returns the parent transcript path for a Claude Code subagent
 /// transcript.
@@ -219,7 +282,14 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
         session.metrics.subagent_cost = 0.0;
         session.metrics.subagent_tokens = 0;
         session.metrics.parent_session = String::new();
+        // rm-2076: the breakdown recomputes with the rollups below —
+        // same idempotency contract (preserved-history rows keep both).
+        session.metrics.agent_breakdowns = Vec::new();
     }
+    // rm-2076: per-agent-type rows accumulated in the same pass as
+    // the `subagent_*` rollups — one slot per parent, keyed by agent
+    // type so same-type children merge into one row.
+    let mut breakdown_rows: HashMap<usize, BTreeMap<String, AgentBreakdown>> = HashMap::new();
     for (child, parent) in links {
         let (cost, tokens) = (
             sessions[child].metrics.cost_estimated,
@@ -240,6 +310,11 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
             .metrics
             .subagent_tokens
             .saturating_add(tokens);
+        add_breakdown_row(
+            breakdown_rows.entry(parent).or_default(),
+            &sessions[child].metrics,
+            "subagent",
+        );
         sessions[child].metrics.parent_session = sessions[parent].path.clone();
     }
     for (child, parent_key) in key_links {
@@ -271,7 +346,13 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
             metrics.subagent_cost += cost;
         }
         metrics.subagent_tokens = metrics.subagent_tokens.saturating_add(tokens);
+        add_breakdown_row(
+            breakdown_rows.entry(parent).or_default(),
+            &sessions[child].metrics,
+            "subagent",
+        );
     }
+    finalize_agent_breakdowns(sessions, breakdown_rows);
     unlinked
 }
 

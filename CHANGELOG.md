@@ -4,6 +4,31 @@
 
 ### Added
 
+- per-session agent-type usage breakdown `agent_breakdowns[]` (rm-2076,
+  run 9cc1462150 cycle 4): `attribute_subagents` builds a per-agent-type
+  row set in the same pass as the `subagent_*` rollups — the session's own
+  lane first (`"main"`, or its `agent_name` when the source carries one),
+  then one row per linked child type (same-type children merged, sorted
+  type order), each carrying `duration_sec` plus the three cost classes
+  (`tokens_cache_r`, `tokens_cache_w`, `tokens_regular`) and `cost_usd`.
+  Rows reconcile to the ledger by construction (Σ rows' token classes ==
+  own `total_tokens` + `subagent_tokens`; Σ `cost_usd` == `cost_estimated` +
+  `subagent_cost`), keep the rollups' rm-487 saturation and rm-1500
+  non-finite-cost discipline, and stay one level like the ledger itself (a
+  middle session's row on its parent carries the middle's OWN metrics,
+  never its subagent rollups). Emitted on the session JSON lane only —
+  `--sessions -f json` serializes `Session`/`Metrics` wholesale and an
+  empty breakdown is skipped so childless lanes stay byte-identical (the
+  rm-232 schema-bump-never-re-key rule). CSV/TSV stay rollup-only: the
+  breakdown is a variable-length nested array that does not fit the flat
+  per-session column budget, so the lanes stay JSON-only (decision
+  recorded in the rm-2076 roadmap row). Preserved history carries the
+  rows verbatim through the rm-787 seam (a restored `history:{id}` row
+  can never re-join the attribution index). Pinned by
+  `crates/agenttrace-core/tests/agent_breakdowns_contract.rs` (shape,
+  ledger reconciliation, discipline parity, idempotency, end-to-end
+  discovery load path) and the history travel test.
+
 - codex turn-boundary ledger + replay guardrail (rm-1949, run
   e4bff731 cycle 1): codex 0.147+ journals turn boundaries as `event_msg`
   payloads — `task_started`, `task_complete`, `user_message` (live census

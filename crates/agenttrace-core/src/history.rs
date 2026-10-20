@@ -1,4 +1,4 @@
-use crate::{project_name, Anomaly, Diagnostics, Metrics, Session};
+use crate::{project_name, AgentBreakdown, Anomaly, Diagnostics, Metrics, Session};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -37,6 +37,17 @@ struct DerivedSession {
     subagent_tokens: i64,
     #[serde(default)]
     parent_session: String,
+    /// rm-2076: per-agent-type breakdown rows the session carried
+    /// while it was live — the same travel-with-the-record discipline
+    /// as the rollups above (the restored row's synthetic
+    /// `history:{id}` path can never re-join the real-path attribution
+    /// index, so recomputing would silently empty them while
+    /// `subagent_count` stayed non-zero). `#[serde(default)]` keeps
+    /// pre-rm-2076 records loadable (disclosed empty shape); empty
+    /// row sets are skipped on write so childless records stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    agent_breakdowns: Vec<AgentBreakdown>,
 }
 
 pub fn history_path() -> PathBuf {
@@ -266,6 +277,7 @@ impl DerivedSession {
             subagent_cost: session.metrics.subagent_cost,
             subagent_tokens: session.metrics.subagent_tokens,
             parent_session: session.metrics.parent_session.clone(),
+            agent_breakdowns: session.metrics.agent_breakdowns.clone(),
         }
     }
 
@@ -296,6 +308,7 @@ impl DerivedSession {
                 subagent_cost: self.subagent_cost,
                 subagent_tokens: self.subagent_tokens,
                 parent_session: self.parent_session,
+                agent_breakdowns: self.agent_breakdowns,
                 ..Metrics::default()
             },
             anomalies: self
@@ -811,6 +824,7 @@ mod tests {
         assert_eq!(record.subagent_cost, 0.0);
         assert_eq!(record.subagent_tokens, 0);
         assert!(record.parent_session.is_empty());
+        assert!(record.agent_breakdowns.is_empty());
         let restored = record.into_session();
         assert_eq!(restored.name, "history-34235f44");
         assert_eq!(restored.path, "history:34235f44");
@@ -818,6 +832,126 @@ mod tests {
         assert_eq!(restored.metrics.subagent_cost, 0.0);
         assert_eq!(restored.metrics.subagent_tokens, 0);
         assert!(restored.metrics.parent_session.is_empty());
+        assert!(restored.metrics.agent_breakdowns.is_empty());
+    }
+
+    #[test]
+    fn agent_breakdowns_travel_with_preserved_history() {
+        // rm-2076 travel pin: the per-agent-type rows are part of the
+        // rm-787 disclosure contract — a preserved parent's breakdown
+        // is re-materialized verbatim through `--include-history`
+        // (the restored row's synthetic `history:{id}` path can never
+        // re-join the real-path attribution index, so recomputing
+        // would silently empty the rows while `subagent_count`
+        // stayed non-zero), and a childless record never writes the
+        // key at all (byte-identical to pre-rm-2076 records).
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm2076-history-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
+        std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+
+        let parent = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "proj-parent".to_string(),
+            path: "/home/u/.config/hermes/P/parent.jsonl".to_string(),
+            cwd: "/work/poc".to_string(),
+            branch: String::new(),
+            metrics: Metrics {
+                source_tool: "claude_code".to_string(),
+                session_start: "2026-10-01T10:00:00Z".to_string(),
+                session_end: "2026-10-01T10:01:00Z".to_string(),
+                duration_sec: 60.0,
+                tokens_input: 100,
+                tokens_output: 10,
+                subagent_count: 2,
+                subagent_cost: 0.75,
+                subagent_tokens: 77,
+                agent_breakdowns: vec![
+                    AgentBreakdown {
+                        agent: "main".to_string(),
+                        duration_sec: 60.0,
+                        tokens_cache_r: 7,
+                        tokens_cache_w: 5,
+                        tokens_regular: 110,
+                        cost_usd: 1.0,
+                    },
+                    AgentBreakdown {
+                        agent: "Explore".to_string(),
+                        duration_sec: 11.0,
+                        tokens_cache_r: 4,
+                        tokens_cache_w: 2,
+                        tokens_regular: 66,
+                        cost_usd: 0.75,
+                    },
+                ],
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let childless = Session {
+            name: "proj-solo".to_string(),
+            path: "/home/u/.config/hermes/P/solo.jsonl".to_string(),
+            cwd: "/work/poc".to_string(),
+            metrics: Metrics {
+                source_tool: "claude_code".to_string(),
+                session_start: "2026-10-02T10:00:00Z".to_string(),
+                session_end: "2026-10-02T10:00:30Z".to_string(),
+                duration_sec: 30.0,
+                tokens_input: 5,
+                ..Metrics::default()
+            },
+            ..parent.clone()
+        };
+        preserve_derived_history(&[parent.clone(), childless.clone()]).expect("preserve history");
+        let raw = std::fs::read_to_string(root.join("history.json")).expect("read history");
+        assert!(
+            raw.contains("agent_breakdowns"),
+            "parent record carries its rows"
+        );
+        let file: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&raw).expect("history file is a json map");
+        let solo = file
+            .get(&session_id(&childless))
+            .expect("childless record present")
+            .as_object()
+            .expect("record is an object");
+        assert!(!solo.contains_key("agent_breakdowns"));
+
+        // Transcripts gone from disk: --include-history restores the
+        // parent WITH its rows, rollups intact, verbatim.
+        let mut live: Vec<Session> = Vec::new();
+        merge_preserved_history(&mut live);
+        assert_eq!(live.len(), 2);
+        let restored_parent = live
+            .iter()
+            .find(|session| session.metrics.subagent_count == 2)
+            .expect("restored parent");
+        assert_eq!(
+            restored_parent.metrics.agent_breakdowns,
+            parent.metrics.agent_breakdowns
+        );
+        assert_eq!(restored_parent.metrics.subagent_tokens, 77);
+        let restored_solo = live
+            .iter()
+            .find(|session| session.metrics.subagent_count == 0)
+            .expect("restored childless row");
+        assert!(restored_solo.metrics.agent_breakdowns.is_empty());
+
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

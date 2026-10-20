@@ -780,6 +780,21 @@ pub struct Metrics {
     pub subagent_cost: f64,
     #[serde(skip_serializing_if = "i64_is_zero")]
     pub subagent_tokens: i64,
+    /// rm-2076 (cycle 4): per-agent-type usage rows for this
+    /// session's subagent family, built by `attribute_subagents` in
+    /// the same pass that computes the `subagent_*` rollups above —
+    /// one `"main"` row for the session's own lane (its `agent_name`
+    /// when the source carries one) plus one row per linked child,
+    /// keyed by the child's `agent_name` with the shared `"subagent"`
+    /// bucket as fallback. Token classes mirror the totals so the
+    /// rows reconcile to the ledger (`own metrics + subagent_*`) by
+    /// construction; non-finite child costs are excluded from rows
+    /// exactly as `subagent_cost` excludes them (rm-1500). Empty for
+    /// sessions without linked children — skipped in JSON so
+    /// childless lanes stay byte-identical (rm-232: schema bump,
+    /// never a re-key).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub agent_breakdowns: Vec<AgentBreakdown>,
     /// rm-545: parent transcript path when this session is itself a
     /// Claude Code subagent transcript (`<session>/subagents/agent-*`),
     /// or — rm-791 — the source parent row id for a sqlite-backed
@@ -795,6 +810,33 @@ pub struct Metrics {
     /// linkage for sqlite-backed children.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_key: String,
+}
+
+/// rm-2076 (cycle 4): one agent-type row of a session's
+/// `agent_breakdowns`. `tokens_regular` is the uncached class
+/// (input+output); the two cache classes mirror `Metrics`
+/// (`tokens_cache_r` cache reads, `tokens_cache_w` cache-creation
+/// writes) so Σ rows == the session ledger. `duration_sec` is that
+/// lane's own wall-clock span — informational only: child lanes run
+/// nested inside the parent's window, so durations do NOT sum to the
+/// family span.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentBreakdown {
+    /// Agent-type label: the lane's `agent_name` when the source
+    /// carries one, else `"main"` for the session's own row and
+    /// `"subagent"` for a linked child.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub duration_sec: f64,
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub tokens_cache_r: i64,
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub tokens_cache_w: i64,
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub tokens_regular: i64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub cost_usd: f64,
 }
 
 fn i64_is_zero(value: &i64) -> bool {
