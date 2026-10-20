@@ -79,15 +79,15 @@
       "id": "005-rm046-wb-adv",
       "class": "cache_priced_as_input",
       "fixture": "cases/rm046-wb-adv.jsonl",
-      "source": "imported verbatim from the rm-046 adversarial corpus (testdata/generated/adversarial/wb-adv.jsonl); the workbuddy cache-inclusive input basis subtracts the cache read down to a disclosed zero instead of silently pricing cache as input; cost literal refreshed at integration 2026-10-08 (conflict case 6ad4bfb5) when the landed snapshot refresh moved glm-5.2's winning rate — the fixture itself stays byte-verbatim per refresh-contract rule 3",
+      "source": "imported verbatim from the rm-046 adversarial corpus (testdata/generated/adversarial/wb-adv.jsonl); the workbuddy cache-inclusive input basis subtracts the cache read down to a disclosed zero instead of silently pricing cache as input; cost literal refreshed at integration 2026-10-08 (conflict case 6ad4bfb5) when the landed snapshot refresh moved glm-5.2's winning rate, then re-baselined to the null bounds arm at the 2026-10-17 bundle refresh when the openrouter/* retirement moved the winner again (see cost_derivation) — the fixture itself stays byte-verbatim per refresh-contract rule 3",
       "verbatim_of": "testdata/generated/adversarial/wb-adv.jsonl",
       "expect": {
         "rc": 0,
         "model": "glm-5.2",
         "source_tool": "workbuddy",
         "tokens": { "input": 0, "output": 10, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
-        "cost_estimated": 0.0001,
-        "cost_derivation": "snapshot-refreshed per docs/solutions/workflow-issues/conformance-pack-refresh-contract.md rule 1: glm-5.2 resolves to openrouter/z-ai/glm-5.2 (priority winner), whose output rate moved 3.99e-6 -> 1.2e-5 per token in the 2026-10-08 snapshot refresh (rm-588 never-drop union); round4(10 * 1.2e-5) = 0.0001 (was round4(10 * 3.99e-6) = 0.0 at the 2026-10-04 derivation snapshot)"
+        "cost_estimated": null,
+        "cost_derivation": "snapshot-refreshed per docs/solutions/workflow-issues/conformance-pack-refresh-contract.md rule 1 at the 2026-10-17 bundle refresh (rm-176 lane): the refresh retired the 459-key openrouter/* reseller family, so glm-5.2's priority winner moved openrouter/z-ai/glm-5.2 -> baseten/zai-org/GLM-5.2 (input 1.4e-6 / output 4.4e-6 / cache_read 1.4e-7 per token, no cache-write rate published); round4(10 * 4.4e-6) = 0.0 would be the literal, but rm-1508's oracle refuses absent-rate rows instead of repricing them at $0, so the numeric pin is un-derivable at this snapshot and the null bounds arm (finite, non-negative) serves — re-pin the literal when a winning row publishes cache rates again (history: 0.0 at the 2026-10-04 derivation via 3.99e-6, 0.0001 at the 2026-10-08 refresh via openrouter 1.2e-5)"
       }
     },
     {

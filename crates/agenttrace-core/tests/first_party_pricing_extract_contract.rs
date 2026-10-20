@@ -26,6 +26,13 @@
 //!    report no specific price;
 //! 5. `catalog_identity` folds the extract bytes in, so a changed
 //!    extract (new binary) reprices cached sessions.
+//!
+//! rm-176 update (2026-10-17 refresh, run ab7a73576cd1 cycle 5): the
+//! sanctioned refresh retired the 459-key `openrouter/*` family (and
+//! the `github_copilot/claude-sonnet-4` straggler), so NO bundle row
+//! ends in these ids anymore — the extract is their only pricing lane
+//! (pinned in tests/models_dev_extract_contract.rs), and the reseller
+//! pin below re-based onto the surviving `github_copilot` lane.
 
 use agenttrace_core::{
     catalog_identity, has_specific_price, lookup_price, pricing_source_for, provider_for,
@@ -115,20 +122,56 @@ fn reseller_qualified_ids_keep_their_reseller_rows() {
     // The session itself scoped these ids to a reseller lane: the
     // extract must NOT override an explicit qualification (it speaks
     // only for the bare first-party form).
-    let openrouter = lookup_price("openrouter/claude-sonnet-4-20250514");
+    //
+    // rm-176 (2026-10-17 refresh, run ab7a73576cd1 cycle 5) retired
+    // the 459-key `openrouter/*` family, so the id this pin
+    // originally rode (openrouter/claude-sonnet-4-20250514) no longer
+    // has a catalog row in any form. The positive half re-based onto
+    // a surviving reseller lane (github_copilot, still carried live
+    // 2026-10-17); the retired id becomes the negative half of the
+    // SAME contract — a qualified id whose reseller row is gone must
+    // not be resurrected by the extract or any ladder: it falls to
+    // the default with no attribution and no specific price.
+    let reseller = lookup_price("github_copilot/claude-haiku-4.5");
     assert!(
-        (openrouter.input - 3.0).abs() < 1e-9,
-        "the openrouter row forwards the same list input rate"
+        (reseller.input - 1.0).abs() < 1e-9,
+        "the github_copilot row forwards its own input rate, $1/M (got {})",
+        reseller.input
+    );
+    assert!(
+        (reseller.output - 5.0).abs() < 1e-9,
+        "the github_copilot row forwards its own output rate, $5/M (got {})",
+        reseller.output
     );
     assert_eq!(
-        provider_for("openrouter/claude-sonnet-4-20250514").as_deref(),
-        Some("openrouter"),
+        provider_for("github_copilot/claude-haiku-4.5").as_deref(),
+        Some("github_copilot"),
         "a reseller-qualified id attributes to the reseller"
     );
     assert!(
-        !pricing_source_for("openrouter/claude-sonnet-4-20250514")
-            .starts_with("models.dev snapshot"),
+        !pricing_source_for("github_copilot/claude-haiku-4.5").starts_with("models.dev snapshot"),
         "a reseller-qualified id prices through the LiteLLM catalog, disclosed as such"
+    );
+
+    // Negative half: the retired openrouter row stays retired. Nothing
+    // may re-attribute it to the reseller or re-price it at reseller-
+    // forwarded rates; whatever first-party lane the ladder's collapse
+    // then finds is acceptable — today the bedrock_converse rows
+    // (e.g. anthropic.claude-sonnet-4-20250514-v1:0, $3/$15 per M,
+    // disclosed as the bundled LiteLLM snapshot) — because those ARE
+    // the vendor list rates, identical to the extract's.
+    let retired = "openrouter/claude-sonnet-4-20250514";
+    assert_ne!(
+        provider_for(retired).as_deref(),
+        Some("openrouter"),
+        "no ladder may re-attribute a retired reseller row to its reseller"
+    );
+    let priced = lookup_price(retired);
+    assert!(
+        (priced.input - 3.0).abs() < 1e-9 && (priced.output - 15.0).abs() < 1e-9,
+        "no reseller-forwarded rate may survive the retirement: the id must \
+         still price at the first-party list rates ($3/$15 per M) through \
+         whatever first-party lane the ladder finds, got {priced:?}"
     );
 }
 

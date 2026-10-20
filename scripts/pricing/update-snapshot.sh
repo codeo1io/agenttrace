@@ -85,6 +85,97 @@ else
     echo "refresh source: $url (live fetch)"
 fi
 
+# ---- rm-1532 extract guard (rider, run ab7a7357 cycle 5, batch
+# 'pricing-truth cure v2') ------------------------------------------------
+# The embedded models.dev first-party extract is FROZEN dated state:
+# this script refreshes ONLY the LiteLLM bundle. Two loud refusals up
+# front, one after the write:
+#   (1) pricing.rs MODELS_DEV_SNAPSHOT_DATE must equal the extract's
+#       _snapshot.date (the desync analog of the PRICING_SNAPSHOT_DATE
+#       gate drift-check enforces on the bundle);
+#   (2) the pinned live catalog must price NONE of the extract's dated
+#       ids first-party — a first-party row SUPERSEDES the extract and
+#       demands a deliberate re-adjudication (rm-1532 self-retirement),
+#       never a silent shadowing;
+#   (3) the extract file must be byte-identical after the refresh (the
+#       md5 check below the writer) — a refresh path that ever
+#       regenerates or rewrites it is a defect, not a feature.
+extract="crates/agenttrace-core/src/models_dev_snapshot.json"
+extract_md5_before="$(md5sum "$extract" | awk '{print $1}')"
+python3 - "$tmp" "$extract" <<'GUARD'
+import json
+import re
+import sys
+
+live_path, extract_path = sys.argv[1], sys.argv[2]
+
+
+def costed_chat_keys(data):
+    # Same keep-filter basis drift-check.sh reports on, so the refusal
+    # fires on exactly the rows the catalog would serve.
+    keep = set()
+    for key, value in data.items():
+        if not isinstance(value, dict) or "*" in key:
+            continue
+        if value.get("mode") != "chat":
+            continue
+        try:
+            priced = (
+                float(value.get("input_cost_per_token") or 0) > 0
+                or float(value.get("output_cost_per_token") or 0) > 0
+            )
+        except (TypeError, ValueError):
+            continue
+        if priced:
+            keep.add(key)
+    return keep
+
+
+priced_live = costed_chat_keys(json.load(open(live_path)))
+extract = json.load(open(extract_path))
+extract_date = extract.get("_snapshot", {}).get("date")
+
+pricing_rs = open("crates/agenttrace-core/src/pricing.rs").read()
+match = re.search(
+    r'const MODELS_DEV_SNAPSHOT_DATE: &str = "([0-9]{4}-[0-9]{2}-[0-9]{2})"',
+    pricing_rs,
+)
+if not match:
+    sys.exit(
+        "REFUSED: MODELS_DEV_SNAPSHOT_DATE declaration not found in "
+        "crates/agenttrace-core/src/pricing.rs — the rm-1532 extract date "
+        "const moved; update this guard's regex before refreshing."
+    )
+if match.group(1) != extract_date:
+    sys.exit(
+        f"REFUSED: pricing.rs MODELS_DEV_SNAPSHOT_DATE ({match.group(1)}) and "
+        f"models_dev_snapshot.json _snapshot.date ({extract_date}) disagree — "
+        "the extract is frozen dated state (rm-1532); resync them deliberately, "
+        "then re-run the refresh."
+    )
+
+superseded = sorted(
+    qual.split("/", 1)[1]
+    for qual in extract
+    if qual != "_snapshot" and qual.split("/", 1)[1] in priced_live
+)
+if superseded:
+    sys.exit(
+        "REFUSED: live LiteLLM now prices first-party row(s) the models.dev "
+        "extract also serves: "
+        + ", ".join(superseded)
+        + " — such a row SUPERSEDES the extract (rm-1532 self-retirement); "
+        "re-adjudicate the extract (drop the row, bump its _snapshot.date + "
+        "the MODELS_DEV_SNAPSHOT_DATE const, fold the new digest through "
+        "catalog_identity) instead of letting the refresh silently shadow it."
+    )
+row_count = len([qual for qual in extract if qual != "_snapshot"])
+print(
+    f"rm-1532 extract guard: frozen extract intact ({row_count} dated rows, "
+    f"date {extract_date}, const in sync, no first-party LiteLLM rows)"
+)
+GUARD
+
 python3 - "$tmp" "$out" "$date" "$drops" <<'EOF'
 import json
 import os
@@ -349,3 +440,15 @@ print(
     "in ROADMAP.md (rm-588 clause 3)"
 )
 EOF
+
+# rm-1532 extract guard, arm (3): the refresh must leave the frozen
+# models.dev extract byte-identical (see the block above the writer).
+extract_md5_after="$(md5sum "$extract" | awk '{print $1}')"
+if [[ "$extract_md5_before" != "$extract_md5_after" ]]; then
+    echo "REFUSED: $extract changed during the refresh" >&2
+    echo "  (md5 $extract_md5_before -> $extract_md5_after). The extract is" >&2
+    echo "  frozen dated state (rm-1532): restore it from git and re-run;" >&2
+    echo "  regenerate it ONLY through a deliberate re-adjudication, never" >&2
+    echo "  as a side effect of a LiteLLM refresh." >&2
+    exit 1
+fi

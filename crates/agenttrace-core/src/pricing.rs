@@ -3791,10 +3791,16 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // rm-231's motivating case was the 1M-window default class; the
+        // 2026-10-17 rm-176 refresh carries upstream's corrected window
+        // for claude-sonnet-4-5 (1M → 200k — one of the window mutations
+        // the refresh adopted, visible in the drift digest), so this
+        // exact-value pin moved with the bundle. 336 refreshed rows
+        // still carry the 1M class, and the with_window threshold above
+        // still proves the bulk ingestion.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 

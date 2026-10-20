@@ -191,16 +191,35 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
 // placeholder. The snapshot date is a property of the bundled catalog, so
 // it is exempt from the wall-clock leak check; every other date in the card
 // (axis ticks, sparkline anchors) remains guarded.
+//
+// rm-176 cure fix-up (run ab7a73576cd1 cycle 5, implement b331cc4969): the
+// original in-place loop re-found the marker INSIDE its own replacement
+// ("snapshot <date> (" contains both "snapshot " and " ("), replaced it
+// with itself byte-for-byte, and spun forever — svg_card_contract hung on
+// the sparkline test. The rewrite consumes the input forward-only, so a
+// replacement can never be re-scanned and the function provably
+// terminates.
 fn strip_snapshot_date(svg: &str) -> String {
     const MARKER: &str = "snapshot ";
-    let mut out = svg.to_string();
-    while let Some(i) = out.find(MARKER) {
-        let rest = &out[i + MARKER.len()..];
-        match rest.find(" (") {
-            Some(j) => out.replace_range(i..i + MARKER.len() + j, "snapshot <date>"),
-            None => break,
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(i) = rest.find(MARKER) {
+        out.push_str(&rest[..i + MARKER.len()]);
+        let tail = &rest[i + MARKER.len()..];
+        match tail.find(" (") {
+            // "snapshot 2026-10-17 (bundled)" -> "snapshot <date> (bundled)"
+            Some(j) => {
+                out.push_str("<date>");
+                rest = &tail[j..]; // resume at the " (" it matched
+            }
+            None => {
+                out.push_str(tail);
+                rest = "";
+                break;
+            }
         }
     }
+    out.push_str(rest);
     out
 }
 
