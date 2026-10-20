@@ -18,7 +18,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-20";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -3990,10 +3990,23 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // The 1M-window default class (rm-231's motivating case) still
+        // exists — 331 live rows carry it (nova-2 family & kin) — but the
+        // former named exemplar's truth moved upstream: LiteLLM now
+        // publishes claude-sonnet-4-5 at a 200k window (verified in the
+        // 2026-10-20 live fetch; the anthropic/ bare row is gone and the
+        // surviving vertex_ai row says 200k), so the rm-176 refresh moved
+        // the bundle with it.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
+        );
+        assert!(
+            catalog
+                .entries
+                .values()
+                .any(|price| price.max_input_tokens == Some(1_000_000)),
+            "the 1M-window default class rm-231 motivated must survive refreshes"
         );
     }
 
