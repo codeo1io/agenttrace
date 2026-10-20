@@ -39,7 +39,7 @@
 #   ... --bundle F.json --pricing-rs F.rs          # overrides for red-arm testing
 #   ... --json                                     # emit the machine report on stdout (summary goes to stderr
 #                                                  #   then — stdout is PURE JSON; review-2 fix F2)
-#   scripts/pricing/drift-check.sh --selftest      # eight embedded offline arms, rc 0 iff all pass
+#   scripts/pricing/drift-check.sh --selftest      # nine embedded offline arms, rc 0 iff all pass
 
 set -euo pipefail
 
@@ -231,7 +231,7 @@ run_check() { # resolves inputs, fetches live if needed, dispatches analyze; ret
   return "$rc"
 }
 
-self_test() { # eight embedded offline arms; rc 0 iff all pass (fixtures never touch the repo)
+self_test() { # nine embedded offline arms; rc 0 iff all pass (fixtures never touch the repo)
   local t rc ok=0
   t="$(mktemp -d -t drift-selftest.XXXXXX)"
   trap 'rm -rf "$t"' RETURN
@@ -372,6 +372,37 @@ PY
     echo "  arm 8 rm-903 wildcard ..... PASS (glob row = parity rc 0; concrete commitment key still new-costed rc 1)"
   else echo "  arm 8 rm-903 wildcard ..... FAIL (parity sub-arm e=$e, commitment sub-arm f=$f)"; sed -n '1,8p' "$t/out8a.txt"; sed -n '1,12p' "$t/out8b.txt"; ok=1; fi
 
+  # Arm 9 — rm-1508 zero-absent equivalence (rm-176 refresh pin, 2026-10-20):
+  # LiteLLM's serialization churn swaps explicit 0.0 and absent between
+  # captures — the 2026-10-08 zero-filled bundle vs a live that omits unset
+  # cache fields showed 2,249 raw shared-key diffs of which exactly 15 were
+  # real. The rate_changed comparison normalizes `field or 0.0` on BOTH
+  # sides, so a shared row whose only difference is 0-vs-absent must judge
+  # as PARITY — while a NONZERO rate going absent is a real removal and
+  # must still flag (live shape: together_ai/together/Tev1-4B-experimental
+  # cache_read 4.2e-08 -> absent on the 2026-10-20 capture).
+  python3 - "$t" <<'PY'
+import json, sys
+t = sys.argv[1]
+base = json.load(open(f"{t}/base.json"))
+z = json.loads(json.dumps(base))
+z["model-a"]["cache_read_input_token_cost"] = 0.0
+json.dump(z, open(f"{t}/bundle-zero.json", "w"))
+nz = json.loads(json.dumps(base))
+nz["model-a"]["cache_read_input_token_cost"] = 4.2e-08
+json.dump(nz, open(f"{t}/bundle-nonzero.json", "w"))
+live = json.load(open(f"{t}/live-parity.json"))
+lz = json.loads(json.dumps(live))
+lz["model-a"]["cache_read_input_token_cost"] = 0.0
+json.dump(lz, open(f"{t}/live-zero.json", "w"))
+PY
+  rc=0; "$0" --live "$t/live-parity.json" --bundle "$t/bundle-zero.json" --pricing-rs "$t/pricing.rs" --json > "$t/out9a.txt" 2>&1 || rc=$?
+  rc2=0; "$0" --live "$t/live-zero.json" --bundle "$t/base.json" --pricing-rs "$t/pricing.rs" --json > "$t/out9b.txt" 2>&1 || rc2=$?
+  rc3=0; "$0" --live "$t/live-parity.json" --bundle "$t/bundle-nonzero.json" --pricing-rs "$t/pricing.rs" --json > "$t/out9c.txt" 2>&1 || rc3=$?
+  if [ "$rc" -eq 0 ] && [ "$rc2" -eq 0 ] && [ "$rc3" -eq 1 ] && grep -q '"rate_changed": 1' "$t/out9c.txt"; then
+    echo "  arm 9 zero-absent ....... PASS (0 == absent parity both directions; nonzero -> absent still flags)"
+  else echo "  arm 9 zero-absent ....... FAIL (a=$rc b=$rc2 c=$rc3)"; sed -n '1,10p' "$t/out9a.txt"; sed -n '1,10p' "$t/out9c.txt"; ok=1; fi
+
   # Control — the keep-filter basis itself: non-chat and uncosted rows never count either side.
   if grep -q 'costed-chat models' "$t/out1.txt"; then
     echo "  control keep-filter ...... PASS (basis line present)"
@@ -381,7 +412,7 @@ PY
 }
 
 if [ "$selftest" -eq 1 ]; then
-  echo "drift-check --selftest (eight offline arms, no network)"
+  echo "drift-check --selftest (nine offline arms, no network)"
   self_test
   rc=$?
   [ "$rc" -eq 0 ] && echo "selftest: ALL ARMS PASS" || echo "selftest: FAILURES PRESENT"

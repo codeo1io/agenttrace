@@ -2,7 +2,8 @@
   "_snapshot": {
     "source": "models.dev first-party pricing extract — the second catalog (rm-1532). Rows are the dated Anthropic model ids the LiteLLM snapshot carries NO first-party row for in any form (verified against live LiteLLM 2026-10-16, research run b1e8b617): only reseller-qualified rows (openrouter/, vercel_ai_gateway/, github_copilot/) end in these ids, so the base-model collapse attributed first-party sessions to a reseller. Rates are the vendor's list prices as published by models.dev, cross-checked against the reseller rows (identical, since resellers forward list pricing). Each row self-retires the day LiteLLM ships a first-party row: serving_catalog consults the LiteLLM ladder first and a first-party winner ends the search.",
     "date": "2026-10-16",
-    "rates_basis": "USD per million tokens (input, output, cache_read, cache_write)"
+    "rates_basis": "USD per million tokens (input, output, cache_read, cache_write)",
+    "retention": "Sole-carrier status, verified 2026-10-20 against fresh live fetches of BOTH upstreams (rm-176 refresh check, run 67fb2996): models.dev api.json (md5 8fcc6ff446af55464fa3ddcae8d39258, 232 providers / 9,080 models) no longer publishes any of these three dated ids — anthropic/claude-3-7-sonnet-20250219, anthropic/claude-sonnet-4-20250514, anthropic/claude-opus-4-1-20250805 — and LiteLLM model_prices_and_context_window.json (md5 8224bac8c7c7e4bf62c2df8d2f114f83) carries no row ending in any of them, not even reseller-qualified ones. This vendored extract is therefore the only catalog still pricing these session ids; pruning the rows would silently re-fall first-party sessions to default pricing. The rows RETAIN deliberately (the extract's own never-drop stance, mirroring rm-588 on the primary snapshot); each still self-retires the day LiteLLM ships a first-party row for its id."
   },
   "anthropic/claude-3-7-sonnet-20250219": {
     "provider": "anthropic",

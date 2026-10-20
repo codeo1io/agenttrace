@@ -296,8 +296,17 @@ if len(merged) < floor:
 
 retained = sorted(k for k in prior if k not in live and k in merged)
 adds = sorted(set(live) - set(prior))
+# rm-176 churn-normalized census (2026-10-20 refresh): LiteLLM's
+# serialization churn swaps explicit 0.0 and absent between captures —
+# the 2026-10-08 zero-filled bundle vs a live that omits unset cache
+# fields showed 2,249 raw shared-key diffs of which exactly 15 were
+# real. The same `field or 0.0` equivalence drift-check.sh judges on
+# makes this refresh census count REAL rate changes only; a nonzero
+# rate going absent still counts (together_ai/together/
+# Tev1-4B-experimental cache_read 4.2e-08 on the 2026-10-20 capture).
 rate_mutations = sorted(
-    k for k in set(live) & set(prior) if any(live[k].get(f) != prior[k].get(f) for f in RATE_FIELDS)
+    k for k in set(live) & set(prior)
+    if any(float(live[k].get(f) or 0.0) != float(prior[k].get(f) or 0.0) for f in RATE_FIELDS)
 )
 window_mutations = sorted(
     k
