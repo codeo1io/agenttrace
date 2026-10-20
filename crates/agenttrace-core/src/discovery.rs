@@ -1639,19 +1639,31 @@ pub fn is_session_file_name(name: &str) -> bool {
     if name.ends_with(".lock") {
         return false;
     }
-    // rm-992 (cycle 5, run e4209f0c assess F1 + research 30082665): codex
-    // 0.163.0 STABLE (2026-10-15) compresses rollouts to `<name>.jsonl.zst`
-    // (opt-in `LocalThreadStoreCompression` + the `migrate_rollouts` CLI;
-    // upstream `rollout/src/compression.rs` COMPRESSED_SUFFIX = ".zst"). The
-    // parser already decodes zstd frames transparently via its magic sniff
-    // (parser.rs, rm-1516, concatenated frames included) — but this NAME
-    // filter rejected the file before the sniff could run, so a migrated
-    // home silently undercounted (assess PoC: a zst-only home reported "No
-    // session files found" while identical bytes under a plain `.jsonl`
-    // name parsed fine). Admitting the name lets the existing sniff+decode
-    // path own the file end to end; anything that is NOT a valid frame still
-    // lands in skipped_files with the honest `zstd-compressed` error (see
-    // discovery_contract's raw-magic test).
+    // rm-992: codex migrates cold rollouts to `<name>.jsonl.zst` names
+    // (stable 0.162.x migration via the opt-in `LocalThreadStoreCompression`
+    // + the `migrate_rollouts` CLI, upstream `rollout/src/compression.rs`
+    // COMPRESSED_SUFFIX = ".zst"; writing compressed-by-default stays
+    // feature-flagged upstream — still off at tag rust-v0.163.0, the
+    // rm-1518 correction in CHANGELOG) — the exact sibling ccusage's
+    // codex reader admits (rust/adapters/codex/src/reader.rs
+    // `is_rollout_file`, issues #1888/#1890). The parser decodes zstd
+    // frames transparently via its magic sniff (parser.rs, rm-1516,
+    // concatenated frames included) — but this NAME filter used to
+    // reject the file before the sniff could run, so a migrated home
+    // silently undercounted (assess PoCs on both lineages: a zst-only
+    // home reported "No session files found" — 0 of 4 compressed lanes
+    // discovered — while identical bytes under a plain `.jsonl` name
+    // parsed fine, with `--doctor` disclosing nothing). The suffix is
+    // admitted at this shared gate because the walkers are
+    // lane-agnostic; the sniff stays the decider — a zstd frame is
+    // bounded-decoded, and anything that is NOT a valid frame still
+    // lands in skipped_files with the honest `zstd-compressed` error
+    // (see discovery_contract's raw-magic test). A bare `.zst` (no
+    // `.jsonl` stem) stays out. Widened in parallel by run e4209f0c
+    // cycle 5 (assess F1 + research 30082665) and run d57c2e56 cycle 1
+    // — the identical disjunction reconciled to one gate at
+    // integration (conflict case ae49eb7a), keeping both lineages'
+    // comments and pin sets.
     name.ends_with(".jsonl") || name.ends_with(".jsonl.zst") || name.ends_with(".json")
 }
 
@@ -2018,5 +2030,33 @@ fn report_load_progress(
             cache_hits,
             session: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod session_file_name_tests {
+    use super::is_session_file_name;
+
+    #[test]
+    fn zstd_named_rollout_passes_the_name_gate() {
+        // rm-992 (run d57c2e56 cycle 1): codex compresses rollouts either
+        // in place (`.jsonl` name, zstd content) or under a `.jsonl.zst`
+        // name - the same two shapes ccusage's codex reader admits
+        // (rust/adapters/codex/src/reader.rs: is_rollout_file accepts
+        // `.jsonl` and `.jsonl.zst`). A gate on `.jsonl`/`.json` alone
+        // silently dropped the compressed half of the fleet (assess PoC:
+        // 0 of 4 zstd lanes discovered, doctor disclosing nothing).
+        assert!(is_session_file_name(
+            "rollout-2026-09-26T20-29-31-7f2f4ba2.jsonl.zst"
+        ));
+    }
+
+    #[test]
+    fn the_widening_stays_narrow() {
+        // Only the `.jsonl.zst` sibling is admitted - not arbitrary zst
+        // payloads or unrelated extensions.
+        assert!(!is_session_file_name("archive.tar.zst"));
+        assert!(!is_session_file_name("rollout-2026-09-26.zst"));
+        assert!(!is_session_file_name("rollout-2026-09-26.jsonl.zst.tmp"));
     }
 }

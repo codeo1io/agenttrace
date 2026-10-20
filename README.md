@@ -405,12 +405,20 @@ files), skippable frames are skipped exactly like `zstd -d`, and an
 over-cap file names the cap and suggests decompressing manually
 (`zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe). The
 same lane covers stdin (`agenttrace --overview - < rollout.jsonl.zst`).
-Discovery scans admit `.jsonl`, `.json`, and `.jsonl.zst` file names
-alike (rm-992): a rollout renamed `.jsonl.zst` by Codex's own migration
-is picked up by default scans and decoded through the same bounded
-lane — a name whose content is not a decodable frame still lands in the
-skipped-files disclosure naming the `zstd -d` recipe above, and an
-explicit path or a pipe keeps working too.
+Default discovery scans admit the migrated name too (rm-992): the
+session-file gate accepts `.jsonl`, `.json`, and exactly the
+`.jsonl.zst` sibling — a bare `.zst` stays out — so a rollout renamed
+`.jsonl.zst` by Codex's own migration is picked up by default scans and
+decoded through the same bounded lane; a name whose content is not a
+decodable frame still lands in the skipped-files disclosure naming the
+`zstd -d` recipe above, and an explicit path or a pipe keeps working
+too. A NotFound on one name retries the compress/restore sibling,
+because Codex flips the suffix when it compresses a cold rollout and
+flips it back on demand. Every decode is disclosed: the session carries
+a `zstd_rollout_decoded` counter that `--doctor` renders, and
+`--search` decodes compressed transcripts, charges its scan budget in
+decompressed bytes, and skips an undecodable frame loudly instead of
+scanning zstd bytes behind a `scanned` verdict.
 
 ### `--demo` never silently replaces an explicit session source
 

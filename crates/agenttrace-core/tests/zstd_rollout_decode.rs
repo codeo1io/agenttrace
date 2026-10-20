@@ -1,8 +1,13 @@
 //! rm-992 — in-process bounded zstd decode for Codex rollouts.
 //!
-//! Codex ≥0.152 stores rollout transcripts as zstd frames (upstream PR
-//! #41357, merged to codex main 2026-10-13): the file keeps a `.jsonl` name
-//! but its content starts with the zstd magic `28 B5 2F FD`. These tests pin
+//! Codex stores rollout transcripts as zstd frames (reader tolerance
+//! since upstream ≥0.152, PR #41357 merged 2026-10-13): stable 0.162.x
+//! migrates cold rollouts to `.jsonl.zst` names while writing compressed
+//! rollouts by default stays feature-flagged (#53732 rode the 0.163
+//! alphas and the flag was still off at tag rust-v0.163.0 — the rm-1518
+//! correction in CHANGELOG; compressed user data on stable: ccusage
+//! #1888, fixed #1890): the file keeps a `.jsonl` name but its content
+//! starts with the zstd magic `28 B5 2F FD`. These tests pin
 //! the decode lane at `parse_session_bytes`:
 //!
 //! 1. golden parity — a compressed rollout parses to the SAME session as its
@@ -255,4 +260,109 @@ fn stdin_bytes_share_the_bounded_zstd_decode_lane() {
         via_stdin.metrics.tokens_input,
         via_file.metrics.tokens_input
     );
+}
+
+#[test]
+fn missing_jsonl_read_retries_the_zstd_sibling() {
+    // rm-992 arm b (run d57c2e56 cycle 1): codex compresses a finished
+    // rollout by RENAMING it (`.jsonl` -> `.jsonl.zst`), so a path handed
+    // to `parse_file` by an earlier discovery walk can be gone at read
+    // time. A NotFound must retry the sibling — the encoding-fallback
+    // ccusage's codex reader ships (#1888 -> #1890).
+    let dir = std::env::temp_dir().join(format!("agenttrace-rm992-sibling-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create sibling temp dir");
+    std::fs::write(
+        dir.join("rollout-2026-10-18T09-00-00-4f1c9d21.jsonl.zst"),
+        std::fs::read(fixture(&[
+            "tests",
+            "fixtures",
+            "codex-zstd",
+            "rollout.jsonl",
+        ]))
+        .expect("read golden frame"),
+    )
+    .expect("write compressed sibling");
+    let session = parse_file(&dir.join("rollout-2026-10-18T09-00-00-4f1c9d21.jsonl"))
+        .expect("a NotFound on the plain name must retry the .jsonl.zst sibling");
+    let twin = parse_file(&fixture(&[
+        "tests",
+        "fixtures",
+        "codex-custom-tools",
+        "rollout.jsonl",
+    ]))
+    .expect("plain twin parses");
+    assert_eq!(session.metrics.events_total, twin.metrics.events_total);
+    assert!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("zstd_rollout_decoded")
+            .is_some_and(|count| *count > 0),
+        "the sibling read is a decode and must disclose it: {:?}",
+        session.metrics.disclosure_counters
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn missing_jsonl_zst_read_retries_the_plain_sibling() {
+    // The flip is bidirectional: codex RESTORES the plain name on
+    // demand, so a stale `.jsonl.zst` path must retry the `.jsonl`
+    // sibling. A plain body parsed this way is NOT a decode — no
+    // `zstd_rollout_decoded` counter may appear.
+    let dir = std::env::temp_dir().join(format!(
+        "agenttrace-rm992-sibling-rev-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create sibling temp dir");
+    std::fs::write(
+        dir.join("rollout-2026-10-18T09-00-00-4f1c9d21.jsonl"),
+        std::fs::read(fixture(&[
+            "tests",
+            "fixtures",
+            "codex-custom-tools",
+            "rollout.jsonl",
+        ]))
+        .expect("read plain twin"),
+    )
+    .expect("write plain sibling");
+    let session = parse_file(&dir.join("rollout-2026-10-18T09-00-00-4f1c9d21.jsonl.zst"))
+        .expect("a NotFound on the compressed name must retry the .jsonl sibling");
+    // 39 events on the merged wall: the fixture parsed to 38 at this
+    // run's base (40425749) and the wall's rm-1949 turn-boundary rescue
+    // (run e4bff731 cycle 1, landed between the base and this
+    // integration) rescues one more turn-boundary event from the same
+    // bytes — re-derived at integration (conflict case ae49eb7a). The
+    // count only proves the plain twin's real content fed the parser;
+    // the assertion that matters is the decode disclosure below.
+    assert_eq!(session.metrics.events_total, 39);
+    assert!(
+        !session
+            .metrics
+            .disclosure_counters
+            .contains_key("zstd_rollout_decoded"),
+        "a plain sibling read is not a decode: {:?}",
+        session.metrics.disclosure_counters
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn missing_file_without_a_sibling_still_names_the_requested_path() {
+    // A NotFound with no sibling pair stays a NotFound FOR THE
+    // REQUESTED PATH: the error names the path the caller asked for,
+    // never a sibling that was only probed.
+    let dir = std::env::temp_dir().join(format!("agenttrace-rm992-nosib-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create nosib temp dir");
+    let missing = dir.join("never-existed.jsonl");
+    let error = parse_file(&missing).expect_err("no sibling exists");
+    let chain = format!("{error:#}");
+    assert!(
+        chain.contains("never-existed.jsonl"),
+        "the error must name the requested path, got: {chain}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -189,3 +189,170 @@ fn blank_queries_still_match_nothing_in_the_detailed_lane() {
     }
     assert_eq!(search_sessions(&[session], "   ", 20).len(), 0);
 }
+
+// ============================================================
+// rm-992 / rm-1872: zstd-compressed Codex rollouts
+// Codex compresses rollout files either in place (the `.jsonl` name
+// is kept, content starts with the zstd magic) or under a
+// `.jsonl.zst` name (ccusage's codex reader admits both names and
+// retries the sibling on ENOENT, because codex flips the suffix when
+// it compresses cold rollouts and back when it restores them).
+// ============================================================
+
+fn codex_compressed_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-zstd/rollout.jsonl")
+}
+
+#[test]
+fn compressed_transcript_is_decoded_and_matchable() {
+    // Golden-parity twin of fixtures/codex-custom-tools/rollout.jsonl:
+    // 2,833 zstd bytes on disk, 22,652 bytes decompressed, and the
+    // needle `turn_context` appears exactly once in the decompressed
+    // body. A raw-byte scan over the compressed file finds nothing
+    // while charging the compressed size to the scan budget - that
+    // silent miss is the falsified claim this test pins away.
+    let session = parse_file(&codex_compressed_fixture())
+        .expect("the decode lane already parses this fixture");
+    let report = search_sessions_detailed(
+        &[session],
+        "turn_context",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        1 << 20,
+    );
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|r| r.transcript_scan == "scanned (22652 bytes)"
+                && r.matches.iter().any(|m| m.contains("turn_context"))),
+        "scan must decode the zstd frame, charge decompressed bytes, and match: {:?}",
+        report.results
+    );
+}
+
+#[test]
+fn refused_zstd_content_is_skipped_loudly() {
+    // Content that claims the zstd magic but is not a decodable frame
+    // must be skipped with an explicit disclosure - never scanned as
+    // raw bytes with a `scanned:` verdict that hides the refusal.
+    let garbage = b"\x28\xb5\x2f\xfd\x00\x00\x00not-a-zstd-frame";
+    // pid-unique home: sibling delegate sessions share a TMPDIR
+    // (workflow-issues/sibling-delegate-sessions-share-tmpdir.md),
+    // and this test writes a fixed-content file under a fixed name.
+    let dir = std::env::temp_dir().join(format!("agenttrace-zst-refused-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let garbage_path = dir.join("rollout-2026-09-26T20-29-31-00000000.jsonl");
+    std::fs::write(&garbage_path, garbage).unwrap();
+    let mut session = parse_file(&fixture("body-only.jsonl")).unwrap();
+    session.path = garbage_path.to_string_lossy().to_string();
+    // The query matches the session NAME so the row survives into
+    // results - a vacuously-true `all()` over zero rows would pin
+    // nothing about the refusal.
+    session.name = "innocuous-session".to_string();
+    let report = search_sessions_detailed(
+        &[session],
+        "innocuous",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        1 << 20,
+    );
+    assert_eq!(report.results.len(), 1, "the name match must keep the row");
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|r| r.transcript_scan.starts_with("skipped: zstd")),
+        "a refused frame must disclose the refusal, got {:?}",
+        report
+            .results
+            .iter()
+            .map(|r| r.transcript_scan.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        report.scan.skipped_zstd, 1,
+        "the refusal must be counted in the summary, not just per row"
+    );
+    let text = agenttrace_core::report_search_text_detailed(&report, "innocuous");
+    assert!(
+        text.contains("zstd decode refused"),
+        "the text summary must name the refusal: {text}"
+    );
+    let full_json = agenttrace_core::report_search_json_detailed(&report);
+    assert!(
+        full_json.contains("\"skipped_zstd\": 1"),
+        "the json summary must carry the refusal: {full_json}"
+    );
+}
+
+#[test]
+fn scan_charge_saturates_when_a_file_reads_past_its_stat_length() {
+    // rm-1872 seam (rm-1993 cession): the budget pre-check runs on the
+    // stat length; the charge uses the ACTUAL read. /proc/self/status is
+    // the deterministic shape of a growth race - stat length 0, read
+    // returns ~1.3 KB. With a zero total budget the charge must
+    // SATURATE at zero (never wrap the budget backward to ~u64::MAX),
+    // so the next file is disclosed as budget-skipped instead of being
+    // scanned for free on a wrapped budget.
+    let proc = std::path::Path::new("/proc/self/status");
+    let stat_len = std::fs::metadata(proc).map(|m| m.len()).unwrap_or(u64::MAX);
+    let read_len = std::fs::read(proc).map(|b| b.len() as u64).unwrap_or(0);
+    if stat_len != 0 || read_len == 0 {
+        // Environment without procfs zero-length semantics: the seam pin
+        // would prove nothing here.
+        eprintln!("skipping: /proc/self/status stat={stat_len} read={read_len}");
+        return;
+    }
+    let mut proc_session = parse_file(&fixture("body-only.jsonl")).unwrap();
+    proc_session.name = "a-proc-shaped-file".to_string();
+    proc_session.path = "/proc/self/status".to_string();
+    let mut real_session = parse_file(&fixture("body-only.jsonl")).unwrap();
+    real_session.name = "b-real-file".to_string();
+    // canonical_sessions orders same-instant parses by name, so the
+    // stat-0 proc file is scanned FIRST and the real file second.
+    let report = search_sessions_detailed(
+        &[proc_session, real_session],
+        "zygobabbington-nonmatching-needle",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        0,
+    );
+    assert!(report.results.is_empty(), "the query matches nothing");
+    assert_eq!(report.scan.files_considered, 2);
+    assert_eq!(
+        report.scan.scanned_files, 1,
+        "the stat-0 proc file passes the length pre-checks and is read"
+    );
+    assert!(
+        report.scan.scanned_bytes > 0,
+        "the ACTUAL read length is charged, not the stat length"
+    );
+    assert_eq!(
+        report.scan.skipped_budget, 1,
+        "the real file must be budget-skipped: a wrapped budget would have scanned it instead (scanned_files would be 2)"
+    );
+}
+
+#[test]
+fn decompressed_budget_charge_saturates() {
+    // Decompressed bodies are larger than their stat size: 2,833
+    // compressed bytes admit through the stat guard, 22,652
+    // decompressed bytes must exhaust a 5,000-byte total budget. The
+    // charge has to saturate and disclose the skip - never wrap the
+    // budget backward and never scan the frame anyway.
+    let session = parse_file(&codex_compressed_fixture()).unwrap();
+    let report = search_sessions_detailed(
+        &[session],
+        "turn_context",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        5_000,
+    );
+    let text = agenttrace_core::report_search_text_detailed(&report, "turn_context");
+    assert!(
+        text.contains("1 skipped"),
+        "budget exhaustion must be disclosed, got: {}",
+        text
+    );
+}

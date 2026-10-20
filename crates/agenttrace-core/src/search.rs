@@ -32,6 +32,9 @@ pub struct TranscriptScanSummary {
     pub skipped_oversized: usize,
     pub skipped_non_file: usize,
     pub skipped_budget: usize,
+    pub skipped_zstd: usize,
+    pub zstd_decoded_files: usize,
+    pub zstd_decoded_bytes: u64,
     pub file_byte_cap: u64,
     pub total_byte_budget: u64,
 }
@@ -47,6 +50,9 @@ impl TranscriptScanSummary {
             skipped_oversized: 0,
             skipped_non_file: 0,
             skipped_budget: 0,
+            skipped_zstd: 0,
+            zstd_decoded_files: 0,
+            zstd_decoded_bytes: 0,
             file_byte_cap,
             total_byte_budget,
         }
@@ -68,10 +74,17 @@ impl TranscriptScanSummary {
             ("over byte cap", self.skipped_oversized),
             ("non-file", self.skipped_non_file),
             ("read budget exhausted", self.skipped_budget),
+            ("zstd decode refused", self.skipped_zstd),
         ] {
             if count > 0 {
                 parts.push(format!("{count} skipped: {label}"));
             }
+        }
+        if self.zstd_decoded_files > 0 {
+            parts.push(format!(
+                "{} zstd-decoded ({} decompressed bytes)",
+                self.zstd_decoded_files, self.zstd_decoded_bytes
+            ));
         }
         Some(format!(
             "Transcript scan: {}; caps: {} bytes/file, {} bytes total.",
@@ -350,6 +363,11 @@ fn write_transcript_summary_json(out: &mut String, scan: &TranscriptScanSummary)
         ("skipped_oversized", scan.skipped_oversized.to_string()),
         ("skipped_non_file", scan.skipped_non_file.to_string()),
         ("skipped_budget", scan.skipped_budget.to_string()),
+        // rm-1872: the compressed-corpus truth — zstd refusals and decodes
+        // are first-class summary facts, not text-only footnotes.
+        ("skipped_zstd", scan.skipped_zstd.to_string()),
+        ("zstd_decoded_files", scan.zstd_decoded_files.to_string()),
+        ("zstd_decoded_bytes", scan.zstd_decoded_bytes.to_string()),
         ("file_byte_cap", scan.file_byte_cap.to_string()),
         ("total_byte_budget", scan.total_byte_budget.to_string()),
     ];
@@ -554,12 +572,59 @@ fn transcript_evidence(
         return (Vec::new(), "skipped: unreadable".to_string());
     }
     let read = bytes.len() as u64;
-    *budget_left -= read;
-    scan.scanned_files += 1;
-    scan.scanned_bytes += read;
+    // rm-1872 (run d57c2e56 cycle 1): a rollout on disk may be a zstd
+    // frame (magic 28 B5 2F FD) under either a `.jsonl` or a `.jsonl.zst`
+    // name. Decode before matching and charge the budget in DEcompressed
+    // bytes - the compressed stat size would silently buy a much larger
+    // body. Refused frames are skipped loudly, never scanned as raw
+    // bytes behind a false `scanned` verdict.
+    let content: std::borrow::Cow<'_, str>;
+    // The bytes actually charged to the scan budget — decompressed size
+    // for a decoded frame, the raw read otherwise. The per-row verdict
+    // string discloses THIS number, never the on-disk size a compressed
+    // frame hides behind (rm-1872).
+    let charged: u64;
+    if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        match crate::parser::decode_zstd_rollout_bounded(bytes, path) {
+            Ok(decoded) => {
+                let decoded_len = decoded.len() as u64;
+                if decoded_len > *budget_left {
+                    scan.skipped_budget += 1;
+                    return (
+                        Vec::new(),
+                        "skipped: read budget exhausted (decompressed body over remaining budget)"
+                            .to_string(),
+                    );
+                }
+                scan.zstd_decoded_files += 1;
+                scan.zstd_decoded_bytes += decoded_len;
+                *budget_left -= decoded_len;
+                charged = decoded_len;
+                scan.scanned_files += 1;
+                scan.scanned_bytes += decoded_len;
+                // Lossy decode: a torn multibyte tail must not abort the scan.
+                content = std::borrow::Cow::Owned(String::from_utf8_lossy(&decoded).into_owned());
+            }
+            Err(reason) => {
+                scan.skipped_zstd += 1;
+                return (
+                    Vec::new(),
+                    format!("skipped: zstd decode refused ({reason})"),
+                );
+            }
+        }
+    } else {
+        // growth race: the file may have grown past the stat length the
+        // budget was pre-checked against, so the charge saturates and
+        // never wraps the remaining budget backward.
+        *budget_left = budget_left.saturating_sub(read);
+        charged = read;
+        scan.scanned_files += 1;
+        scan.scanned_bytes += read;
 
-    // Lossy decode: a torn multibyte tail must not abort the scan.
-    let content = String::from_utf8_lossy(&bytes);
+        // Lossy decode: a torn multibyte tail must not abort the scan.
+        content = String::from_utf8_lossy(&bytes);
+    }
     let mut out = Vec::new();
     for line in content.lines() {
         if out.len() >= TRANSCRIPT_MATCHES_PER_SESSION {
@@ -569,7 +634,7 @@ fn transcript_evidence(
             out.push(format!("transcript: {snippet}"));
         }
     }
-    (out, format!("scanned ({read} bytes)"))
+    (out, format!("scanned ({charged} bytes)"))
 }
 
 /// A `…window…` snippet centered on the first case-insensitive hit of

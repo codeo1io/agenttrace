@@ -1013,6 +1013,31 @@
 
 ### Fixed
 
+- Codex compressed rollouts are admitted by name, survive the compress/restore flip, and disclose their decode (rm-992, run d57c2e56 cycle 1, batch "Codex compressed-rollout truth: admit, decode, search, disclose"): stable Codex 0.162.x migrates cold rollouts under `~/.codex/sessions`/`~/.codex/archived_sessions` to `.jsonl.zst` names while writing compressed rollouts by default stays feature-flagged upstream (reader tolerance since ≥0.152 via #41357, merged 2026-10-13; #53732 rode the 0.163 alphas and the flag was still off at tag rust-v0.163.0, per this tree's own rm-1518 correction) — so compressed history is already on real users' disks, the wall ccusage hit same-class (#1888, fixed #1890) — but the session-file NAME gate kept `.jsonl`/`.json` only, so the migrated cold history was invisible BEFORE any content sniff: the assess PoC planted 4 compressed lanes and discovered 0, with `--doctor` disclosing nothing. `is_session_file_name` (discovery.rs) now admits exactly the `.jsonl.zst` sibling (bare `.zst` still excluded; the walkers are lane-agnostic so the suffix lands at the shared gate while the parser's magic probe stays the decider), and `parse_file` retries the compress/restore sibling on a NotFound — codex compresses by RENAMING (`x.jsonl` → `x.jsonl.zst`) and restores on demand, so a path handed over by an earlier walk can be gone at read time; with no pair the error still names the REQUESTED path (the encoding-fallback ccusage's codex reader ships). Every decode discloses: the parse carries a `zstd_rollout_decoded` counter on the session, flowing through the doctor's generic disclosure fold into the `--doctor` map and both renders. New fixture `rollout.jsonl.zst` (a byte-identical copy of the golden frame under the migrated name) separates admission-by-name from decode-by-content, and the parser/README comments keep the reconciled threshold truth (migration on stable 0.162.x; write flag off at 0.163.0 stable; main-head #54930 spreads zstd to app-server WebSockets). Pinned red-first in `discovery_contract.rs` (one-pass admit+decode: 1 of 1 file discovered, `codex_cli`, non-zero tokens, disclosed), `zstd_rollout_decode.rs` (sibling fallback in both directions; no-pair error names the requested path; a plain-sibling read is NOT a decode — no counter), and `doctor_honesty_contract.rs` (report map + json render carry the disclosure).
+
+  Integration seam (2026-10-20, conflict case ae49eb7a, landing onto a
+  wall that had since integrated run e4209f0c's own rm-992 name-gate arm
+  and the c0a02f64 salvage's rm-451 bounded named-file read): the wall
+  had ALREADY widened `is_session_file_name` to `.jsonl.zst` (the
+  identical disjunction from its cycle-5 assess F1 + research 30082665),
+  so this landing keeps ONE gate carrying both comment lineages, with
+  both pin sets composing side by side — the wall's
+  `codex_compressed_rollout_is_admitted_by_name_and_decoded`
+  (discovery_contract) beside this run's
+  `codex_zst_named_rollout_is_admitted_and_decoded_in_one_pass` and the
+  new `session_file_name_tests` module. The sibling retry itself was
+  reimplemented over the wall's bounded reader: `parse_file` now
+  detects NotFound through `read_session_file_bounded`'s context chain
+  and retries the sibling THROUGH the same rm-451 cap — an over-cap
+  sibling refuses loudly with the marker error naming the sibling,
+  never an unbounded read — while a missing pair still reports the
+  requested path and every other error propagates untouched. The
+  rm-1872 search lane below composed unchanged: its hunks sit in
+  `transcript_evidence` and the scan summary, disjoint from the wall's
+  rm-1515 limit rewrite in `search_sessions_detailed`.
+
+- `--search` decodes compressed transcripts, charges the budget in decompressed bytes, and discloses the compression instead of scanning zstd bytes behind a `scanned` verdict (rm-1872, same batch): the transcript scan read raw bytes with no decode arm — a needle inside a `.jsonl.zst` lane returned `count:0` while its 2795 COMPRESSED bytes were charged against the scan budget as if read, and a frame that merely claimed the magic was reported `scanned` with its on-disk size. The scan now probes the zstd magic: a decodable frame is decoded through the existing 64 MiB bounded decoder, matched on its DECOMPRESSED content, charged in decompressed bytes, and the per-row verdict reads `scanned (22652 bytes)` for a 2833-byte file; an undecodable frame is skipped loudly (`skipped: zstd decode refused...` + a `skipped_zstd` summary counter) before any budget accounting; a decompressed body that overruns the remaining budget skips with an explicit decompressed-bytes message instead of being silently undercharged. The budget charge saturates across the stat-length-precheck vs actual-read seam — the growth-race shape, pinned deterministically via `/proc/self/status` (stat 0, read ~1.3 KB, next file disclosed budget-skipped instead of scanned on a wrapped budget). The summary carries the compressed-corpus truth in every format: `skipped_zstd`, `zstd_decoded_files`, and `zstd_decoded_bytes` join the JSON alongside the text summary's refusal/decode lines. Pinned red-first in `search_transcript_contract.rs` (decode-and-match with the decompressed-byte verdict; loud refusal with summary/JSON counters and the row kept alive by a name match; decompressed budget-exhaustion skip; the stat-vs-read saturation seam).
+
 - Statusline journal writers no longer hang forever behind a wedged journal
   lock (rm-686 production lock-wait arm, run c0a02f64 cycle 1):
   `open_locked_journal` called `File::lock` with no deadline — the retry
