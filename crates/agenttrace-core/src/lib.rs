@@ -1202,7 +1202,12 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
             continue;
         }
         let Some(mut value) = parser::parse_jsonl_value_lenient(line) else {
-            count_skip("unparseable_line", &mut line_skips);
+            // rm-1958: a magnitude-overflow number (serde_json "number
+            // out of range", the 1e400 usage-line class) is a distinct
+            // loss class from a torn tail — classify the reason so the
+            // dropped line is attributable in line_skips and the session
+            // report instead of reading as zero usage.
+            count_skip(parser::unparseable_line_reason(line), &mut line_skips);
             // rm-616: a rejected line that itself carries model identity
             // or a usage block is not just a lost message — it is lost
             // ACCOUNTING. Count it separately so the drop is disclosed,
@@ -3086,6 +3091,13 @@ struct QuotaWindow {
     end: DateTime<Utc>,
     spend_usd: f64,
     sessions_contributing: usize,
+    // rm-1957: true when the rolling start had to saturate at
+    // DateTime::MIN instead of underflowing. Unreachable while the
+    // parse_ts_form year gate holds (cutoffs are year 0..=9999, spans
+    // are hours); disclosed as `window_start_clamped` if a future arm
+    // ever re-admits an extreme stamp, so the defense can never be
+    // silent.
+    start_clamped: bool,
 }
 
 /// The corpus cutoff: the newest instant any loaded session can place
@@ -3188,7 +3200,17 @@ fn quota_window(
     cutoff: DateTime<Utc>,
     span: chrono::Duration,
 ) -> QuotaWindow {
-    let start = cutoff - span;
+    // rm-1957: clamp-with-disclosure under the parse_ts_form year gate.
+    // A cutoff near DateTime::MIN (a journal stamping
+    // "-262143-01-01T00:00:00", pre-gate) made `cutoff - span` panic at
+    // this exact line (run 82f099da assess PoC c11-minext: rc101 on both
+    // --quota and --overview -f svg, cold parse only — warm cache reruns
+    // masked it). Saturate instead; the clamp flags itself through
+    // `window_start_clamped` in the JSON schema.
+    let (start, start_clamped) = match cutoff.checked_sub_signed(span) {
+        Some(start) => (start, false),
+        None => (DateTime::<Utc>::MIN, true),
+    };
     let mut spend_usd = 0.0;
     let mut sessions_contributing = 0;
     for session in sessions {
@@ -3208,6 +3230,7 @@ fn quota_window(
         end: cutoff,
         spend_usd: round4(spend_usd),
         sessions_contributing,
+        start_clamped,
     }
 }
 
@@ -3238,15 +3261,28 @@ fn quota_ts(ts: &DateTime<Utc>) -> String {
 }
 
 fn quota_window_json(window: &QuotaWindow, span: chrono::Duration) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "window_start_utc": quota_ts(&window.start),
         "window_end_utc": quota_ts(&window.end),
         "spend_usd": window.spend_usd,
         "sessions_contributing": window.sessions_contributing,
         // Rolling analog of a plan reset: the instant after which every
         // event currently counted has aged out of the trailing window.
-        "resets_at_utc": quota_ts(&(window.end + span)),
-    })
+        // rm-1957: saturating on the defensive path, symmetric with the
+        // clamped window start.
+        "resets_at_utc": quota_ts(
+            &(window
+                .end
+                .checked_add_signed(span)
+                .unwrap_or(DateTime::<Utc>::MAX)),
+        ),
+    });
+    if window.start_clamped {
+        // rm-1957: present only when it fired — the schema stays
+        // byte-stable for every corpus the year gate admits.
+        value["window_start_clamped"] = serde_json::json!(true);
+    }
+    value
 }
 
 /// rm-201 (run 12a73275 cycle 4): the `--quota` report value —
@@ -3600,12 +3636,32 @@ fn parse_ts_form(value: &str) -> Option<(DateTime<Utc>, TimestampForm)> {
     }
     let normalized = value.replace('Z', "+00:00");
     if let Ok(ts) = DateTime::parse_from_rfc3339(&normalized) {
-        return Some((ts.with_timezone(&Utc), TimestampForm::Rfc3339));
+        // rm-1957: chrono's RFC-3339 reader admits expanded years
+        // ±262142, and the naive arm below admits NaiveDateTime::MIN —
+        // a journal stamping "-262143-01-01T00:00:00" reached
+        // quota_window and the reports day arithmetic as DateTime::MIN,
+        // where any subtraction underflowed and panicked (rc101 on
+        // --quota and --overview -f svg; run 82f099da assess PoC
+        // c11-minext, cold parse only — warm reruns masked it). Stamps
+        // outside 0000..=9999 are not renderable as RFC-3339 four-digit
+        // years anyway; rejecting them flows to the existing disclosure
+        // counters (quota attribution census `unplaced`) instead of
+        // panicking.
+        let form = TimestampForm::Rfc3339;
+        return match (0..=9999).contains(&ts.year()) {
+            true => Some((ts.with_timezone(&Utc), form)),
+            false => None,
+        };
     }
-    NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f")
-        .or_else(|_| NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S"))
-        .ok()
-        .map(|ts| (ts.and_utc(), TimestampForm::NaiveUtc))
+    let naive = NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S"))?;
+    // Same gate on the naive arm: NaiveDateTime::MIN parses cleanly and
+    // poisoned every downstream window/trend computation.
+    let form = TimestampForm::NaiveUtc;
+    match (0..=9999).contains(&naive.year()) {
+        true => Some((naive.and_utc(), form)),
+        false => None,
+    }
 }
 
 pub(crate) fn percentile(sorted: &[f64], p: f64) -> f64 {

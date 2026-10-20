@@ -167,6 +167,25 @@ pub fn report_json_with_language(session: &Session, language: ReportLanguage) ->
         json_string(&metrics.model_used)
     ));
     out.push_str("  },\n");
+    if !metrics.line_skips.is_empty() {
+        // rm-1958 (run 82f099da cycle 1): a session whose lines were
+        // dropped must never read as a clean zero. The loss channel is
+        // disclosed in-band — counts by reason, magnitude class included
+        // (`number_out_of_range_line`, the 1e400 usage-line class that
+        // silently zeroed a whole session's cost/turns pre-fix).
+        out.push_str("  \"data_health\": {\n");
+        out.push_str("    \"dropped_lines\": {\n");
+        let entries: Vec<String> = metrics
+            .line_skips
+            .iter()
+            .map(|(reason, count)| {
+                format!("      {}: {}", json_string(reason), count)
+            })
+            .collect();
+        out.push_str(&entries.join(",\n"));
+        out.push_str("\n    }\n");
+        out.push_str("  },\n");
+    }
     out.push_str(&format!("  \"health_score\": {},\n", session.health));
     out.push_str("  \"latency\": {\n");
     out.push_str(&format!("    \"avg\": {},\n", json_float(latency_avg)));
@@ -465,6 +484,27 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         out.push_str(language.t("  (no thinking blocks)\n", "  （无推理块）\n"));
     }
     out.push('\n');
+
+    if !metrics.line_skips.is_empty() {
+        // rm-1958 (run 82f099da cycle 1): dropped lines are disclosed in
+        // the human lane too — counts by reason, magnitude class
+        // included (`number_out_of_range_line`, the 1e400 usage line
+        // that silently zeroed a session's cost/turns pre-fix). A
+        // zero-usage report with no dropped lines stays clean; one with
+        // drops never reads as clean again.
+        out.push_str(language.t("🩺 DATA HEALTH\n", "🩺 数据健康\n"));
+        out.push_str(&sub);
+        out.push('\n');
+        for (reason, count) in &metrics.line_skips {
+            out.push_str(&format!(
+                "  {}: {} {}\n",
+                language.t("Dropped", "丢弃"),
+                count,
+                reason
+            ));
+        }
+        out.push('\n');
+    }
 
     out.push_str(language.t("🚨 ANOMALIES\n", "🚨 异常\n"));
     out.push_str(&sub);
@@ -999,7 +1039,18 @@ fn card_daily_series(sessions: &[Session], days: usize) -> Vec<(chrono::NaiveDat
     match latest {
         Some(anchor) => {
             for offset in (0..days).rev() {
-                let day = anchor - chrono::Duration::days(offset as i64);
+                // rm-1957: clamp-with-disclosure under the parse_ts_form
+                // year gate. An anchor at NaiveDate::MIN (pre-gate, a
+                // "-262143-01-01" session_end) made this subtraction
+                // underflow and panic (rc101 on --overview -f svg; run
+                // 82f099da assess PoC c11-minext). Clamped buckets
+                // collapse onto the calendar floor and the card's first
+                // date label renders the clamped day, so the defense is
+                // visible, never silent. Unreachable while the gate
+                // holds (anchors are year 0..=9999).
+                let day = anchor
+                    .checked_sub_days(chrono::Days::new(offset as u32))
+                    .unwrap_or(chrono::NaiveDate::MIN);
                 series.push((day, buckets.get(&day).copied().unwrap_or(0.0)));
             }
         }

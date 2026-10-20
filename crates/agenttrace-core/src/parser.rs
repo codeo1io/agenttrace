@@ -1471,12 +1471,20 @@ struct AntigravityModelId {
 
 /// rm-1864: numeric model ids observed in the wild and their proven
 /// model names. 1417 → gemini-4-argon is ccusage v20.0.34's first-party
-/// mapping (PR #1894, 2026-10-15); further ids arrive weekly (ccusage
-/// #1897 reports 1277/1050 unmapped). The map fixes IDENTITY only —
-/// pricing still rides the catalog's normal lookup, so a mapped id whose
-/// model is absent from the catalog degrades through the disclosed
-/// unknown-model path rather than this table inventing a price.
-const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[(1417, "gemini-4-argon")];
+/// mapping (PR #1894, 2026-10-15); ccusage v20.0.36 proved
+/// 1050 → gemini-3.1-flash-lite (#1902, alongside 1418/1419 →
+/// gemini-4-argon #1905), so 1050 joins the map here (rm-1533 1050-arm,
+/// run 82f099da cycle 1) — and unlike argon it is priced in the bundled
+/// snapshot, making the arm refresh-independent. 1277 stays unmapped
+/// (#1897 reports it in the wild; no proven name yet — disclosed and
+/// attributed raw). The map fixes IDENTITY only — pricing still rides
+/// the catalog's normal lookup, so a mapped id whose model is absent
+/// from the catalog degrades through the disclosed unknown-model path
+/// rather than this table inventing a price.
+const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
+    (1050, "gemini-3.1-flash-lite"),
+    (1417, "gemini-4-argon"),
+];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
 /// number, but the float spelling stringifies as `"1417.0"` — the
@@ -8873,7 +8881,7 @@ fn jsonl_objects_counted(raw: &str) -> (Vec<Map<String, Value>>, BTreeMap<String
         match parse_jsonl_value_lenient(line) {
             Some(Value::Object(obj)) => objs.push(obj),
             Some(_) => *skips.entry("non_object_line".to_string()).or_insert(0) += 1,
-            None => *skips.entry("unparseable_line".to_string()).or_insert(0) += 1,
+            None => *skips.entry(unparseable_line_reason(line).to_string()).or_insert(0) += 1,
         }
     }
     (objs, skips)
@@ -8887,6 +8895,22 @@ pub(crate) fn parse_jsonl_value_lenient(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(line)
         .ok()
         .or_else(|| repair_lone_surrogates(line).and_then(|line| serde_json::from_str(&line).ok()))
+}
+
+/// rm-1958 (run 82f099da cycle 1): WHY a line failed strict+lenient
+/// parsing. A number beyond f64's range — serde_json's "number out of
+/// range", the `1e400` usage-line class — is a distinct loss class from
+/// a torn tail: it names a journal the reader can never accept (a
+/// magnitude the format cannot carry), not a truncated write. The
+/// class rides `line_skips` as `number_out_of_range_line` so the drop
+/// is attributable per session instead of reading as zero usage.
+pub(crate) fn unparseable_line_reason(line: &str) -> &'static str {
+    match serde_json::from_str::<Value>(line) {
+        Err(error) if error.to_string().contains("number out of range") => {
+            "number_out_of_range_line"
+        }
+        _ => "unparseable_line",
+    }
 }
 
 /// Parses the four bytes of a `\uXXXX` escape. Reading hex from **bytes**

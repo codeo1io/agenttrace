@@ -40,6 +40,23 @@ impl ExplorerLayout {
     }
 }
 
+/// rm-1960 (run 82f099da cycle 1): the explorer's descending sorts
+/// must be a TOTAL order even on poisoned floats.
+/// `partial_cmp().unwrap_or(Ordering::Equal)` made NaN rank "equal"
+/// to every key — an inconsistent comparator that can scramble the
+/// whole list — while ±Inf outranked every real session. Non-finite
+/// utilization/cost is rm-1500's poison marker, not a ranking signal:
+/// finite sessions always sort first, non-finite always sink, and
+/// ties stay stable (sort_by is stable, so NaN/Inf keep source order).
+fn finite_desc(a: f64, b: f64) -> Ordering {
+    match (a.is_finite(), b.is_finite()) {
+        (true, true) => b.partial_cmp(&a).unwrap_or(Ordering::Equal),
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => Ordering::Equal,
+    }
+}
+
 impl App {
     pub(super) fn expire_notice(&mut self) -> bool {
         if self
@@ -613,26 +630,29 @@ impl App {
             }
 
             ExplorerView::Context => indices.sort_by(|a, b| {
-                self.sessions[*b]
-                    .diagnostics
-                    .context_utilization
-                    .utilization_pct
-                    .partial_cmp(
-                        &self.sessions[*a]
-                            .diagnostics
-                            .context_utilization
-                            .utilization_pct,
-                    )
-                    .unwrap_or(Ordering::Equal)
+                // rm-1960: poisoned (non-finite) utilization sinks below
+                // every finite session instead of corrupting the order.
+                finite_desc(
+                    self.sessions[*a]
+                        .diagnostics
+                        .context_utilization
+                        .utilization_pct,
+                    self.sessions[*b]
+                        .diagnostics
+                        .context_utilization
+                        .utilization_pct,
+                )
             }),
             ExplorerView::Storage => indices
                 .sort_by_key(|index| std::cmp::Reverse(session_file_size(&self.sessions[*index]))),
             ExplorerView::Cost => indices.sort_by(|a, b| {
-                self.sessions[*b]
-                    .metrics
-                    .cost_estimated
-                    .partial_cmp(&self.sessions[*a].metrics.cost_estimated)
-                    .unwrap_or(Ordering::Equal)
+                // rm-1960: same guard on the cost ladder — a NaN/Inf cost
+                // estimate is a disclosed poison marker (rm-1500), never
+                // the "most expensive session".
+                finite_desc(
+                    self.sessions[*a].metrics.cost_estimated,
+                    self.sessions[*b].metrics.cost_estimated,
+                )
             }),
             ExplorerView::Tools => indices.sort_by_key(|index| {
                 std::cmp::Reverse(self.sessions[*index].metrics.tool_calls_fail)
@@ -2854,6 +2874,45 @@ fn left_rule() -> Block<'static> {
     Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(Color::DarkGray))
+}
+
+#[cfg(test)]
+mod sort_poison_tests {
+    use super::*;
+
+    // rm-1960 (run 82f099da cycle 1): coverage pin for the explorer
+    // sorts' total order. Red-first pre-fix: `partial_cmp().unwrap_or(
+    // Ordering::Equal)` returned Equal for NaN against EVERY key — the
+    // inconsistent-comparator hazard — and ±Inf won both ladders.
+    #[test]
+    fn finite_desc_orders_finite_values_descending() {
+        assert_eq!(finite_desc(1.0, 2.0), Ordering::Less);
+        assert_eq!(finite_desc(2.0, 1.0), Ordering::Greater);
+        assert_eq!(finite_desc(1.5, 1.5), Ordering::Equal);
+    }
+
+    #[test]
+    fn finite_desc_sinks_every_non_finite_below_every_finite() {
+        // NaN and ±Inf are poison markers (rm-1500), not rankings.
+        assert_eq!(finite_desc(1.0, f64::NAN), Ordering::Less);
+        assert_eq!(finite_desc(f64::NAN, 1.0), Ordering::Greater);
+        assert_eq!(finite_desc(f64::INFINITY, 1.0), Ordering::Greater);
+        assert_eq!(finite_desc(f64::NEG_INFINITY, 1.0), Ordering::Greater);
+        assert_eq!(finite_desc(0.0, f64::INFINITY), Ordering::Less);
+        // Poison vs poison never decides — sort_by is stable, so source
+        // order survives and the comparator contract stays consistent.
+        assert_eq!(finite_desc(f64::NAN, f64::INFINITY), Ordering::Equal);
+        assert_eq!(finite_desc(f64::NAN, f64::NAN), Ordering::Equal);
+    }
+
+    #[test]
+    fn finite_desc_sort_pins_the_poisoned_list_tail() {
+        let mut values = vec![2.0, f64::NAN, 1.0, f64::INFINITY, 3.0];
+        values.sort_by(|a, b| finite_desc(*a, *b));
+        // Finite ladder descending, poison tail in stable source order
+        // (NaN appeared before Inf in the source vector).
+        assert_eq!(values, vec![3.0, 2.0, 1.0, f64::NAN, f64::INFINITY]);
+    }
 }
 
 #[cfg(test)]
