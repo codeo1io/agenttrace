@@ -653,12 +653,30 @@
   path — with a loud `codex_replay_scan_refused_oversized` disclosure on
   the session and a `scans_refused_oversized` stats count; stat-size is
   the advisory fast refusal, the `take(cap + 1)` read is the
-  authoritative one). Pinned end-to-end by
+  authoritative one). The admission arm is LANE-GLOBAL, not codex-root
+  scoped: `is_session_file_name` is the one shared walk gate for every
+  lane root (codex, claude, opencode), and by design it stays that way —
+  zstd bytes under a `.jsonl` name already decoded in any lane, so
+  scoping only the name gate would make admission lane-dependent while
+  decode stays content-driven; pinned on a non-codex (claude projects)
+  root (review fix 2176720f, finding F3). Pinned end-to-end by
   `tests/codex_zstd_admission.rs` (name-gate admission + bare-`.zst`
-  exclusion, parse-identical to the plain twin, doctor compressed-share,
-  search decode-share, replay over-cap refusal with no fabricated
-  family) over the new golden fixture `rollout-migrated.jsonl.zst` — the
-  `rollout.jsonl` frame under the migration name, README-documented.
+  exclusion, lane-global admission on a non-codex root, parse-identical
+  to the plain twin, doctor compressed-share, search decode-share,
+  replay over-cap refusal with no fabricated family) over the new
+  golden fixture `rollout-migrated.jsonl.zst` — the `rollout.jsonl`
+  frame under the migration name, README-documented. KNOWN RESIDUAL
+  disclosed at independent review (80dcb0be, finding F1; review fix
+  2176720f): a home holding BOTH `<stem>.jsonl` and
+  `<stem>.jsonl.zst` (cold-migration residue) still double-reports —
+  identical twins surface a phantom zero-cost second session (the
+  replay fold suppresses the duplicated cost in JSON disclosure only;
+  text views show a `COST 0.0000` row), divergent twins double-count
+  dollars; the cure (deterministic stem-twin precedence + doctor
+  disclosure + golden twin fixture) is next-cycle work, fleet-ledgered
+  under the `zst twin double-count` title on the sibling
+  df7c2590-lineage wall (rm-2074 @cd847d84) — reconcile by title
+  (rm-708) at integration.
 
 - `-o` onto a directory refuses with the truthful cause instead of a
   mislabeled EISDIR (rm-534, run 7e61b07e cycle 3, same batch): the

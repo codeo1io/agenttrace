@@ -158,9 +158,82 @@ fn with_hermetic_home<F: FnOnce(&Path)>(f: F) {
     }
 }
 
+/// Independent-review fix F3 (review 80dcb0be, run 7e61b07e cycle 3): the
+/// `.jsonl.zst` name-gate arm is LANE-GLOBAL — `is_session_file_name`
+/// (discovery.rs) is the shared mechanism for every walk root (codex,
+/// claude, opencode), so a compressed journal under a NON-codex lane
+/// root is admitted too. Decision of record: kept lane-global rather
+/// than codex-root-scoped, because the CONTENT lane was already
+/// lane-global before this batch (zstd bytes under a `.jsonl` name
+/// decode in any lane via the magic sniff + bounded decode); scoping
+/// only the name gate would make admission lane-dependent while
+/// decoding stays content-driven. This pin holds the decision on the
+/// claude lane root. Fixture bytes reuse the codex-zstd pair — the gate
+/// under test is name-based, and parse parity needs a plain twin.
+#[test]
+fn name_gate_is_lane_global_claude_root_admits_jsonl_zst() {
+    let dir = std::env::temp_dir().join(format!(
+        "agenttrace-rm992-lane-global-{}-{}",
+        std::process::id(),
+        thread_name_or_id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    // A claude lane root shape: `.claude/projects/<project>/` holding a
+    // plain journal plus its compressed migration twin.
+    let claude = dir.join(".claude/projects/demo");
+    std::fs::create_dir_all(&claude).unwrap();
+    for (src, dst) in [
+        (
+            fixture(&["tests", "fixtures", "codex-custom-tools", "rollout.jsonl"]),
+            "session-plain.jsonl",
+        ),
+        (
+            fixture(&[
+                "tests",
+                "fixtures",
+                "codex-zstd",
+                "rollout-migrated.jsonl.zst",
+            ]),
+            "session-migrated.jsonl.zst",
+        ),
+    ] {
+        std::fs::copy(&src, claude.join(dst)).unwrap();
+    }
+
+    let found = find_session_files(Some(&claude));
+    let names: Vec<String> = found
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "session-migrated.jsonl.zst"),
+        "the .jsonl.zst name gate must admit under a non-codex lane root \
+         (the mechanism is lane-global, discovery.rs is_session_file_name): {names:?}"
+    );
+
+    // Decode-by-content is lane-global as well: the compressed twin
+    // parses identical to its plain sibling regardless of the root.
+    let plain = parse_file(&claude.join("session-plain.jsonl")).unwrap();
+    let migrated = parse_file(&claude.join("session-migrated.jsonl.zst")).unwrap();
+    assert_eq!(migrated.name, plain.name);
+    assert_eq!(
+        migrated.metrics.tokens_input, plain.metrics.tokens_input,
+        "decode parity must not depend on the lane root"
+    );
+    assert_eq!(migrated.metrics.tokens_output, plain.metrics.tokens_output);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn thread_name_or_id() -> String {
+    format!("{:?}", std::thread::current().id())
+}
+
 #[test]
 fn name_gate_admits_migration_shape_and_excludes_bare_zst() {
-    with_hermetic_home(|home| {
+    // `find_session_files(None)` resolves the hermetic HOME itself; the
+    // closure parameter is intentionally unused here (underscore).
+    with_hermetic_home(|_home| {
         let found = find_session_files(None);
         let names: Vec<String> = found
             .iter()

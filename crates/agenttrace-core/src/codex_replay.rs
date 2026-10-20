@@ -161,22 +161,6 @@ struct RolloutScan {
     response_items: usize,
 }
 
-/// Stream a rollout file once: hash the opening `response_item` payloads,
-/// remember the last `token_count` cumulative snapshot, the first line
-/// timestamp and the total item count. Cheap and strictly read-only;
-/// malformed lines are ignored exactly like the parser ignores them, so
-/// fingerprint and parse see the same file.
-///
-/// zstd rollouts (Codex ≥ 0.152 writes the `.jsonl` file as a zstd frame,
-/// landed rm-992 after this run's base): the raw read is bounded
-/// (rm-451 below), and a zstd-magic file goes through the SAME bounded
-/// decoder `parse_session_bytes` uses, so a session the parser accepted as first-class can never be
-/// invisible to family detection — the acceptance (replay counted once,
-/// attributed to the parent, disclosed) holds on the wire format Codex
-/// actually writes. A decode failure here yields no evidence, not an error:
-/// the parser has already failed loudly for that file at parse time, and
-/// reconciliation must never turn one parse-level refusal into a second one.
-
 /// rm-451 raw-read admission bound for this lane: the SAME numeral the
 /// decode lane caps decompressed output at
 /// ([`crate::parser::ZSTD_ROLLOUT_DECODE_MAX_BYTES`]) — one cap per lane,
@@ -216,6 +200,23 @@ fn read_rollout_bounded(path: &Path) -> std::io::Result<RolloutRead> {
     Ok(RolloutRead::Ok(bytes))
 }
 
+/// Stream a rollout file once: hash the opening `response_item` payloads,
+/// remember the last `token_count` cumulative snapshot, the first line
+/// timestamp and the total item count. Cheap and strictly read-only;
+/// malformed lines are ignored exactly like the parser ignores them, so
+/// fingerprint and parse see the same file.
+///
+/// zstd rollouts (Codex ≥ 0.152 writes the `.jsonl` file as a zstd frame,
+/// landed rm-992 after this run's base): the raw read is bounded
+/// (`read_rollout_bounded`, the rm-451 residual arm), and a zstd-magic
+/// file goes through the SAME bounded decoder `parse_session_bytes`
+/// uses, so a session the parser accepted as first-class can never be
+/// invisible to family detection — the acceptance (replay counted once,
+/// attributed to the parent, disclosed) holds on the wire format Codex
+/// actually writes. A decode failure here yields no evidence, not an
+/// error: the parser has already failed loudly for that file at parse
+/// time, and reconciliation must never turn one parse-level refusal into
+/// a second one.
 fn scan_rollout(path: &Path) -> RolloutScan {
     let mut scan = RolloutScan {
         fingerprint: None,
@@ -236,7 +237,7 @@ fn scan_rollout(path: &Path) -> RolloutScan {
     };
     // The zstd magic `28 B5 2F FD` — same probe as `parse_session_bytes`
     // (rm-992). Plain rollouts take the direct path byte-for-byte.
-    if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+    if raw.starts_with(&crate::parser::ZSTD_FRAME_MAGIC) {
         let label = path.display().to_string();
         match crate::parser::decode_zstd_rollout_bounded(raw, &label) {
             Ok(decoded) => raw = decoded,

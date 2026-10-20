@@ -4420,7 +4420,17 @@ mod tests {
         // on B8, one byte into the 3-byte char.
         let contents = format!("{head}\u{4E2D}{tail}");
         let total = head_len + 3 + tail_len;
-        let journal = std::env::temp_dir().join("agenttrace-test-statusline-torn-utf8.jsonl");
+        // Unique per process+thread: delegate sessions on this host share
+        // TMPDIR, and sibling runs of this same test would otherwise delete
+        // each other's fixture between the write above and the read below
+        // (observed 2026-10-19: capped_away_bytes 0 with the fixture gone —
+        // the sibling's trailing remove_file). The pid/thread suffix is the
+        // repo's dominant fixture convention (250 sites).
+        let journal = std::env::temp_dir().join(format!(
+            "agenttrace-test-statusline-torn-utf8-{}-{:?}.jsonl",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::write(&journal, contents.as_bytes()).unwrap();
         let stats = statusline_journal_stats(&journal);
         // The walk advances B8 -> AD and stops at the '\n' (an ASCII start):

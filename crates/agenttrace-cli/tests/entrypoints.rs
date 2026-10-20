@@ -38,16 +38,17 @@ fn output_to_a_directory_refuses_with_the_truthful_cause() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        // Flags BEFORE the positional path (go_flag_compatible_args drops
+        // flags after positionals loudly — the rm-247 shim) so the run
+        // actually reaches the write guard.
         .args([
             "--sessions",
-            "--limit",
-            "1",
-            generated_fixture("detailed-tool-steps.jsonl")
-                .to_str()
-                .expect("fixture path is valid UTF-8"),
             "-o",
             dir.to_str().expect("temp dir path is valid UTF-8"),
+            "--limit",
+            "1",
         ])
+        .arg(generated_fixture("detailed-tool-steps.jsonl"))
         .output()
         .expect("run agenttrace CLI");
 
@@ -2430,16 +2431,37 @@ fn error_stderr_carries_the_anyhow_cause_chain() {
 
     let enospc_err = String::from_utf8_lossy(&enospc.stderr);
     let eisdir_err = String::from_utf8_lossy(&eisdir.stderr);
-    for (label, code, stderr) in [
-        ("enospc", enospc.status.code(), &enospc_err),
-        ("eisdir", eisdir.status.code(), &eisdir_err),
-    ] {
-        assert_eq!(code, Some(1), "{label}: exit code unchanged: {stderr}");
-        assert!(
-            stderr.contains("Error: writing report output file"),
-            "{label}: context site still leads the chain: {stderr}"
-        );
-    }
+    // rm-610 (enospc arm): the handler must surface the full cause chain
+    // through the "writing report output file" context site; exit code 1.
+    assert_eq!(
+        enospc.status.code(),
+        Some(1),
+        "enospc: exit code unchanged: {enospc_err}"
+    );
+    assert!(
+        enospc_err.contains("Error: writing report output file"),
+        "enospc: context site still leads the chain: {enospc_err}"
+    );
+    // rm-534 (run 7e61b07e cycle 3) superseded the eisdir arm of this pin:
+    // `-o <directory>` is now refused by the PRE-WRITE guard (same family
+    // as the fifo/socket/block-device refusal) with the truthful cause and
+    // advice, instead of reaching the atomic writer and surfacing the raw
+    // io error through the write context — so the truthful-cause contract
+    // moved from "kind visible through the context site" to "refusing to
+    // write … it is a directory", and exit code stays 1.
+    assert_eq!(
+        eisdir.status.code(),
+        Some(1),
+        "eisdir: exit code unchanged: {eisdir_err}"
+    );
+    assert!(
+        eisdir_err.contains("refusing to write"),
+        "eisdir: the refusal must name itself: {eisdir_err}"
+    );
+    assert!(
+        eisdir_err.contains("it is a directory"),
+        "eisdir: the truthful cause must lead: {eisdir_err}"
+    );
     assert!(
         enospc_err.contains("No space left on device")
             || enospc_err.contains("Permission denied")
@@ -2447,10 +2469,6 @@ fn error_stderr_carries_the_anyhow_cause_chain() {
         "the underlying write cause must surface through the context site \
          (on hosts where the atomic writer's temp sibling cannot be created \
          next to /dev/full, the honest cause is EACCES): {enospc_err}"
-    );
-    assert!(
-        eisdir_err.contains("Is a directory"),
-        "EISDIR cause must be visible through the context site: {eisdir_err}"
     );
     assert_ne!(
         enospc_err, eisdir_err,

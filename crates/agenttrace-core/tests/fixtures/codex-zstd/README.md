@@ -11,7 +11,7 @@ rollouts by default is still feature-flagged upstream).
   `../codex-custom-tools/rollout.jsonl`. Pins decode parity: the
   compressed parse must equal the twin's parse.
 - `rollout-migrated.jsonl.zst` (rm-992) — the SAME zstd frame as
-  `rollout.jsonl` (byte-identical, md5 d41f59b81ae46c07ec4b8de57a2e351f)
+  `rollout.jsonl` (byte-identical, md5 81ee93192ff7e423d72c1c5aa318b300)
   under the migration NAME stable Codex writes when it compresses cold
   rollouts (`rollout-*.jsonl.zst`). Before rm-992 the name gate admitted
   only `.jsonl`, so the migrated twin was invisible to discovery while
@@ -37,6 +37,8 @@ Regenerate (zstd CLI ≥1.5; parity oracle included):
 ```sh
 FIX=crates/agenttrace-core/tests/fixtures
 TWIN=$FIX/codex-custom-tools/rollout.jsonl
+cp "$FIX/codex-zstd/rollout.jsonl" "$FIX/codex-zstd/rollout-migrated.jsonl.zst"
+# (the migration twin is a byte-copy of rollout.jsonl — same frame, new name)
 head -n 25 "$TWIN" > half-a.jsonl
 tail -n 26 "$TWIN" > half-b.jsonl
 zstd -f -q -19 half-a.jsonl half-b.jsonl
