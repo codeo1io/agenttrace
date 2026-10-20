@@ -1092,10 +1092,13 @@ fn walk_session_files_cached(
         // listing, so the gate cannot re-run here (re-reading the
         // directory would defeat the walk the listing exists to
         // skip). The stored per-directory count keeps the
-        // loader/doctor disclosure cache-invariant; the
-        // SESSION_CACHE_SCHEMA_VERSION rung regenerates listings
-        // written before the field existed rather than serving their
-        // silent zero.
+        // loader/doctor disclosure cache-invariant; listings
+        // written before the field existed are retired by the
+        // DIR_LISTING_WALK_VERSION 6 -> 7 rung, not the session
+        // schema rung (a schema bump alone keeps lane-current
+        // listings — the walk lane owns listing retirement), so the
+        // next scan re-walks and counts live instead of serving
+        // their silent zero.
         *cline_rejected += listing.cline_rejected;
         for child in listing.dirs {
             if visited.admit(&child) {

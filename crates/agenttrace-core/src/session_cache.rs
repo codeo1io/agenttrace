@@ -1219,7 +1219,7 @@ const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 /// manifest and `hooks.jsonl` siblings no longer are. A listing stored
 /// by a pre-rm-1881 walk of that root replays the old admission set,
 /// so the lane bumps once to retire every stored listing.
-const DIR_LISTING_WALK_VERSION: i64 = 6;
+const DIR_LISTING_WALK_VERSION: i64 = 7;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")

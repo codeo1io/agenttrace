@@ -19,6 +19,22 @@ Extract as much as the source format safely provides:
 
 Partial extraction is fine. Incorrect extraction is worse than missing data.
 
+## Model Precedence
+
+When a format carries model evidence at more than one layer, the most
+explicit source wins and weaker evidence only fills a gap. The Cline
+lanes are the reference (`parser.rs` `parse_cline_value` / `cline_envelope_model`):
+the CLI envelope's per-message `modelInfo.id` — the envelope lane's only
+model evidence, last-wins across turns — is harvested for `ModelUsed`,
+but the harvest only UPGRADES a missing or `"unknown"` model: a model
+explicitly threaded by the task-dir lane (`cline_model` from task
+metadata or `apiConfiguration`) stays authoritative, and an envelope
+with no `modelInfo` keeps the disclosed `"unknown"` instead of
+inventing a model. Pinned at the parser by
+`cline_task_metadata_model_wins_over_message_modelinfo`,
+`cline_envelope_modelinfo_feeds_the_model_thread`, and
+`cline_envelope_without_modelinfo_stays_unknown`.
+
 ## Add Format Detection
 
 Start in `crates/agenttrace-core/src/parser.rs`:

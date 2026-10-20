@@ -23,7 +23,7 @@ Implemented this cycle — **4 of the 6 band mints**, all arms landed red-first 
 - **rm-1993** governance non-finite cost-audit fold guard (governance.rs :744-749 `saturating`-class guard; `cost_non_finite_contract.rs` pins)
 - **rm-1994** cline envelope `modelInfo.id` feeds the model thread (parser.rs:843 reads modelInfo.id instead of hardcoded `"unknown"`; envelope-with-modelInfo fixture prices non-fallback; unknown stays disclosed)
 - **rm-1995** cline admission-loss disclosure (discovery.rs bare `continue`s → typed counters; LoadReport/DoctorDirReport wiring; insights surface; `discovery_contract` admission-rejection pins; svg fixture pair)
-- **rm-1996** CHANGELOG duplicate-block heal + gate extension (the :471-494 == :545-568 block removed −23; `check-changelog-structure.sh` Pass 4 = awk 6-content-line-window hash, blank-insensitive, section-scoped, never crossing `##` headers; 4 adversarial fixture trees in the 2de78e04 envelope)
+- **rm-1996** CHANGELOG duplicate-block heal + gate extension (the :471-494 == :545-568 duplicate block removed — 0 insertions/−103 deletions in the salvage numstat, 64 non-trivial lines each present ≥2× pre-heal and exactly 1× after; the “−23” this row originally carried was the tranche-2 whole-tree deletion figure transplanted onto the tranche-1 heal — corrected at review fix, independent review d4ea20a6 F3; `check-changelog-structure.sh` Pass 4 = awk 6-content-line-window hash, blank-insensitive, section-scoped, never crossing `##` headers; 4 adversarial fixture trees in the 2de78e04 envelope)
 
 Not flipped (candidates standing for next cycle): **rm-1997** secrets scrub mode (P44), **rm-1998** subscription value report (P40).
 

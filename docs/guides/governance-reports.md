@@ -498,10 +498,13 @@ listings (`DirCacheEntry::cline_rejected`, rm-1995 review fix, run
 754e0809 cycle 1): only admitted files persist in a stored listing,
 so a warm walk saw nothing to count and every run after the first
 silently reported 0 rejections while the first reported the truth
-(live-proven: cold doctor 1, warm doctor absent) — minted 71 → 72 at
-base f50c3f14 and re-based at integration onto the advanced fleet
-ceiling per the landed-rung convention, one invalidation either way;
-the SQLite snapshot stays 13)
+(live-proven: cold doctor 1, warm doctor absent) — the schema rung
+minted 71 → 72 at base f50c3f14 and re-bases at integration onto
+the advanced fleet ceiling per the landed-rung convention, one
+invalidation either way, regenerating the cached session entries;
+the listing retirement itself rides DIR_LISTING_WALK_VERSION 6 → 7
+(a schema rung alone keeps listings whose walk lane is current —
+independent review d4ea20a6); the SQLite snapshot stays 13)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
