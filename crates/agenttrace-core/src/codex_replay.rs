@@ -59,6 +59,48 @@
 //! double-counted) usage and carries a loud
 //! `codex_multiagent_reconcile_skipped_unreadable` disclosure instead.
 //!
+//! rm-2019: identical twins. Two byte-identical rollouts are ONE
+//! session recorded twice (copy / duplicate / backup), never a
+//! parent-then-child replay pair — a real child continues past the
+//! shared opening, and identical bytes continue past nothing. The
+//! pass used to sort the copies into arbitrary parent/child roles and
+//! rebase the "child" onto the parent's final snapshot: identical
+//! totals saturate to zero on every field, so the corpus reported one
+//! full row beside an all-zero $0.00 twin wearing replay disclosures
+//! (assess PoC, run d0c2a3dc cycle 2) — a whole session's usage
+//! silently destroyed. The refusal: a child whose full decoded
+//! content hashes equal to the family parent's keeps its entire usage
+//! (the corpus over-bills the duplicate rather than erasing it) and
+//! carries a named `codex_multiagent_identical_twin_refused`
+//! disclosure. The digest is taken over the rollout's DECODED text —
+//! the same post-decode content the fingerprint hashes — so the
+//! refusal holds across the format split (an uncompressed copy of a
+//! rollout ties with its zstd sibling exactly like another
+//! uncompressed copy would). The refusal is per-child, never a
+//! family-wide opt-out: a genuine replay child in the same family
+//! still rebases, so the double-count this pass exists to close stays
+//! closed.
+//!
+//! rm-2020: the reconcile's own re-read honors the named-file read cap
+//! (`AGENTTRACE_FILE_CAP_BYTES`, default 256 MiB — the parse lane's
+//! rm-451 admission bound). The scan used to be a bare unbounded
+//! `std::fs::read`, so a corpus whose sessions survived through the
+//! session cache — the warm shape, where the parse lane that would
+//! have refused an oversized file never ran — reconciled families off
+//! files the cap had refused at admission (assess PoC, run d0c2a3dc
+//! cycle 2: `AGENTTRACE_FILE_CAP_BYTES=512`, warm cache, both
+//! multi-KB rollouts still scanned whole and rebased). The scan now
+//! takes the same bounded path the parse lane and the discovery
+//! content-signature use (`parser::read_session_file_bounded`:
+//! metadata fast path, then `take(cap + 1)` so a file that grew
+//! between stat and read still cannot allocate past one byte over the
+//! cap). An over-cap rollout is a TYPED refusal, distinct from the
+//! rm-1542 unreadable arm: the session keeps its full
+//! (cache-provided, possibly double-counted) usage and carries a
+//! named `codex_multiagent_reconcile_skipped_cap_exceeded`
+//! disclosure. Under the default cap no real rollout is refused and
+//! genuine families reconcile byte-identically before/after.
+//!
 //! Guarantees:
 //! * A corpus with no family (e.g. any single-file codex corpus) is
 //!   untouched — byte-identical output before/after.
@@ -107,6 +149,18 @@ pub struct CodexReplayAdjustment {
     /// Each also carries a per-session
     /// `codex_multiagent_reconcile_skipped_unreadable` disclosure.
     pub rollouts_unreadable: usize,
+    /// rm-2020: codex rollouts refused at scan time by the named-file
+    /// read cap (`AGENTTRACE_FILE_CAP_BYTES` — the parse lane's
+    /// admission bound, honored by this pass's own re-read). Each
+    /// keeps its full usage (conservative) and carries a per-session
+    /// `codex_multiagent_reconcile_skipped_cap_exceeded` disclosure.
+    pub rollouts_cap_refused: usize,
+    /// rm-2019: family children refused rebase because their full
+    /// decoded content is byte-identical to the family parent — one
+    /// session recorded twice. Each keeps its entire usage
+    /// (over-billed, never erased) and carries a per-session
+    /// `codex_multiagent_identical_twin_refused` disclosure.
+    pub identical_twins_refused: usize,
     /// Replayed tokens removed from children, per class.
     pub tokens_input_dropped: i64,
     pub tokens_cache_read_dropped: i64,
@@ -184,6 +238,20 @@ struct RolloutScan {
     /// Total `response_item` lines (not just fingerprinted ones) — a
     /// replay child by definition continues past the shared opening.
     response_items: usize,
+    /// rm-2019: digest of the rollout's full DECODED text — the twin
+    /// signal. Two members whose digests tie are one rollout recorded
+    /// twice (copy / duplicate / backup), never a parent-then-child
+    /// replay pair. Taken over the post-decode text (the same content
+    /// the fingerprint hashes), so the tie holds across the format
+    /// split: an uncompressed copy of a rollout ties with its zstd
+    /// sibling exactly like another uncompressed copy would.
+    content_digest: u64,
+    /// rm-2020: the file was refused by the named-file read cap
+    /// (`AGENTTRACE_FILE_CAP_BYTES`) at scan time — a typed arm,
+    /// distinct from `unreadable`: the cap is an operator knob, not a
+    /// verification gap. The session keeps its full usage and carries
+    /// a `codex_multiagent_reconcile_skipped_cap_exceeded` disclosure.
+    cap_refused: bool,
 }
 
 /// Stream a rollout file once: hash the opening `response_item` payloads,
@@ -193,7 +261,8 @@ struct RolloutScan {
 /// fingerprint and parse see the same file.
 ///
 /// zstd rollouts (Codex ≥ 0.152 writes the `.jsonl` file as a zstd frame,
-/// landed rm-992 after this run's base): the file is read whole, and a
+/// landed rm-992 after this run's base): the file is read whole
+/// (bounded by the named-file read cap — rm-2020), and a
 /// zstd-magic file goes through the SAME bounded decoder `parse_session_bytes`
 /// uses, so a session the parser accepted as first-class can never be
 /// invisible to family detection — the acceptance (replay counted once,
@@ -210,14 +279,39 @@ fn scan_rollout(path: &Path) -> RolloutScan {
         total: TotalSnapshot::default(),
         first_timestamp: None,
         response_items: 0,
+        content_digest: 0,
+        cap_refused: false,
     };
-    let Ok(mut raw) = std::fs::read(path) else {
-        // rm-1542: unreadable at reconcile time (missing / chmod-000) —
-        // report the gap so the caller can disclose it; a session that
-        // only survives via the cache must not silently opt out of the
-        // family (the warm/cold totals flip).
-        scan.unreadable = true;
-        return scan;
+    // rm-2020: the reconcile's own re-read honors the SAME named-file
+    // read cap the parse lane enforces (`parser::read_session_file_bounded`
+    // — metadata fast path, then `take(cap + 1)` so a file that grew
+    // between stat and read still cannot allocate past one byte over
+    // the cap). A bare unbounded `std::fs::read` here silently
+    // bypassed `AGENTTRACE_FILE_CAP_BYTES` exactly when the session
+    // cache disarmed the parse lane that would have refused the file.
+    // The refusal is typed: an over-cap rollout is NOT unreadable
+    // (rm-1542 arm) and discloses its own knob-shaped skip.
+    let mut raw = match crate::parser::read_session_file_bounded(
+        path,
+        crate::parser::file_read_cap_bytes(),
+    ) {
+        Ok(raw) => raw,
+        Err(err)
+            if err
+                .downcast_ref::<crate::parser::ReadCapRefused>()
+                .is_some() =>
+        {
+            scan.cap_refused = true;
+            return scan;
+        }
+        Err(_) => {
+            // rm-1542: unreadable at reconcile time (missing / chmod-000) —
+            // report the gap so the caller can disclose it; a session that
+            // only survives via the cache must not silently opt out of the
+            // family (the warm/cold totals flip).
+            scan.unreadable = true;
+            return scan;
+        }
     };
     // The zstd magic `28 B5 2F FD` — same probe as `parse_session_bytes`
     // (rm-992). Plain rollouts take the direct path byte-for-byte.
@@ -239,6 +333,15 @@ fn scan_rollout(path: &Path) -> RolloutScan {
         scan.unreadable = true;
         return scan;
     };
+    // rm-2019: the twin signal — one digest over the full DECODED text.
+    // Byte-identical decoded content ties regardless of the container
+    // format (a plain copy of a rollout ties with its zstd sibling),
+    // and distinct rollouts live a 64-bit space apart — a collision
+    // would only ever refuse a rebase, the conservative direction,
+    // and would be disclosed by name.
+    let mut content_hasher = DefaultHasher::new();
+    text.hash(&mut content_hasher);
+    scan.content_digest = content_hasher.finish();
     let mut hasher = DefaultHasher::new();
     let mut items = 0usize;
     let mut bytes = 0usize;
@@ -369,6 +472,19 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
             .or_insert(1);
     }
 
+    // rm-2020: the loud arm for a rollout the read cap refused — the
+    // same keep-whole contract as the unreadable arm, under its own
+    // label so a cap refusal (operator knob) is never mistaken for a
+    // verification gap (file gone / unreadable).
+    fn note_reconcile_cap_skip(session: &mut Session) {
+        session
+            .metrics
+            .disclosure_counters
+            .entry("codex_multiagent_reconcile_skipped_cap_exceeded".to_string())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
     // Pass 1: scan codex sessions for family evidence.
     struct Evidence {
         session_idx: usize,
@@ -377,6 +493,9 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
         total: TotalSnapshot,
         fingerprint_items: usize,
         response_items: usize,
+        /// rm-2019: the full-decoded-content digest the twin refusal
+        /// keys on (see [`RolloutScan::content_digest`]).
+        content_digest: u64,
     }
     // rm-1541: the family key is the opening fingerprint PLUS the
     // corroborating cwd — identical openings in different projects are
@@ -397,6 +516,15 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
             continue;
         };
         let scan = scan_rollout(&path);
+        // rm-2020: over the read cap — a typed skip, not a gap. The
+        // operator lowered the knob (or the corpus holds a monster);
+        // the session keeps its full usage and the corpus learns the
+        // reconciliation was refused for it BY the cap.
+        if scan.cap_refused {
+            note_reconcile_cap_skip(session);
+            stats.rollouts_cap_refused += 1;
+            continue;
+        }
         if scan.unreadable {
             note_reconcile_skip(session);
             stats.rollouts_unreadable += 1;
@@ -430,6 +558,7 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
                 total: scan.total,
                 fingerprint_items: fingerprint.items,
                 response_items: scan.response_items,
+                content_digest: scan.content_digest,
             });
     }
 
@@ -448,6 +577,7 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
                 .then_with(|| a.path.cmp(&b.path))
         });
         let parent_total = members[0].total;
+        let parent_digest = members[0].content_digest;
         for child in &members[1..] {
             let session = &mut sessions[child.session_idx];
             if session.metrics.upstream_cost_usd > 0.0 {
@@ -458,6 +588,30 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
                 stats.children_skipped_upstream += 1;
+                continue;
+            }
+            // rm-2019: identical twin — the child's full decoded content
+            // is byte-identical to the family parent's (the content
+            // digests tie). Two identical rollouts are one session
+            // recorded twice, never a parent-then-child replay pair: a
+            // real child continues past the shared opening, identical
+            // bytes continue past nothing. Rebasing the twin saturated
+            // every field to zero and destroyed a whole session's
+            // usage under a replayed-tokens disclosure (assess PoC,
+            // run d0c2a3dc cycle 2: an all-zero $0.00 row beside its
+            // full twin). Refuse: keep the twin's entire usage — the
+            // corpus over-bills the duplicate rather than erasing it —
+            // and disclose the refusal by name. Per-child, never a
+            // family-wide opt-out: a genuine child in the same family
+            // still rebases below.
+            if child.content_digest == parent_digest {
+                session
+                    .metrics
+                    .disclosure_counters
+                    .entry("codex_multiagent_identical_twin_refused".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                stats.identical_twins_refused += 1;
                 continue;
             }
             // Review af521003 F4 (second discriminator): a session whose

@@ -851,6 +851,61 @@
 
 ### Fixed
 
+- Content-dedup survivor is canonical, not first-seen (rm-2024 fix,
+  run d0c2a3dc cycle 3 full-suite regression): the rm-1886 admission
+  dedup picked its survivor by first-seen order on the assumption the
+  discovery walk yields a stable order — but the walk is parallel, so
+  which byte-identical copy survived (and which path fed parsing)
+  flipped run-to-run; the `count_honesty_disclosures_in_cli_lanes`
+  entrypoints test failed ~40% of runs on a clean tree (bisected:
+  stash-the-band still flaked 2/5). The survivor is now the
+  lexicographically smallest path, always, and the reported
+  duplicate pair names `(survivor, suppressed)` deterministically;
+  `deduped` membership ordering is unaffected (the list is sorted by
+  `sort_paths_by_cache` before return).
+- Codex replay reconcile refuses byte-identical twins instead of zeroing
+  them (rm-2019, run d0c2a3dc cycle 3, batch "replay reconcile truth"):
+  two byte-identical rollout files are ONE session recorded twice (copy
+  / duplicate / backup), but the family pass sorted them into arbitrary
+  parent/child roles and rebased the "child" onto the parent's final
+  snapshot — identical totals saturate to zero on every field, so a
+  corpus reported one full row beside an all-zero $0.00 twin wearing a
+  false replayed-tokens disclosure (assess PoC: run d0c2a3dc cycle 2,
+  byte-identical parent/child pair, one row 2000-in/2000-out at $0.036,
+  the other all-zero at $0.00 claiming thousands of replayed tokens
+  dropped — a whole session's usage silently destroyed). `scan_rollout`
+  now digests each rollout's full DECODED text (post-zstd-decode, so an
+  uncompressed copy of a rollout ties with its zstd sibling), and a
+  child whose digest ties the family parent's is refused: it keeps its
+  entire usage (the corpus over-bills the duplicate rather than erasing
+  it) and carries a named `codex_multiagent_identical_twin_refused`
+  disclosure plus an `identical_twins_refused` stat on the adjustment
+  summary. The refusal is per-child, never a family-wide opt-out — a
+  genuine replay child in the same family still rebases, so the
+  double-count the pass exists to close stays closed.
+- The codex replay reconcile's own re-read honors the named-file read cap
+  (rm-2020, run d0c2a3dc cycle 3, batch "replay reconcile truth"):
+  `scan_rollout` re-reads every codex rollout from disk at each call
+  site, and that read was a bare unbounded `std::fs::read` — the parse
+  lane's `AGENTTRACE_FILE_CAP_BYTES` admission bound (default 256 MiB,
+  rm-451) did not hold there. Assess PoC: with
+  `AGENTTRACE_FILE_CAP_BYTES=512` and a corpus whose sessions survived
+  through the session cache, the pass still scanned both multi-KB
+  rollouts whole and rebased the family — the cap was silently bypassed
+  exactly when the cache disarmed the parse lane that would otherwise
+  have refused the files. The scan now takes the same bounded path the
+  parse lane and the discovery content-signature use
+  (`parser::read_session_file_bounded`: metadata fast-path refusal
+  before any read, then `take(cap + 1)` so a file that grew between
+  stat and read still cannot allocate past one byte over the cap). An
+  over-cap rollout is a TYPED refusal — a `rollouts_cap_refused` stat
+  plus a per-session
+  `codex_multiagent_reconcile_skipped_cap_exceeded` disclosure,
+  distinct from the unreadable arm — and the session keeps its full
+  (possibly double-counted) usage. Under the default cap no real
+  rollout is refused: genuine families reconcile byte-identically
+  before/after.
+
 - Codex replay families corroborate on cwd, and warm-cache totals flip
   LOUDLY instead of silently (rm-1956 at this landing — campaign-local
   numeral rm-1541, run cd6782b46fb4 cycle 2, batch "replay-family

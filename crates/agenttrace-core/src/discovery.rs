@@ -982,13 +982,13 @@ pub(crate) fn find_session_files_cached(
     retain_single_cline_session_per_id(&mut all);
     // rm-1886: content dedup at admission — a byte-identical journal
     // at a second path re-emits the same events and double-banks every
-    // aggregate it feeds. First-seen survivor wins (deterministic: the
-    // walk yields sorted per-directory files, roots in registration
-    // order); a file whose bytes cannot be read is KEPT — the parse
-    // lane owns unreadable files and discloses them, dedup must not
-    // silently drop what it cannot verify. Unreadable-file stance
-    // keeps this pass observable: suppressed copies are counted and
-    // the first pairs named.
+    // aggregate it feeds. Canonical survivor (rm-2024 fix): the walk is
+    // parallel, so first-seen is NOT stable — the lexicographically
+    // smallest path always survives; a file whose bytes cannot be read
+    // is KEPT — the parse lane owns unreadable files and discloses
+    // them, dedup must not silently drop what it cannot verify.
+    // Unreadable-file stance keeps this pass observable: suppressed
+    // copies are counted and the first pairs named.
     let mut deduped: Vec<PathBuf> = Vec::with_capacity(all.len());
     let mut signatures: HashMap<(i64, u64), PathBuf> = HashMap::new();
     for path in all {
@@ -997,12 +997,31 @@ pub(crate) fn find_session_files_cached(
             continue;
         };
         match signatures.entry(signature) {
-            std::collections::hash_map::Entry::Occupied(survivor) => {
+            std::collections::hash_map::Entry::Occupied(mut survivor) => {
                 suppressed.duplicate_session_files += 1;
-                if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
-                    suppressed
-                        .duplicate_session_file_pairs
-                        .push((survivor.get().clone(), path));
+                // rm-1886 follow-up: the discovery walk is parallel, so
+                // first-seen order is NOT stable across runs — the
+                // survivor/suppressed pair (and which byte-identical
+                // path feeds parsing) flipped run-to-run. Canonicalize:
+                // the lexicographically smallest path always survives.
+                // `deduped` is sorted by `sort_paths_by_cache` before it
+                // is returned, so swapping the kept path in place does
+                // not disturb downstream ordering.
+                let (keep, drop) = if path < *survivor.get() {
+                    (path.clone(), survivor.get().clone())
+                } else {
+                    (survivor.get().clone(), path.clone())
+                };
+                if keep != drop {
+                    if *survivor.get() != keep {
+                        survivor.insert(keep.clone());
+                        if let Some(slot) = deduped.iter_mut().find(|p| **p == drop) {
+                            *slot = keep.clone();
+                        }
+                    }
+                    if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
+                        suppressed.duplicate_session_file_pairs.push((keep, drop));
+                    }
                 }
             }
             std::collections::hash_map::Entry::Vacant(slot) => {

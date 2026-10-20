@@ -559,3 +559,202 @@ fn unreadable_rollout_discloses_reconciliation_skip() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// rm-2019: two byte-identical rollout files are one session recorded
+/// twice (copy / duplicate / backup), never a parent-then-child replay
+/// pair — a real child continues past the shared opening, and identical
+/// bytes continue past nothing. The reconcile used to sort the copies
+/// into arbitrary parent/child roles and rebase the "child" onto the
+/// parent's final snapshot: identical totals saturate to zero, so the
+/// corpus reported one full row beside an all-zero $0.00 twin carrying
+/// a replayed-tokens disclosure (assess PoC, run d0c2a3dc cycle 2) —
+/// a whole session's usage silently destroyed. The refusal: a child
+/// whose full decoded content is byte-identical to the family parent
+/// keeps its entire usage (over-billed, never erased) and carries a
+/// named `codex_multiagent_identical_twin_refused` disclosure.
+#[test]
+fn identical_twin_family_refuses_the_zero_rebase() {
+    let dir = std::env::temp_dir().join(format!("agenttrace-rm2019-twin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-multiagent-v2");
+    let twin_text = std::fs::read_to_string(base.join("parent.jsonl")).unwrap();
+    let twin_a = dir.join("twin-a.jsonl");
+    let twin_b = dir.join("twin-b.jsonl");
+    std::fs::write(&twin_a, &twin_text).unwrap();
+    std::fs::write(&twin_b, &twin_text).unwrap();
+
+    let mut sessions = vec![
+        agenttrace_core::parse_file(&twin_a).expect("twin a parses"),
+        agenttrace_core::parse_file(&twin_b).expect("twin b parses"),
+    ];
+    let naive: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 1, "identical openings still form a family");
+    assert_eq!(stats.children_adjusted, 0, "the twin must never be rebased");
+    assert_eq!(
+        stats.identical_twins_refused, 1,
+        "named refusal stat must be observable"
+    );
+
+    // Both copies keep their full naive usage — the corpus over-bills
+    // the duplicated session rather than destroying one copy of it.
+    let inputs: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    assert_eq!(inputs, naive, "usage must not be destroyed");
+    assert_eq!(inputs, vec![1_400, 1_400]);
+    for session in &sessions {
+        assert!(
+            session.metrics.cost_estimated > 0.0,
+            "both copies must price non-zero (no silent $0.00 row)"
+        );
+        assert!(
+            !session
+                .metrics
+                .disclosure_counters
+                .contains_key("codex_multiagent_replayed_child_adjusted"),
+            "a refused twin is not an adjusted child"
+        );
+        assert!(
+            !session
+                .metrics
+                .disclosure_counters
+                .contains_key("codex_multiagent_replayed_tokens_dropped"),
+            "nothing may be disclosed as dropped — nothing was"
+        );
+    }
+
+    // The refusal lands on the sorted-second member (the would-be
+    // child); the parent stays silent, mirroring the below-baseline
+    // and unreadable conventions.
+    let child = sessions
+        .iter()
+        .find(|s| s.path.ends_with("twin-b.jsonl"))
+        .expect("child by path");
+    assert_eq!(
+        child
+            .metrics
+            .disclosure_counters
+            .get("codex_multiagent_identical_twin_refused"),
+        Some(&1),
+        "the refused twin must carry the named disclosure"
+    );
+    let parent = sessions
+        .iter()
+        .find(|s| s.path.ends_with("twin-a.jsonl"))
+        .expect("parent by path");
+    assert!(!parent
+        .metrics
+        .disclosure_counters
+        .contains_key("codex_multiagent_identical_twin_refused"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// rm-2019 composition: a family may hold a genuine replay child AND a
+/// byte-identical twin of the parent at once. The twin is refused (kept
+/// whole, disclosed); the genuine child still rebases onto the parent —
+/// the refusal is per-child, never a family-wide opt-out that would
+/// re-open the double-count the reconcile exists to close.
+#[test]
+fn twin_refusal_composes_with_a_genuine_replay_child() {
+    let dir =
+        std::env::temp_dir().join(format!("agenttrace-rm2019-compose-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-multiagent-v2");
+    let parent_text = std::fs::read_to_string(base.join("parent.jsonl")).unwrap();
+    let child_text = std::fs::read_to_string(base.join("child.jsonl")).unwrap();
+    std::fs::write(dir.join("parent.jsonl"), &parent_text).unwrap();
+    std::fs::write(dir.join("child.jsonl"), &child_text).unwrap();
+    std::fs::write(dir.join("twin-of-parent.jsonl"), &parent_text).unwrap();
+
+    let mut sessions = vec![
+        agenttrace_core::parse_file(&dir.join("parent.jsonl")).expect("parent parses"),
+        agenttrace_core::parse_file(&dir.join("twin-of-parent.jsonl")).expect("twin parses"),
+        agenttrace_core::parse_file(&dir.join("child.jsonl")).expect("child parses"),
+    ];
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 1);
+    assert_eq!(stats.identical_twins_refused, 1);
+    assert_eq!(
+        stats.children_adjusted, 1,
+        "the genuine child must still rebase"
+    );
+    assert_eq!(stats.tokens_input_dropped, 1_400);
+
+    let by_suffix = |suffix: &str| {
+        sessions
+            .iter()
+            .find(|s| s.path.ends_with(suffix))
+            .unwrap_or_else(|| panic!("session {suffix}"))
+    };
+    // Parent keeps 1,400; the twin keeps its full 1,400 (refused, not
+    // rebased); the genuine child reports its 300-token delta.
+    assert_eq!(by_suffix("parent.jsonl").metrics.tokens_input, 1_400);
+    assert_eq!(
+        by_suffix("twin-of-parent.jsonl").metrics.tokens_input,
+        1_400
+    );
+    assert_eq!(by_suffix("child.jsonl").metrics.tokens_input, 300);
+    let family: i64 = sessions.iter().map(|s| s.metrics.tokens_input).sum();
+    assert_eq!(family, 3_100, "parent + refused twin + child delta");
+
+    let twin = by_suffix("twin-of-parent.jsonl");
+    assert_eq!(
+        twin.metrics
+            .disclosure_counters
+            .get("codex_multiagent_identical_twin_refused"),
+        Some(&1)
+    );
+    assert_eq!(
+        by_suffix("child.jsonl")
+            .metrics
+            .disclosure_counters
+            .get("codex_multiagent_replayed_child_adjusted"),
+        Some(&1),
+        "the genuine child still carries the adjustment disclosure"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// rm-2019, zstd arm: the twin digest is taken over the rollout's
+/// DECODED content (the same post-decode text the fingerprint hashes),
+/// so a zstd copy of a rollout ties with its sibling exactly like an
+/// uncompressed copy would — the refusal must hold across the format
+/// split the parser accepts (codex ≥ 0.152 writes zstd frames).
+#[test]
+fn zstd_identical_twin_refuses_like_the_uncompressed_twin() {
+    let dir = std::env::temp_dir().join(format!("agenttrace-rm2019-zst-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let base =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-multiagent-v2-zstd");
+    let frame = std::fs::read(base.join("parent.jsonl")).expect("zstd fixture");
+    assert!(
+        frame.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]),
+        "fixture must be a zstd frame"
+    );
+    let twin_a = dir.join("twin-a.jsonl");
+    let twin_b = dir.join("twin-b.jsonl");
+    std::fs::write(&twin_a, &frame).unwrap();
+    std::fs::write(&twin_b, &frame).unwrap();
+
+    let mut sessions = vec![
+        agenttrace_core::parse_file(&twin_a).expect("zstd twin a decodes and parses"),
+        agenttrace_core::parse_file(&twin_b).expect("zstd twin b decodes and parses"),
+    ];
+    let naive: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.children_adjusted, 0, "zstd twins must not rebase");
+    assert_eq!(stats.identical_twins_refused, 1);
+    let inputs: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    assert_eq!(inputs, naive, "both zstd twins keep their full usage");
+    let child = sessions
+        .iter()
+        .find(|s| s.path.ends_with("twin-b.jsonl"))
+        .expect("child by path");
+    assert_eq!(
+        child
+            .metrics
+            .disclosure_counters
+            .get("codex_multiagent_identical_twin_refused"),
+        Some(&1)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
