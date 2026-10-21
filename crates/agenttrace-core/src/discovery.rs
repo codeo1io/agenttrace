@@ -392,14 +392,33 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     // content dedup so an id-level duplicate resolves by the canonical
     // store rather than first-seen path order, matching the cached walk.
     retain_single_cline_session_per_id(&mut all);
-    let mut signatures: HashSet<(i64, u64)> = HashSet::new();
-    all.retain(|path| {
+    // rm-1888 residual (cycle 1, 2026-10-21): mirrors the cached walk's
+    // deterministic survivor — among signature-equal copies the
+    // LEXICOGRAPHICALLY SMALLEST path wins, not first-seen (the uncached
+    // walk is mtime-descending too, so first-seen followed the clock and
+    // could flip across platforms on mtime-coincident writes).
+    let mut signatures: HashMap<(i64, u64), usize> = HashMap::new();
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(all.len());
+    for path in all {
         // Unreadable: keep (the parse lane owns and discloses those).
-        content_signature(path)
-            .map(|signature| signatures.insert(signature))
-            .unwrap_or(true)
-    });
-    sort_paths_by_mod_time(all)
+        let Some(signature) = content_signature(&path) else {
+            kept.push(path);
+            continue;
+        };
+        match signatures.entry(signature) {
+            std::collections::hash_map::Entry::Occupied(survivor_slot) => {
+                let index = *survivor_slot.get();
+                if path < kept[index] {
+                    kept[index] = path;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(kept.len());
+                kept.push(path);
+            }
+        }
+    }
+    sort_paths_by_mod_time(kept)
 }
 
 pub fn load_sessions_from_dir(dir: Option<&Path>) -> Vec<Session> {
@@ -1088,15 +1107,21 @@ pub(crate) fn find_session_files_cached(
     retain_single_cline_session_per_id(&mut all);
     // rm-1886: content dedup at admission — a byte-identical journal
     // at a second path re-emits the same events and double-banks every
-    // aggregate it feeds. First-seen survivor wins (deterministic: the
-    // walk yields sorted per-directory files, roots in registration
-    // order); a file whose bytes cannot be read is KEPT — the parse
-    // lane owns unreadable files and discloses them, dedup must not
-    // silently drop what it cannot verify. Unreadable-file stance
+    // aggregate it feeds. rm-1888 residual (cycle 1, 2026-10-21): the
+    // survivor among signature-equal copies is the LEXICOGRAPHICALLY
+    // SMALLEST path — deterministic under every mtime regime. The old
+    // first-seen rule inherited `sort_paths_by_cache`'s newest-mtime
+    // ordering, so the winner followed the clock (the assess HOME
+    // probe flipped survivors by touching one copy) and flipped across
+    // platforms on mtime-coincident writes (macOS CI red, fork master
+    // run 39394440216: `count_honesty_disclosures_in_cli_lanes`
+    // survivor flip). A file whose bytes cannot be read is KEPT — the
+    // parse lane owns unreadable files and discloses them, dedup must
+    // not silently drop what it cannot verify. Unreadable-file stance
     // keeps this pass observable: suppressed copies are counted and
-    // the first pairs named.
+    // the first pairs named as `survivor <- suppressed copy`.
     let mut deduped: Vec<PathBuf> = Vec::with_capacity(all.len());
-    let mut signatures: HashMap<(i64, u64), PathBuf> = HashMap::new();
+    let mut signatures: HashMap<(i64, u64), usize> = HashMap::new();
     for path in all {
         // rm-451 × rm-1886 composition (conflict case a2dd44ed): an
         // over-cap opencode info doc is NEVER materialized on any lane —
@@ -1119,16 +1144,35 @@ pub(crate) fn find_session_files_cached(
             continue;
         };
         match signatures.entry(signature) {
-            std::collections::hash_map::Entry::Occupied(survivor) => {
+            std::collections::hash_map::Entry::Occupied(survivor_slot) => {
                 suppressed.duplicate_session_files += 1;
-                if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
+                let index = *survivor_slot.get();
+                if path < deduped[index] {
+                    // The incoming path is the lexicographically smaller
+                    // survivor: the previous one is now the suppressed
+                    // copy. Earlier sampled pairs that named the outgoing
+                    // path as SURVIVOR would disclose a stale winner, so
+                    // they are dropped in favor of pairs that name the
+                    // final survivor (only shapes the capped sample, never
+                    // the count).
+                    let outgoing = std::mem::replace(&mut deduped[index], path.clone());
                     suppressed
                         .duplicate_session_file_pairs
-                        .push((survivor.get().clone(), path));
+                        .retain(|(kept, _)| kept != &outgoing);
+                    if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
+                        suppressed
+                            .duplicate_session_file_pairs
+                            .push((path, outgoing));
+                    }
+                } else if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES
+                {
+                    suppressed
+                        .duplicate_session_file_pairs
+                        .push((deduped[index].clone(), path));
                 }
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(path.clone());
+                slot.insert(deduped.len());
                 deduped.push(path);
             }
         }

@@ -870,6 +870,10 @@ fn statusline_host_mode_never_fails_the_host() {
     let _ = std::fs::remove_dir_all(cache);
 }
 
+// rm-1537 (fork master CI red, run 39394440216: /dev/full exists on
+// Linux but not on macOS/Windows — the target_os pin keeps the lane on
+// the runners that actually have the device).
+#[cfg(target_os = "linux")]
 #[test]
 fn statusline_host_mode_survives_stdout_write_failure() {
     // Review F2 (cycle 7): the host contract is exit 0 for any input —
@@ -3544,12 +3548,31 @@ fn count_honesty_disclosures_in_cli_lanes() {
         .expect("named pairs ride the duplicate disclosure");
     assert_eq!(pairs.len(), 1, "one pair, capped shape");
     let pair = pairs[0].as_str().expect("pair renders as a string");
+    // rm-1888 residual (cycle 1, 2026-10-21): the survivor among
+    // byte-identical copies is deterministic — the lexicographically
+    // smallest path wins, under every mtime ordering (the macOS CI
+    // survivor flip is what this asserts away). Assert structurally:
+    // `survivor <- suppressed`, sides exactly the two journals, and
+    // the survivor is the lexical min (alpha), independent of which
+    // file was written last.
+    let (survivor, suppressed) = pair
+        .split_once(" <- ")
+        .expect("the pair names survivor <- suppressed");
+    let survivor_path = std::path::Path::new(survivor);
+    let suppressed_path = std::path::Path::new(suppressed);
+    assert_eq!(
+        survivor_path.file_name().and_then(|n| n.to_str()),
+        Some("a.jsonl"),
+        "the survivor must be the lexical min copy deterministically: {pair}"
+    );
+    assert_eq!(
+        suppressed_path.file_name().and_then(|n| n.to_str()),
+        beta.file_name().and_then(|n| n.to_str()),
+        "the suppressed copy is named after '<-': {pair}"
+    );
     assert!(
-        pair.contains("a.jsonl")
-            && pair.contains("beta")
-            && pair.contains("<-")
-            && pair.ends_with(beta.file_name().expect("name").to_string_lossy().as_ref()),
-        "the pair names survivor <- suppressed: {pair}"
+        survivor_path.ends_with("alpha/a.jsonl") && suppressed_path.ends_with("beta/b.jsonl"),
+        "the pair names exactly the two byte-identical journals: {pair}"
     );
     assert_eq!(
         value["recorded_costs_negative_rejected"], 1,

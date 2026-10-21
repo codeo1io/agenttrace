@@ -35,6 +35,7 @@ use agenttrace_core::{
 };
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -416,6 +417,89 @@ fn byte_identical_copy_is_suppressed_with_disclosure() {
 }
 
 #[test]
+fn duplicate_survivor_is_the_lexicographic_min_regardless_of_mtime() {
+    // rm-1888 residual (cycle 1, 2026-10-21): the survivor among
+    // byte-identical copies used to be whichever copy the mtime sort
+    // visited first — newest-mtime wins — so the winner followed the
+    // clock (the HOME probe flipped survivors by touching one copy)
+    // and flipped on mtime-coincident writes (fork master CI red,
+    // run 39394440216: the CLI count-honesty lane's survivor flipped
+    // on macOS). The rule no longer consults the clock: the
+    // LEXICOGRAPHICALLY SMALLEST path survives, under BOTH mtime
+    // orderings and on a warm-cache rerun.
+    let home = temp_home("lexmin");
+    let journal = pi_journal_with_cost("0.0038");
+    let alpha = write(&home.join(".pi/agent/sessions/alpha/a.jsonl"), &journal);
+    let beta = write(&home.join(".pi/agent/sessions/beta/b.jsonl"), &journal);
+    let older = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    let newer = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    let set_mtime = |path: &Path, mtime: std::time::SystemTime| {
+        let file = fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for set_modified");
+        file.set_modified(mtime).expect("set_modified");
+    };
+    let assert_alpha_survives = |tag: &str| {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "{tag}: copies collapse to one session"
+        );
+        assert_eq!(
+            report.duplicate_session_files, 1,
+            "{tag}: the copy is counted"
+        );
+        assert_eq!(
+            report.duplicate_session_file_pairs.len(),
+            1,
+            "{tag}: the pair is named"
+        );
+        let (survivor, suppressed) = &report.duplicate_session_file_pairs[0];
+        assert_eq!(
+            survivor, &alpha,
+            "{tag}: the lexicographically smallest path survives"
+        );
+        assert_eq!(suppressed, &beta, "{tag}: the other copy is suppressed");
+        assert_eq!(
+            Path::new(&report.sessions[0].path),
+            alpha.as_path(),
+            "{tag}: the admitted session is the deterministic survivor"
+        );
+    };
+    with_pinned_home(&home, || {
+        // Regime 1: natural order — beta (written second) is newest.
+        set_mtime(&alpha, older);
+        set_mtime(&beta, newer);
+        assert_alpha_survives("beta-newest");
+        // Regime 2: flipped — alpha is the newest copy. The survivor
+        // must not move: that movement is exactly the macOS CI flip.
+        set_mtime(&alpha, newer);
+        set_mtime(&beta, older);
+        assert_alpha_survives("alpha-newest");
+        // Warm-cache rerun under the flipped regime stays on the same
+        // survivor — the content-signature memo must not resurrect an
+        // mtime-order winner from an earlier cache generation.
+        let mut cache = load_session_cache();
+        let warm = load_sessions_with_progress_from_cache(
+            None,
+            &LoadOptions::default(),
+            &mut cache,
+            |_| {},
+        );
+        assert_eq!(
+            Path::new(&warm.sessions[0].path),
+            alpha.as_path(),
+            "warm rerun stays on the lexicographic-min survivor"
+        );
+        assert_eq!(warm.duplicate_session_files, 1);
+        assert_eq!(warm.sessions.len(), 1);
+    });
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn distinct_content_of_the_same_size_is_not_suppressed() {
     // The ledger keys content, not size: same byte-length journals
     // with different content are two real sessions.
@@ -475,6 +559,9 @@ fn explicit_dir_lane_keeps_duplicate_copies() {
     let _ = fs::remove_dir_all(&home);
 }
 
+#[cfg(unix)]
+// from_mode chmod arm has no Windows equivalent (fork
+// master CI red, run 39419593000: E0433 :38 / E0599 :488/:502)
 #[test]
 fn unreadable_journal_is_kept_and_never_a_duplicate() {
     // A journal whose bytes cannot be read (permissions) has no

@@ -56,10 +56,16 @@ jobs:
       matrix:
         include:
           # Linux targets cross-compile the arm64 build on ubuntu
-          - os: ubuntu-latest
+          # rm-1537/leg C (2026-10-21): linux assets build on ubuntu-22.04
+          # (glibc 2.35) — the compatibility floor install.sh verifies. The
+          # previous ubuntu-latest (glibc 2.39) build shipped binaries that
+          # die with "GLIBC_2.39 not found" on 22.04 hosts (Maestro finding
+          # 47fa1154); building here keeps every shipped linux asset on the
+          # defended floor.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset: agenttrace-linux-amd64
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             asset: agenttrace-linux-arm64
           # Darwin targets need the Apple SDK — build natively on macOS runners

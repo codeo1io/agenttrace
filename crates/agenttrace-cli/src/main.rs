@@ -4994,6 +4994,9 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    // rm-1537 (fork master CI red, run 39394440216: E0433 at
+    // main.rs:5017/5019 — FileTypeExt/is_fifo are unix-only).
+    #[cfg(unix)]
     #[test]
     fn write_output_refuses_special_files_instead_of_materializing_them() {
         // rm-250 residual (cycle 1): a fifo destination is refused with

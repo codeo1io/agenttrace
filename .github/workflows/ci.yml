@@ -222,7 +222,12 @@ jobs:
 
   smoke:
     name: Release binary smoke
-    runs-on: ubuntu-latest
+    # rm-1537/leg C (2026-10-21): ubuntu-22.04 = glibc 2.35, the shipped-binary
+    # floor check-install-runtime.sh defends. On ubuntu-latest (24.04 / glibc
+    # 2.39) the release binary links against 2.39-only symbols and the
+    # glibc-baseline guard fails AFTER the fact (fork master CI red, run
+    # 39394440216); building on 22.04 proves the floor at compile time.
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
       AGENTTRACE_BIN: target/release/agenttrace
