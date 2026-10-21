@@ -549,7 +549,8 @@ pub fn append_statusline_capture(payload: &Value) -> io::Result<()> {
     // vanished. The whole write-and-maybe-compact critical section now
     // runs under an exclusive cross-process lock
     // (`open_locked_journal`).
-    let journal = open_locked_journal(&path)?;
+    #[allow(unused_mut)]
+    let mut journal = open_locked_journal(&path)?;
     // Windows: the journal opens read+write (not O_APPEND — an
     // append-only handle cannot LockFileEx), so position at end; the
     // rm-166 lock serializes writers, making the seek-then-write pair
