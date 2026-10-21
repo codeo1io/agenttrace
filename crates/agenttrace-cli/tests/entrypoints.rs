@@ -870,6 +870,9 @@ fn statusline_host_mode_never_fails_the_host() {
     let _ = std::fs::remove_dir_all(cache);
 }
 
+// /dev/full exists only on Linux (absent on macOS and the Windows
+// runners), so this ENOSPC survival pin rides a Linux gate.
+#[cfg(target_os = "linux")]
 #[test]
 fn statusline_host_mode_survives_stdout_write_failure() {
     // Review F2 (cycle 7): the host contract is exit 0 for any input —
@@ -2667,44 +2670,62 @@ fn error_stderr_carries_the_anyhow_cause_chain() {
     // exit codes stay pinned at 1.
     let dir = std::env::temp_dir().join(format!("at-rm610-dir-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create -o directory target");
-    let enospc = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
-        .args(["--demo", "--overview", "-o", "/dev/full"])
-        .output()
-        .expect("run agenttrace against /dev/full");
     let eisdir = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .args(["--demo", "--overview", "-o", dir.to_str().expect("utf8")])
         .output()
         .expect("run agenttrace against a directory -o target");
-    let _ = std::fs::remove_dir(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
 
-    let enospc_err = String::from_utf8_lossy(&enospc.stderr);
     let eisdir_err = String::from_utf8_lossy(&eisdir.stderr);
-    for (label, code, stderr) in [
-        ("enospc", enospc.status.code(), &enospc_err),
-        ("eisdir", eisdir.status.code(), &eisdir_err),
-    ] {
-        assert_eq!(code, Some(1), "{label}: exit code unchanged: {stderr}");
-        assert!(
-            stderr.contains("Error: writing report output file"),
-            "{label}: context site still leads the chain: {stderr}"
-        );
-    }
-    assert!(
-        enospc_err.contains("No space left on device")
-            || enospc_err.contains("Permission denied")
-            || enospc_err.contains("ENOSPC"),
-        "the underlying write cause must surface through the context site \
-         (on hosts where the atomic writer's temp sibling cannot be created \
-         next to /dev/full, the honest cause is EACCES): {enospc_err}"
+    assert_eq!(
+        eisdir.status.code(),
+        Some(1),
+        "eisdir: exit code unchanged: {eisdir_err}"
     );
     assert!(
-        eisdir_err.contains("Is a directory"),
+        eisdir_err.contains("Error: writing report output file"),
+        "eisdir: context site still leads the chain: {eisdir_err}"
+    );
+    // Opening a directory for write is EISDIR on unix and surfaces as
+    // ERROR_ACCESS_DENIED ("Access is denied") on Windows — both are
+    // the io error kind's honest rendering through the context site.
+    assert!(
+        eisdir_err.contains("Is a directory") || eisdir_err.contains("Access is denied"),
         "EISDIR cause must be visible through the context site: {eisdir_err}"
     );
-    assert_ne!(
-        enospc_err, eisdir_err,
-        "a full disk and path misuse must be distinguishable in stderr"
-    );
+
+    // /dev/full exists only on Linux (absent on macOS and the Windows
+    // runners), so the ENOSPC leg rides a Linux gate; the cause-chain
+    // contract itself stays exercised on every lane by EISDIR above.
+    #[cfg(target_os = "linux")]
+    {
+        let enospc = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args(["--demo", "--overview", "-o", "/dev/full"])
+            .output()
+            .expect("run agenttrace against /dev/full");
+        let enospc_err = String::from_utf8_lossy(&enospc.stderr);
+        assert_eq!(
+            enospc.status.code(),
+            Some(1),
+            "enospc: exit code unchanged: {enospc_err}"
+        );
+        assert!(
+            enospc_err.contains("Error: writing report output file"),
+            "enospc: context site still leads the chain: {enospc_err}"
+        );
+        assert!(
+            enospc_err.contains("No space left on device")
+                || enospc_err.contains("Permission denied")
+                || enospc_err.contains("ENOSPC"),
+            "the underlying write cause must surface through the context site \
+             (on hosts where the atomic writer's temp sibling cannot be created \
+             next to /dev/full, the honest cause is EACCES): {enospc_err}"
+        );
+        assert_ne!(
+            enospc_err, eisdir_err,
+            "a full disk and path misuse must be distinguishable in stderr"
+        );
+    }
 }
 
 // rm-1434: the positional-path guard literal at main.rs opened with
@@ -3544,12 +3565,22 @@ fn count_honesty_disclosures_in_cli_lanes() {
         .expect("named pairs ride the duplicate disclosure");
     assert_eq!(pairs.len(), 1, "one pair, capped shape");
     let pair = pairs[0].as_str().expect("pair renders as a string");
+    // rm-1543 arm 3: with the twins written in the same millisecond the
+    // survivor choice is walk-order dependent (an mtime tie breaks by
+    // readdir order — the macOS red and the Linux ~1-in-5 flake), so
+    // what is pinned is the "survivor <- suppressed" shape with both
+    // twins named exactly once — never WHICH twin wins.
+    let (survivor, suppressed) = pair
+        .split_once("<-")
+        .expect("pair renders survivor <- suppressed");
+    let survivor = survivor.trim_end();
+    let suppressed = suppressed.trim_start();
+    let a = "a.jsonl";
+    let b = beta.file_name().expect("name").to_string_lossy();
     assert!(
-        pair.contains("a.jsonl")
-            && pair.contains("beta")
-            && pair.contains("<-")
-            && pair.ends_with(beta.file_name().expect("name").to_string_lossy().as_ref()),
-        "the pair names survivor <- suppressed: {pair}"
+        (survivor.ends_with(a) && suppressed.ends_with(b.as_ref()))
+            || (survivor.ends_with(b.as_ref()) && suppressed.ends_with(a)),
+        "the pair names both twins once, survivor first: {pair}"
     );
     assert_eq!(
         value["recorded_costs_negative_rejected"], 1,
