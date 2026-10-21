@@ -346,7 +346,16 @@ fn default_text_lane_guards_spreadsheet_formulas_like_csv() {
     );
     // And the guard actually fired: every hostile stem shows up
     // apostrophe-prefixed in the name column, never row-leading raw.
+    // (Windows cannot hold pipe-bearing filenames, so stems skipped in
+    // the fixture loop above are skipped here too — the guard contract
+    // is asserted over every stem the host filesystem could hold.)
     for stem in &hostile_stems {
+        #[cfg(windows)]
+        {
+            if stem.contains('|') {
+                continue;
+            }
+        }
         assert!(
             text.contains(&format!("'{stem}")),
             "hostile stem {stem:?} missing its formula guard in the TSV lane"
