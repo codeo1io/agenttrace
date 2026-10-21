@@ -483,12 +483,16 @@ fn oversized_message_line_is_refused_and_the_stream_stays_framed() {
 
 #[test]
 fn protocol_version_is_negotiated_never_echoed() {
-    // rm-780: `initialize` answers the newest revision BOTH sides
-    // speak. A declared-in-set version is answered with itself; an
-    // unknown or absent one falls back to the server's newest with a
-    // one-line stderr disclosure (stdout stays protocol-only). The
-    // pre-fix server echoed `"1999-99-99"` back verbatim, claiming
-    // support for a version it does not speak (assess F5a PoC).
+    // rm-780 + rm-455 (run f62ee197 cycle 4): `initialize` answers
+    // the newest revision BOTH sides speak. A declared-in-set
+    // version is answered with itself; an unknown one now answers
+    // the 2026-07-28 schema's typed `UnsupportedProtocolVersionError`
+    // (-32022, data {requested, supported}) instead of the old
+    // success-with-newest fallback that claimed a session in a
+    // dialect neither side speaks; an ABSENT one keeps the rm-780
+    // fallback (newest + one-line stderr disclosure, stdout stays
+    // protocol-only). The pre-fix server echoed `"1999-99-99"` back
+    // verbatim (assess F5a PoC).
     let (home, cache) = seed_home("negotiate", false);
     let requests = concat!(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
@@ -505,10 +509,35 @@ fn protocol_version_is_negotiated_never_echoed() {
     assert_eq!(4, responses.len());
     let answered = |index: usize| responses[index]["result"]["protocolVersion"].as_str();
     assert_eq!(Some("2026-07-28"), answered(0), "newest supported answered");
+    // rm-455 A2: the unknown version answers the typed error — never
+    // a success result, never an echo. The old test pinned the
+    // fallback lie this arm removes.
     assert_eq!(
-        Some("2026-07-28"),
-        answered(1),
-        "unknown versions fall back to the server's newest — never an echo"
+        Some(-32022),
+        responses[1]["error"]["code"].as_i64(),
+        "unknown versions answer the schema's typed error"
+    );
+    assert_eq!(
+        Some("Unsupported version"),
+        responses[1]["error"]["message"].as_str(),
+        "message text is fixed by the 2026-07-28 schema"
+    );
+    assert_eq!(
+        Some("1999-99-99"),
+        responses[1]["error"]["data"]["requested"].as_str(),
+        "the data object names what was requested"
+    );
+    assert!(
+        responses[1]["error"]["data"]["supported"]
+            .as_array()
+            .expect("supported list")
+            .iter()
+            .any(|v| v.as_str() == Some("2026-07-28")),
+        "the recovery list ships in the error — no second round trip"
+    );
+    assert!(
+        responses[1]["result"].is_null(),
+        "the typed error is never accompanied by a success result"
     );
     assert_eq!(
         Some("2026-07-28"),
@@ -521,12 +550,153 @@ fn protocol_version_is_negotiated_never_echoed() {
         "older mutual revision honored"
     );
     assert!(
-        stderr.contains("1999-99-99") && stderr.contains("does not speak"),
-        "the fallback discloses on stderr: {stderr}"
+        stderr.contains("<none>") && stderr.contains("does not speak"),
+        "only the ABSENT arm discloses on stderr now (the unknown arm
+         is answered on the wire): {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn server_discover_answers_the_mandatory_rpc_statelessly() {
+    // rm-455 (run f62ee197 cycle 4, A1): the 2026-07-28 revision
+    // makes `server/discover` the ONE mandatory server RPC — its
+    // schema description reads "Servers MUST implement
+    // `server/discover`. Clients MAY call it but are not required to
+    // — version negotiation can also happen inline via per-request
+    // `_meta`." The pre-fix server answered -32601 (assess F1 live
+    // probe). The result is stateless — served BEFORE any
+    // `initialize` — and carries the schema's five required
+    // members; a tools request on the same connection still serves
+    // without a handshake.
+    let (home, cache) = seed_home("discover", false);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(2, responses.len());
+    let discover = &responses[0]["result"];
+    assert!(
+        discover.is_object(),
+        "the mandatory RPC is answered, not -32601: {}",
+        responses[0]
+    );
+    assert_eq!(1, responses[0]["id"], "id echoed");
+    let versions = discover["supportedVersions"]
+        .as_array()
+        .expect("supportedVersions");
+    assert!(
+        versions.iter().any(|v| v.as_str() == Some("2026-07-28"))
+            && versions.iter().any(|v| v.as_str() == Some("2025-11-25"))
+            && versions.iter().any(|v| v.as_str() == Some("2025-06-18")),
+        "the negotiation list matches initialize: {versions:?}"
+    );
+    assert_eq!(
+        Some(false),
+        discover["capabilities"]["tools"]["listChanged"].as_bool(),
+        "honest static read-only surface"
     );
     assert!(
-        stderr.contains("<none>"),
-        "the absent-version arm names its shape: {stderr}"
+        discover["ttlMs"].as_u64().is_some_and(|ttl| ttl >= 1),
+        "cacheable-result TTL"
+    );
+    assert_eq!(
+        Some("public"),
+        discover["cacheScope"].as_str(),
+        "schema enum member"
+    );
+    assert_eq!(
+        Some("complete"),
+        discover["resultType"].as_str(),
+        "inserted by the central with_result_type seam — discovery is not a delta"
+    );
+    assert_eq!(
+        Some("agenttrace"),
+        discover["_meta"]["io.modelcontextprotocol/serverInfo"]["name"].as_str(),
+        "the reserved server-info key carries identity without a handshake"
+    );
+    assert!(
+        responses[1]["result"]["tools"].is_array(),
+        "the same connection serves tools without initialize"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn per_request_meta_version_negotiates_statelessly_and_typed() {
+    // rm-455 (run f62ee197 cycle 4, A2+A3): the reserved canonical
+    // `_meta` key `io.modelcontextprotocol/protocolVersion` carries
+    // inline version negotiation on EVERY request — `initialize`
+    // honors it when the legacy member is absent; unknown values (on
+    // any method) answer the typed -32022 with data {requested,
+    // supported}; the explicit member takes precedence over `_meta`;
+    // a BARE `protocolVersion` `_meta` member is client-chosen, not
+    // reserved, and must NOT be honored (assess F1 probe: `_meta`
+    // negotiation was silently ignored and answered with the newest
+    // revision).
+    let (home, cache) = seed_home("meta-version", false);
+    let requests = concat!(
+        // initialize: the version arrives ONLY under the canonical _meta key
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-06-18"},"capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        // tools/list: a supported inline version on a non-initialize method is served
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-06-18"}}}"#,
+        "\n",
+        // tools/list: unknown inline version answers the typed error
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-99-99"}}}"#,
+        "\n",
+        // bare, non-reserved _meta spelling is ignored
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{"_meta":{"protocolVersion":"1999-99-99"}}}"#,
+        "\n",
+        // the explicit member wins over a contradicting _meta key
+        r#"{"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2026-07-28","_meta":{"io.modelcontextprotocol/protocolVersion":"1999-99-99"},"capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+    );
+    let (code, responses, stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(5, responses.len());
+    assert_eq!(
+        Some("2025-06-18"),
+        responses[0]["result"]["protocolVersion"].as_str(),
+        "initialize honors the canonical _meta key when the member is absent"
+    );
+    assert!(
+        responses[1]["result"]["tools"].is_array(),
+        "a supported inline version on any method is served"
+    );
+    assert_eq!(
+        Some(-32022),
+        responses[2]["error"]["code"].as_i64(),
+        "unknown inline version answers the typed error on a non-initialize method"
+    );
+    assert_eq!(
+        Some("1999-99-99"),
+        responses[2]["error"]["data"]["requested"].as_str()
+    );
+    assert!(
+        responses[2]["error"]["data"]["supported"]
+            .as_array()
+            .expect("supported list")
+            .iter()
+            .any(|v| v.as_str() == Some("2026-07-28")),
+        "the recovery list is in the error, no second round trip needed"
+    );
+    assert!(
+        responses[3]["result"]["tools"].is_array(),
+        "a bare (non-reserved) _meta protocolVersion is NOT a version signal"
+    );
+    assert_eq!(
+        Some("2026-07-28"),
+        responses[4]["result"]["protocolVersion"].as_str(),
+        "the explicit member takes precedence over _meta"
+    );
+    assert!(
+        !stderr.contains("1999-99-99"),
+        "the typed path answers on the wire; stderr stays for the absent fallback: {stderr}"
     );
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));
 }
