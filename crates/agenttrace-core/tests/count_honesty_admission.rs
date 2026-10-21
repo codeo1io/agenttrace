@@ -35,6 +35,7 @@ use agenttrace_core::{
 };
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -476,6 +477,7 @@ fn explicit_dir_lane_keeps_duplicate_copies() {
 }
 
 #[test]
+#[cfg(unix)]
 fn unreadable_journal_is_kept_and_never_a_duplicate() {
     // A journal whose bytes cannot be read (permissions) has no
     // content signature: it must stay ADMITTED (its parse failure is

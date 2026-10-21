@@ -22,6 +22,12 @@ grep -q "cargo build --release -p agenttrace" install.sh ||
 	fail "install.sh source-build fallback must use cargo"
 grep -q "cargo build --release -p agenttrace" install.ps1 ||
 	fail "install.ps1 source-build fallback must use cargo"
+grep -q 'PROCESSOR_ARCHITEW6432' install.ps1 ||
+	fail "install.ps1 arch detection must fall back to PROCESSOR_ARCHITEW6432 (PSReadLine can shadow RuntimeInformation in interactive PS 5.1; upstream #314)"
+grep -q 'PROCESSOR_ARCHITECTURE' install.ps1 ||
+	fail "install.ps1 arch detection must fall back to PROCESSOR_ARCHITECTURE when W6432 is unset"
+grep -q 'Unsupported architecture' install.ps1 ||
+	fail "install.ps1 must fail closed on unsupported architecture"
 grep -q -- '--version' install.sh ||
 	fail "install.sh must verify the downloaded binary runs before installing it"
 grep -q "AGENTTRACE_SKIP_SOURCE_BUILD" install.sh ||
