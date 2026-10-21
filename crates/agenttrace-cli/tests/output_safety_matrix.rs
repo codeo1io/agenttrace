@@ -298,7 +298,10 @@ fn default_text_lane_guards_spreadsheet_formulas_like_csv() {
         // filesystem cannot even hold (Linux covers the full set).
         #[cfg(windows)]
         {
-            if stem.contains('|') {
+            // '|' is a reserved separator; ':' in the middle of a name
+            // silently creates an NTFS alternate data stream instead of a
+            // plain file, so neither stem can back a session on Windows.
+            if stem.contains('|') || stem.contains(':') {
                 continue;
             }
         }
@@ -352,7 +355,10 @@ fn default_text_lane_guards_spreadsheet_formulas_like_csv() {
     for stem in &hostile_stems {
         #[cfg(windows)]
         {
-            if stem.contains('|') {
+            // '|' is a reserved separator; ':' in the middle of a name
+            // silently creates an NTFS alternate data stream instead of a
+            // plain file, so neither stem can back a session on Windows.
+            if stem.contains('|') || stem.contains(':') {
                 continue;
             }
         }
