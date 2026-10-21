@@ -2179,7 +2179,16 @@ pub(crate) fn open_private_append(path: &Path) -> std::io::Result<fs::File> {
     }
     #[cfg(not(unix))]
     {
-        fs::OpenOptions::new().create(true).append(true).open(path)
+        // Windows: a FILE_APPEND_DATA-only handle cannot take a byte-range
+        // lock — LockFileEx refuses it with ERROR_ACCESS_DENIED, which made
+        // every statusline capture fail on Windows. Open read+write so the
+        // rm-166 journal lock can be taken; the caller positions at end
+        // under the lock (append positioning is the lock's to guarantee).
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
     }
 }
 

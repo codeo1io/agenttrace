@@ -550,6 +550,15 @@ pub fn append_statusline_capture(payload: &Value) -> io::Result<()> {
     // runs under an exclusive cross-process lock
     // (`open_locked_journal`).
     let journal = open_locked_journal(&path)?;
+    // Windows: the journal opens read+write (not O_APPEND — an
+    // append-only handle cannot LockFileEx), so position at end; the
+    // rm-166 lock serializes writers, making the seek-then-write pair
+    // atomic. Unix O_APPEND needs no seek (writes always land at end).
+    #[cfg(not(unix))]
+    {
+        use std::io::Seek as _;
+        journal.seek(std::io::SeekFrom::End(0))?;
+    }
     let size_after_append = journal.metadata()?.len() + line.len() as u64 + 1;
     let mut writer = &journal;
     let appended = writeln!(writer, "{line}").and_then(|()| writer.flush());
