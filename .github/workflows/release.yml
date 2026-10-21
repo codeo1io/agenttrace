@@ -45,6 +45,13 @@ jobs:
       - name: Rust tests (locked)
         run: cargo test --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
 
+      - name: Release glibc floor gate (self-test)
+        # rm-2248: the release workflow consumes check-glibc-floor.sh one
+        # job below this one; prove the gate's own fixtures (red-first on
+        # a GLIBC_2.39 asset) inside the release pipeline too, so a CI
+        # lane regression cannot leave the release gate unexercised.
+        run: scripts/ci/check-glibc-floor.sh --self-test
+
   build-linux:
     name: Build release assets (linux)
     permissions:
@@ -80,13 +87,18 @@ jobs:
           persist-credentials: false
 
       - name: Install container toolchain
-        # The bare ubuntu:22.04 image ships no compiler, no binutils and
-        # no git/curl for the checkout and toolchain actions. `strings`
-        # backs the glibc floor gate below.
+        # The bare ubuntu:22.04 image ships none of the build surface a
+        # hosted image carries: gcc + binutils (`strings` backs the glibc
+        # floor gate below), curl + ca-certificates for the rustup
+        # install below, perl because ring's build plumbing expects it on
+        # hosted images (a minimal container is the first place its
+        # absence would surface). actions/checkout needs nothing here:
+        # JavaScript actions execute on the host runner and reach this
+        # job only through the mounted workspace.
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git curl ca-certificates gcc binutils
+            curl ca-certificates gcc binutils perl
 
       - name: Install Linux ARM linker
         # The aarch64-unknown-linux-gnu toolchain needs a cross linker.
@@ -94,18 +106,35 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          # rm-173: aligned with rust-toolchain.toml (the toolchain file
-          # overrides this input for every cargo step in the repo).
-          toolchain: "1.98.1"
-          targets: ${{ matrix.target }}
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: ${{ matrix.target }}
+      - name: Install Rust toolchain (in-container)
+        # rm-2248: dtolnay/rust-toolchain and Swatinem/rust-cache are
+        # JavaScript actions — they run on the HOST runner, and the state
+        # they write (~/.cargo, ~/.rustup, the host cache paths) never
+        # reaches this container, where only `run` steps execute. A
+        # JS-action toolchain here would leave the Build step without
+        # cargo. rustup installs inside the container instead — the only
+        # mechanism that can work under `container:` — pinned by parsing
+        # rust-toolchain.toml at run time (rm-173: one home for the
+        # version; the toml still outranks the rustup default for every
+        # cargo invocation in this workspace, so the two cannot
+        # disagree). No dependency cache: the host-path cache action is
+        # useless here and release cadence does not pay for a container-
+        # visible one; cold builds fit the 30-minute job timeout.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          pin="$(sed -nE 's/^channel = "(.*)"/\1/p' rust-toolchain.toml)"
+          [[ -n "$pin" ]] || {
+            echo "release: rust-toolchain.toml carries no channel pin" >&2
+            exit 1
+          }
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain "$pin"
+          . "$HOME/.cargo/env"
+          rustup target add "$TARGET"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          cargo --version
+          rustc --version
 
       - name: Build
         shell: bash
