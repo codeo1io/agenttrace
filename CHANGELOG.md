@@ -4,6 +4,63 @@
 
 ### Added
 
+- Zst stem twins count once, with disclosure (rm-2056, run 18f9b98a
+  cycle 2, assess 9158ade7): codex 0.163's rollout migration leaves a
+  journal present as BOTH `<stem>.jsonl` and `<stem>.jsonl.zst` — one
+  session, two names, and bytes that differ by construction (plain vs
+  zstd frame) so the content-signature dedup (rm-1886) cannot collapse
+  the pair; aggregation counted the session twice (PoC: the same
+  rollout listed at $0.0042 x2). The aggregation walk now admits the
+  plain twin by NAME — deterministic regardless of the migration's
+  mtime ordering — suppresses the `.jsonl.zst` shadow, and counts it:
+  `zst_stem_twins` / `zst_stem_twin_pairs` join the `--audit` JSON
+  disclosure and `--doctor` renders a "Compressed rollout twins" row
+  with a recommendation naming both twin sources — codex's rollout
+  migration and the documented `zstd -d` decompress-without-delete
+  recipe (review fix 133ceef5 F4: operator-created twins are never
+  cleared by any migration). The `-d` inspection lane
+  keeps both names (rm-548 stance), and a `.jsonl.zst` with no plain
+  sibling still admits and decodes unchanged (rm-992).
+
+- Hostile extreme timestamps no longer crash the reports (rm-2057,
+  run 18f9b98a cycle 2, assess 9158ade7): the last two crashes in a
+  20+-flag hostile sweep were both calendar-floor underflows — `--quota`
+  panicking at `cutoff - span` (lib.rs quota_window) and `--overview
+  -f svg` at `anchor - Duration::days` (reports.rs card_daily_series)
+  when a journal's newest event sits at the representable floor
+  (`-262143-01-01T00:00:00Z`, the naive-arm admission). Both windows
+  now clamp at consumption: a start that would precede representable
+  time extends to the floor (spend stays fully attributed — every
+  event is at or after the floor), and floor-underflow days render AT
+  the floor with an honest 0.0 so the anchor day's cost is painted
+  exactly once.
+
+- The finiteness gate now covers the TUI and the CSV cells (rm-1500
+  riders, run 18f9b98a cycle 2, assess 9158ade7 F1/F3): the landed CLI
+  clamp wave (0ff02e09) never reached agenttrace-tui — one poisoned
+  session cost NaN'd the driver folds (explorer.rs, presentation.rs,
+  shared.rs) and the Cost-view comparator used
+  `partial_cmp().unwrap_or(Equal)`, an inconsistent order under NaN
+  that a sort is allowed to reject. The six folds clamp through a
+  shared `finite_cost`, the comparator uses `total_cmp` over gated
+  values, the cost delta gates its operands, and `--sessions -f csv`
+  cost cells render `0.0000` instead of NaN/inf text (machine-consumed
+  cells must stay parseable). Review fix (run 18f9b98a cycle 2,
+  review 133ceef5 F1/F2/F3, attempt 74e51089): the gate now also
+  covers the three remaining TUI cost sums (narrow-header total,
+  range summary, project popup) and the Cost sort lane
+  (`compare_sessions` gates then `total_cmp` — a total order under
+  NaN), and the CSV lane discloses clamped cells with a trailing
+  `#`-marker row (the rm-798 convention) so a poisoned cost never
+  reads as a true $0; clean CSV output stays byte-identical.
+
+- Antigravity numeric id 1050 maps to `gemini-3.1-flash-lite`
+  (rm-1533 rider, run 18f9b98a cycle 2, research 0418480c): ccusage
+  v20.0.36 (#1902) established the mapping; the bare key is already
+  priced in the bundled snapshot, so the arm is identity-only like its
+  1417 sibling and the spend prices instead of banking under a
+  stringified "1050".
+
 - Compressed codex rollouts (`.jsonl.zst`) are admitted by discovery and
   decoded (rm-992, run e4209f0c cycle 5): upstream codex `migrate_rollouts`
   compresses rollouts to `<name>.jsonl.zst` (compression stable-adjacent

@@ -83,24 +83,56 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             "parent_session",
         ],
     );
+    // rm-1500 review fix (133ceef5 F3): the clamp alone made a
+    // poisoned cost indistinguishable from a true $0 in every cell.
+    // The lane now carries the rm-798 trailing-# marker so a consumer
+    // can tell — and a clean corpus stays byte-identical (no marker).
+    let mut non_finite_cells = 0usize;
     for row in rows {
+        if !row.cost.is_finite() {
+            non_finite_cells += 1;
+        }
+        if !row.subagent_cost.is_finite() {
+            non_finite_cells += 1;
+        }
         out.push_str(&csv_row(&[
             &row.session,
             &row.health.to_string(),
             &row.data,
             &row.source,
             &row.model,
-            &format!("{:.4}", row.cost),
+            &csv_cost_cell(row.cost),
             &row.tokens.to_string(),
             &row.fail.to_string(),
             &row.anomalies.to_string(),
             &row.zero_usage_events.to_string(),
             &row.subagents.to_string(),
-            &format!("{:.4}", row.subagent_cost),
+            &csv_cost_cell(row.subagent_cost),
             &row.parent_session,
         ]));
     }
+    if non_finite_cells > 0 {
+        out.push_str(&csv_row(&[&format!(
+            "# non-finite costs clamped to 0.0000: {non_finite_cells} cell(s)"
+        )]));
+    }
     out
+}
+
+/// rm-1500 rider (run 18f9b98a cycle 2, assess 9158ade7 F3): CSV
+/// cost cells render through the same finiteness gate the interactive
+/// lanes carry — NaN/inf text in a machine-consumed cell breaks
+/// jq/spreadsheet parsers downstream, so a poisoned cost reads 0.0000
+/// while the session row still lists. Review fix (133ceef5 F3):
+/// [`sessions_csv`] discloses how many cells were clamped with a
+/// trailing `#`-marker row (the rm-798 convention) so the clamp never
+/// reads as a true $0.
+fn csv_cost_cell(cost: f64) -> String {
+    if cost.is_finite() {
+        format!("{:.4}", cost)
+    } else {
+        "0.0000".to_string()
+    }
 }
 
 /// rm-798: [`sessions_csv`] plus an explicit truncation statement.
@@ -281,6 +313,67 @@ fn is_formula_introducer(first: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csv_cost_cells_gate_non_finite_values() {
+        // rm-1500 rider (run 18f9b98a cycle 2, assess 9158ade7 F3):
+        // the CLI cost folds gate NaN/inf to 0.0, but the CSV cells
+        // rendered `{:.4}` directly — NaN/inf TEXT in a
+        // machine-consumed cell breaks jq and spreadsheet parsers
+        // downstream. Same gate, same convention: poisoned reads
+        // 0.0000, the row still lists.
+        assert_eq!(csv_cost_cell(f64::NAN), "0.0000");
+        assert_eq!(csv_cost_cell(f64::INFINITY), "0.0000");
+        assert_eq!(csv_cost_cell(f64::NEG_INFINITY), "0.0000");
+        assert_eq!(csv_cost_cell(0.0), "0.0000");
+        assert_eq!(csv_cost_cell(0.00423), "0.0042");
+        assert_eq!(csv_cost_cell(12.5), "12.5000");
+    }
+
+    fn csv_row_fixture(session: &str, cost: f64, subagent_cost: f64) -> SessionCsvRow {
+        SessionCsvRow {
+            session: session.to_string(),
+            health: 100,
+            data: "2026-10-21".to_string(),
+            source: "claude_code".to_string(),
+            model: "gpt-5".to_string(),
+            cost,
+            tokens: 10,
+            fail: 0,
+            anomalies: 0,
+            zero_usage_events: 0,
+            subagents: 0,
+            subagent_cost,
+            parent_session: String::new(),
+        }
+    }
+
+    #[test]
+    fn sessions_csv_discloses_clamped_non_finite_cost_cells() {
+        // rm-1500 review fix (133ceef5 F3): the 0.0000 clamp alone
+        // made a poisoned cost indistinguishable from a true $0 in
+        // every cell — the lane now carries the rm-798 trailing-#
+        // marker row, and a clean corpus stays byte-identical (no
+        // marker, same bytes as before the fix).
+        let clean = csv_row_fixture("s1", 0.25, 0.0);
+        let poisoned = csv_row_fixture("s2", f64::NAN, f64::INFINITY);
+
+        let clean_table = sessions_csv(std::slice::from_ref(&clean));
+        assert!(
+            !clean_table.contains("# non-finite"),
+            "a clean corpus renders no marker: {clean_table}"
+        );
+
+        let table = sessions_csv(&[clean, poisoned]);
+        assert!(
+            table.contains("# non-finite costs clamped to 0.0000: 2 cell(s)"),
+            "poisoned cells are disclosed: {table}"
+        );
+        assert!(
+            table.contains("s2"),
+            "the poisoned session's row still lists"
+        );
+    }
 
     #[test]
     fn quotes_embedded_commas_quotes_and_newlines() {

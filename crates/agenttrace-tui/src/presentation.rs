@@ -3563,7 +3563,7 @@ pub(super) fn top_driver<T: Borrow<Session>>(
         entry.sessions += 1;
         entry.failures += session.metrics.tool_calls_fail;
         entry.tokens = entry.tokens.saturating_add(total_tokens(session));
-        entry.cost += session.metrics.cost_estimated;
+        entry.cost += shared::finite_cost(session.metrics.cost_estimated);
     }
     groups.into_values().max_by(compare_driver_items)
 }
@@ -3584,7 +3584,7 @@ pub(super) fn top_anomaly_driver<T: Borrow<Session>>(sessions: &[T]) -> Option<D
             entry.sessions += 1;
             entry.failures += session.metrics.tool_calls_fail;
             entry.tokens = entry.tokens.saturating_add(total_tokens(session));
-            entry.cost += session.metrics.cost_estimated;
+            entry.cost += shared::finite_cost(session.metrics.cost_estimated);
         }
     }
     groups.into_values().max_by(compare_driver_items)

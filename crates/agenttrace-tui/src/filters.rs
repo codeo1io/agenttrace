@@ -327,7 +327,12 @@ pub(super) fn compare_sessions(a: &Session, b: &Session, key: SortKey, desc: boo
                 .then_with(|| a.name.cmp(&b.name))
         }
         SortKey::Health => a.health.cmp(&b.health).then_with(|| a.name.cmp(&b.name)),
-        SortKey::Cost => cmp_f64(a.metrics.cost_estimated, b.metrics.cost_estimated)
+        // rm-1500 review fix (133ceef5 F2): raw cmp_f64 under a NaN
+        // cost is not a total order (transitivity breaks), the same
+        // hazard the Cost-view comparator cured — gate then
+        // total_cmp, mirroring explorer.rs.
+        SortKey::Cost => shared::finite_cost(a.metrics.cost_estimated)
+            .total_cmp(&shared::finite_cost(b.metrics.cost_estimated))
             .then_with(|| a.name.cmp(&b.name)),
         SortKey::Turns => a
             .metrics
@@ -358,6 +363,11 @@ pub(super) fn compare_sessions(a: &Session, b: &Session, key: SortKey, desc: boo
     }
 }
 
+/// FINITE inputs only: callers must pre-gate (the presentation
+/// lanes fold through `shared::finite_cost` at accumulation, so the
+/// values arriving here are already finite). Raw session metrics
+/// must go through `finite_cost(...).total_cmp(...)` instead — see
+/// the SortKey::Cost arm (rm-1500 review fix, 133ceef5 F2).
 pub(super) fn cmp_f64(a: f64, b: f64) -> Ordering {
     a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
