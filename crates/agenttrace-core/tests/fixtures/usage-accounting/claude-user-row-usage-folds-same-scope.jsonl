@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-10-01T10:00:05.100Z","sessionId":"user-row-fold","cwd":"/tmp/ph","version":"2.1.300","message":{"id":"gw-ux","usage":{"input_tokens":1000,"output_tokens":999}}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:05.456Z","sessionId":"user-row-fold","cwd":"/tmp/ph","version":"2.1.300","message":{"id":"gw-ux","usage":{"input_tokens":1000,"output_tokens":120}}}

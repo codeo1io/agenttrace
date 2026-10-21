@@ -1,0 +1,4 @@
+{"type":"user","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"hi"}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:05Z","message":{"id":"gateway-1","model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":50}}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:05Z","message":{"id":"gateway-1","model":"claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":120}}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:09Z","message":{"id":"gateway-1","model":"claude-sonnet-4-20250514","usage":{"input_tokens":400,"output_tokens":40}}}

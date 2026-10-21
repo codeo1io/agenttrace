@@ -1,0 +1,6 @@
+{"type":"user","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"run the build"}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:05Z","message":{"id":"gateway-9","model":"claude-sonnet-4-20250514","content":[{"type":"tool_use","id":"call_1","name":"run_tests","input":{"suite":"core"}}],"usage":{"input_tokens":100,"output_tokens":10}}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:06Z","message":{"id":"gateway-9","model":"claude-sonnet-4-20250514","content":[{"type":"tool_result","tool_use_id":"call_1","content":"1 passed"}],"usage":{"input_tokens":150,"output_tokens":15}}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:08Z","message":{"id":"gateway-9","model":"claude-sonnet-4-20250514","content":[{"type":"tool_use","id":"call_1","name":"run_lint","input":{"fix":false}}],"usage":{"input_tokens":100,"output_tokens":20}}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:08Z","message":{"id":"gateway-9","model":"claude-sonnet-4-20250514","content":[{"type":"tool_use","id":"call_1","name":"run_lint","input":{"fix":false}}],"usage":{"input_tokens":100,"output_tokens":10}}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:09Z","message":{"id":"gateway-9","model":"claude-sonnet-4-20250514","content":[{"type":"tool_result","tool_use_id":"call_1","content":"0 findings"}],"usage":{"input_tokens":100,"output_tokens":10}}}
