@@ -4,6 +4,26 @@
 
 ### Added
 
+- Transcript-derived 5-hour billing blocks (rm-042, run 6a6d06b5
+  cycle 2): `--blocks` replays the provider's first-use-aligned billing
+  windows from the local corpus — a session's first parsable event
+  timestamp opens a `[t0, t0+5h)` block, an event at or past the end
+  rolls to a fresh block, overlapping blocks from concurrent sessions
+  merge, and the active block carries an elapsed-only burn rate.
+  Attribution follows the quota census (event-basis pro-rata by stamp
+  membership; span-basis anchor for stampless warm-cache rows;
+  unplaceable counted, not guessed), and the provider's early
+  inactivity reset is disclosed as underivable from transcripts
+  instead of being invented. Before this view the only 5h window
+  truth was the statusline capture — corpora parsed without a
+  statusline configured carried none at all. `-f json` emits the
+  stable `agenttrace.blocks/1` schema; text is the default, other
+  formats are refused loudly. Corpus-scope under the same guards as
+  `--quota`; pairing it with another report action is a usage error.
+  Parity with captures is contract-pinned: the derived active block
+  satisfies `start == resets_at - 5h` and `end == resets_at` against a
+  captured `insights.five_hour.resets_at` (red-first in
+  `five_hour_blocks_contract.rs`).
 - Zst stem twins count once, with disclosure (rm-2056, run 18f9b98a
   cycle 2, assess 9158ade7): codex 0.163's rollout migration leaves a
   journal present as BOTH `<stem>.jsonl` and `<stem>.jsonl.zst` — one

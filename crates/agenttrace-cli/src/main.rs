@@ -161,6 +161,18 @@ struct Args {
     /// data. Corpus-scope — view filters do not apply.
     #[arg(long)]
     quota: bool,
+    /// Show the transcript-derived 5-hour billing-block view (rm-042):
+    /// first-use-aligned provider billing windows replayed from event
+    /// timestamps (the same alignment the provider applies), merged
+    /// across concurrent sessions, with an active-block burn rate and
+    /// the same attribution census as `--quota` (event-basis / span-
+    /// basis / unplaced; pro-rata by stamp membership). The provider's
+    /// early inactivity reset is disclosed as underivable from
+    /// transcripts. `-f json` emits the stable `agenttrace.blocks/1`
+    /// schema; the default is a text summary. Corpus-scope — view
+    /// filters do not apply.
+    #[arg(long)]
+    blocks: bool,
     /// Report on the Claude Code statusline capture journal (candidate
     /// 53, cycle 7): limit-pressure windows, reset crossings, and
     /// per-session prompt-cache miss causes recorded by
@@ -748,6 +760,21 @@ fn run() -> anyhow::Result<()> {
         // as a session report action for exactly that reason.
         let sessions = load_sessions(&args)?;
         let out = agenttrace_core::render_quota_view(&args.format, &sessions)?;
+        let out = dispatch_sanitize(&args.format, out);
+        write_output(&args.output, &out)?;
+        write_stdout(&out)?;
+        return Ok(());
+    }
+
+    if args.blocks {
+        // rm-042 (run 6a6d06b5 cycle 2): the transcript-derived
+        // billing-block view — corpus-scope for the same reason as
+        // `--quota` above (a filtered corpus would understate the
+        // windows concurrent sessions opened together); the filter
+        // family is refused loudly by the same applicability guards.
+        let sessions = load_sessions(&args)?;
+        let out = agenttrace_core::render_blocks_view(&args.format, &sessions, Utc::now())
+            .map_err(|e| anyhow::anyhow!(e))?;
         let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
@@ -1401,6 +1428,7 @@ fn refuse_inapplicable_mcp_flags(args: &Args) {
     flag(args.update_pricing, "--update-pricing");
     flag(args.test_match, "--test-match");
     flag(args.quota, "--quota");
+    flag(args.blocks, "--blocks");
     flag(args.fetch, "--fetch");
     flag(args.weekly_budget.is_some(), "--weekly-budget");
     flag(args.budget, "--budget");
@@ -3173,6 +3201,7 @@ fn has_post_pricing_action(args: &Args) -> bool {
         || args.statusline_report
         || args.budget
         || args.quota
+        || args.blocks
 }
 
 /// Session-report actions only — the interactive-TUI fallback and the
@@ -3220,9 +3249,9 @@ fn validate_range_applicability(args: &Args) -> anyhow::Result<()> {
     // the corpus down (an old fixture under `--range 1d` renders an
     // EMPTY quota, which looks exactly like a measured zero). Refuse
     // the pair loudly before that, in this guard's own voice.
-    if args.range != "all" && args.quota {
+    if args.range != "all" && (args.quota || args.blocks) {
         bail!(
-            "--range does not apply to --quota: the quota view is corpus-scope (every discovered session bills the window); drop --range to see the full-corpus windows"
+            "--range does not apply to --quota/--blocks: both views are corpus-scope (every discovered session bills the window); drop --range to see the full-corpus windows"
         );
     }
     // rm-598 quota-scope rider (run 80e8beb6 cycle 1, batch "bounded
@@ -3234,7 +3263,7 @@ fn validate_range_applicability(args: &Args) -> anyhow::Result<()> {
     // "no session carries placeable time" at rc0 while the
     // unfiltered view carried real windows). Same guard family, same
     // voice: the view-filter set cannot narrow a corpus-scope window.
-    if args.quota {
+    if args.quota || args.blocks {
         let mut filters = Vec::new();
         if !args.project.is_empty() {
             filters.push("--project");
@@ -3249,7 +3278,7 @@ fn validate_range_applicability(args: &Args) -> anyhow::Result<()> {
             let pair = filters.join("/");
             let verb = if filters.len() == 1 { "does" } else { "do" };
             bail!(
-                "{pair} {verb} not apply to --quota: the quota view is corpus-scope (every discovered session bills the window); drop the filter(s) to see the full-corpus windows"
+                "{pair} {verb} not apply to --quota/--blocks: both views are corpus-scope (every discovered session bills the window); drop the filter(s) to see the full-corpus windows"
             );
         }
     }
@@ -3384,6 +3413,10 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
         // registration contract — it is a report action, so pairing it
         // with another one is the same hijack, not a combination.
         args.quota,
+        // rm-042 (run 6a6d06b5 cycle 2): `--blocks` is a report action
+        // of the same shape — registering it keeps the pair a loud
+        // usage error instead of a silent first-branch win.
+        args.blocks,
         args.version,
         args.search
             .as_deref()
@@ -3649,6 +3682,7 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
         list_models: false,
         statusline_report: false,
         quota: false,
+        blocks: false,
         fetch: false,
         update_pricing: false,
         test_match: false,
@@ -3817,6 +3851,13 @@ mod tests {
                 // exit 0 with the quota action silently swallowed.
                 let mut a = base();
                 a.quota = true;
+                a
+            }),
+            ("--blocks", {
+                // rm-042 (run 6a6d06b5 cycle 2): same registration
+                // contract as `--quota` above.
+                let mut a = base();
+                a.blocks = true;
                 a
             }),
         ];

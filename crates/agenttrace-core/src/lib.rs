@@ -1,3 +1,4 @@
+mod billing_blocks;
 mod cache_dir;
 mod codex_replay;
 mod demo;
@@ -25,6 +26,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use billing_blocks::{billing_blocks, render_blocks_view, BLOCK_WINDOW_SECS};
 pub use demo::{demo_sessions, DEMO_REPORT_EPOCH};
 pub use diagnostics::{
     attention_priority, attention_rank, fix_suggestions, inspect_first, inspect_reason,

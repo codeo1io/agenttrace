@@ -1,0 +1,3 @@
+{"type":"user","timestamp":"2026-10-15T10:00:00Z","message":{"content":"first block opens"}}
+{"type":"assistant","timestamp":"2026-10-15T10:30:00Z","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":100,"output_tokens":50}},"costUSD":0.01}
+{"type":"assistant","timestamp":"2026-10-15T15:30:00Z","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":100,"output_tokens":50}},"costUSD":0.01}
