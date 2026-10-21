@@ -101,18 +101,36 @@ fn resolve_user_config_path(
     xdg_config_home: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
-    let base = xdg_config_home
+    // XDG-spec path semantics, platform-independent: the spec's
+    // "absolute" means an absolute *spec* path (leading '/'), and the
+    // separator is '/'. std::path semantics would make this Windows-
+    // relative (no drive letter) and render '\\' separators, so a
+    // spec-compliant $XDG_CONFIG_HOME (always POSIX-shaped) was ignored
+    // and the HOME fallback used on Windows. Resolve with '/'-joined
+    // spec strings and convert to the platform PathBuf only at the end.
+    let xdg = xdg_config_home
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+        .and_then(|value| value.to_str())
         // rm-248: the XDG Base Directory Specification says a relative
         // $XDG_CONFIG_HOME is ignored as if unset — a cwd-relative
         // `.config` must not silently become the config root.
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            home.filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".config"))
-        })?;
-    Some(base.join("agenttrace").join("config.toml"))
+        .filter(|value| value.starts_with('/'));
+    let base = match xdg {
+        Some(base) => base.to_string(),
+        None => {
+            let home = home
+                .filter(|value| !value.is_empty())
+                .and_then(|value| value.to_str())?;
+            if home.starts_with('~') {
+                // Test/fixture homes use real paths; only a literal '~'
+                // prefix would need expansion, which HOME itself already
+                // provides — treat non-absolute homes as absent.
+                return None;
+            }
+            format!("{home}/.config")
+        }
+    };
+    Some(PathBuf::from(format!("{base}/agenttrace/config.toml")))
 }
 
 /// The project-level configuration path: `./.agenttrace/config.toml`

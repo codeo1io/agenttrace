@@ -2972,7 +2972,17 @@ mod tests {
         let previous_env = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
         let previous_home = std::env::var_os("HOME");
         let previous_xdg = std::env::var_os("XDG_CACHE_HOME");
-        let default_root = root.join("home").join(".cache").join("agenttrace");
+        // The documented cache ladder (cache_dir.rs): $HOME/.cache on
+        // Linux, $HOME/Library/Caches on macOS — the platform arm the
+        // test pins must follow the ladder, not assume Linux.
+        let default_root = if cfg!(target_os = "macos") {
+            root.join("home")
+                .join("Library")
+                .join("Caches")
+                .join("agenttrace")
+        } else {
+            root.join("home").join(".cache").join("agenttrace")
+        };
         std::env::set_var("HOME", root.join("home"));
         std::env::remove_var("XDG_CACHE_HOME");
 
