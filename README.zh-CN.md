@@ -82,17 +82,15 @@ Windows PowerShell：
 irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
-Windows CMD：
-
-```bat
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
-```
-
 安装脚本会下载对应平台的发布版程序，按发布的校验和验证 SHA-256，并把安装目录
 （`~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\agenttrace`）加入 PATH。
 Shell 安装脚本始终获取最新发布版（源码构建回退可用
-`AGENTTRACE_SOURCE_REF=v0.10.1` 固定）；Windows 上用 `-Version v0.10.1`
-（PowerShell）固定版本。
+`AGENTTRACE_SOURCE_REF=v0.10.1` 固定）。上面的 PowerShell 一行命令同样无法
+传递参数；要固定版本，请先设置环境变量——
+`$env:AGENTTRACE_VERSION = "v0.10.1"; iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex`
+——或使用显式参数形式
+`powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.10.1`
+（显式参数优先于环境变量；`AGENTTRACE_INSTALL_DIR` 以同样方式覆盖安装目录）。
 
 包管理器：
 

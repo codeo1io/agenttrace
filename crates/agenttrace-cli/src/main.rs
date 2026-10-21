@@ -6,7 +6,7 @@ use agenttrace_core::{
     load_sessions_with_options, lookup_price, matches_numeric_filter, mcp_governance, parse_file,
     parse_numeric_filter, parse_stdin_bytes, predict_cost_anomaly, pricing_cache_path,
     pricing_source, recommendations, render_doctor_report, render_model_pricing_list,
-    render_test_match, render_waste_report_with_language, report_compare_json,
+    render_test_match, render_waste_report_prepared, report_compare_json,
     report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
     report_overview_svg_with_context, report_overview_text_with_context,
@@ -930,17 +930,35 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.waste {
-        let sessions = prepare_cli_view(load_sessions(&args)?, &args)?;
-        let session =
-            latest_session(&sessions).context("No sessions match the requested filters")?;
+        // rm-2111 (run 1c12a0bc cycle 3; assess bff3a140 F2): keep the
+        // LoadReport — the count of discovered-but-unparseable siblings
+        // is now disclosed IN the report (it used to surface only as a
+        // stderr parse warning, and the report named no subject at all,
+        // so a junk newer sibling silently changed the reported subject).
+        let (discovered, load_report) = load_sessions_report(&args)?;
+        let sessions = prepare_cli_view(discovered, &args)?;
+        let selection =
+            latest_selection(&sessions).context("No sessions match the requested filters")?;
+        disclose_latest_selection_tie(&selection);
+        let session = selection.session;
+        let mut report = compute_waste_report(session);
+        if let Some(load_report) = load_report.as_ref() {
+            report.skipped_unparseable = load_report.parse_failures;
+            // rm-2111(b) / review fd3a37ab F4: names, not just the count.
+            report.skipped_unparseable_paths = load_report
+                .parse_failure_paths
+                .iter()
+                .map(|p| sanitize_line_segment(&p.display().to_string()))
+                .collect();
+        }
         // rm-544: the format guard admits `-f json` for every action, so
         // every admitted machine format must be honored here too — the
         // json cell used to fall through to the text banner, handing
         // scripts prose where they expected data. markdown/html stay
         // rejected upstream (they are overview/governance surfaces).
         let out = match args.format.as_str() {
-            "json" => waste_report_json(&compute_waste_report(session)),
-            _ => render_waste_report_with_language(session, language),
+            "json" => waste_report_json(&report),
+            _ => render_waste_report_prepared(&report, language),
         };
         let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &(out.clone() + "\n"))?;
@@ -964,8 +982,11 @@ fn run() -> anyhow::Result<()> {
 
     if single_session_report_requested(&args) {
         let sessions = prepare_cli_view(load_sessions(&args)?, &args)?;
-        let session =
-            latest_session(&sessions).context("No sessions match the requested filters")?;
+        let selection =
+            latest_selection(&sessions).context("No sessions match the requested filters")?;
+        // rm-2110: same disclosed tie ladder as --waste / --latest.
+        disclose_latest_selection_tie(&selection);
+        let session = selection.session;
         let out = match args.format.as_str() {
             "json" => report_json_with_language(session, language),
             _ => report_text_with_language(session, language),
@@ -1036,7 +1057,12 @@ fn run() -> anyhow::Result<()> {
             ));
             Some(&sessions[index])
         } else if args.latest {
-            latest_session(&sessions)
+            let selection = latest_selection(&sessions);
+            if let Some(selection) = selection.as_ref() {
+                // rm-2110: same disclosed tie ladder as --waste / --report.
+                disclose_latest_selection_tie(selection);
+            }
+            selection.map(|selection| selection.session)
         } else {
             sessions.first()
         };
@@ -1963,7 +1989,19 @@ fn inspect_identity_header(
     )
 }
 
-fn latest_session(sessions: &[Session]) -> Option<&Session> {
+/// rm-2110 (run 1c12a0bc cycle 3; assess bff3a140 F1): a `--latest` /
+/// `--waste` pick now carries how many candidates are TIED with the
+/// winner at the top of the recency ladder, so the path rung is a
+/// disclosed counter instead of a silent coin. `tie_count == 1` is the
+/// ordinary strict-winner case; `tie_count > 1` means the winner was
+/// chosen by the ladder's LAST rung (lexicographic path, last wins) and
+/// callers disclose that on stderr.
+struct LatestSelection<'a> {
+    session: &'a Session,
+    tie_count: usize,
+}
+
+fn latest_selection(sessions: &[Session]) -> Option<LatestSelection<'_>> {
     // rm-688: the mtime fallback stats the file on every comparison, so a
     // --latest selection over n mixed-presence sessions stat'ed each
     // fallback file up to 2·(n−1) times for one answer. One memo per
@@ -1972,9 +2010,69 @@ fn latest_session(sessions: &[Session]) -> Option<&Session> {
     // like any other).
     let mut mod_times: std::collections::HashMap<&Path, SystemTime> =
         std::collections::HashMap::with_capacity(sessions.len());
-    sessions
+    let winner = sessions
         .iter()
-        .max_by(|a, b| newer_session_order(a, b, &mut mod_times))
+        .max_by(|a, b| newer_session_order(a, b, &mut mod_times))?;
+    // rm-2110 tie scan: a candidate is TIED with the winner when every
+    // rung of `newer_session_order` EXCEPT the final path rung compares
+    // Equal — same parsed instant (dated ties skip the mtime rung by
+    // construction), or both undated with the same file mod time (the
+    // epoch fallback included, which is what the missing-file fixtures
+    // pin). The winner itself is always in the count, so a corpus with a
+    // strict newest instant reports 1 and says nothing.
+    let tie_count = sessions
+        .iter()
+        .filter(|candidate| {
+            if session_start_cmp(
+                &candidate.metrics.session_start,
+                &winner.metrics.session_start,
+            ) != std::cmp::Ordering::Equal
+            {
+                return false;
+            }
+            if !candidate.metrics.session_start.is_empty() {
+                return true;
+            }
+            let candidate_mod_time = session_mod_time(candidate, &mut mod_times);
+            let winner_mod_time = session_mod_time(winner, &mut mod_times);
+            candidate_mod_time == winner_mod_time
+        })
+        .count();
+    Some(LatestSelection {
+        session: winner,
+        tie_count,
+    })
+}
+
+/// rm-2110: the disclosure half of the tie ladder. A pick decided by
+/// the lexicographic path rung says so on stderr (the same advisory
+/// channel the parse warnings use), naming the winner, the tie
+/// count, and the actual deciding rung — never implying mod-time
+/// decided when both files carry parsed session_start (review
+/// fd3a37ab F3: the old "(session_start, mod-time) instant" wording
+/// over-claimed mod-time for dated ties, where the mtime rung is
+/// skipped entirely).
+fn disclose_latest_selection_tie(selection: &LatestSelection) {
+    if selection.tie_count > 1 {
+        // Both files dated → the mtime rung never ran; the path rung
+        // alone decided. Any file undated → mtime broke the tie as far
+        // as it could, path decided the rest. Datedness is read off the
+        // ladder's own key — `metrics.session_start` non-empty (Session
+        // carries no timestamp field).
+        let undated = selection.session.metrics.session_start.is_empty();
+        let basis = if undated {
+            "an equal file mod-time (all tied files undated)"
+        } else {
+            "the same parsed session_start instant (all dated: the mod-time rung is skipped)"
+        };
+        eprintln!(
+            "agenttrace: session selection: {} sessions tie on {}; selected {} ({}) by the lexicographic path rung (last path wins)",
+            selection.tie_count,
+            basis,
+            selection.session.name,
+            selection.session.path
+        );
+    }
 }
 
 fn newer_session_order<'a>(
@@ -1993,9 +2091,20 @@ fn newer_session_order<'a>(
     //
     // rm-688 (composed at integration): the mtime fallback below is the
     // stat-storm site — both stats go through the ONE memo threaded by
-    // the caller (`latest_session`), so each fallback file is stat'ed at
-    // most once per selection pass, and missing files still resolve to
-    // the epoch fallback (their "stat" is cached like any other).
+    // the caller (`latest_selection`), so each fallback file is stat'ed
+    // at most once per selection pass, and missing files still resolve
+    // to the epoch fallback (their "stat" is cached like any other).
+    //
+    // rm-2110: the FULL ladder, in order: (1) the parsed session_start
+    // instant — undated loses to dated; (2) file mod time when BOTH are
+    // undated, missing files resolving to the epoch fallback; (3)
+    // lexicographic path, LAST wins. Rung 3 makes the order total over
+    // distinct paths but is a silent coin for anything sharing a top
+    // key — a genuinely newer write inside the filesystem's mtime
+    // resolution (or two missing files, both at the epoch fallback)
+    // loses to a lexicographically larger path with no trace — so
+    // `latest_selection` counts rung-3 ties and `disclose_latest_
+    // selection_tie` discloses them on stderr.
     session_start_cmp(&a.metrics.session_start, &b.metrics.session_start)
         .then_with(|| {
             if a.metrics.session_start.is_empty() && b.metrics.session_start.is_empty() {
@@ -4196,7 +4305,8 @@ mod tests {
         let newer_session_time = session("newer-time", &older_file, "2026-01-02T00:00:00Z");
 
         assert_eq!(
-            latest_session(&[older_mtime_session, newer_session_time])
+            latest_selection(&[older_mtime_session, newer_session_time])
+                .map(|selection| selection.session)
                 .map(|session| session.name.as_str()),
             Some("newer-time")
         );
@@ -4207,14 +4317,23 @@ mod tests {
 
     #[test]
     fn latest_session_uses_mod_time_when_timestamps_are_missing() {
+        // rm-2110 (run 1c12a0bc cycle 3; assess bff3a140 F1): the fixture
+        // mtime is ASSIGNED, not raced — the old body slept 5ms between
+        // writes and hoped the host clock advanced (CLK_TCK=100 means a
+        // 10ms tick; under load both writes can land in one tick and the
+        // "newer" file then loses to the path rung — the cycle-3 full
+        // battery's single red, x20-solo-green flake). Explicit instants
+        // make the corpus exact and repeatable.
         let older = temp_session_file("agenttrace-older-modtime", "older");
-        std::thread::sleep(std::time::Duration::from_millis(5));
         let newer = temp_session_file("agenttrace-newer-modtime", "newer");
+        set_test_mtime(Path::new(&older), 1_700_000_000, 0);
+        set_test_mtime(Path::new(&newer), 1_700_000_001, 0);
         let older_session = session("older", &older, "");
         let newer_session = session("newer", &newer, "");
 
         assert_eq!(
-            latest_session(&[newer_session, older_session]).map(|session| session.name.as_str()),
+            latest_selection(&[newer_session, older_session])
+                .map(|selection| selection.session.name.as_str()),
             Some("newer")
         );
 
@@ -4224,13 +4343,95 @@ mod tests {
 
     #[test]
     fn latest_session_breaks_mod_time_ties_by_path() {
+        // rm-2110: the path rung is the LAST rung of the ladder and now a
+        // disclosed one — both missing files resolve to the epoch
+        // fallback, the top key ties, and the lexicographically LAST path
+        // wins (the pin the ladder has always had). The tie counter (not
+        // just the winner) is pinned too: 2 candidates share the top key,
+        // so a selection over this corpus must disclose, not stay silent.
         let alpha = session_with_missing_file("alpha", "/tmp/agenttrace-alpha.jsonl");
         let omega = session_with_missing_file("omega", "/tmp/agenttrace-omega.jsonl");
+        let sessions = [alpha, omega];
 
+        let selection = latest_selection(&sessions).expect("a selection exists");
+        assert_eq!(selection.session.name, "omega");
         assert_eq!(
-            latest_session(&[alpha, omega]).map(|session| session.name.as_str()),
-            Some("omega")
+            selection.tie_count, 2,
+            "epoch-fallback ties must be counted, not silent"
         );
+    }
+
+    // rm-2110 red-first: the ladder's path rung was a silent coin — two
+    // REAL files with EXPLICITLY equal mtimes (the same-instant case the
+    // sleep-based fixtures could never construct on purpose) were picked
+    // apart by filename with no trace anywhere in the output. The
+    // counter must say 2, the winner is the lexicographically last path,
+    // and a strictly older third candidate must not inflate the count.
+    #[test]
+    fn latest_selection_counts_real_equal_mtime_ties() {
+        let alpha = temp_session_file("agenttrace-tie-alpha", "tie");
+        let omega = temp_session_file("agenttrace-tie-omega", "tie");
+        let strictly_older = temp_session_file("agenttrace-tie-zold", "tie");
+        set_test_mtime(Path::new(&alpha), 1_700_000_050, 250_000_000);
+        set_test_mtime(Path::new(&omega), 1_700_000_050, 250_000_000);
+        set_test_mtime(Path::new(&strictly_older), 1_700_000_049, 0);
+        let sessions = [
+            session("alpha", &alpha, ""),
+            session("omega", &omega, ""),
+            session("old", &strictly_older, ""),
+        ];
+
+        let selection = latest_selection(&sessions).expect("a selection exists");
+        assert_eq!(selection.session.name, "omega");
+        assert_eq!(
+            selection.tie_count, 2,
+            "only the two same-instant files tie; the strictly older one does not"
+        );
+
+        let _ = fs::remove_file(alpha);
+        let _ = fs::remove_file(omega);
+        let _ = fs::remove_file(strictly_older);
+    }
+
+    // rm-2110: distinct instants stay tie-free — the disclosed ladder is
+    // byte-identical to the old silent one whenever there is a strict
+    // newest instant, in both the undated (mtime) and the dated
+    // (session_start) mixes, and a dated-vs-undated split never ties.
+    #[test]
+    fn latest_selection_reports_no_tie_for_distinct_instants() {
+        let undated_older = session_with_missing_file("u-old", "/tmp/agenttrace-u-older.jsonl");
+        let undated_newer = session_with_missing_file("u-new", "/tmp/agenttrace-u-newer.jsonl");
+        let dated = session(
+            "dated",
+            "/tmp/agenttrace-dated.jsonl",
+            "2026-01-01T00:00:00Z",
+        );
+
+        // Undated pair: distinct paths, but both missing files sit at the
+        // SAME epoch fallback — this corpus IS a tie (the counter says
+        // so); swap in a dated session and the split is strict again.
+        let tie_corpus = [undated_older.clone(), undated_newer.clone()];
+        let tie_selection = latest_selection(&tie_corpus).expect("a selection exists");
+        assert_eq!(tie_selection.tie_count, 2);
+
+        let strict_corpus = [undated_older, undated_newer, dated.clone()];
+        let strict_selection = latest_selection(&strict_corpus).expect("a selection");
+        assert_eq!(strict_selection.session.name, "dated");
+        assert_eq!(
+            strict_selection.tie_count, 1,
+            "the dated winner stands alone"
+        );
+
+        // Two DISTINCT dated instants: no tie either.
+        let other_dated = session(
+            "other",
+            "/tmp/agenttrace-other.jsonl",
+            "2026-01-02T00:00:00Z",
+        );
+        let pair_corpus = [dated, other_dated];
+        let pair = latest_selection(&pair_corpus).expect("a selection exists");
+        assert_eq!(pair.session.name, "other");
+        assert_eq!(pair.tie_count, 1);
     }
 
     // rm-688: one stat per distinct fallback path per selection pass.
@@ -4244,11 +4445,15 @@ mod tests {
     fn latest_session_selection_stats_each_fallback_file_once() {
         let mut files = Vec::new();
         for index in 0..6 {
-            std::thread::sleep(std::time::Duration::from_millis(5));
             files.push(temp_session_file(
                 &format!("agenttrace-stat-pin-{index}"),
                 "stat-pin",
             ));
+        }
+        // rm-2110: distinct instants by ASSIGNMENT, not by sleeping — the
+        // corpus must be exact even on a host whose mtime tick is slow.
+        for (index, file) in files.iter().enumerate() {
+            set_test_mtime(Path::new(file), 1_700_000_100 + index as i64, 0);
         }
         // Mixed presence: two sessions carry session_start (no stat needed),
         // five fall back to mtime, one of which points at a missing file
@@ -4293,11 +4498,15 @@ mod tests {
     fn latest_session_mixed_presence_selection_matches_unmemoized() {
         let mut files = Vec::new();
         for index in 0..4 {
-            std::thread::sleep(std::time::Duration::from_millis(5));
             files.push(temp_session_file(
                 &format!("agenttrace-parity-{index}"),
                 "parity",
             ));
+        }
+        // rm-2110: same assignment pattern — the parity oracle reads live
+        // stats, so deterministic mtimes keep the two sides comparable.
+        for (index, file) in files.iter().enumerate() {
+            set_test_mtime(Path::new(file), 1_700_000_200 + index as i64, 0);
         }
         let sessions = vec![
             session("file-0", &files[0], ""),
@@ -4336,12 +4545,12 @@ mod tests {
         // ascending — assert the winner, and the full precedence (stamped
         // above all mtime sessions) via repeated selection.
         assert_eq!(
-            latest_session(&sessions).map(|session| session.name.clone()),
+            latest_selection(&sessions).map(|selection| selection.session.name.clone()),
             expected.first().cloned(),
             "memoized selection disagrees with the unmemoized oracle"
         );
         assert_eq!(
-            latest_session(&sessions).map(|session| session.name.clone()),
+            latest_selection(&sessions).map(|selection| selection.session.name.clone()),
             Some("stamped".to_string()),
             "stamped sessions outrank every mtime fallback"
         );
@@ -4368,11 +4577,12 @@ mod tests {
         );
 
         assert_eq!(
-            latest_session(&[later.clone(), offset.clone()]).map(|session| session.name.as_str()),
+            latest_selection(&[later.clone(), offset.clone()])
+                .map(|selection| selection.session.name.as_str()),
             Some("later")
         );
         assert_eq!(
-            latest_session(&[offset, later]).map(|session| session.name.as_str()),
+            latest_selection(&[offset, later]).map(|selection| selection.session.name.as_str()),
             Some("later")
         );
     }
@@ -5264,6 +5474,31 @@ mod tests {
         let mut file = fs::File::create(&path).expect("create temp session");
         writeln!(file, "{content}").expect("write temp session");
         path.to_string_lossy().to_string()
+    }
+
+    // rm-2110 (run 1c12a0bc cycle 3; assess bff3a140 F1): assign a
+    // fixture file's mtime EXACTLY instead of sleeping between writes.
+    // The sleep-based fixtures (5ms apart on a 10ms mtime tick) could
+    // land in one tick under load and silently change which session
+    // "latest" picked — the cycle-3 battery's single red. Review
+    // fd3a37ab L3: the acceptance names `std::fs::File::set_times`
+    // (stable 1.75, below the 1.89 MSRV floor), so the helper drops
+    // libc's `utimensat` and its `#[cfg(unix)]` gate — the exact-mtime
+    // tie pins now run on Windows hosts instead of silently vanishing
+    // there. Only mtime is set; fixture atimes are irrelevant.
+    fn set_test_mtime(path: &Path, seconds: i64, nanoseconds: i64) {
+        use std::time::{Duration, SystemTime};
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap_or_else(|error| {
+                panic!("fixture mtime assignment could not open {path:?}: {error}")
+            });
+        let modified = SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, nanoseconds as u32);
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap_or_else(|error| {
+                panic!("fixture mtime assignment failed for {path:?}: {error}")
+            });
     }
 
     fn session(name: &str, path: &str, session_start: &str) -> Session {

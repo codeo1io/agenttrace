@@ -8,7 +8,10 @@
 //! and no control byte reaches the output — the neutralized bytes are
 //! disclosed in place as U+FFFD instead.
 
-use agenttrace_core::{parse_raw_session, render_waste_report, report_compare, Session};
+use agenttrace_core::{
+    compute_waste_report, parse_raw_session, render_waste_report, render_waste_report_prepared,
+    report_compare, ReportLanguage, Session,
+};
 
 /// OSC-52 clipboard-write payload in the session name (the ESC + "]" +
 /// ... + ESC + "\" framing), the exact shape assess planted in journals.
@@ -149,10 +152,11 @@ fn compare_text_row_neutralizes_invisible_spoofing_cf_in_session_names() {
 
 #[test]
 fn compare_text_row_neutralizes_osc7501_program_status_payloads() {
-    // render_waste_report never prints session names (its summary is
-    // aggregate-only), so the name-bearing row contract lands on the
-    // --compare lane; the waste lane's hostile-name exposure flows
-    // through the same shared row sanitizer.
+    // rm-2111 (run 1c12a0bc cycle 3) retired the old premise here —
+    // render_waste_report now DOES print the session name (the Session
+    // subject line), so the name-bearing row contract lands on BOTH
+    // lanes; the waste arm below pins it. The --compare lane keeps its
+    // own arm because its rows print many names, not just the subject.
     let name = "\u{1b}]7501;agenttrace\u{1b}\\status";
     let report = report_compare(
         &[hostile_session_with(HOSTILE_OSC7501_NAME_JSON, name)],
@@ -166,5 +170,80 @@ fn compare_text_row_neutralizes_osc7501_program_status_payloads() {
     assert!(
         report.contains("status"),
         "benign tail survives, got: {report}"
+    );
+}
+
+#[test]
+fn waste_subject_line_neutralizes_hostile_session_names() {
+    // rm-2111 (run 1c12a0bc cycle 3; assess bff3a140 F2): --waste now
+    // names its subject (Session + Journal lines), so the hostile-name
+    // contract lands on this lane too — both subject fields route
+    // through the shared `sanitize_line_segment` neutralizer like every
+    // other transcript-derived cell this file pins.
+    let report = render_waste_report(&hostile_session());
+    assert_no_control_bytes(&report, "--waste");
+    assert!(
+        report.contains('\u{FFFD}'),
+        "the neutralized OSC-52 payload must be disclosed in place (U+FFFD), got: {report}"
+    );
+    assert!(
+        report.contains("audit"),
+        "benign tail survives, got: {report}"
+    );
+    assert!(
+        report.contains("/tmp/rm239/hostile.jsonl"),
+        "the subject Journal line names the parsed fixture path, got: {report}"
+    );
+}
+
+#[test]
+fn waste_subject_line_neutralizes_osc7501_program_status_payloads() {
+    // rm-2111 companion arm: the OSC-7501 variant (program-status
+    // reporting) rides the same Session subject line and must neutralize
+    // identically — the name derives from the first user message, so
+    // both terminator variants (ESC-\ and the BEL form in the tool
+    // name) reach the renderer from one transcript.
+    let name = "\u{1b}]7501;agenttrace\u{1b}\\status";
+    let report = render_waste_report(&hostile_session_with(HOSTILE_OSC7501_NAME_JSON, name));
+    assert_no_control_bytes(&report, "--waste");
+    assert!(
+        report.contains('\u{FFFD}'),
+        "the neutralized OSC-7501 payload must be disclosed in place (U+FFFD), got: {report}"
+    );
+    assert!(
+        report.contains("status"),
+        "benign tail survives, got: {report}"
+    );
+}
+
+#[test]
+fn waste_skip_disclosure_neutralizes_hostile_skipped_paths() {
+    // review fd3a37ab M1/F4 companion arm: the skip disclosure gained
+    // NAMES alongside the count (bounded list in the text lane,
+    // skipped_unparseable_paths in the json cell), and a skipped path
+    // is operator-inspectable output derived from the filesystem walk
+    // — the same sanitize_line_segment contract as the subject lines
+    // above must hold for it. The CLI pre-sanitizes the paths on
+    // ingest; this arm pins the RENDER side directly so a hostile
+    // path can never reach the terminal even from a prepared report
+    // (the json cell rides serde's control-byte escaping instead, so
+    // only the text lane needs the terminal-safety pin).
+    let hostile_path = "\u{1b}]52;c;aGVsbG8=\u{1b}\\audit.jsonl";
+    let mut report = compute_waste_report(&hostile_session());
+    report.skipped_unparseable = 1;
+    report.skipped_unparseable_paths = vec![hostile_path.to_string()];
+    let rendered = render_waste_report_prepared(&report, ReportLanguage::En);
+    assert_no_control_bytes(&rendered, "--waste skips");
+    assert!(
+        rendered.contains('\u{FFFD}'),
+        "the neutralized skipped path must be disclosed in place (U+FFFD), got: {rendered}"
+    );
+    assert!(
+        rendered.contains("audit.jsonl"),
+        "the benign tail of the skipped path must survive, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("Skipped: 1 discovered session file(s) failed to parse"),
+        "the skip line must carry the count alongside the names, got: {rendered}"
     );
 }

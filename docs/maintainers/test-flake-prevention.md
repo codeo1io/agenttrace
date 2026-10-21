@@ -213,3 +213,28 @@ authority. Numbered 11 at mint: sibling run 5c144613's unlanded band
 every `.git` ancestor; pristine-base triage) — theirs keep 9–10 at any
 fold where both land, this stays 11 (the Rule 7→8 renumber precedent).
 
+## 2.1 Wall-clock mtime ties are not an ordering (closed 2026-10-20, rm-2110)
+
+The one battery flake of cycle 3 (assess bff3a140, ~1-in-3 full batteries, never solo: x20 = 0 fails)
+was a selection test that wrote two fixture files and relied on their mtimes differing. At
+CLK_TCK=100 the two writes can land inside one jiffy: equal mtimes, and the winner is left to sort
+stability. Production was equally unspecified — `newer_session_order` sorted by mtime only, so a
+tied pair silently picked an arbitrary session for `--latest`/`--waste`/`--report`.
+
+Rules that close this class:
+
+1. **Production selection must be a total order.** mtime first, then a stable tiebreak that is
+   total over distinct paths — rm-2110 landed lexicographic path, last wins (machine-independent:
+   identical corpora order identically everywhere; acceptance deviation recorded on rm-2110,
+   review fd3a37ab H2) in `crates/agenttrace-cli/src/main.rs`
+   (`newer_session_order`).
+2. **Fixtures must assign mtimes explicitly** (`std::fs::File::set_times` or equivalent) — never
+   sleeps, never reliance on write spacing. The flaky fixture at `main.rs:4211-4213` (old
+   numbering) was rewritten to explicit assignment.
+3. **Pin the tie deterministically with a red-first test**: a tied-mtime pair must resolve to the
+   same winner on every machine and every run.
+4. Sibling host fact from the same investigation: ext4 with `CLK_TCK=100` yields jiffies ≈ 10 ms;
+   a 400x experiment (two writes 5 ms apart) produced 0 equal, 0 inverted mtimes — "5 ms apart" is
+   NOT a guaranteed tie either, which is exactly why explicit assignment is the only stable
+   fixture. APFS hosts have the mirror-image hazard (ns mtimes reordering pairs, rm-1886 class) —
+   the same total-order rule covers both directions.

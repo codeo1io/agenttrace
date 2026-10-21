@@ -1,20 +1,44 @@
 # agenttrace Windows installer (PowerShell)
 # Usage: powershell -ExecutionPolicy Bypass -File install.ps1
 # Or:    iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+#
+# Environment variables act as parameter defaults (rm-550 arm 3,
+# upstream #317 port) — the only way to pin a release through the
+# piped one-liner above, which cannot pass parameters:
+#   AGENTTRACE_VERSION=v0.10.1   pin a release instead of "latest"
+#   AGENTTRACE_INSTALL_DIR=...   override the install directory
+# An explicit -File parameter always beats the environment variable.
+# Upstream's AGENTTRACE_NO_MODIFY_PATH has no counterpart here: this
+# installer never modifies PATH (it only prints an advisory).
 
 param(
-    [string]$Version = "latest",
-    [string]$InstallDir = "$env:LOCALAPPDATA\agenttrace"
+    [string]$Version = $(if ($env:AGENTTRACE_VERSION) { $env:AGENTTRACE_VERSION } else { "latest" }),
+    [string]$InstallDir = $(if ($env:AGENTTRACE_INSTALL_DIR) { $env:AGENTTRACE_INSTALL_DIR } else { "$env:LOCALAPPDATA\agenttrace" })
 )
 
 $REPO = "luoyuctl/agenttrace"
 $BIN = "agenttrace.exe"
 
-# Detect architecture
-$ARCH = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
-    "X64"   { "amd64" }
+# Detect architecture.
+# rm-550 (run 1c12a0bc cycle 3; upstream #314 port): in an interactive
+# Windows PowerShell 5.1 session PSReadLine 2.0.0 ships its own older
+# RuntimeInformation facade whose ProcessArchitecture property resolves
+# EMPTY (the PSReadLine shadow), so the documented `irm | iex` one-liner
+# failed with "Unsupported architecture: ''" on a normal x64 machine.
+# One resolver, in order: read the property as a STRING inside a
+# try/catch (an empty OR throwing property no longer kills the install),
+# fall back to $env:PROCESSOR_ARCHITEW6432 (set when a 32-bit shell runs
+# on a 64-bit OS), then $env:PROCESSOR_ARCHITECTURE; accept the AMD64
+# environment spelling; quote the detected value in the error so a
+# failed detection says what it actually saw.
+$detectedArch = try { "$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)" } catch { "" }
+if (-not $detectedArch) {
+    $detectedArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+}
+$ARCH = switch ($detectedArch) {
+    { $_ -eq "X64" -or $_ -eq "AMD64" } { "amd64" }
     "Arm64" { "arm64" }
-    default { throw "Unsupported architecture: $_" }
+    default { throw "Unsupported architecture: '$detectedArch'" }
 }
 
 Write-Host "🔍 Fetching latest release..." -ForegroundColor Cyan

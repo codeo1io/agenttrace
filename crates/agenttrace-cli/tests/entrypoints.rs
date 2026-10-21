@@ -3566,3 +3566,116 @@ fn count_honesty_disclosures_in_cli_lanes() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn waste_report_names_its_subject_and_discloses_skipped_siblings() {
+    // rm-2111 (run 1c12a0bc cycle 3; assess bff3a140 F2, PoC flipped
+    // into a pin): `--waste` used to report on the newest VALID session
+    // anonymously — a junk NEWER sibling silently changed the reported
+    // subject, the skip lived only in a stderr parse warning, and the
+    // report named nothing. The text lane now carries Session/Journal
+    // lines and an in-report skip disclosure, extended by review
+    // fd3a37ab M1/F4 from count-only to count AND NAMES (first five
+    // skipped files, `(+N more)` beyond); the json lane carries
+    // subject{name,path}, `skipped_unparseable` and
+    // `skipped_unparseable_paths` (all additive, schema stays
+    // agenttrace.waste.v1). rm-2110 rides the same corpus: the junk
+    // sibling does not tie (it never parses), so no tie warning fires.
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-waste-subject-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&work).expect("create temp dir");
+    // Valid fixture: one priced assistant turn, undated filename so the
+    // pick cannot accidentally win by path shape.
+    std::fs::write(
+        work.join("older.jsonl"),
+        r#"{"type":"user","message":{"role":"user","content":"run the thing"},"sessionId":"s1","timestamp":"2026-05-07T02:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"bash","input":{"command":"ls"}}]},"sessionId":"s1","timestamp":"2026-05-07T02:00:05Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"ok"}]},"sessionId":"s1","timestamp":"2026-05-07T02:00:06Z"}
+"#,
+    )
+    .expect("write valid session");
+    // The junk sibling: alphabetically later ("newer...") and unparseable
+    // — the assess PoC corpus exactly.
+    std::fs::write(work.join("newer-junk.jsonl"), "{{not a jsonl line\n")
+        .expect("write junk sibling");
+
+    // rm-301 style sandbox: the spawned CLI loads and saves the session
+    // cache, so pin HOME/XDG_CACHE_HOME/AGENTTRACE_SESSION_CACHE_DIR or
+    // this test would read and REWRITE the operator's real cache.
+    let cache = work.join("cache");
+    std::fs::create_dir_all(&cache).expect("create sandbox cache dir");
+    let dir = work.to_str().expect("temp dir is valid UTF-8");
+
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .env("HOME", &work)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+            .args(args)
+            .output()
+            .expect("run agenttrace CLI")
+    };
+
+    // Text lane: the subject is the VALID session, named in-band, with
+    // the junk sibling's skip disclosed in the report itself.
+    let output = run(&["-d", dir, "--waste"]);
+    assert!(
+        output.status.success(),
+        "--waste must exit 0 with one valid session: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("older.jsonl"),
+        "text lane must name the subject journal: {stdout}"
+    );
+    assert!(
+        stdout.contains("Skipped: 1 discovered session file(s) failed to parse"),
+        "skip disclosure must live in the report: {stdout}"
+    );
+    assert!(
+        stdout.contains("newer-junk.jsonl"),
+        "skip disclosure must NAME the excluded file, not just count it: {stdout}"
+    );
+
+    // Json lane: same disclosure, machine-readable.
+    let output = run(&["-d", dir, "--waste", "-f", "json"]);
+    assert!(
+        output.status.success(),
+        "--waste -f json must exit 0: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).expect("json lane must emit parseable JSON");
+    assert_eq!(value["schema"], "agenttrace.waste.v1");
+    let subject_path = value["subject"]["path"].as_str().expect("subject path");
+    assert!(
+        subject_path.ends_with("older.jsonl"),
+        "json subject path must name the valid session, got {subject_path}"
+    );
+    assert!(
+        value["subject"]["name"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
+        "json subject name must be non-empty"
+    );
+    assert_eq!(
+        value["skipped_unparseable"], 1,
+        "the junk sibling is disclosed in the json cell"
+    );
+    let skipped_paths = value["skipped_unparseable_paths"]
+        .as_array()
+        .expect("json lane must list the skipped file paths");
+    assert!(
+        skipped_paths.iter().any(|entry| entry
+            .as_str()
+            .is_some_and(|path| path.ends_with("newer-junk.jsonl"))),
+        "the json skip list must name the junk sibling, got {skipped_paths:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}

@@ -88,8 +88,9 @@ jobs:
         run: scripts/ci/check-npm-files.sh
 
       - name: Release pin examples gate
-        # rm-1038: version-pin examples on install.cmd / README*.md must
-        # match install.sh's AGENTTRACE_SOURCE_REF default (rm-017 chain).
+        # rm-1038: version-pin examples on README*.md must match
+        # install.sh's AGENTTRACE_SOURCE_REF default (rm-017 chain;
+        # install.cmd left the surface list with rm-550).
         run: scripts/ci/check-release-pins.sh
 
       - name: Codex plugin version sync

@@ -64,6 +64,21 @@ pub struct WasteReport {
     session_cost: f64,
     summary: String,
     top_actions: Vec<String>,
+    /// rm-2111 (run 1c12a0bc cycle 3; assess bff3a140 F2): the subject
+    /// this report describes — display name and journal path. The report
+    /// used to be anonymous: a junk newer sibling silently changed the
+    /// reported subject with no in-report trace. Both are printed
+    /// through the lane's line sanitizer (never raw).
+    subject_name: String,
+    subject_path: String,
+    /// rm-2111: discovered-but-unparseable session files, disclosed IN
+    /// the report (they used to surface only as stderr parse warnings).
+    /// The CLI sets this from its LoadReport — core cannot see the
+    /// discovery walk — so core-only renders carry 0.
+    pub skipped_unparseable: usize,
+    /// Skipped-unparseable sibling file names (sanitized on ingest;
+    /// acceptance rm-2111(b): count + NAMES — review fd3a37ab F4).
+    pub skipped_unparseable_paths: Vec<String>,
 }
 
 pub fn compute_waste_report(session: &Session) -> WasteReport {
@@ -237,6 +252,10 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         session_cost: session.metrics.cost_estimated.max(0.0),
         summary,
         top_actions,
+        subject_name: session.name.clone(),
+        subject_path: session.path.clone(),
+        skipped_unparseable: 0,
+        skipped_unparseable_paths: Vec::new(),
     }
 }
 
@@ -246,6 +265,14 @@ pub fn render_waste_report(session: &Session) -> String {
 
 pub fn render_waste_report_with_language(session: &Session, language: ReportLanguage) -> String {
     waste_report_text(&compute_waste_report(session), language)
+}
+
+/// rm-2111 (run 1c12a0bc cycle 3): render an already-computed report.
+/// The CLI `--waste` arm augments `skipped_unparseable` from its
+/// LoadReport (core cannot see the discovery walk), so the text lane
+/// needs a prepared-report entry point beside the session-based ones.
+pub fn render_waste_report_prepared(report: &WasteReport, language: ReportLanguage) -> String {
+    waste_report_text(report, language)
 }
 
 /// rm-544 (run b1ff12f8, minted campaign-locally as rm-451, cycle 2): machine-readable waste report.
@@ -272,6 +299,18 @@ pub fn waste_report_json(report: &WasteReport) -> String {
             "priced"
         },
         "session_cost": round4(report.session_cost),
+        // rm-2111 (run 1c12a0bc cycle 3; assess bff3a140 F2): additive
+        // subject identity + parse-skip disclosure. The json cell used
+        // to be anonymous — a junk newer sibling silently changed the
+        // reported subject with no in-report trace. Additive fields,
+        // schema stays `agenttrace.waste.v1` (the rm-1148 additive-JSON
+        // disclosure precedent: no schema bump).
+        "subject": {
+            "name": report.subject_name,
+            "path": report.subject_path,
+        },
+        "skipped_unparseable": report.skipped_unparseable,
+        "skipped_unparseable_paths": report.skipped_unparseable_paths,
         "cache": {
             "rating": report.cache.rating,
             "hit_rate_percent": (report.cache.hit_rate * 10.0).round() / 10.0,
@@ -463,6 +502,48 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
         level_emoji(report.waste_level),
         waste_level_label(report.waste_level, language)
     ));
+    // rm-2111 (run 1c12a0bc cycle 3; assess bff3a140 F2): the report was
+    // anonymous — a junk newer sibling silently changed the reported
+    // subject and the report itself named nothing. Name the session AND
+    // its journal path; both are transcript/filesystem-derived, so they
+    // go through the lane's line sanitizer before printing (composed
+    // with, not instead of, the document sanitizer at output dispatch).
+    // The skip line discloses parse failures IN the report — they used
+    // to live only in a stderr parse warning.
+    out.push_str(&format!(
+        "  {}: {}\n",
+        t(language, "Session", "会话"),
+        sanitize_line_segment(&report.subject_name)
+    ));
+    out.push_str(&format!(
+        "  {}: {}\n",
+        t(language, "Journal", "日志文件"),
+        sanitize_line_segment(&report.subject_path)
+    ));
+    if report.skipped_unparseable > 0 {
+        out.push_str(&format!(
+            "  {}: {} {}\n",
+            t(language, "Skipped", "跳过"),
+            report.skipped_unparseable,
+            t(
+                language,
+                "discovered session file(s) failed to parse and are excluded from this report",
+                "个发现的会话文件解析失败，已被排除在本报告之外"
+            )
+        ));
+        // rm-2111(b) / review F4: names, not just the count — a junk
+        // sibling must be identifiable from the report alone.
+        let shown = report.skipped_unparseable_paths.len().min(5);
+        for name in &report.skipped_unparseable_paths[..shown] {
+            out.push_str(&format!("    - {}\n", sanitize_line_segment(name)));
+        }
+        if report.skipped_unparseable_paths.len() > shown {
+            out.push_str(&format!(
+                "    - (+{} more)\n",
+                report.skipped_unparseable_paths.len() - shown
+            ));
+        }
+    }
     out.push_str(&format!(
         "  {}: {}\n",
         t(language, "Wasted", "浪费成本"),
@@ -808,6 +889,78 @@ mod tests {
             report.loop_percent, 0.0,
             "NaN loop_cost must clamp to 0% loop waste"
         );
+    }
+
+    #[test]
+    fn waste_report_names_subject_and_discloses_skips() {
+        // rm-2111 (run 1c12a0bc cycle 3; assess bff3a140 F2): the text and
+        // json lanes used to describe a session that neither named — a
+        // junk newer sibling silently changed the reported subject, and
+        // the parse skips lived only in a stderr warning. The report now
+        // names its subject (Session/Journal lines, sanitized) and
+        // discloses skipped files IN the report. The json arm mirrors it
+        // additively (schema stays agenttrace.waste.v1, rm-1148
+        // precedent); the end-to-end CLI flip over a junk-NEWER sibling
+        // corpus is pinned in agenttrace-cli/tests/entrypoints.rs.
+        let session = Session {
+            name: "the-reported-one".to_string(),
+            path: "/tmp/rm2111/older.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let report = compute_waste_report(&session);
+        let text = render_waste_report_prepared(&report, ReportLanguage::En);
+        assert!(
+            text.contains("Session: the-reported-one"),
+            "text lane must name the subject: {text}"
+        );
+        assert!(
+            text.contains("Journal: /tmp/rm2111/older.jsonl"),
+            "text lane must name the journal path"
+        );
+        assert!(
+            !text.contains("Skipped:"),
+            "no skip line when nothing was skipped"
+        );
+
+        // The CLI augmentation contract: skipped_unparseable comes from
+        // the LoadReport the CLI holds (core cannot see the walk).
+        let mut report = report;
+        report.skipped_unparseable = 2;
+        report.skipped_unparseable_paths = vec![
+            "newer-junk.jsonl".to_string(),
+            "newer-junk-2.jsonl".to_string(),
+        ];
+        let text = render_waste_report_prepared(&report, ReportLanguage::En);
+        assert!(
+            text.contains("Skipped: 2 discovered session file(s) failed to parse"),
+            "skip disclosure must live in the report: {text}"
+        );
+        // rm-2111(b) / review F4: NAMES, not just the count.
+        assert!(
+            text.contains("- newer-junk.jsonl") && text.contains("- newer-junk-2.jsonl"),
+            "skipped siblings must be named in the text report: {text}"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&waste_report_json(&report)).expect("waste json parses");
+        assert_eq!(payload["schema"], "agenttrace.waste.v1");
+        assert_eq!(payload["subject"]["name"], "the-reported-one");
+        assert_eq!(payload["subject"]["path"], "/tmp/rm2111/older.jsonl");
+        assert_eq!(payload["skipped_unparseable"], 2);
+        let names: Vec<&str> = payload["skipped_unparseable_paths"]
+            .as_array()
+            .expect("paths array present")
+            .iter()
+            .map(|v| v.as_str().expect("string entry"))
+            .collect();
+        assert_eq!(names, vec!["newer-junk.jsonl", "newer-junk-2.jsonl"]);
     }
 
     #[test]

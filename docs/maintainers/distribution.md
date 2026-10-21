@@ -17,11 +17,9 @@ install.sh
 install.ps1
 ```
 
-`install.cmd` is a thin CMD wrapper that runs `install.ps1`. Both installers download the
-release asset and its `.sha256`, refuse to install on a checksum mismatch, and add the install
-directory to the user's PATH. Standalone installs upgrade with `agenttrace update`, which uses
-the same assets and checksums; Homebrew, npm and cargo installs are pointed back to their
-package manager.
+The installer downloads the release asset and its `.sha256`, refuses to install on a checksum mismatch, and adds the install directory to the user's PATH. Standalone installs upgrade with `agenttrace update`, which uses the same assets and checksums; Homebrew, npm and cargo installs are pointed back to their package manager.
+
+`install.cmd` — a thin CMD wrapper that re-fetched `install.ps1` from an UNPINNED upstream-master URL at install time — was removed in rm-550 (run 1c12a0bc cycle 3; upstream #315 port): the wrapper served the least-capable documented Windows path (an `irm | iex` incompatibility that also fetched a moving-target script and littered `install.cmd` into whatever directory CMD started in; see the CHANGELOG entry). `install.ps1` is the only Windows installer.
 
 These scripts remain at repository root because users invoke them through stable raw-GitHub URLs. `install.sh` verifies the downloaded asset against the release's `.sha256` sidecar — a missing or malformed sidecar, a checksum mismatch, or a host with no sha256 tool aborts the install before anything is executed, at parity with `install.ps1` and the npm installer (rm-234; behavioral gates in `scripts/ci/check-install-runtime.sh`). That check protects against corrupted mirrors and asset drift; since the asset and its sidecar share one origin and channel, it is not a defense against a compromised release origin. When the verified asset still cannot run on the host, `install.sh` proves it runs before installing (`--version` probe) and falls back to a source build of a pinned ref — the newest release tag by default, or whatever `AGENTTRACE_SOURCE_REF` names (a tag or a full commit id, fetched and checked against the pin) — and records the exact commit built in an install receipt (rm-051/rm-235).
 
@@ -34,7 +32,7 @@ npm is also a release channel:
 - The workflow sets the npm package version from the `v*` tag immediately before packing and publishing it. Its postinstall hook downloads the matching checksummed GitHub Release binary.
 - The workflow renders the Homebrew Formula from the same `checksums.txt` artifact.
 
-WinGet is not a release channel; Windows users install with `install.ps1` / `install.cmd`.
+WinGet is not a release channel; Windows users install with `install.ps1`.
 
 The source tree deliberately uses non-release version placeholders. A release tag is the only source of a public version, so package metadata and rendered manifests never need manual version bumps.
 

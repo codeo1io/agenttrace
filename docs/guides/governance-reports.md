@@ -626,6 +626,16 @@ JSON it carries the same verdicts the text banner does, as data (schema
 (`tools_per_turn`, `bloat_score`, `bloat_level`, `top_bloat[]`),
 `stuck_patterns[]`, `summary`, and `top_actions[]`.
 
+The report names its subject (rm-2111): `subject` (`name`, `path`)
+identifies the newest matching session the verdicts describe, and
+`skipped_unparseable` counts discovered session files that failed to
+parse and are excluded from the selection — the same skips the parse
+advisory reports on stderr, now disclosed in the report itself. The
+text banner mirrors both (`Session`/`Journal` lines and a `Skipped:`
+line when any file was skipped). Before rm-2111 a junk NEWER sibling
+silently changed the reported subject and the report named nothing.
+Additive fields; the schema stays `agenttrace.waste.v1`.
+
 The cache block's two hit rates carry different bases (rm-339):
 `hit_rate_percent` is the cache-INCLUSIVE share of the billed context
 served from cache — reads / (reads + fresh input), bounded at 100% by

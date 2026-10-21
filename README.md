@@ -75,18 +75,18 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
-Windows CMD:
-
-```bat
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
-```
-
-The install scripts download the release binary for your platform, verify its
-SHA-256 against the published checksum, and add the install directory to your
+The install script downloads the release binary for your platform, verifies its
+SHA-256 against the published checksum, and adds the install directory to your
 PATH (`~/.local/bin`, or `%LOCALAPPDATA%\agenttrace` on Windows). The shell
 installer always fetches the newest release (pin its build-from-source
-fallback with `AGENTTRACE_SOURCE_REF=v0.10.1`); on Windows, pin a release
-with `-Version v0.10.1` (PowerShell).
+fallback with `AGENTTRACE_SOURCE_REF=v0.10.1`). The PowerShell one-liner
+cannot pass parameters either, so to pin a release set the environment
+variable first —
+`$env:AGENTTRACE_VERSION = "v0.10.1"; iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex`
+— or keep the explicit form
+`powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.10.1`
+(an explicit parameter beats the variable; `AGENTTRACE_INSTALL_DIR`
+overrides the install directory the same way).
 
 Package managers:
 

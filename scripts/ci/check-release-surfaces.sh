@@ -30,6 +30,13 @@ grep -q "Falling back to building from source" install.sh ||
 	fail "install.sh must fall back to a cargo source build when the prebuilt binary is incompatible"
 grep -q -- '--version' install.ps1 ||
 	fail "install.ps1 must verify the installed binary runs"
+# rm-550 arm 3 (upstream #317 port; review fd3a37ab H1): the piped
+# one-liner cannot pass parameters, so env-var defaults are the only
+# pinning path through it — the gate pins both knobs to the docs.
+grep -q "AGENTTRACE_VERSION" install.ps1 ||
+	fail "install.ps1 must honor AGENTTRACE_VERSION (pipe pinning; upstream #317)"
+grep -q "AGENTTRACE_INSTALL_DIR" install.ps1 ||
+	fail "install.ps1 must honor AGENTTRACE_INSTALL_DIR (upstream #317)"
 grep -q "verifyRuntime" npm/scripts/install.js ||
 	fail "npm installer must verify the installed binary runs"
 grep -q "cargo install" README.md ||
@@ -39,12 +46,10 @@ grep -q "cargo install" README.zh-CN.md ||
 grep -q "brew install luoyuctl/tap/agenttrace" README.md ||
 	fail "README must document Homebrew installation"
 # WinGet is no longer a release channel (adopted upstream v0.10.1 #301/#312
-# channel decision): install.ps1 / install.cmd serve Windows instead.
+# channel decision): install.ps1 serves Windows instead.
 if grep -R -qi "winget" .github/workflows scripts/release README.md README.zh-CN.md; then
 	fail "WinGet is no longer a release channel; use install.ps1 on Windows"
 fi
-grep -q "install.ps1" install.cmd ||
-	fail "install.cmd must delegate to install.ps1"
 grep -q "npm install -g @zack78/agenttrace" README.md ||
 	fail "README must document npm installation"
 grep -q "npm install -g @zack78/agenttrace" README.zh-CN.md ||
