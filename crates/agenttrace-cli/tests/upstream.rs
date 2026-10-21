@@ -498,6 +498,39 @@ fn upstream_remote_env_override_is_honored() {
 }
 
 #[test]
+fn upstream_remote_hostile_env_is_refused_before_git_argv() {
+    // Stewardship 7e19719f unit-2 (argv hardening, CWE-88): `git fetch`
+    // honors `--upload-pack=<cmd>`, so a leading-dash UPSTREAM_REMOTE is
+    // argument injection, not a bad remote name. The CLI must exit
+    // non-zero with a disclosure naming the env var and the value —
+    // refused at parse, before any git argv is built. Red at base: git's
+    // own parser answered instead (`unknown option` via remote get-url),
+    // and on the `--fetch` lane the same shape is a live git option.
+    let fixture = Fixture::new("hostileremote");
+    let hostile = "--upload-pack=touch /tmp/at-u2-pwned-marker";
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+    command
+        .arg("upstream")
+        .current_dir(&fixture.fork)
+        .env("UPSTREAM_REMOTE", hostile);
+    for (key, value) in GIT_ENV {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run agenttrace CLI");
+    assert!(
+        !output.status.success(),
+        "hostile UPSTREAM_REMOTE must exit non-zero"
+    );
+    let err = stderr(&output);
+    assert!(err.contains("UPSTREAM_REMOTE"), "names the env var: {err}");
+    assert!(err.contains(hostile), "echoes the value verbatim: {err}");
+    assert!(
+        !Path::new("/tmp/at-u2-pwned-marker").exists(),
+        "refused before any git invocation could act"
+    );
+}
+
+#[test]
 fn hostile_upstream_bytes_render_zero_control_bytes() {
     // rm-979, end-to-end replay of the assess PoC fixture
     // /tmp/at-assess-59bc/osc: a fork tracking a hostile upstream

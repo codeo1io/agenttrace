@@ -83,8 +83,8 @@ jobs:
         run: scripts/ci/check-changelog-structure.sh
 
       - name: npm files pack gate
-        # rm-1037: every npm/package.json files entry must match something
-        # in the tree (lib/ is a postinstall artifact, never packed).
+        # rm-1037: every packaging/npm/package.json files entry must match
+        # something in the tree (lib/ is a postinstall artifact, never packed).
         run: scripts/ci/check-npm-files.sh
 
       - name: Release pin examples gate
@@ -100,10 +100,10 @@ jobs:
           scripts/ci/check-plugin-version.sh
 
       - name: Validate Homebrew formula syntax
-        run: ruby -c homebrew/Formula/agenttrace.rb
+        run: ruby -c packaging/homebrew/Formula/agenttrace.rb
 
       - name: Test npm package contract
-        run: npm --prefix npm test
+        run: npm --prefix packaging/npm test
 
   test:
     name: Test (${{ matrix.os }})
@@ -335,7 +335,8 @@ jobs:
   deny:
     # rm-010, cycle 1 ("Trusted transport, gated supply chain"): dependency
     # policy gate — advisories (RUSTSEC), licenses, bans, sources — against
-    # deny.toml at the repo root. Runs on every push/PR/schedule
+    # .cargo/deny.toml (cargo-deny falls back to .cargo/ when the repo
+    # root has no deny.toml). Runs on every push/PR/schedule
     # (metadata-only, no compile, ~1min).
     name: Dependency policy (cargo-deny)
     runs-on: ubuntu-latest

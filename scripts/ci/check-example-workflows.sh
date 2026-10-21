@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-example="examples/github-actions/agenttrace-health-gate.yml"
+example="docs/examples/github-actions/agenttrace-health-gate.yml"
 if [ ! -f "$example" ]; then
   echo "FAIL: missing example workflow ${example}" >&2
   exit 1

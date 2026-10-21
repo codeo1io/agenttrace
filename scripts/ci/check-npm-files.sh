@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # rm-1037 pack gate (run 4aaa4c9fd914 cycle 2, batch "release-artifact
-# truth"). npm/package.json's files list named a "lib" directory that does
+# truth"). packaging/npm/package.json's files list named a "lib" directory that does
 # not exist in the tree: lib/ is created by scripts/install.js at
 # postinstall time on the END-USER's machine and is never packed (npm
 # silently skips files entries that match nothing — `npm pack --dry-run`
 # packed 6 files, none from lib). The entry read as a shipped artifact
 # while packing nothing. This gate fails when any files entry matches
-# nothing under npm/, so a future add-or-remove of lib/ (or any other
+# nothing under packaging/npm/, so a future add-or-remove of lib/ (or any other
 # path) must be a conscious change, not silent drift. The npm package's
 # channel shape itself is owned by the rm-930 release-channel identity
 # decision; this gate only enforces pack-time truth whatever that
@@ -20,12 +20,12 @@ fail() {
 }
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
-manifest="$repo_root/npm/package.json"
-pkgdir="$repo_root/npm"
+manifest="$repo_root/packaging/npm/package.json"
+pkgdir="$repo_root/packaging/npm"
 
-[ -f "$manifest" ] || fail "npm/package.json not found at $manifest"
+[ -f "$manifest" ] || fail "packaging/npm/package.json not found at $manifest"
 
-command -v node >/dev/null 2>&1 || fail "node is required to read npm/package.json"
+command -v node >/dev/null 2>&1 || fail "node is required to read packaging/npm/package.json"
 
 if ! node - "$manifest" "$pkgdir" <<'NODE'
 	const [manifestPath, pkgDir] = process.argv.slice(2);
@@ -39,7 +39,7 @@ if ! node - "$manifest" "$pkgdir" <<'NODE'
 		process.exit(0);
 	}
 
-	// Recursive listing of everything under npm/ (files AND directories —
+	// Recursive listing of everything under packaging/npm/ (files AND directories —
 	// npm packs a directory entry as its whole subtree, so a directory
 	// that exists counts as matching even when empty).
 	const listing = [];
@@ -69,7 +69,7 @@ if ! node - "$manifest" "$pkgdir" <<'NODE'
 			.replace(/\u0000/g, ".*");
 		const re = new RegExp("^" + pattern + "/?$");
 		if (!listing.some((p) => re.test(p))) {
-			problems.push('"' + entry + '" matches nothing under npm/');
+			problems.push('"' + entry + '" matches nothing under packaging/npm/');
 		}
 	}
 	if (problems.length > 0) {
@@ -80,9 +80,9 @@ if ! node - "$manifest" "$pkgdir" <<'NODE'
 		process.exit(1);
 	}
 	console.log(
-		"check-npm-files: all " + files.length + " files entries match the npm/ tree (pack truth)",
+		"check-npm-files: all " + files.length + " files entries match the packaging/npm/ tree (pack truth)",
 	);
 NODE
 then
-	fail "every npm/package.json files entry must match something under npm/"
+	fail "every packaging/npm/package.json files entry must match something under packaging/npm/"
 fi

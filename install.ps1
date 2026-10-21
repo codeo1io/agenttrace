@@ -80,7 +80,7 @@ try {
     $size = (Get-Item $tmp).Length
     Write-Host "   Binary size: $size bytes"
 
-    # rm-005: integrity gate. install.sh and npm/scripts/install.js both
+    # rm-005: integrity gate. install.sh and packaging/npm/scripts/install.js both
     # verify the .sha256 sidecar before installing; this channel had no
     # check at all. Missing sidecar, malformed digest, or mismatch means
     # the install is refused before anything reaches $DEST. The sidecar is

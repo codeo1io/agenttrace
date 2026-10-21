@@ -402,9 +402,36 @@ fn ref_name() -> String {
     std::env::var("UPSTREAM_REF").unwrap_or_else(|_| DEFAULT_REF.to_string())
 }
 
+/// Stewardship 7e19719f unit-2 (argv hardening, CWE-88): UPSTREAM_REMOTE
+/// and UPSTREAM_REF are the only env-derived bytes reaching this module's
+/// git argv, and `git fetch` honors `--upload-pack=<cmd>` — so a
+/// leading-dash value is argument injection, not a bad remote name.
+/// Refuse both at parse, BEFORE any argv is constructed, naming the env
+/// var and the value verbatim so the operator sees which knob to fix.
+/// Legal values are unaffected: git's own check-ref-format rejects
+/// '-'-leading remote and ref names, so no legal value starts with '-'.
+fn validate_remote_and_ref(remote: &str, ref_name: &str) -> anyhow::Result<()> {
+    for (var, value) in [("UPSTREAM_REMOTE", remote), ("UPSTREAM_REF", ref_name)] {
+        if value.starts_with('-') {
+            bail!(
+                "{var}={value:?} is refused: a leading-dash remote/ref would be \
+                 parsed as a git option (argument injection, e.g. --upload-pack) \
+                 before any git invocation — no legal git remote/ref name starts \
+                 with '-'; set a non-dash value"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
     let remote = remote_name();
     let ref_name = ref_name();
+
+    // Unit-2 (argv hardening): refuse a hostile remote/ref BEFORE any
+    // argv is constructed — ahead of even the show-toplevel probe, so
+    // no git subprocess ever spawns on a leading-dash value.
+    validate_remote_and_ref(&remote, &ref_name)?;
 
     // Fail fast with the same hints scripts/upstream-delta gives.
     // rm-543 + rm-579 routing lives in `git_probe`: only a probe that
@@ -415,7 +442,11 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
         "not inside a git repository",
     )?;
     let remote_url = git_probe(
-        &["remote", "get-url", &remote],
+        // Unit-2: the `--` keeps the env-derived remote in the positional
+        // slot (honored by `git remote get-url`; verified live against git
+        // 2.34, standard parse-options behavior) — defense in depth under
+        // the parse-time refusal in validate_remote_and_ref.
+        &["remote", "get-url", "--", &remote],
         &format!("no '{remote}' remote configured (git remote add {remote} <url>)"),
     )?;
     if fetch {
@@ -524,7 +555,16 @@ fn fetch_remote(remote: &str) -> anyhow::Result<()> {
     // fetch (hung remote, stale mount) hung the whole CLI. It now runs
     // under UPSTREAM_FETCH_TIMEOUT; a timeout is terminal and names the
     // deadline, the operation, and the remote.
-    match run_bounded("git", &["fetch", remote, "--quiet"], UPSTREAM_FETCH_TIMEOUT,
+    // Unit-2: `--` before the env-derived remote keeps it positional
+    // (`git fetch` assigns the first post-`--` argument to the
+    // repository — verified live against a two-remote fixture on git
+    // 2.34; stable parse-options behavior) so an option-shaped value
+    // can never be interpreted, on top of the parse-time refusal in
+    // validate_remote_and_ref.
+    match run_bounded(
+        "git",
+        &["fetch", "--quiet", "--", remote],
+        UPSTREAM_FETCH_TIMEOUT,
         UPSTREAM_GIT_MAX_BYTES,
     ) {
         Ok(_) => Ok(()),
@@ -1165,6 +1205,38 @@ mod opencode_channel_tests {
 mod tests {
     use super::*;
 
+    /// Stewardship 7e19719f unit-2 (argv hardening, CWE-88): UPSTREAM_REMOTE
+    /// and UPSTREAM_REF are the only env-derived bytes in this module's git
+    /// argv, and `git fetch` honors `--upload-pack=<cmd>` — so a hostile
+    /// value is argument injection, not a bad remote name. Both must be
+    /// refused at parse, naming the env var AND the value verbatim, BEFORE
+    /// any git argv is constructed. Red at base: git's own parser was the
+    /// only line of defense (`error: unknown option 'upload-pack=…'` for
+    /// `remote get-url`; on the fetch lane the shape is a live option).
+    /// One test, sequential arms, env restored eagerly — no other test in
+    /// this binary reads these vars (pinned by grep at landing).
+    #[test]
+    fn leading_dash_upstream_env_is_refused_before_argv_construction() {
+        let hostile = "--upload-pack=touch /tmp/at-u2-refused-marker";
+        for var in ["UPSTREAM_REMOTE", "UPSTREAM_REF"] {
+            std::env::set_var(var, hostile);
+            let err = match collect_status(false) {
+                Ok(_) => panic!("leading-dash {var} must be refused"),
+                Err(err) => err,
+            };
+            std::env::remove_var(var);
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(var),
+                "{var} refusal must name the env var: {msg}"
+            );
+            assert!(
+                msg.contains(hostile),
+                "{var} refusal must echo the value verbatim: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn rm052_curl_probe_args_are_time_and_byte_bounded() {
         // rm-052: the registry probe must be bounded in BOTH dimensions —
@@ -1711,9 +1783,11 @@ mod tests {
     /// PRIVACY.md names it.
     #[test]
     fn privacy_disclosure_lists_every_network_touch() {
-        let privacy =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../PRIVACY.md"))
-                .expect("PRIVACY.md readable");
+        let privacy = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/PRIVACY.md"
+        ))
+        .expect("PRIVACY.md readable");
 
         // The npm registry probe URL, constructor-derived from the const.
         assert!(

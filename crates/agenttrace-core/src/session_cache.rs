@@ -5511,6 +5511,7 @@ mod tests {
         // disclosing it fails here.
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
+            .join("docs")
             .join("PRIVACY.md");
         let privacy = fs::read_to_string(&repo_root)
             .unwrap_or_else(|err| panic!("read {}: {err}", repo_root.display()));

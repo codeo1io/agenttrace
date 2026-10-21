@@ -4105,8 +4105,8 @@ mod tests {
         let ps1 =
             std::fs::read_to_string(format!("{root}install.ps1")).expect("install.ps1 readable");
         let sh = std::fs::read_to_string(format!("{root}install.sh")).expect("install.sh readable");
-        let js = std::fs::read_to_string(format!("{root}npm/scripts/install.js"))
-            .expect("npm/scripts/install.js readable");
+        let js = std::fs::read_to_string(format!("{root}packaging/npm/scripts/install.js"))
+            .expect("packaging/npm/scripts/install.js readable");
         assert!(
             ps1.contains(".sha256"),
             "install.ps1 must fetch the sidecar"

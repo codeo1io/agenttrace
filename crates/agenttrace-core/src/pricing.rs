@@ -3948,9 +3948,11 @@ mod tests {
     /// `privacy_disclosure_lists_every_artifact` pin in session_cache).
     #[test]
     fn privacy_disclosure_names_the_pricing_download_url() {
-        let privacy =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../PRIVACY.md"))
-                .expect("PRIVACY.md readable");
+        let privacy = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/PRIVACY.md"
+        ))
+        .expect("PRIVACY.md readable");
         assert!(
             privacy.contains(PRICING_URL),
             "PRIVACY.md must enumerate the --update-pricing download URL {PRICING_URL}"
