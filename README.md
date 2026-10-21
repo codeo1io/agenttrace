@@ -86,6 +86,12 @@ SHA-256 against the published checksum before installing. They never edit your
 shell profile — they print the `PATH` addition instead (`~/.local/bin`, or
 `%LOCALAPPDATA%\agenttrace` on Windows).
 
+Linux release binaries are built against glibc 2.35 (Ubuntu 22.04) and require
+glibc 2.35 or newer — the release pipeline fails closed if any Linux asset
+needs a newer glibc. Systems older than that can build from source
+(`cargo install --git https://github.com/luoyuctl/agenttrace agenttrace`),
+which links against the host toolchain instead.
+
 Install a specific release (rm-2014) — both installers honor the same
 environment variables, which is the only way to pin from a piped one-liner
 (PowerShell's `iex` pipe cannot pass parameters, so `-Version` never worked

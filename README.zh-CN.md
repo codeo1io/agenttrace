@@ -92,6 +92,12 @@ curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.
 SHA-256。脚本从不修改你的 shell 配置文件——只会打印加入 PATH 的方法
 （`~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\agenttrace`）。
 
+Linux 发布版二进制基于 glibc 2.35（Ubuntu 22.04）构建，要求 glibc 2.35
+或更新版本——发布流水线对任何需要更新 glibc 的 Linux 资产都会构建失败。
+更旧的系统可以从源码构建
+（`cargo install --git https://github.com/luoyuctl/agenttrace agenttrace`），
+改用宿主工具链链接。
+
 安装指定版本（rm-2014）——两个安装脚本遵守同一套环境变量；
 通过管道一行命令安装时，环境变量是唯一的固定版本方式
 （PowerShell 的 `iex` 管道无法传参，`-Version` 在那里从来不可用）：

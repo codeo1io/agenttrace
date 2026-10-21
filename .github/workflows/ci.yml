@@ -62,6 +62,12 @@ jobs:
       - name: Release surface drift
         run: scripts/ci/check-release-surfaces.sh
 
+      - name: Release glibc floor gate (self-test)
+        # rm-2248: offline fixture battery for the release floor gate;
+        # the release workflow runs the gate itself on every Linux asset
+        # it builds.
+        run: scripts/ci/check-glibc-floor.sh --self-test
+
       - name: Validate helper scripts
         run: |
           bash -n scripts/record-demo.sh scripts/ci/*.sh scripts/release/*.sh
@@ -112,8 +118,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # rm-2247: macos-14 is removed from GitHub's fleet on 2026-11-02
+        # with 10-hour brownouts on Oct 23, 26, 29 and 30, 14:00-24:00
+        # UTC (actions/runner-images#13518) — the Test matrix moved to
+        # macos-15 ahead of the first brownout. Bump again on macos-15's
+        # own retirement notice, not under brownout pressure.
+        # Brownout-calendar triage rule: a macOS lane that fails ONLY
+        # inside a published runner-images brownout window is a runner
+        # outage, not a code regression — re-run the job after the
+        # window closes before bisecting anything.
         # Linux tests run under the coverage job.
-        os: [macos-14, windows-latest]
+        os: [macos-15, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

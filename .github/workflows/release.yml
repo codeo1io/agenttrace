@@ -45,6 +45,106 @@ jobs:
       - name: Rust tests (locked)
         run: cargo test --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
 
+  build-linux:
+    name: Build release assets (linux)
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    # rm-2248: Linux assets build inside a pinned container so the glibc
+    # baseline they carry is decoupled from the hosted runner image
+    # lifecycle — ubuntu-latest began flipping to 26.04 on 2026-10-19
+    # (actions/runner-images#14748) and each flip silently raised the
+    # asset floor (every v0.10.1-class asset shipped requiring
+    # GLIBC_2.39). The ubuntu:22.04 CONTAINER image tracks Ubuntu 22.04
+    # LTS's own lifecycle, not the runner-images retirement calendar
+    # (#14254 retires the 22.04 RUNNER image in 2027, not this container
+    # image). A musl target stays the documented fallback if the
+    # container surface ever becomes a burden — check-glibc-floor.sh
+    # passes static/musl assets by design. The floor itself is enforced
+    # fail-closed after the build.
+    container: ubuntu:22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The arm64 asset cross-compiles on the amd64 container.
+          - target: x86_64-unknown-linux-gnu
+            asset: agenttrace-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            asset: agenttrace-linux-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install container toolchain
+        # The bare ubuntu:22.04 image ships no compiler, no binutils and
+        # no git/curl for the checkout and toolchain actions. `strings`
+        # backs the glibc floor gate below.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates gcc binutils
+
+      - name: Install Linux ARM linker
+        # The aarch64-unknown-linux-gnu toolchain needs a cross linker.
+        # The job container runs as root, so no sudo here.
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          # rm-173: aligned with rust-toolchain.toml (the toolchain file
+          # overrides this input for every cargo step in the repo).
+          toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          release_version="${GITHUB_REF_NAME#v}"
+          AGENTTRACE_RELEASE_VERSION="$release_version" \
+            cargo build --release -p agenttrace --target "$TARGET" --locked
+          out="$ASSET"
+          exe=""
+          if [[ "$TARGET" == *windows* ]]; then exe=".exe"; fi
+          cp "target/$TARGET/release/agenttrace${exe}" "$out"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$out" > "${out}.sha256"
+          else
+            shasum -a 256 "$out" > "${out}.sha256"
+          fi
+
+      - name: Enforce glibc floor
+        # rm-2248: fail-closed floor assertion on the built asset
+        # (default floor 2.35 — the ubuntu:22.04 baseline, matching the
+        # README system requirement). Static/musl assets carry no
+        # GLIBC_ references and pass by design.
+        shell: bash
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: scripts/ci/check-glibc-floor.sh "$ASSET"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}*
+          if-no-files-found: error
+
   build:
     name: Build release assets
     permissions:
@@ -55,13 +155,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux targets cross-compile the arm64 build on ubuntu
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset: agenttrace-linux-amd64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            asset: agenttrace-linux-arm64
           # Darwin targets need the Apple SDK — build natively on macOS runners
           - os: macos-latest
             target: x86_64-apple-darwin
@@ -90,10 +183,6 @@ jobs:
           # overrides this input for every cargo step in the repo).
           toolchain: "1.98.1"
           targets: ${{ matrix.target }}
-
-      - name: Install Linux ARM linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -130,7 +219,7 @@ jobs:
 
   release:
     name: Publish GitHub release
-    needs: [build, verify]
+    needs: [build, build-linux, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
