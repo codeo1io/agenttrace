@@ -292,6 +292,16 @@ fn default_text_lane_guards_spreadsheet_formulas_like_csv() {
         // Bare stem: the session NAME is the file stem, and a formula
         // only executes when an introducer leads the CELL — the
         // interesting case is the stem itself leading.
+        // Windows: `-2+5|cmd` is not a legal filename there (the pipe is
+        // a reserved separator) — the formula-guard contract is about the
+        // CELL rendering of session names, so skip stems the host
+        // filesystem cannot even hold (Linux covers the full set).
+        #[cfg(windows)]
+        {
+            if stem.contains('|') {
+                continue;
+            }
+        }
         let file = corpus.join(format!("{stem}.jsonl"));
         fs::write(
             &file,
