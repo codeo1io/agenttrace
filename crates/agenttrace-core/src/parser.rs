@@ -13905,6 +13905,54 @@ const CHATS_METADATA: &str = concat!(
 );
 
 #[test]
+fn gemini_chats_resumed_journal_twin_ids_collapse() {
+    // A resumed pre-0.65 gemini-cli chats export re-records every
+    // message under both its plain id and a `_response`-suffixed twin
+    // (upstream #29618 stopped the re-recording in 0.65). The upsert
+    // dedupe key folds one trailing `_response`, so each twin replaces
+    // its original row in place instead of doubling every turn.
+    let twin = |id: &str, typ: &str, content: &str| {
+        format!(
+            r#"{{"id":"{id}","timestamp":"2026-10-12T08:00:05.000Z","type":"{typ}","content":"{content}"}}"#
+        )
+    };
+    let raw = format!(
+        "{CHATS_METADATA}\n{}\n{}\n{}\n{}\n",
+        twin("m-user-1", "user", "hello gemini"),
+        twin("m-gen-1", "gemini", "hi there"),
+        twin("m-user-1_response", "user", "hello gemini"),
+        twin("m-gen-1_response", "gemini", "hi there"),
+    );
+    let events =
+        parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("chats record stream claimed");
+    // Two logical messages, each twinned by the resume re-recording:
+    // the twins must collapse onto the original rows (replace in
+    // place), never a duplicate of either turn.
+    assert_eq!(events.len(), 2, "resumed twins must collapse");
+    assert_eq!(events[0].role, "user");
+    assert_eq!(events[0].content, "hello gemini");
+    assert_eq!(events[0].source_tool, "gemini_cli");
+    assert_eq!(events[1].role, "assistant");
+    assert_eq!(events[1].content, "hi there");
+}
+
+#[test]
+fn gemini_chats_lone_response_suffixed_id_owns_one_row() {
+    // 0.65+ corpora never twin. A lone `_response`-suffixed id (the
+    // fold maps it to its prefix) must still own exactly one row --
+    // the fold is idempotent for non-twining journals.
+    let raw = format!(
+        "{CHATS_METADATA}\n{}\n",
+        r#"{"id":"m-gen-1_response","timestamp":"2026-10-12T08:00:05.000Z","type":"gemini","content":"hi there","model":"gemini-2.5-pro"}"#
+    );
+    let events =
+        parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("chats record stream claimed");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].role, "assistant");
+    assert_eq!(events[0].model_used, "gemini-2.5-pro");
+}
+
+#[test]
 fn gemini_chats_lane_claims_the_record_stream_and_replaces_reappends() {
     let raw = format!(
         "{CHATS_METADATA}\n{}",
