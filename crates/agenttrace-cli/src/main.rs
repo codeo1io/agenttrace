@@ -464,6 +464,12 @@ fn run() -> anyhow::Result<()> {
         // `validate_dir_flag_or_exit` twin — same rc2, same messages.
         validate_explicit_dir(args.dir.as_deref());
         let resolved = config::resolve(&args)?;
+        // rm-2112: a repository-controlled project file that
+        // redirected any knob gets one loud line on stderr — the
+        // stdio JSON-RPC protocol on stdout stays byte-clean.
+        if let Some(line) = config::project_redirection_disclosure(&resolved) {
+            eprintln!("{line}");
+        }
         agenttrace_core::set_runtime_config(agenttrace_core::RuntimeConfigOverrides {
             history_dir: resolved.history_dir.clone(),
             pricing_file: resolved.pricing_file.clone(),
@@ -549,6 +555,12 @@ fn run() -> anyhow::Result<()> {
     // winning knobs before any consumer (history persistence,
     // pricing override loading) initializes.
     let resolved = config::resolve(&args)?;
+    // rm-2112: a repository-controlled project file that redirected
+    // any knob gets one loud line on stderr (stdout machine
+    // contracts — json/csv/tsv/otel — stay byte-stable).
+    if let Some(line) = config::project_redirection_disclosure(&resolved) {
+        eprintln!("{line}");
+    }
     agenttrace_core::set_runtime_config(agenttrace_core::RuntimeConfigOverrides {
         history_dir: resolved.history_dir.clone(),
         pricing_file: resolved.pricing_file.clone(),

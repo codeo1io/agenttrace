@@ -5,14 +5,25 @@
 //!
 //! 1. CLI flags (`--history-dir`, `--pricing-file`, `--weekly-budget`)
 //! 2. an explicit `--config PATH` file
-//! 3. a project file at `./.agenttrace/config.toml`
-//! 4. a user file at `~/.config/agenttrace/config.toml`
+//! 3. a user file at `~/.config/agenttrace/config.toml`
 //!    (`$XDG_CONFIG_HOME` respected)
+//! 4. a project file at `./.agenttrace/config.toml`
 //! 5. the `AGENTTRACE_*` environment knobs and built-in defaults
 //!
 //! Each layer only fills keys left unset by higher layers; the first
 //! layer that sets a key wins. `--doctor` discloses every layer that
 //! was found and the winning source of each knob.
+//!
+//! rm-2112 (run 8b321cfcba93 cycle 2) inverted the old file order: the
+//! operator's user file used to sit BELOW the repository's project
+//! file, so a cloned repository silently redirected pricing/history
+//! knobs under the operator's own configuration (the assess PoC
+//! priced a corpus with the repo's attacker-controlled
+//! `pricing_file` and pointed `history_dir` at the repo itself). The
+//! user file now outranks the project file; when the project file
+//! still wins a knob (the operator set it nowhere higher), the CLI
+//! prints one loud line naming the redirected knobs
+//! ([`project_redirection_disclosure`]).
 //!
 //! The file is parsed with a deliberate scalar subset of TOML syntax —
 //! `key = value` lines with quoted or bare scalars and `#` comments.
@@ -297,7 +308,10 @@ pub struct ConfigLayer {
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     /// Layers that existed and parsed, ascending precedence
-    /// (user, project, explicit).
+    /// (project, user, explicit) — rm-2112 moved the user file above
+    /// the project file, so the vector (and the merge that folds it)
+    /// loads the repository-controlled layer FIRST and lets the
+    /// operator's layers win.
     pub layers: Vec<ConfigLayer>,
     /// Paths probed but absent.
     pub absent: Vec<(&'static str, PathBuf)>,
@@ -322,12 +336,21 @@ pub struct ResolvedConfig {
     /// Where each winning knob came from (`CLI flag`, `config file`,
     /// `env`, or `default`).
     pub sources: [(&'static str, &'static str); 4],
+    /// Knobs the repository-controlled project file actually won
+    /// (rm-2112): set there, set by no operator-chosen layer (user
+    /// file, `--config`), and not pinned by a CLI flag. Each entry is
+    /// a knob this repository redirected under the operator's own
+    /// configuration — [`project_redirection_disclosure`] prints one
+    /// loud line whenever it is non-empty.
+    pub project_redirected: Vec<&'static str>,
 }
 
 /// Resolve the configuration for this invocation: discover the user
 /// and project files, parse them plus an explicit `--config` file,
-/// layer them (user < project < explicit), then apply CLI flags on
-/// top. The env knobs sit below every layer and stay core's fallback.
+/// layer them (project < user < explicit — rm-2112: the operator's
+/// user file outranks the repository's project file), then apply CLI
+/// flags on top. The env knobs sit below every layer and stay core's
+/// fallback.
 pub fn resolve(args: &crate::Args) -> anyhow::Result<ResolvedConfig> {
     resolve_with_paths(args, user_config_path().as_deref(), &project_config_path())
 }
@@ -374,8 +397,14 @@ pub fn resolve_with_paths(
         Ok(())
     };
 
-    load("user", user, false, &mut layers, &mut absent)?;
+    // rm-2112: load the repository-controlled project layer FIRST so
+    // the operator's user layer folds over it and wins every shared
+    // key; the explicit --config file and CLI flags still outrank
+    // both. The pre-fix order (user, then project) let a cloned
+    // repository silently redirect pricing/history knobs under the
+    // operator's own configuration.
     load("project", Some(project), false, &mut layers, &mut absent)?;
+    load("user", user, false, &mut layers, &mut absent)?;
     load(
         "--config",
         args.config.as_deref(),
@@ -461,6 +490,49 @@ pub fn resolve_with_paths(
         ),
     ];
 
+    // rm-2112: name every knob the repository-controlled project
+    // file actually won — set there, set by no operator-chosen layer
+    // (user file, `--config`), and not pinned by a CLI flag. Those
+    // are exactly the knobs a cloned repository redirected under its
+    // operator's configuration; `project_redirection_disclosure`
+    // turns them into one loud line.
+    let higher_layer_sets = |pick: fn(&ConfigFile) -> bool| {
+        layers
+            .iter()
+            .filter(|layer| layer.name != "project")
+            .any(|layer| pick(&layer.file))
+    };
+    let mut project_redirected: Vec<&'static str> = Vec::new();
+    if let Some(project) = layers
+        .iter()
+        .find(|layer| layer.name == "project")
+        .map(|layer| &layer.file)
+    {
+        if project.history_dir.is_some()
+            && args.history_dir.is_none()
+            && !higher_layer_sets(|file| file.history_dir.is_some())
+        {
+            project_redirected.push("history_dir");
+        }
+        if project.pricing_file.is_some()
+            && args.pricing_file.is_none()
+            && !higher_layer_sets(|file| file.pricing_file.is_some())
+        {
+            project_redirected.push("pricing_file");
+        }
+        if project.weekly_budget_usd.is_some()
+            && args.weekly_budget.is_none()
+            && !higher_layer_sets(|file| file.weekly_budget_usd.is_some())
+        {
+            project_redirected.push("weekly_budget_usd");
+        }
+        if project.session_cache_entries.is_some()
+            && !higher_layer_sets(|file| file.session_cache_entries.is_some())
+        {
+            project_redirected.push("session_cache_entries");
+        }
+    }
+
     Ok(ResolvedConfig {
         layers,
         absent,
@@ -472,12 +544,39 @@ pub fn resolve_with_paths(
         env_pricing_file,
         env_session_cache_entries,
         sources,
+        project_redirected,
     })
 }
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// rm-2112: one loud line (stderr) whenever a repository-controlled
+/// project file redirected a knob that is in effect for this run.
+/// After the trust inversion the operator's user file outranks the
+/// project file, but a knob the operator set nowhere higher still
+/// falls through to the repository's file — that redirection must be
+/// visible, not silent: the line names the knobs, the file, and how
+/// to take control. `None` when the project layer won nothing (no
+/// project file, everything overridden, or nothing set).
+pub fn project_redirection_disclosure(config: &ResolvedConfig) -> Option<String> {
+    if config.project_redirected.is_empty() {
+        return None;
+    }
+    let knobs = config.project_redirected.join(", ");
+    let path = config
+        .layers
+        .iter()
+        .find(|layer| layer.name == "project")
+        .map(|layer| layer.path.display().to_string())
+        .unwrap_or_else(|| ".agenttrace/config.toml".to_string());
+    Some(format!(
+        "agenttrace: the repository's config file {path} redirected {knobs} for this run \
+         (rm-2112) — pin them in ~/.config/agenttrace/config.toml or pass the matching \
+         CLI flags to override the repo"
+    ))
+}
 
 /// The `--doctor` disclosure as a standalone JSON document (emitted
 /// on stderr so stdout stays one pure JSON object in JSON mode).
@@ -518,6 +617,9 @@ pub fn disclosure_json(config: &ResolvedConfig) -> String {
             "name": name,
             "path": path.display().to_string(),
         })).collect::<Vec<_>>(),
+        // rm-2112: knobs the repository-controlled project file won —
+        // additive; absent/empty means no redirection in effect.
+        "project_redirected": config.project_redirected,
         "knobs": [
             knob(
                 "history_dir",
@@ -582,6 +684,15 @@ pub fn disclosure_text(config: &ResolvedConfig) -> String {
     }
     if config.layers.is_empty() && config.absent.is_empty() {
         out.push_str("  no config files discovered\n");
+    }
+    // rm-2112: the redirection the CLI prints as one loud line is
+    // part of the doctor disclosure too — the knob-source lines above
+    // say "config file" without saying WHOSE file.
+    if !config.project_redirected.is_empty() {
+        out.push_str(&format!(
+            "  project config redirected: {} (repo-controlled values in effect, rm-2112)\n",
+            config.project_redirected.join(", ")
+        ));
     }
     let session_cache_knob = session_cache_entries_effective(config);
     let session_cache_source = match session_cache_knob {
@@ -820,6 +931,7 @@ mod tests {
                 ("weekly_budget", "default"),
                 ("AGENTTRACE_SESSION_CACHE_ENTRIES", "env"),
             ],
+            project_redirected: vec![],
         };
         let json = disclosure_json(&clamped);
         let flat_json: String = json.split_whitespace().collect();
@@ -855,6 +967,7 @@ mod tests {
                 ("weekly_budget", "default"),
                 ("session_cache_entries", "config file"),
             ],
+            project_redirected: vec![],
         };
         assert!(!disclosure_json(&in_range).contains("clamped"));
         assert!(disclosure_text(&in_range).contains("session_cache_entries: 20000 (config file)"));
@@ -885,7 +998,9 @@ mod tests {
     #[test]
     fn resolve_precedence_matrix_covers_all_file_layers_and_flags() {
         // rm-384 acceptance: a test matrix across the precedence chain
-        // CLI flag > --config file > project > user. The fifth level
+        // CLI flag > --config file > user > project (rm-2112 inverted
+        // the two file layers: the operator's user file outranks the
+        // repository's project file). The fifth level
         // (AGENTTRACE_* env knobs) sits below every file layer and
         // stays core's runtime fallback — it is disclosed by --doctor
         // and demonstrated live, not asserted here (reading the real
@@ -924,16 +1039,20 @@ mod tests {
         assert_eq!(resolved.sources[0].1, "CLI flag");
         assert_eq!(resolved.sources[2].1, "config file");
 
-        // Drop the CLI flag: the project layer wins history_dir over
-        // the user file.
+        // Drop the CLI flag: the USER layer now wins history_dir over
+        // the project file — rm-2112's inversion. Pre-fix the project
+        // layer loaded later and won every shared key, so a cloned
+        // repository silently redirected knobs under the operator's
+        // own configuration.
         args.history_dir = None;
         let resolved = resolve_with_paths(&args, Some(&user), &project).unwrap();
-        assert_eq!(resolved.history_dir, Some(PathBuf::from("/project-h")));
+        assert_eq!(resolved.history_dir, Some(PathBuf::from("/user-h")));
 
-        // Drop --config: the project budget wins over the user's.
+        // Drop --config: the user budget wins over the project's
+        // (same inversion on the second shared key).
         args.config = None;
         let resolved = resolve_with_paths(&args, Some(&user), &project).unwrap();
-        assert_eq!(resolved.weekly_budget, Some(20.0));
+        assert_eq!(resolved.weekly_budget, Some(10.0));
 
         // Drop the project layer: the user file is the only one left.
         let resolved = resolve_with_paths(&args, Some(&user), &absent_project).unwrap();
@@ -969,6 +1088,109 @@ mod tests {
             "{error}"
         );
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_config_outranks_project_file_for_every_shared_key() {
+        // rm-2112 red-first: the operator's user file outranks the
+        // repository's project file for EVERY shared key. Pre-fix the
+        // project layer loaded later and won every key it set — the
+        // assess PoC cloned a repository whose .agenttrace/config.toml
+        // redirected pricing_file (cost falsification) and history_dir
+        // (writes into the repository itself) under the operator's own
+        // configuration.
+        let root = std::env::temp_dir().join(format!("at-config-rm2112-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let user_dir = root.join("user/agenttrace");
+        let project_dir = root.join("project/.agenttrace");
+        fs::create_dir_all(&user_dir).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            user_dir.join("config.toml"),
+            "history_dir = \"/user-h\"\npricing_file = \"/user-p\"\nweekly_budget_usd = 10\nsession_cache_entries = 11111\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("config.toml"),
+            "history_dir = \"/repo-h\"\npricing_file = \"/repo-evil-pricing.json\"\nweekly_budget_usd = 20\nsession_cache_entries = 22222\n",
+        )
+        .unwrap();
+        let user = user_dir.join("config.toml");
+        let project = project_dir.join("config.toml");
+        let args = crate::test_args(None);
+        let resolved = resolve_with_paths(&args, Some(&user), &project).unwrap();
+        assert_eq!(resolved.history_dir, Some(PathBuf::from("/user-h")));
+        assert_eq!(resolved.pricing_file, Some(PathBuf::from("/user-p")));
+        assert_eq!(resolved.weekly_budget, Some(10.0));
+        assert_eq!(resolved.session_cache_entries, Some(11111));
+        // The repo's file won nothing, so there is nothing to disclose.
+        assert!(resolved.project_redirected.is_empty());
+        assert!(project_redirection_disclosure(&resolved).is_none());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn project_redirection_disclosure_names_only_knobs_the_repo_won() {
+        // rm-2112: after the inversion, a knob the operator set
+        // nowhere higher still falls through to the repository's file
+        // — that redirection is named by ONE loud line (and by the
+        // --doctor disclosure), never silent. The knobs an operator
+        // layer or CLI flag pinned drop out of the line.
+        let root = std::env::temp_dir().join(format!("at-config-rm2112d-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let user_dir = root.join("user/agenttrace");
+        let project_dir = root.join("project/.agenttrace");
+        fs::create_dir_all(&user_dir).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        let user = user_dir.join("config.toml");
+        let project = project_dir.join("config.toml");
+
+        // No project file: nothing to disclose.
+        fs::write(user_dir.join("config.toml"), "pricing_file = \"/user-p\"\n").unwrap();
+        let args = crate::test_args(None);
+        let resolved = resolve_with_paths(&args, Some(&user), &root.join("absent")).unwrap();
+        assert!(project_redirection_disclosure(&resolved).is_none());
+
+        // Project sets history_dir + pricing_file; the user file pins
+        // pricing_file. Only history_dir was redirected by the repo,
+        // and the line names the file that did it.
+        fs::write(
+            project_dir.join("config.toml"),
+            "history_dir = \"/repo-h\"\npricing_file = \"/repo-evil-pricing.json\"\n",
+        )
+        .unwrap();
+        let mut args = crate::test_args(None);
+        args.history_dir = Some(PathBuf::from("/cli-h"));
+        let resolved = resolve_with_paths(&args, Some(&user), &project).unwrap();
+        assert_eq!(resolved.history_dir, Some(PathBuf::from("/cli-h")));
+        assert_eq!(resolved.pricing_file, Some(PathBuf::from("/user-p")));
+        assert!(project_redirection_disclosure(&resolved).is_none());
+
+        // Drop every operator pin: the repo wins both knobs, and the
+        // line + doctor disclosure name exactly those two.
+        let args = crate::test_args(None);
+        let resolved = resolve_with_paths(&args, None, &project).unwrap();
+        assert_eq!(resolved.history_dir, Some(PathBuf::from("/repo-h")));
+        assert_eq!(
+            resolved.pricing_file,
+            Some(PathBuf::from("/repo-evil-pricing.json"))
+        );
+        assert_eq!(
+            resolved.project_redirected,
+            vec!["history_dir", "pricing_file"]
+        );
+        let line =
+            project_redirection_disclosure(&resolved).expect("repo won knobs -> one loud line");
+        assert!(line.contains("history_dir, pricing_file"), "{line}");
+        assert!(line.contains(".agenttrace/config.toml"), "{line}");
+        assert!(line.contains("rm-2112"), "{line}");
+        let text = disclosure_text(&resolved);
+        assert!(
+            text.contains("project config redirected: history_dir, pricing_file"),
+            "{text}"
+        );
+        assert!(disclosure_json(&resolved).contains("project_redirected"));
         fs::remove_dir_all(&root).ok();
     }
 

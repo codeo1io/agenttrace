@@ -957,6 +957,29 @@
 
 ### Fixed
 
+- Hostile extreme-year timestamps no longer panic `--quota`/statusline
+  window arithmetic: the `parse_ts` choke point holds every accepted
+  form to 4-digit ISO-profile years (rm-2113, run 8b321cfcba93 cycle 2,
+  batch "Hostile-input truth hardening: config-layer trust + parser
+  robustness"; implemented as a byte-identical port of the landed
+  rm-2013 fix — the wall's 9c2b87a8 already carries this exact
+  `parse_ts_form` guard, and this run's base de3168de predates it, so
+  the body is adopted verbatim and the union at the merge is a
+  no-op): chrono 0.4.45 parses expanded-year strings on both arms of
+  `parse_ts_form` — RFC-3339 signed forms
+  (`+262143-12-31T23:59:59+00:00`) and the naive `%Y` arm's negative
+  form (`-262143-01-01T00:00:00`) — and such an anchor became the
+  corpus cutoff, where `quota_window`'s `cutoff - span` overflowed
+  `DateTime - TimeDelta` and killed the process (rc101, observed on
+  a hostile hermes session-index whose `session_start` is applied
+  verbatim as an event timestamp; every hostile-string lane funnels
+  through this one parser). Years outside `0..=9999` are unplaceable:
+  they flow to the existing disclosure counters
+  (`corpus.attribution.unplaced`), never to arithmetic. Pinned
+  red-first by `tests/hostile_timestamp_truth.rs` (naive
+  negative/positive edges, RFC-3339 signed edges, and a `quota_report`
+  survival + full-disclosure pass over a hostile corpus) —
+  byte-identical to the landed rm-2013 contract test.
 - Statusline journal writers no longer hang forever behind a wedged journal
   lock (rm-686 production lock-wait arm, run c0a02f64 cycle 1):
   `open_locked_journal` called `File::lock` with no deadline — the retry
@@ -1931,6 +1954,40 @@
 
 ### Changed
 
+- The operator's user config file now outranks the repository's
+  project file, and every project-layer redirection is disclosed
+  loudly (rm-2112, run 8b321cfcba93 cycle 2, same batch): the layered
+  config loaded user → project → `--config` and folded each layer
+  over the last, so the repository-controlled
+  `./.agenttrace/config.toml` outranked
+  `~/.config/agenttrace/config.toml` for every shared key. A cloned
+  repository therefore silently redirected knobs under its operator's
+  own configuration — the assess PoC's `evil-repo` priced every
+  report with the repo's attacker-controlled `pricing_file` (cost
+  falsification a `--doctor` line only traced to an anonymous
+  "config file") and pointed `history_dir` at the repository itself,
+  where `--sessions --preserve-history` wrote `history.json` straight
+  into the repo. The load order is inverted at the one construction
+  site (`resolve_with_paths`): project loads first, the user file
+  folds over it, `--config` and CLI flags stay above both, and the
+  `AGENTTRACE_*` knobs stay below every file layer — the CLI >
+  `--config` > user > project > env > defaults chain the README
+  documents. A knob the operator set nowhere higher still falls
+  through to the project file (dropping project-layer support would
+  break legitimate per-repo budgets), so that residual redirection is
+  never silent: `project_redirection_disclosure` prints one stderr
+  line naming the redirected knobs and the file, `--doctor`'s text
+  gains a `project config redirected: …` line and its JSON document
+  an additive `project_redirected` array (stdout machine contracts —
+  json/csv/tsv/otel — stay byte-stable; the line rides stderr), and
+  the mcp arm discloses before `serve()` so both parity lanes agree.
+  Pinned red-first by `user_config_outranks_project_file_for_every_shared_key`
+  (all four shared keys invert) and
+  `project_redirection_disclosure_names_only_knobs_the_repo_won`
+  (an operator pin — CLI flag or user file — removes the knob from
+  the line; no project file → no line), with the rm-384 precedence
+  matrix deliberately flipped to the new chain (its old stage-2/3
+  expectations were the vulnerability's pin).
 - One shared cache-directory resolver replaces the four byte-identical per-module copies (rm-1536, assess F4, run 79fe78c0 cycle 3; adoption of salvage 9b2a7a1 U2): doctor, pricing, session_cache, and statusline each carried their own `user_cache_dir` ladder for locating the `agenttrace` cache root (sessions.json, pricing.json, the statusline capture journal, the doctor cache report). The ladder now lives once in `agenttrace-core::cache_dir` — `resolve_user_cache_dir(home, xdg_cache_home, macos)` takes the platform arm as an injected boolean so the Linux CI legs can pin the macOS behavior that `cfg!` copies made compile-time dead code, and one 17-row decision table replaces the four per-module pin tests. Two order-of-precedence disclosures ride the consolidation: an ABSOLUTE, non-empty `$XDG_CACHE_HOME` now wins on EVERY OS — the old macOS arm returned `$HOME/Library/Caches` first, so the rm-596 doctor demo sandbox (HOME + absolute XDG override asserting no $HOME text in the report) was unsatisfiable on macOS — and the landed rm-248 rider stays on the home arms (a set-but-empty OR RELATIVE `HOME` is unset-equivalent on both arms; an unusable HOME never yields a per-cwd cache). No environment variable is read anywhere new — the `user_cache_dir()` wrapper reads exactly the same two variables through one code path.
 - `resolve_user_cache_dir` is defined exactly once (rm-1389, run 1a4cce3a cycle 3, batch "one truth on the money-and-cache path"; reliability 30.0): the user-cache base resolver existed as four hand-synced private copies (session_cache, doctor, pricing, statusline — byte-identical 29-line bodies at the consolidation base 3e90993, verified) that had already drifted twice in three days — the empty/relative-HOME fix (rm-248 rider, dade9cd) landed on three copies while statusline's lagged, and the relative-HOME review fix then landed on statusline alone. The session_cache copy — the module that owns the cache-root policy — is now the single `pub(crate)` definition, imported by the other three; it stays pure over `(HOME, XDG_CACHE_HOME)` so every call path remains test-injectable. No behavior change (the bodies were identical); the consolidation is pinned by `shared_user_cache_resolver_census_pins_one_definition` (session_cache unit test that walks every `crates/**/*.rs` and asserts exactly one `fn` definition — the needle is assembled at runtime so the test's own source cannot count itself) on top of the existing per-module parity tests (`user_cache_dir_treats_empty_and_relative_home_as_unset` in session_cache/doctor/pricing plus statusline's historical pins), which now exercise the one shared body from all four beds. (Integration, conflict case 4d82812f: this run's session_cache-hosted consolidation is superseded at the merge by the landed rm-1536 `cache_dir` consolidation above — same one-definition intent, mechanics rehomed: the shared resolver lives in `agenttrace-core::cache_dir` as `resolve_user_cache_dir(home, xdg_cache_home, macos)` with an injected macOS arm, so the Linux CI legs can pin it; the census pin `shared_user_cache_resolver_census_pins_one_definition` relocated to cache_dir.rs beside the one definition, and the per-module parity tests this entry cites were themselves folded into cache_dir's 17-row `user_cache_dir_decision_table`.)
 

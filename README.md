@@ -133,10 +133,14 @@ agenttrace
 
 ```bash
 # agenttrace reads a small set of knobs from a layered config:
-#   CLI flags > --config PATH > ./.agenttrace/config.toml
-#   > ~/.config/agenttrace/config.toml > AGENTTRACE_* env > defaults
-# Every layer only fills keys left unset above it, and --doctor
-# discloses which files were found and where each knob came from.
+#   CLI flags > --config PATH > ~/.config/agenttrace/config.toml
+#   > ./.agenttrace/config.toml > AGENTTRACE_* env > defaults
+# Your user file outranks the repository's project file (rm-2112): a
+# cloned repository cannot silently redirect pricing/history knobs
+# under your own config. When the project file still wins a knob,
+# agenttrace prints one loud line naming the redirected knobs, and
+# --doctor discloses which files were found and where each knob came
+# from.
 agenttrace --doctor
 
 # ~/.config/agenttrace/config.toml — all keys optional:
@@ -539,9 +543,9 @@ fails when the README table drifts from the binary's actual flag count
 | `--quota` |  | Show the plan-window quota view (rm-201): current 5h and 7d ROLLING spend windows over the discovered corpus, TTL-correct (a session's cost enters a window pro rata by its event timestamps; warm-cache sessions by their start-to-end span), with `resets_at` full-decay horizons and a corpus-cutoff disclosure. The cutoff clamps at the newest at-or-before-now instant — future-dated timestamps are discarded at a disclosed clock-skew guard (rm-1402) so a hostile or skewed journal line cannot hide the real spend. `-f json` emits the stable `agenttrace.quota/1` schema, the default a text summary; every other format is rejected loudly. Limits are disclosed-unknown — agenttrace reads no credentials and no plan data. Corpus-scope: `--range`, `--project`, `--source`, `--model-filter`, and the sample/history flags do not apply to it and are refused loudly |
 | `--statusline-report` |  | Report on the Claude Code statusline capture journal (candidate 53, cycle 7): limit-pressure windows, reset crossings, and per-session prompt-cache miss causes recorded by `agenttrace statusline` |
 | `--fetch` |  | `agenttrace upstream`: refresh the remote-tracking refs from the network via `git fetch` (and probe the npm registry) before reporting fork-vs-upstream drift. Without it, `agenttrace upstream` is fully offline (rm-024) |
-| `--config <PATH>` |  | Explicit configuration file (rm-384). Layered above the project and user config files; a missing file is an error |
-| `--history-dir <PATH>` |  | Override the history directory: highest precedence, then the config files, then `AGENTTRACE_HISTORY_DIR` (rm-384) |
-| `--pricing-file <PATH>` |  | Override the pricing override file: highest precedence, then the config files, then `AGENTTRACE_PRICING_FILE` (rm-384) |
+| `--config <PATH>` |  | Explicit configuration file (rm-384). Layered above the user and project config files; a missing file is an error |
+| `--history-dir <PATH>` |  | Override the history directory: highest precedence, then the config files (user above project, rm-2112), then `AGENTTRACE_HISTORY_DIR` (rm-384) |
+| `--pricing-file <PATH>` |  | Override the pricing override file: highest precedence, then the config files (user above project, rm-2112), then `AGENTTRACE_PRICING_FILE` (rm-384) |
 | `--weekly-budget <USD>` |  | Weekly spend budget in USD for `--statusline-report` and `--budget`: highest precedence, then config `weekly_budget_usd` (rm-385) |
 | `--budget` |  | Show the weekly budget window-burn view: per-day spend from the statusline journal against the resolved weekly budget; the window is the trailing 7 CALENDAR days ending today — stale journals disclose instead of verdicting, and hostile capture costs (negative or non-finite `total_cost_usd`) plus unparsable journal lines are discarded and disclosed, never folded into the total, with `remaining_usd` floored to [0, budget] in the JSON arms (rm-385, rm-917) |
 | `--version` |  | Print the version banner and exit 0; wins over action validation |
