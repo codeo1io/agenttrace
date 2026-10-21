@@ -1097,6 +1097,18 @@ pub(crate) fn find_session_files_cached(
     // the first pairs named.
     let mut deduped: Vec<PathBuf> = Vec::with_capacity(all.len());
     let mut signatures: HashMap<(i64, u64), PathBuf> = HashMap::new();
+    // macOS determinism cure: the walk order fed to this scan is
+    // mtime-newest-first per root (sort_paths_by_cache), so which
+    // byte-identical copy is "first seen" depended on filesystem mtime
+    // granularity — APFS nanosecond mtimes crowned a different survivor
+    // than Linux's coarser timestamps, flipping the pinned
+    // survivor <- suppressed disclosure pairs. Scan in canonical sorted
+    // path order instead: the survivor is the lexicographically smallest
+    // path on every platform, and the determinism claim
+    // ("sorted per-directory files, roots in registration order")
+    // becomes true by construction.
+    let mut all: Vec<PathBuf> = all;
+    all.sort();
     for path in all {
         // rm-451 × rm-1886 composition (conflict case a2dd44ed): an
         // over-cap opencode info doc is NEVER materialized on any lane —
