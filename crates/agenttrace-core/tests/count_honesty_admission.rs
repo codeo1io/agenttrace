@@ -679,3 +679,187 @@ fn doctor_and_audit_disclose_the_admission_ledger() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+#[test]
+fn zst_stem_twin_admits_once_with_disclosure() {
+    // rm-2056 (run 18f9b98a cycle 2, assess 9158ade7 F2): codex 0.163's
+    // rollout migration compresses a rollout to `<stem>.jsonl.zst`
+    // while the plain `<stem>.jsonl` sibling still exists — the two
+    // names hold ONE session, but their bytes differ by construction
+    // (plain vs zstd frame), so the rm-1886 content-signature dedup
+    // cannot collapse the pair and aggregation counted the session
+    // twice (PoC: same rollout listed at $0.0042 x2). The aggregation
+    // walk now admits the plain twin by NAME (deterministic regardless
+    // of the migration's mtime ordering), suppresses the shadow, and
+    // counts it for disclosure.
+    let home = temp_home("zst-twin-cold");
+    let day = home.join(".codex/sessions/2026/10/15");
+    let plain = write(
+        &day.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"),
+        include_str!(
+            "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"
+        ),
+    );
+    let shadow = day.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst");
+    fs::write(
+        &shadow,
+        include_bytes!(
+            "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"
+        ),
+    )
+    .expect("write real-named compressed twin");
+
+    with_pinned_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "one codex session present as a stem pair must admit exactly once"
+        );
+        assert_eq!(
+            report.zst_stem_twins, 1,
+            "the shadow is counted, not silent"
+        );
+        assert_eq!(report.zst_stem_twin_pairs.len(), 1);
+        let (survivor, suppressed) = &report.zst_stem_twin_pairs[0];
+        assert_eq!(survivor, &plain, "the plain .jsonl twin wins by name");
+        assert_eq!(suppressed, &shadow, "the .jsonl.zst twin is the shadow");
+        let total: f64 = report
+            .sessions
+            .iter()
+            .map(|session| session.metrics.cost_estimated)
+            .sum();
+        assert!(
+            (total - 0.0042).abs() < 1e-6,
+            "the session's cost banks once ({total}), not twice"
+        );
+        assert_eq!(
+            report.duplicate_session_files, 0,
+            "a stem pair is not a byte-identical duplicate — the classes stay distinct"
+        );
+
+        // The doctor lane carries the same count and renders the pair.
+        let doctor = build_doctor_report(None, false);
+        assert_eq!(
+            doctor.disclosures.get("zst_stem_twins"),
+            Some(&1),
+            "doctor carries the zst stem-twin count"
+        );
+        let text = agenttrace_core::doctor_report_text(&doctor);
+        assert!(
+            text.contains("Compressed rollout twins"),
+            "rendered doctor text names the twin row: {text}"
+        );
+        assert!(
+            text.contains("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"),
+            "the row names the survivor and the shadow"
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn zst_stem_twin_warm_cache_still_admits_once() {
+    // The rm-2056 policy rides the name, not the listing cache: the
+    // second (warm) pass over the same home must suppress the shadow
+    // exactly like the cold pass — the dir-listing cache (rm-9e6210a
+    // walk-version rung lane) replays raw names, and the twin pass
+    // runs on them every time.
+    let home = temp_home("zst-twin-warm");
+    let day = home.join(".codex/sessions/2026/10/15");
+    let plain = write(
+        &day.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"),
+        include_str!(
+            "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"
+        ),
+    );
+    fs::write(
+        day.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"),
+        include_bytes!(
+            "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"
+        ),
+    )
+    .expect("write real-named compressed twin");
+
+    with_pinned_home(&home, || {
+        for pass in 0..2 {
+            let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+            assert_eq!(
+                report.sessions.len(),
+                1,
+                "pass {pass}: exactly one admission cold and warm"
+            );
+            assert_eq!(
+                report.zst_stem_twins, 1,
+                "pass {pass}: the shadow discloses on every pass"
+            );
+        }
+        let _ = &plain;
+    });
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn zst_only_name_still_admits_without_a_plain_twin() {
+    // rm-992 regression guard for the rm-2056 pass: a `.jsonl.zst`
+    // with NO plain sibling is a complete admission (the parser
+    // decodes it end to end) — the twin policy suppresses a NAME
+    // pair, never the compressed suffix itself.
+    let home = temp_home("zst-twin-solo");
+    let day = home.join(".codex/sessions/2026/10/15");
+    fs::create_dir_all(&day).expect("mkdir date tree");
+    fs::write(
+        day.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"),
+        include_bytes!(
+            "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"
+        ),
+    )
+    .expect("write real-named compressed rollout");
+
+    with_pinned_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "a zst-only rollout still admits and decodes (rm-992)"
+        );
+        assert_eq!(
+            report.zst_stem_twins, 0,
+            "no plain sibling means no twin to suppress"
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn explicit_dir_lane_keeps_zst_stem_twin() {
+    // rm-548 stance guard for rm-2056: `-d` is the inspection lane —
+    // an explicitly requested directory keeps every admitted file
+    // (same stance the byte-identical duplicate class carries), so the
+    // twin policy must not leak into it.
+    let home = temp_home("zst-twin-explicit");
+    let sessions = home.join(".codex/sessions");
+    fs::create_dir_all(sessions.join("2026/10/15")).expect("mkdir date tree");
+    fs::write(
+        sessions.join("2026/10/15/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"),
+        include_str!(
+            "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"
+        ),
+    )
+    .expect("write plain rollout");
+    fs::write(
+        sessions.join("2026/10/15/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"),
+        include_bytes!(
+            "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"
+        ),
+    )
+    .expect("write compressed twin");
+
+    let found = find_session_files(Some(&sessions));
+    assert_eq!(
+        found.len(),
+        2,
+        "the -d inspection lane keeps both names (rm-548 stance): {found:?}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}

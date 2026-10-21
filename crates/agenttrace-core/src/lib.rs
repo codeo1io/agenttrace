@@ -3220,14 +3220,24 @@ fn quota_window(
     cutoff: DateTime<Utc>,
     span: chrono::Duration,
 ) -> QuotaWindow {
-    // rm-2031 (run e40a66d3 cycle 6): a past-extreme event timestamp
-    // puts `cutoff` at the very floor of the chrono range and the plain
-    // subtraction overflowed (`DateTime - TimeDelta overflowed`, a panic
-    // on a 94-byte hostile journal). Saturate at MIN_UTC instead: the
-    // window starts at the floor and renders — never crashes the lane.
+    // rm-2031 (run e40a66d3 cycle 6) + rm-2057 (run 18f9b98a cycle 2,
+    // assess 9158ade7 — independent mints of the same clamp, landed
+    // together at this seam): a past-extreme event timestamp puts
+    // `cutoff` at the very floor of the chrono range and the plain
+    // subtraction overflowed (`DateTime - TimeDelta overflowed`, a
+    // panic on a 94-byte hostile journal; rc101 on EVERY explicit-file
+    // run — that lane never caches, main.rs rm-503 — and the rm-1402
+    // clock-skew guard bounds the cutoff at `now` but not at the
+    // calendar floor, so a hostile meter or one fabricated journal
+    // line reached this math unguarded). Clamp at consumption, and
+    // saturate at MIN_UTC: a window start that would precede
+    // representable time extends to the floor and renders — the
+    // window still covers the session, the spend stays fully
+    // attributed (every event is at or after MIN_UTC, so the share
+    // math is unchanged), and the report never crashes the lane.
     let start = cutoff
         .checked_sub_signed(span)
-        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
     let mut spend_usd = 0.0;
     let mut sessions_contributing = 0;
     for session in sessions {
@@ -5305,6 +5315,54 @@ mod quota_tests {
         assert!(report["limits"]["weekly_usd"].is_null());
         assert_eq!(report["corpus"]["attribution"]["event_timestamps"], 2);
         assert_eq!(report["corpus"]["attribution"]["unplaced"], 0);
+    }
+
+    #[test]
+    fn quota_report_extreme_floor_timestamp_clamps_window_start() {
+        // rm-2057 (run 18f9b98a cycle 2, assess 9158ade7 PoC F1): the
+        // rm-1402 skew guard bounds the cutoff at `now` but never at
+        // the calendar floor — a journal whose newest event sits AT
+        // the representable floor made `cutoff - 7d` overflow and
+        // panic the whole quota view (rc101 lib.rs quota_window,
+        // deterministic on the explicit-file lane). The window start
+        // now clamps to MIN_UTC: every event is >= the floor, so the
+        // spend stays fully attributed and the report renders. The
+        // floor arrives through the parser's integer-epoch admission
+        // (the live PoC shape); `parse_ts` never accepts the negative
+        // year STRING, so this fixture carries the parsed timestamps
+        // directly.
+        let floor = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+        let session = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "hostile-floor".to_string(),
+            path: "/hostile-floor.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                timestamps: vec![floor, floor + chrono::Duration::seconds(2)],
+                cost_estimated: 0.0072,
+                session_start: "-262143-01-01T00:00:00Z".to_string(),
+                session_end: "-262143-01-01T00:00:02Z".to_string(),
+                ..Default::default()
+            },
+            anomalies: vec![],
+            health: 0,
+            tool_warnings: vec![],
+            diagnostics: Diagnostics::default(),
+        };
+        let report = quota_report(&[session]);
+        assert_eq!(report["corpus"]["cutoff_utc"], "-262143-01-01T00:00:02Z");
+        assert_eq!(
+            report["weekly"]["window_start_utc"], "-262143-01-01T00:00:00Z",
+            "a window that would precede representable time extends to the floor"
+        );
+        assert_eq!(report["weekly"]["spend_usd"], 0.0072);
+        assert_eq!(
+            report["five_hour"]["window_start_utc"], "-262143-01-01T00:00:00Z",
+            "the 5h window underflows the same floor and clamps identically"
+        );
+        assert_eq!(report["five_hour"]["spend_usd"], 0.0072);
     }
 
     #[test]

@@ -17,6 +17,20 @@ pub(super) struct InspectFirstItem {
     pub(super) index: usize,
 }
 
+/// rm-1500 (run 18f9b98a cycle 2, assess 9158ade7 F1): the
+/// finiteness-gate wave (0ff02e09) covered every CLI fold but none of
+/// agenttrace-tui — a poisoned session cost (NaN/inf) NaN'd every
+/// TUI aggregate it touched while the CLI lanes clamped with
+/// disclosure. Same clamp here: a non-finite cost contributes 0.0;
+/// the session itself still counts.
+pub(super) fn finite_cost(cost: f64) -> f64 {
+    if cost.is_finite() {
+        cost
+    } else {
+        0.0
+    }
+}
+
 pub(super) fn cache_state_label() -> String {
     match agenttrace_core::session_cache_path().metadata() {
         Ok(metadata) if metadata.len() > 0 => "cache warm".to_string(),
@@ -163,7 +177,7 @@ pub(super) fn top_driver<T: Borrow<Session>>(
         entry.sessions += 1;
         entry.failures += session.metrics.tool_calls_fail;
         entry.tokens = entry.tokens.saturating_add(total_tokens(session));
-        entry.cost += session.metrics.cost_estimated;
+        entry.cost += finite_cost(session.metrics.cost_estimated);
     }
     groups.into_values().max_by(compare_driver_items)
 }
@@ -182,7 +196,7 @@ pub(super) fn top_anomaly_driver<T: Borrow<Session>>(sessions: &[T]) -> Option<D
             entry.sessions += 1;
             entry.failures += session.metrics.tool_calls_fail;
             entry.tokens = entry.tokens.saturating_add(total_tokens(session));
-            entry.cost += session.metrics.cost_estimated;
+            entry.cost += finite_cost(session.metrics.cost_estimated);
         }
     }
     groups.into_values().max_by(compare_driver_items)

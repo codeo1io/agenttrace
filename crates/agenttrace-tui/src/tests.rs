@@ -2050,6 +2050,75 @@ fn wait_for_progress(app: &mut App) {
     }
 }
 
+#[test]
+fn tui_cost_folds_and_comparator_gate_non_finite_costs() {
+    // rm-1500 TUI arm (run 18f9b98a cycle 2, assess 9158ade7 F1):
+    // the 0ff02e09 finiteness gate covered every CLI fold but none of
+    // agenttrace-tui — one poisoned session cost NaN'd every TUI
+    // aggregate it touched (driver folds) and the Cost-view
+    // comparator (partial_cmp().unwrap_or(Equal) makes NaN equal to
+    // everything, an inconsistent order a sort may reject). The folds
+    // now clamp through shared::finite_cost and the comparator uses
+    // total_cmp over gated values.
+    assert_eq!(shared::finite_cost(f64::NAN), 0.0);
+    assert_eq!(shared::finite_cost(f64::INFINITY), 0.0);
+    assert_eq!(shared::finite_cost(f64::NEG_INFINITY), 0.0);
+    assert_eq!(shared::finite_cost(0.0042), 0.0042);
+
+    let poisoned = session("poisoned", "claude_code", "gpt-5", 100, f64::NAN, "bash");
+    let healthy = session("healthy", "claude_code", "gpt-5", 100, 0.2, "bash");
+    let mut app = App::new(vec![healthy, poisoned], "test", None);
+    app.explorer_view = ExplorerView::Cost;
+    let indices = app.explorer_indices();
+    assert_eq!(indices.len(), 2, "the NaN session still lists");
+    let order: Vec<usize> = indices.to_vec();
+    assert_eq!(
+        order.len(),
+        2,
+        "the comparator stays a total order under a NaN cost"
+    );
+
+    // rm-1500 review fix (133ceef5 F2): the SORT lane gates too —
+    // filters.rs SortKey::Cost now folds through finite_cost before
+    // total_cmp, so a NaN cost sorts as 0.0 with the name tiebreaker
+    // (a total order; the old cmp_f64 lane broke transitivity).
+    let poisoned = session("poisoned", "claude_code", "gpt-5", 100, f64::NAN, "bash");
+    let healthy = session("healthy", "claude_code", "gpt-5", 100, 0.2, "bash");
+    assert_eq!(
+        filters::compare_sessions(&poisoned, &healthy, SortKey::Cost, false),
+        std::cmp::Ordering::Less,
+        "NaN gates to 0.0 and sorts below 0.2"
+    );
+    assert_eq!(
+        filters::compare_sessions(&healthy, &poisoned, SortKey::Cost, false),
+        std::cmp::Ordering::Greater,
+        "antisymmetric under the same pair"
+    );
+    assert_eq!(
+        filters::compare_sessions(&poisoned, &healthy, SortKey::Cost, true),
+        std::cmp::Ordering::Greater,
+        "desc is the exact reverse of asc"
+    );
+
+    // Driver folds clamp: the poisoned session contributes 0.0, the
+    // healthy one keeps its true cost.
+    let sessions = [session(
+        "poisoned2",
+        "claude_code",
+        "gpt-5",
+        100,
+        f64::NAN,
+        "bash",
+    )];
+    let driver = shared::top_driver(&sessions, |session| session.metrics.source_tool.clone())
+        .expect("driver aggregate renders");
+    assert_eq!(driver.sessions, 1, "the poisoned session is still counted");
+    assert_eq!(
+        driver.cost, 0.0,
+        "its non-finite cost folds to 0.0, not NaN"
+    );
+}
+
 fn session(name: &str, source: &str, model: &str, health: i32, cost: f64, tool: &str) -> Session {
     let mut metrics = Metrics {
         source_tool: source.to_string(),

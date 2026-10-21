@@ -219,6 +219,12 @@ pub struct DoctorReport {
     /// byte-identical copies were found.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub duplicate_session_file_pairs: Vec<String>,
+    /// rm-2056 (run 18f9b98a cycle 2): zst stem twins suppressed at
+    /// admission, rendered `survivor.jsonl <- shadow.jsonl.zst` —
+    /// capped at five, the exact count rides
+    /// `disclosures["zst_stem_twins"]`. Empty when no twin pairs were
+    /// found (absent = nothing happened, the disclosure convention).
+    pub zst_stem_twin_pairs: Vec<String>,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
     /// `agenttrace statusline` has been configured as the statusLine
@@ -341,6 +347,8 @@ struct DoctorDiscovery {
     /// never operator input) — the report then carries zero sessions
     /// and names the error instead of panicking mid-diagnosis.
     demo_corpus_error: Option<String>,
+    zst_stem_twins: usize,
+    zst_stem_twin_pairs: Vec<(PathBuf, PathBuf)>,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -384,6 +392,8 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             duplicate_session_file_pairs: Vec::new(),
             opencode_info_docs_skipped_over_cap: 0,
             demo_corpus_error,
+            zst_stem_twins: 0,
+            zst_stem_twin_pairs: Vec::new(),
         };
     }
     let cache = load_session_cache_report();
@@ -445,6 +455,8 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         duplicate_session_file_pairs: suppressed.duplicate_session_file_pairs,
         opencode_info_docs_skipped_over_cap,
         demo_corpus_error: None,
+        zst_stem_twins: suppressed.zst_stem_twins,
+        zst_stem_twin_pairs: suppressed.zst_stem_twin_pairs,
     }
 }
 
@@ -474,6 +486,8 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         duplicate_session_file_pairs,
         opencode_info_docs_skipped_over_cap,
         demo_corpus_error,
+        zst_stem_twins,
+        zst_stem_twin_pairs,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -547,6 +561,13 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             opencode_info_docs_skipped_over_cap,
         );
     }
+    // rm-2056: zst stem twins, same-key discipline — the loader's
+    // LoadReport counter and the doctor's disclosure agree, so a
+    // migrating codex home reads "one session, one shadow twin" on
+    // both surfaces instead of silently halving.
+    if zst_stem_twins > 0 {
+        disclosures.insert("zst_stem_twins".to_string(), zst_stem_twins);
+    }
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -603,6 +624,13 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         },
         sqlite_partial_dbs: sqlite_ingest.partial_dbs.clone(),
         duplicate_session_file_pairs: duplicate_session_file_pairs
+            .iter()
+            .take(5)
+            .map(|(survivor, suppressed)| {
+                format!("{} <- {}", survivor.display(), suppressed.display())
+            })
+            .collect(),
+        zst_stem_twin_pairs: zst_stem_twin_pairs
             .iter()
             .take(5)
             .map(|(survivor, suppressed)| {
@@ -1573,6 +1601,21 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
             ));
         }
     }
+    // rm-2056: zst stem twins — one session under two names, not a
+    // second session. The plain twin wins; the shadow is disclosed so
+    // the shrunken count reads "counted once", not "lost".
+    // Review fix (133ceef5 F4): the migration is one of TWO known
+    // sources — the README/parser `zstd -d rollout.jsonl.zst` recipe
+    // decompresses without deleting the archive and manufactures the
+    // same pair, and no migration ever clears that one.
+    if let Some(&count) = report.disclosures.get("zst_stem_twins") {
+        if count > 0 {
+            recommendations.push(format!(
+                "{} compressed rollout twin(s) (.jsonl.zst shadowed by their .jsonl sibling) were counted once; two known sources leave this pair behind — codex's rollout migration (transient until finished or cleared) and a manual 'zstd -d rollout.jsonl.zst' that decompresses without deleting the archive (the documented recipe); finish or clear the migration, or delete one of the two names, to drop the duplicate.",
+                count
+            ));
+        }
+    }
     if demo {
         recommendations.push(
             "Demo sessions are bundled in memory, so cache reuse does not apply in this mode."
@@ -1713,6 +1756,23 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
                 .unwrap_or(report.duplicate_session_file_pairs.len()),
             report
                 .duplicate_session_file_pairs
+                .iter()
+                .map(|pair| format!("    {}\n", guard_formula_cell(pair)))
+                .collect::<String>()
+        ));
+    }
+    // rm-2056: the twin pairs render like the duplicate pairs — count
+    // from the disclosure map (exact), samples underneath.
+    if !report.zst_stem_twin_pairs.is_empty() {
+        out.push_str(&format!(
+            "Compressed rollout twins (rm-2056): {}\n{}",
+            report
+                .disclosures
+                .get("zst_stem_twins")
+                .copied()
+                .unwrap_or(report.zst_stem_twin_pairs.len()),
+            report
+                .zst_stem_twin_pairs
                 .iter()
                 .map(|pair| format!("    {}\n", guard_formula_cell(pair)))
                 .collect::<String>()

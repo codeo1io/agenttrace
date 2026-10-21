@@ -80,6 +80,17 @@ pub struct LoadReport {
     /// doc is NOT an aggregation suppression (the session stays admitted),
     /// only its probe read was refused.
     pub opencode_info_docs_skipped_over_cap: usize,
+    /// rm-2056 (run 18f9b98a cycle 2): zst stem twins —
+    /// `<stem>.jsonl.zst` admissions suppressed because the plain
+    /// `<stem>.jsonl` sibling holds the same codex session (rollout
+    /// migration transient, rm-992); see
+    /// [`SuppressedSessions::zst_stem_twins`]. Carried here so the
+    /// journal disclosure channel can report the shadow instead of
+    /// quietly halving the directory.
+    pub zst_stem_twins: usize,
+    /// rm-2056: first (survivor `.jsonl`, suppressed `.jsonl.zst`)
+    /// pairs, capped at five, naming the stems.
+    pub zst_stem_twin_pairs: Vec<(PathBuf, PathBuf)>,
     /// rm-835 (minted campaign-locally as rm-695 by run f7f81aea, rebound
     /// at integration — the landed wall already holds an rm-695): how many
     /// discovered files failed to parse (the parse share of `skipped`,
@@ -392,6 +403,13 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     // content dedup so an id-level duplicate resolves by the canonical
     // store rather than first-seen path order, matching the cached walk.
     retain_single_cline_session_per_id(&mut all);
+    // rm-2056: zst stem twins collapse to the plain `.jsonl` (see
+    // `suppress_zst_stem_twins`). This uncached aggregation lane
+    // carries no disclosure ledger, so its counter is local — parity
+    // with its other silent passes; the cached lane owns the counts
+    // that reach the operator.
+    let mut twin_ledger = SuppressedSessions::default();
+    all = suppress_zst_stem_twins(all, &mut twin_ledger);
     let mut signatures: HashSet<(i64, u64)> = HashSet::new();
     all.retain(|path| {
         // Unreadable: keep (the parse lane owns and discloses those).
@@ -735,6 +753,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
     let subagent_artifact_files = suppressed.subagent_artifact_files;
     let duplicate_session_files = suppressed.duplicate_session_files;
     let duplicate_session_file_pairs = suppressed.duplicate_session_file_pairs;
+    let zst_stem_twins = suppressed.zst_stem_twins;
+    let zst_stem_twin_pairs = suppressed.zst_stem_twin_pairs;
     if dir.is_none() {
         let (sqlite_sessions, ingest) =
             crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
@@ -824,6 +844,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
         duplicate_session_files,
         duplicate_session_file_pairs,
         opencode_info_docs_skipped_over_cap,
+        zst_stem_twins,
+        zst_stem_twin_pairs,
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
@@ -897,6 +919,75 @@ pub struct SuppressedSessions {
     /// capped at [`MAX_DUPLICATE_PAIR_SAMPLES`]; the full count rides
     /// `duplicate_session_files`.
     pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-2056 (run 18f9b98a cycle 2, assess 9158ade7 / roadmap
+    /// 7699dfb5): zst stem twins — `<stem>.jsonl.zst` files whose
+    /// plain `<stem>.jsonl` sibling was also admitted. Both names
+    /// hold the SAME codex session (a designed transient of the
+    /// 0.163 rollout migration, rm-992), not two sessions — but the
+    /// twin bytes differ by construction (plain vs zstd frame), so
+    /// every earlier dedup arm missed the pair and aggregation
+    /// double-counted it. The plain twin wins (the decompressed
+    /// content lane is complete; the compressed lane is still blind
+    /// inside, rm-1872); the shadowed copy is counted here, never
+    /// silently dropped.
+    pub zst_stem_twins: usize,
+    /// rm-2056: first (survivor `.jsonl`, suppressed `.jsonl.zst`)
+    /// pairs, capped at [`MAX_ZST_TWIN_PAIR_SAMPLES`], naming the
+    /// stems so an operator can tell a migration transient from a
+    /// coincidence.
+    pub zst_stem_twin_pairs: Vec<(PathBuf, PathBuf)>,
+}
+
+/// rm-2056: cap on the named zst stem-twin pairs — same discipline as
+/// [`MAX_DUPLICATE_PAIR_SAMPLES`]: the count stays exact, the samples
+/// name the shape.
+const MAX_ZST_TWIN_PAIR_SAMPLES: usize = 5;
+
+/// rm-2056 (run 18f9b98a cycle 2): collapse zst stem twins to one
+/// admission per stem — see `SuppressedSessions::zst_stem_twins` for
+/// the full rationale. Deterministic and IO-free: precedence rides
+/// the NAME (plain `.jsonl` beats `.jsonl.zst`), not walk order, so
+/// cold and warm aggregation admit the same file regardless of the
+/// migration's mtime ordering. A `.jsonl.zst` with NO plain sibling
+/// stays admitted (rm-992: the parser decodes it end to end); a
+/// `.json`/other-name collision is not this class and is left alone.
+fn suppress_zst_stem_twins(all: Vec<PathBuf>, suppressed: &mut SuppressedSessions) -> Vec<PathBuf> {
+    const ZST_SUFFIX: &str = ".jsonl.zst";
+    let plains: HashSet<PathBuf> = all
+        .iter()
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            name.ends_with(".jsonl") && !name.ends_with(ZST_SUFFIX)
+        })
+        .cloned()
+        .collect();
+    let mut kept = Vec::with_capacity(all.len());
+    for path in all {
+        let Some(name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
+            kept.push(path);
+            continue;
+        };
+        if name.ends_with(ZST_SUFFIX) {
+            let stem = &name[..name.len() - ZST_SUFFIX.len()];
+            let plain = path.with_file_name(format!("{stem}.jsonl"));
+            if plains.contains(&plain) {
+                suppressed.zst_stem_twins += 1;
+                if suppressed.zst_stem_twin_pairs.len() < MAX_ZST_TWIN_PAIR_SAMPLES {
+                    suppressed.zst_stem_twin_pairs.push((plain, path));
+                }
+                continue;
+            }
+        }
+        kept.push(path);
+    }
+    kept
 }
 
 /// rm-1886: cap on the named duplicate pairs carried for disclosure —
@@ -1086,6 +1177,13 @@ pub(crate) fn find_session_files_cached(
     // duplicates resolve by the canonical store, then byte-level copies
     // collapse first-seen, so both landed rules stay observable.
     retain_single_cline_session_per_id(&mut all);
+    // rm-2056: zst stem twins — one admission per stem, plain `.jsonl`
+    // wins, the shadowed `.jsonl.zst` counted for disclosure. Ordered
+    // after the cline-id pass and before the rm-1886 content dedup:
+    // the twin's compressed bytes never collide with the plain file's
+    // signature, so this pass is the only one that can collapse the
+    // pair. Deterministic by NAME, so cold and warm runs agree.
+    all = suppress_zst_stem_twins(all, &mut suppressed);
     // rm-1886: content dedup at admission — a byte-identical journal
     // at a second path re-emits the same events and double-banks every
     // aggregate it feeds. First-seen survivor wins (deterministic: the

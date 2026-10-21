@@ -1567,7 +1567,15 @@ struct AntigravityModelId {
 /// pricing still rides the catalog's normal lookup, so a mapped id whose
 /// model is absent from the catalog degrades through the disclosed
 /// unknown-model path rather than this table inventing a price.
-const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[(1417, "gemini-4-argon")];
+const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
+    (1417, "gemini-4-argon"),
+    // rm-1533 (run 18f9b98a cycle 2, research 0418480c): ccusage
+    // v20.0.36 (2026-10-18, #1902) maps antigravity id 1050 to
+    // gemini-3.1-flash-lite — the bare key is already priced in the
+    // bundled snapshot, so this stays an identity-only mapping like
+    // its sibling.
+    (1050, "gemini-3.1-flash-lite"),
+];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
 /// number, but the float spelling stringifies as `"1417.0"` — the
@@ -11181,6 +11189,53 @@ mod tests {
                 .get("antigravity_usage_basis:planner_response_summed"),
             Some(&2),
             "the fold names its basis"
+        );
+    }
+
+    #[test]
+    fn antigravity_numeric_1050_maps_to_flash_lite() {
+        // rm-1533 (run 18f9b98a cycle 2, research 0418480c): ccusage
+        // v20.0.36 (2026-10-18, #1902) maps antigravity numeric
+        // modelConfigId 1050 to gemini-3.1-flash-lite — the bare key
+        // is already priced in the bundled snapshot, so this stays an
+        // identity-only mapping like its 1417 sibling and the spend
+        // prices instead of banking under a stringified "1050".
+        let raw = serde_json::json!({
+            "trajectoryId": "33333333-4444-5555-6666-777777777777",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-15T10:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Flash-lite generation.",
+                        "usageStats": {
+                            "inputTokens": 1000,
+                            "outputTokens": 500
+                        },
+                        "modelConfigId": 1050
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("numeric-1050", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "gemini-3.1-flash-lite",
+            "1050 maps through ANTIGRAVITY_NUMERIC_MODEL_MAP instead of stringifying"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+            "the mapped sighting still discloses its numeric origin"
+        );
+        assert!(
+            session.metrics.cost_estimated > 0.0,
+            "the bare gemini-3.1-flash-lite key is priced in the bundled snapshot"
         );
     }
 

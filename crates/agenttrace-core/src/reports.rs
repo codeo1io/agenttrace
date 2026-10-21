@@ -1007,8 +1007,23 @@ fn card_daily_series(sessions: &[Session], days: usize) -> Vec<(chrono::NaiveDat
     match latest {
         Some(anchor) => {
             for offset in (0..days).rev() {
-                let day = anchor - chrono::Duration::days(offset as i64);
-                series.push((day, buckets.get(&day).copied().unwrap_or(0.0)));
+                // rm-2057 (run 18f9b98a cycle 2, assess 9158ade7): same
+                // floor clamp as quota_window — an anchor day at the
+                // calendar floor minus a multi-day offset overflowed
+                // NaiveDate's range and panicked `--overview -f svg`
+                // (rc101 reports.rs). Days below the floor are not days
+                // with recorded spend: they render AT the floor with an
+                // honest 0.0, so the anchor day's bucket carries its
+                // cost exactly once (offset 0 never underflows) and the
+                // chart cannot double-paint it across collapsed days.
+                match anchor.checked_sub_signed(chrono::Duration::days(offset as i64)) {
+                    Some(day) => {
+                        series.push((day, buckets.get(&day).copied().unwrap_or(0.0)));
+                    }
+                    None => {
+                        series.push((chrono::NaiveDate::MIN, 0.0));
+                    }
+                }
             }
         }
         None => {
@@ -4179,6 +4194,58 @@ mod tests {
                 "non-finite cost leaked into the daily series"
             );
         }
+    }
+
+    #[test]
+    fn card_daily_series_floor_anchor_clamps_instead_of_panic() {
+        // rm-2057 (run 18f9b98a cycle 2, assess 9158ade7 PoC F2): an
+        // anchor day at the calendar floor minus a 13-day offset
+        // overflowed NaiveDate's range and panicked `--overview -f
+        // svg` (rc101 reports.rs card_daily_series). Days below the
+        // floor now render AT the floor with 0.0, and the anchor
+        // day's cost is carried exactly once (offset 0 never
+        // underflows) — collapsed floor days never re-paint it.
+        let session = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "hostile-floor".to_string(),
+            path: "/tmp/hostile-floor.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                cost_estimated: 0.0072,
+                // The live PoC shape: the hostile year reached the
+                // metrics through the parser's integer-epoch admission
+                // (metrics.timestamps), while the bound STRING never
+                // parses through `parse_ts` — card_daily_series falls
+                // back to the timestamps, exactly like the crashed run.
+                timestamps: vec![
+                    chrono::DateTime::<chrono::Utc>::MIN_UTC + chrono::Duration::seconds(2),
+                ],
+                session_start: "-262143-01-01T00:00:00Z".to_string(),
+                session_end: "-262143-01-01T00:00:02Z".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let series = card_daily_series(&[session], 14);
+        assert_eq!(series.len(), 14, "the series renders, not panics");
+        let floor_total: f64 = series
+            .iter()
+            .filter(|(day, _)| *day == chrono::NaiveDate::MIN)
+            .map(|(_, cost)| *cost)
+            .sum();
+        assert_eq!(
+            floor_total, 0.0072,
+            "the anchor-day cost is carried exactly once across the collapsed floor days"
+        );
+        assert!(
+            series.iter().all(|(_, cost)| cost.is_finite()),
+            "no non-finite leak"
+        );
     }
 
     #[test]

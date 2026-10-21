@@ -1589,6 +1589,29 @@ fn attach_admission_disclosures(
                 .collect::<Vec<_>>()),
         );
     }
+    // rm-2056 (run 18f9b98a cycle 2): a zst stem twin is a migration
+    // transient, not a second session — the disclosure says so under
+    // the same keys-and-only-when-fired convention as the duplicate
+    // class above (absent = no twin in the corpus).
+    if report.zst_stem_twins > 0 {
+        map.insert(
+            "zst_stem_twins".to_string(),
+            serde_json::json!(report.zst_stem_twins),
+        );
+        map.insert(
+            "zst_stem_twin_pairs".to_string(),
+            serde_json::json!(report
+                .zst_stem_twin_pairs
+                .iter()
+                .take(5)
+                .map(|(survivor, suppressed)| format!(
+                    "{} <- {}",
+                    survivor.display(),
+                    suppressed.display()
+                ))
+                .collect::<Vec<_>>()),
+        );
+    }
     let negative_rejected: usize = sessions
         .iter()
         .filter_map(|session| {

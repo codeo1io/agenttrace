@@ -561,7 +561,7 @@ impl App {
                 }
             });
             entry.count += 1;
-            entry.cost += session.metrics.cost_estimated;
+            entry.cost += shared::finite_cost(session.metrics.cost_estimated);
         }
         for entry in totals.values_mut() {
             if names.get(&entry.label).copied().unwrap_or(0) > 1 {
@@ -596,7 +596,7 @@ impl App {
                     let entry = projects
                         .entry(self.project_identity(session).id)
                         .or_insert((*index, 0.0));
-                    entry.1 += session.metrics.cost_estimated;
+                    entry.1 += shared::finite_cost(session.metrics.cost_estimated);
                     if session.metrics.session_start > self.sessions[entry.0].metrics.session_start
                     {
                         entry.0 = *index;
@@ -628,11 +628,14 @@ impl App {
             ExplorerView::Storage => indices
                 .sort_by_key(|index| std::cmp::Reverse(session_file_size(&self.sessions[*index]))),
             ExplorerView::Cost => indices.sort_by(|a, b| {
-                self.sessions[*b]
-                    .metrics
-                    .cost_estimated
-                    .partial_cmp(&self.sessions[*a].metrics.cost_estimated)
-                    .unwrap_or(Ordering::Equal)
+                // rm-1500: total_cmp over gated values keeps the
+                // comparator a total order even when a session cost
+                // is NaN — the old partial_cmp().unwrap_or(Equal)
+                // made NaN equal to everything, an inconsistent
+                // order a sort is allowed to reject.
+                shared::finite_cost(self.sessions[*b].metrics.cost_estimated).total_cmp(
+                    &shared::finite_cost(self.sessions[*a].metrics.cost_estimated),
+                )
             }),
             ExplorerView::Tools => indices.sort_by_key(|index| {
                 std::cmp::Reverse(self.sessions[*index].metrics.tool_calls_fail)
@@ -695,7 +698,11 @@ fn render_compare(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         return;
     };
-    let cost_delta = right.metrics.cost_estimated - left.metrics.cost_estimated;
+    // rm-1500: the delta gates its operands too — a poisoned cost on
+    // either side rendered a NaN delta ("NaN" into the {:+.4} cell and
+    // a NaN-verdict that always fell to the catch-all arm).
+    let cost_delta = shared::finite_cost(right.metrics.cost_estimated)
+        - shared::finite_cost(left.metrics.cost_estimated);
     let duration_delta = right.metrics.duration_sec - left.metrics.duration_sec;
     let token_delta = total_tokens(&right) - total_tokens(&left);
     let fail_delta = right.metrics.tool_calls_fail as i64 - left.metrics.tool_calls_fail as i64;
@@ -770,7 +777,14 @@ fn render_explorer_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             range_label(app.range_filter, app.language),
             visible.len(),
             app.t("sessions", "个会话"),
-            format_compact_cost(visible.iter().map(|item| item.metrics.cost_estimated).sum())
+            // rm-1500 review fix (133ceef5 F1): gate the header total —
+            // one poisoned cost must not NaN the visible-cost figure.
+            format_compact_cost(
+                visible
+                    .iter()
+                    .map(|item| shared::finite_cost(item.metrics.cost_estimated))
+                    .sum(),
+            )
         );
         let used = 13 + unicode_width::UnicodeWidthStr::width(title);
         frame.render_widget(
@@ -824,9 +838,10 @@ fn render_explorer_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn range_summary(app: &App) -> String {
     let visible = app.visible_sessions();
     let tokens = total_tokens_all(&visible);
+    // rm-1500 review fix (133ceef5 F1): gate the sum, not the cells.
     let cost: f64 = visible
         .iter()
-        .map(|session| session.metrics.cost_estimated)
+        .map(|session| shared::finite_cost(session.metrics.cost_estimated))
         .sum();
     let attention = visible
         .iter()
@@ -1056,9 +1071,11 @@ fn project_preview(app: &App, session: &Session) -> String {
         .into_iter()
         .filter(|item| app.project_identity(item).id == identity.id)
         .collect::<Vec<_>>();
+    // rm-1500 review fix (133ceef5 F1): the project popup total
+    // folds through the same gate as the rest of the TUI.
     let cost: f64 = sessions
         .iter()
-        .map(|item| item.metrics.cost_estimated)
+        .map(|item| shared::finite_cost(item.metrics.cost_estimated))
         .sum();
     let tokens = total_tokens_all(&sessions);
     let attention = sessions.iter().filter(|item| needs_attention(item)).count();

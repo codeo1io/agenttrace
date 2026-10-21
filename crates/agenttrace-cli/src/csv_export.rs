@@ -351,6 +351,10 @@ mod tests {
             "no bare non-finite token in the machine CSV: {out}"
         );
         assert_eq!(out.matches("n/a").count(), 2);
+        assert!(
+            !out.contains("# non-finite"),
+            "`n/a` is self-disclosing — no marker row needed: {out}"
+        );
     }
 
     #[test]

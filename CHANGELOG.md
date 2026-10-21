@@ -4,6 +4,94 @@
 
 ### Added
 
+- Zst stem twins count once, with disclosure (rm-2056, run 18f9b98a
+  cycle 2, assess 9158ade7): codex 0.163's rollout migration leaves a
+  journal present as BOTH `<stem>.jsonl` and `<stem>.jsonl.zst` — one
+  session, two names, and bytes that differ by construction (plain vs
+  zstd frame) so the content-signature dedup (rm-1886) cannot collapse
+  the pair; aggregation counted the session twice (PoC: the same
+  rollout listed at $0.0042 x2). The aggregation walk now admits the
+  plain twin by NAME — deterministic regardless of the migration's
+  mtime ordering — suppresses the `.jsonl.zst` shadow, and counts it:
+  `zst_stem_twins` / `zst_stem_twin_pairs` join the `--audit` JSON
+  disclosure and `--doctor` renders a "Compressed rollout twins" row
+  with a recommendation naming both twin sources — codex's rollout
+  migration and the documented `zstd -d` decompress-without-delete
+  recipe (review fix 133ceef5 F4: operator-created twins are never
+  cleared by any migration). The `-d` inspection lane
+  keeps both names (rm-548 stance), and a `.jsonl.zst` with no plain
+  sibling still admits and decodes unchanged (rm-992).
+
+- Hostile extreme timestamps no longer crash the reports (rm-2057,
+  run 18f9b98a cycle 2, assess 9158ade7): the last two crashes in a
+  20+-flag hostile sweep were both calendar-floor underflows — `--quota`
+  panicking at `cutoff - span` (lib.rs quota_window) and `--overview
+  -f svg` at `anchor - Duration::days` (reports.rs card_daily_series)
+  when a journal's newest event sits at the representable floor
+  (`-262143-01-01T00:00:00Z`, the naive-arm admission). Both windows
+  now clamp at consumption: a start that would precede representable
+  time extends to the floor (spend stays fully attributed — every
+  event is at or after the floor), and floor-underflow days render AT
+  the floor with an honest 0.0 so the anchor day's cost is painted
+  exactly once.
+
+- The finiteness gate now covers the TUI and the CSV cells (rm-1500
+  riders, run 18f9b98a cycle 2, assess 9158ade7 F1/F3): the landed CLI
+  clamp wave (0ff02e09) never reached agenttrace-tui — one poisoned
+  session cost NaN'd the driver folds (explorer.rs, presentation.rs,
+  shared.rs) and the Cost-view comparator used
+  `partial_cmp().unwrap_or(Equal)`, an inconsistent order under NaN
+  that a sort is allowed to reject. The six folds clamp through a
+  shared `finite_cost`, the comparator uses `total_cmp` over gated
+  values, the cost delta gates its operands, and `--sessions -f csv`
+  cost cells stay parseable machine cells, never NaN/inf text. Review
+  fix (run 18f9b98a cycle 2, review 133ceef5 F1/F2/F3, attempt
+  74e51089): the gate now also covers the three remaining TUI cost
+  sums (narrow-header total, range summary, project popup) and the
+  Cost sort lane (`compare_sessions` gates then `total_cmp` — a total
+  order under NaN).
+
+- Antigravity numeric id 1050 maps to `gemini-3.1-flash-lite`
+  (rm-1533 rider, run 18f9b98a cycle 2, research 0418480c): ccusage
+  v20.0.36 (#1902) established the mapping; the bare key is already
+  priced in the bundled snapshot, so the arm is identity-only like its
+  1417 sibling and the spend prices instead of banking under a
+  stringified "1050".
+
+  Integration seam (2026-10-21, conflict case 524b2312e1b84f0592e6c153baca23da,
+  landing onto a wall ≈7 runs past this run's base df7c2590): the
+  run's rows land atop the Unreleased Added list as the newest
+  landing commit, and three seams were adjudicated against the
+  advanced wall. (1) The CSV cells: this run's `csv_cost_cell` clamp
+  (`0.0000` + a trailing `#`-marker row, the run's review fix
+  133ceef5 F3) is superseded by the wall's `money_cell` decision
+  (run e40a66d3 cycle 6, conflict case 77e1fa9a / review 76618454):
+  every money cell renders `n/a` on non-finite, exact four-decimal
+  bytes otherwise, with no marker row — `n/a` is self-disclosing
+  (never a bare NaN token, never a silent $0), and the wall's pinned
+  contract (`sessions_csv_poisoned_cost_renders_na_not_bare_nan`)
+  stands; the run's marker row and `csv_cost_cell` are dropped as the
+  superseded mechanics, their disclosure intent already satisfied by
+  the `n/a` marker. (2) The `--quota` half of rm-2057 composes with
+  the wall's landed rm-2013 (4-digit-year admission at the one
+  `parse_ts_form` seam) + rm-2031 (`quota_window` saturation): the
+  run minted the identical `checked_sub_signed(...).unwrap_or(MIN_UTC)`
+  clamp at a base that predated both — one clamp lands, its comment
+  carrying both lineages, and the fog quota-panic claims reconcile by
+  title at rm-2031; rm-2057's distinct contribution (the
+  `card_daily_series` floor-arm in reports.rs, the explicit-file-lane
+  live re-proof rc101→rc0, red-first pins at both anchors) rides as
+  minted. (3) The disclosure fields union: the wall's
+  `opencode_info_docs_skipped_over_cap` (rm-451) + `demo_corpus_error`
+  (rm-1978) and this run's `zst_stem_twins` / `zst_stem_twin_pairs`
+  (rm-2056) land together in `LoadReport` and the doctor report —
+  additive counters, no shared key, both disclosures render. The
+  run's roadmap band + compound (mints rm-2056/rm-2057, 7 dated
+  riders, the VALIDATED flips) never applied to the wall (the commit
+  gate failed at eabc36eff) and lands re-anchored in ROADMAP.md plus
+  docs/stewardship/2026-10-21-cycle2-compound-record-run18f9b98a.md at
+  this seam.
+
 - installer release pinning + hostile-timestamp no-panic + CSV/TUI
   pricing basis (rm-2014 + rm-2013 + rm-1574 extension, run 91066ba0
   cycle 2): `install.ps1`'s `-Version` parameter was unreachable under
