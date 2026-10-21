@@ -20,7 +20,7 @@ mod statusline;
 mod subagents;
 mod waste;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1218,6 +1218,32 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
             }
             continue;
         };
+        // rm-2147 (run aebfcae5b94f cycle 3): a line that parses as JSON
+        // but is not an object is not a session event. serde's derived
+        // struct Deserialize accepts sequences positionally, so the line
+        // `["user","hello world"]` admitted as role/content (a two-line
+        // junk corpus reported "Total Sessions: 1" with priced tokens)
+        // and arrays/scalars could become agent truth. Every other lane
+        // already refuses non-object lines — `jsonl_objects_counted`
+        // names the refusal `non_object_line`, the codex lane counts
+        // `codex_non_object_line:{kind}` — the generic fallback here was
+        // the last ungated one. Same reason key, same disclosure.
+        if !value.is_object() {
+            count_skip("non_object_line", &mut line_skips);
+            // rm-616 symmetry: a refused line that itself carries model
+            // identity or a usage block is lost ACCOUNTING, not just a
+            // lost message. The value is not an object, so keys cannot
+            // be inspected — the same conservative substring census the
+            // unparseable arm uses applies here.
+            if line.contains("model_used")
+                || line.contains("ModelUsed")
+                || line.contains("\"usage\"")
+                || line.contains("\"Usage\"")
+            {
+                count_skip("model_or_usage_dropped", &mut line_skips);
+            }
+            continue;
+        }
         if line_objects.len() < 20 {
             if let Some(object) = value.as_object() {
                 line_objects.push(object.clone());
@@ -1273,6 +1299,15 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         events.push(event);
     }
     if events.is_empty() {
+        // rm-2147: per-line counters ride session metrics only when a
+        // session survives; when nothing survives, this message is the
+        // file-level disclosure surface. Byte-identical to the old
+        // message for every corpus the non-object gate did not refuse.
+        if let Some(non_object) = line_skips.get("non_object_line") {
+            anyhow::bail!(
+                "generic: unable to parse as JSONL or JSON array ({non_object} non-object line(s) refused)"
+            );
+        }
         anyhow::bail!("generic: unable to parse as JSONL or JSON array");
     }
     let source_tool = jsonl_source_tool(&line_objects);
@@ -3244,6 +3279,18 @@ fn quota_attribution_census(sessions: &[Session]) -> (usize, usize, usize) {
 }
 
 fn quota_ts(ts: &DateTime<Utc>) -> String {
+    // rm-2013 residual (run aebfcae5b94f cycle 3): year-0 anchors are
+    // admitted by the landed parse contract (the 0..=9999 year gate;
+    // pinned at origin/master tip by tests/hostile_timestamp_truth.rs,
+    // which lands ahead of this wall), and
+    // the 5h/7d window arithmetic can then subtract past the CE floor,
+    // producing BCE bounds that to_rfc3339_opts renders as non-RFC3339
+    // strings ("-0001-12-31T19:00:00Z"). Render-only clamp to the CE
+    // floor; parse and window math are untouched, and quota_report
+    // discloses the clamp on corpus.window_anchor when it fires.
+    if ts.year() < 0 {
+        return "0000-01-01T00:00:00Z".to_string();
+    }
     ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -3305,6 +3352,19 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
             })
         }
     };
+    // rm-2013 residual (run aebfcae5b94f cycle 3): when a year-0 anchor
+    // (admitted by the landed parse contract) subtracts a window span
+    // past the CE floor, quota_ts renders the bound as the CE floor
+    // 0000-01-01T00:00:00Z (RFC3339 has no negative years). The clamp
+    // must never be silent: disclose it on corpus.window_anchor, the
+    // field that already carries window-anchoring caveats. Schema
+    // fields (agenttrace.quota/1) are unchanged.
+    let bce_clamped = five_hour.start.year() < 0 || weekly.start.year() < 0;
+    let window_anchor = if bce_clamped {
+        "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials; rm-2013: year-0 anchors put one or both window starts before the CE floor - those bounds render as the CE floor 0000-01-01T00:00:00Z (RFC3339 has no negative years; parse and window math unchanged)"
+    } else {
+        "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials"
+    };
     serde_json::json!({
         "schema": "agenttrace.quota/1",
         "five_hour": quota_window_json(&five_hour, chrono::Duration::hours(5)),
@@ -3319,7 +3379,7 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
             "cutoff_utc": quota_ts(&five_hour.end),
             "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant",
             "future_discarded_sessions": future_discarded,
-            "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
+            "window_anchor": window_anchor,
             "attribution": {
                 "event_timestamps": event_basis,
                 "session_span": span_basis,
@@ -4156,6 +4216,68 @@ mod tests {
             BTreeMap::from([("unparseable_line".to_string(), 1)])
         );
         assert_eq!(session.metrics.tokens_input, 7);
+    }
+
+    #[test]
+    fn parse_jsonl_session_refuses_non_object_lines() {
+        // rm-2147 red-first (run aebfcae5b94f cycle 3): the exact
+        // roadmap PoC corpus — two lines, zero objects — used to admit
+        // "Total Sessions: 1" (serde's struct Deserialize accepts
+        // sequences positionally, so `["user","hello world"]` became
+        // role/content). It must refuse: nothing in it is a session.
+        let junk = "[1,2,3]\n[\"user\",\"hello world\"]\n";
+        let err = parse_jsonl_session("junk", "junk.jsonl", junk)
+            .expect_err("all-junk corpus must not yield a session");
+        assert!(err.to_string().contains("non-object line(s) refused"));
+
+        // Every non-object kind is refused by name and disclosed, mixed
+        // with a real line that must still be admitted.
+        let mixed = concat!(
+            "{\"role\":\"user\",\"content\":\"real line\",\"timestamp\":\"2026-10-01T00:00:00Z\"}\n",
+            "[1,2,3]\n",
+            "[\"user\",\"hello world\"]\n",
+            "\"scalar\"\n",
+            "42\n",
+            "true\n",
+            "null\n",
+        );
+        let session = parse_jsonl_session("mixed", "mixed.jsonl", mixed).expect("real line admits");
+        assert_eq!(
+            session.metrics.line_skips.get("non_object_line"),
+            Some(&6),
+            "all six junk kinds refused and counted"
+        );
+        // The refused lines carry no model/usage markers, so no
+        // accounting drop may be disclosed either.
+        assert!(session
+            .metrics
+            .line_skips
+            .get("model_or_usage_dropped")
+            .is_none());
+        // Session keeps no event list; the admitted real line must show
+        // as estimated token accounting (the junk pair line used to
+        // produce the only tokens in the all-junk corpus — now none).
+        assert!(
+            session.metrics.tokens_input > 0 || session.metrics.tokens_output > 0,
+            "the real object line must still be admitted and counted"
+        );
+    }
+
+    #[test]
+    fn parse_jsonl_session_discloses_non_object_usage_drops() {
+        // rm-616 symmetry on the rm-2147 gate: a refused non-object
+        // line that mentions a usage block is lost ACCOUNTING, not just
+        // a lost message — disclosed as such, never silent.
+        let corpus = concat!(
+            "{\"role\":\"user\",\"content\":\"real\",\"timestamp\":\"2026-10-01T00:00:00Z\"}\n",
+            "[{\"usage\":{\"input_tokens\":5}}]\n",
+        );
+        let session = parse_jsonl_session("acct", "acct.jsonl", corpus).expect("real line admits");
+        assert_eq!(session.metrics.line_skips.get("non_object_line"), Some(&1));
+        assert_eq!(
+            session.metrics.line_skips.get("model_or_usage_dropped"),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -5260,6 +5382,48 @@ mod quota_tests {
         assert!(report["limits"]["weekly_usd"].is_null());
         assert_eq!(report["corpus"]["attribution"]["event_timestamps"], 2);
         assert_eq!(report["corpus"]["attribution"]["unplaced"], 0);
+    }
+
+    #[test]
+    fn quota_report_clamps_bce_window_bounds_to_ce_floor() {
+        // rm-2013 residual (run aebfcae5b94f cycle 3): a year-0 anchor
+        // is admitted by the landed parse contract (the 0..=9999 year
+        // gate; pinned at origin/master tip by
+        // tests/hostile_timestamp_truth.rs, which lands ahead of this
+        // wall); the 5h/7d
+        // arithmetic then subtracts past the CE floor. The render must
+        // stay RFC3339 (no "-0001-..." strings) and the clamp must be
+        // disclosed on corpus.window_anchor. Parse and window math
+        // untouched.
+        let raw = "{\"role\":\"user\",\"content\":\"y0\",\"timestamp\":\"0000-01-01T00:00:00Z\"}\n";
+        let session = parse_jsonl_session("y0", "y0.jsonl", raw).expect("year-0 line admits");
+        let report = quota_report(&[session]);
+        let five = &report["five_hour"];
+        assert_eq!(
+            five["window_start_utc"].as_str(),
+            Some("0000-01-01T00:00:00Z"),
+            "BCE 5h bound clamps to the CE floor, never '-0001-...'"
+        );
+        let weekly = &report["weekly"];
+        assert_eq!(
+            weekly["window_start_utc"].as_str(),
+            Some("0000-01-01T00:00:00Z"),
+            "BCE weekly bound clamps to the CE floor"
+        );
+        assert_eq!(
+            report["corpus"]["cutoff_utc"].as_str(),
+            Some("0000-01-01T00:00:00Z")
+        );
+        assert!(
+            report["corpus"]["window_anchor"]
+                .as_str()
+                .expect("window_anchor present")
+                .contains("CE floor"),
+            "clamp must be disclosed on corpus.window_anchor"
+        );
+        // No negative-year string anywhere in the render.
+        let text = serde_json::to_string_pretty(&report).unwrap();
+        assert!(!text.contains("-0001-"), "non-RFC3339 BCE bound leaked");
     }
 
     #[test]
