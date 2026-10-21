@@ -566,8 +566,40 @@ fn pi_compaction_usage_sentinel_counts_tokens_cost_and_disclosure() {
 
 /// rm-499: `cacheWrite1h` (the 1h-tier cache write, present in 77% of
 /// the live fleet corpus) is recognized as its own canonical class and
-/// disclosed via `pi_cache_write_1h_blocks`. Pricing stays gated: the
-/// 1h tier feeds no rate and never inflates the 5m cache-write total.
+/// disclosed via `pi_cache_write_1h_blocks`. Priced at its own tier
+/// (rm-164 arm 3, run d2775a7e): the class bills at the row's
+/// published `cw_1h` rate — pinned to the cent in
+/// `pi_cache_write_1h_priced_at_own_tier` — and never inflates the
+/// 5m cache-write total.
+/**
+ * rm-164 arm 3 (run d2775a7e): the 1h-tier cache write is PRICED at
+ * its own catalog class instead of riding silently under the 5m tier.
+ * Golden on the pi-cachewrite-1h fixture: 300 1h tokens × the
+ * claude-sonnet-4-5 1h rate ($6.00/M) add 0.0018 on top of the 5m
+ * terms (100 in × $3 + 50 out × $15 + 200 cw × $3.75 = 0.0018), and
+ * the 5m-assumed disclosure must NOT fire — the row publishes a 1h
+ * rate.
+ */
+#[test]
+fn pi_cache_write_1h_priced_at_own_tier() {
+    let session = parse_fixture_session(
+        "pi-cachewrite-1h",
+        "tests/fixtures/pi-cachewrite-1h/journal.jsonl",
+    );
+    assert_eq!(session.metrics.tokens_cache_w, 200);
+    assert_eq!(
+        session.metrics.cost_estimated, 0.0036,
+        "300 1h tokens must add 300 × $6.00/M = 0.0018 on top of the 5m terms"
+    );
+    assert!(
+        !session
+            .metrics
+            .disclosure_counters
+            .contains_key("cache_write_1h_5m_assumed"),
+        "a row that publishes a 1h rate must not fire the 5m-assumed disclosure"
+    );
+}
+
 #[test]
 fn pi_cache_write_1h_blocks_disclosed() {
     let session = parse_fixture_session(

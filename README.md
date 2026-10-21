@@ -300,12 +300,16 @@ prioritized recommendations, MCP governance, context trends, and delivery
 signals in JSON, Markdown, and HTML output. All cost and delivery fields are
 explicitly estimates or heuristics; they are not provider billing or proof that
 a commit reached `main`. When a gateway records its own cost, agenttrace
-uses it and counts — never silently — the estimates it suppresses; one
-honest gap in that counter: the suppressed estimate prices the same four
-buckets as the estimate formula (input/output/cache-write/cache-read), so
-1h-tier cache writes (Claude's `ephemeral_1h_input_tokens`) are not in it
-and a 1h-dominated gateway block can suppress less than its true catalog
-cost — the counter is a lower bound until tier-aware pricing lands (rm-176).
+uses it and counts — never silently — the estimates it suppresses. The
+suppressed estimate prices the same five buckets as the estimate formula
+(input/output/cache-write/cache-write-1h/cache-read): 1h-tier cache writes
+(Claude's `ephemeral_1h_input_tokens`) bill at the row's published >1h
+catalog rate, or at the 5m cache-write rate with a loud per-session
+`cache_write_1h_5m_assumed` disclosure when the row publishes none — so
+the counter is a true catalog-cost counterfactual on those buckets, no
+longer a lower bound (the >1h class was silently unpriced before the
+2026-10-20 snapshot re-base landed its rates; rm-164's remaining tier
+zoo stays open and disclosed).
 
 <a id="pricing"></a>
 
@@ -531,7 +535,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--inspect <INSPECT>` |  | Inspect a single session by its `--sessions` list index (1-based) instead of the whole corpus |
 | `-m <MODEL>` | `default` | Reference model for `--compare` framing (cost-rate attribution in the comparison narrative; not a session filter — see `--model-filter`). Short flag only — there is no `--model` long form; `--model` is a usage error, and the session filter is `--model-filter` |
 | `-o <OUTPUT>` |  | Write the report to this path instead of stdout (the report is also kept on stdout — a tee, not a redirect). Regular paths stage atomically through a temp sibling (rm-250); terminal sinks like /dev/null and /dev/stdout write through directly, while fifo/socket/block-device targets are refused with a disclosed reason instead of being replaced (rm-489). Missing parent directories are created recursively (mkdir -p semantics); when a parent cannot be created, the error names the directory and the requested target (rm-784) |
-| `--latest` |  | Restrict the view to the single most recent session (works with `--waste` and report actions) |
+| `--latest` |  | Restrict the view to the single most recent session (works with `--diagnostics`, `--inspect`, and the bare single-session report; every other report action — `--waste` included — is rejected, and `--waste` needs no `--latest`: it renders the single most recent session by construction) |
 | `--waste` |  | Render the token-waste report: redundant context, loop cost, and unused tool output, with a per-reason breakdown. The cache-efficiency grade runs on the cache-INCLUSIVE basis — reads / (reads + fresh input) — because `tokens_input` is the parser's fresh-only (cache-exclusive) basis, on which reads routinely exceed input; the raw exclusive ratio stays disclosed (`hit_rate_exclusive_percent` in `-f json`) instead of being graded as an anomaly (rm-339) |
 | `--list-models` |  | List the models the pricing catalog knows, with rate coverage; `--test-match` shows the resolution probes. Region/vendor-qualified ids (e.g. `us.anthropic.…`, `bedrock/us-gov-east-1/…`) are their own catalog rows and bill at their own regional rates (rm-1053) |
 | `--update-pricing` |  | Refresh the vendored pricing-catalog snapshots from their upstream sources, then report the drift |

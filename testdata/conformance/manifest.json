@@ -5,7 +5,7 @@
   "derived_from": "AgentMeasure 2026-09 audit taxonomy (github.com/roy-tong/AgentMeasure, campaigns/audit-report-2026-09.md): five recurring billing-bug classes measured across ~110 usage tools — re-emitted/resumed events double-counted, cache-tokens priced as input, price-table drift vs vendor consoles, resume/fork lineage loss, overflow/clamp handling.",
   "pricing_basis": {
     "rule": "Every expected cost in this pack is a TOTAL derived from the bundled snapshot (crates/agenttrace-core/src/pricing_snapshot.json) through the catalog formula in crates/agenttrace-core/src/lib.rs (round4 of sum(tokens_class/1e6 * price_class), cache classes at their own rates). The pack embeds no price table of its own: crates/agenttrace-core/tests/token_conformance.rs re-derives every literal from pricing::lookup_price/default_price at run time and fails if a literal drifts from the live snapshot by more than one round4 step (6e-5), so a snapshot refresh that moves a used model's rates forces a pack refresh instead of silently re-blessing old totals.",
-    "snapshot_date_at_derivation": "2026-10-04",
+    "snapshot_date_at_derivation": "2026-10-20",
     "formula_tolerance": 6e-5
   },
   "classes": {
@@ -79,15 +79,15 @@
       "id": "005-rm046-wb-adv",
       "class": "cache_priced_as_input",
       "fixture": "cases/rm046-wb-adv.jsonl",
-      "source": "imported verbatim from the rm-046 adversarial corpus (testdata/generated/adversarial/wb-adv.jsonl); the workbuddy cache-inclusive input basis subtracts the cache read down to a disclosed zero instead of silently pricing cache as input; cost literal refreshed at integration 2026-10-08 (conflict case 6ad4bfb5) when the landed snapshot refresh moved glm-5.2's winning rate — the fixture itself stays byte-verbatim per refresh-contract rule 3",
+      "source": "imported verbatim from the rm-046 adversarial corpus (testdata/generated/adversarial/wb-adv.jsonl); the workbuddy cache-inclusive input basis subtracts the cache read down to a disclosed zero instead of silently pricing cache as input; cost literal refreshed at integration 2026-10-08 (conflict case 6ad4bfb5) when the landed snapshot refresh moved glm-5.2's winning rate, and again at the 2026-10-20 rm-176 refresh when that winner retired — the fixture itself stays byte-verbatim per refresh-contract rule 3",
       "verbatim_of": "testdata/generated/adversarial/wb-adv.jsonl",
       "expect": {
         "rc": 0,
         "model": "glm-5.2",
         "source_tool": "workbuddy",
         "tokens": { "input": 0, "output": 10, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
-        "cost_estimated": 0.0001,
-        "cost_derivation": "snapshot-refreshed per docs/solutions/workflow-issues/conformance-pack-refresh-contract.md rule 1: glm-5.2 resolves to openrouter/z-ai/glm-5.2 (priority winner), whose output rate moved 3.99e-6 -> 1.2e-5 per token in the 2026-10-08 snapshot refresh (rm-588 never-drop union); round4(10 * 1.2e-5) = 0.0001 (was round4(10 * 3.99e-6) = 0.0 at the 2026-10-04 derivation snapshot)"
+        "cost_estimated": null,
+        "cost_derivation": "snapshot-refreshed per docs/solutions/workflow-issues/conformance-pack-refresh-contract.md rule 1: glm-5.2's priority winner openrouter/z-ai/glm-5.2 (output 1.2e-5 per token) retired with the 2026-10-20 rm-176 reconcile (all 459 openrouter/* twins dropped from the upstream key-space restructure, dated in snapshot-drops.txt); the base row now derives from the surviving carrier twins — eight of nine at output 4.4e-6 (zai, dashscope, qwencloud, tencent, cloudflare, novita, qwen_ai_platform, vertex_ai), scaleway's 5.5e-6 losing the provider-priority collapse — so the session total falls to round4(10 * 4.4e-6) = 0.0000. No carrier twin publishes a cache-write rate, so the rm-1508 oracle discipline (snapshot_derived_cost refuses to re-price an absent-rate row at $0) can no longer re-derive this case's literal — the expectation moves to the null arm (total must price finite and non-negative) instead of silently re-blessing a number the snapshot no longer supports; was 0.0001 = round4(10 * 1.2e-5) at the 2026-10-08 refresh, 0.0 = round4(10 * 3.99e-6) at the 2026-10-04 derivation snapshot"
       }
     },
     {

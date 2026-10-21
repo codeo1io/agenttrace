@@ -599,6 +599,16 @@ pub struct Metrics {
     pub tokens_reasoning: i64,
     pub tokens_cache_w: i64,
     pub tokens_cache_r: i64,
+    /// rm-164 arm 3 (run d2775a7e): the >1h-tier cache-write class
+    /// (pi `cacheWrite1h`, canonical usage key
+    /// `cache_write_1h_tokens`) — its own counter beside the 5m
+    /// class, never folded into `tokens_cache_w`, and priced at the
+    /// row's `cw_1h` catalog rate (5m-assumed with the
+    /// `cache_write_1h_5m_assumed` disclosure when the row publishes
+    /// none). Warm-cache freshness rides the catalog-identity stamp
+    /// (the digest hashes the `cw_1h` slot), so rows a pre-arm
+    /// binary wrote re-parse instead of replaying a silent 0.
+    pub tokens_cache_w_1h: i64,
     #[serde(skip)]
     pub timestamps: Vec<DateTime<Utc>>,
     pub gaps_sec: Vec<f64>,
@@ -716,6 +726,11 @@ pub struct Metrics {
     pub upstream_priced_output: i64,
     #[serde(skip_serializing_if = "zero_i64")]
     pub upstream_priced_cache_w: i64,
+    /// rm-164 arm 3 (run d2775a7e): the 1h-tier share of the
+    /// upstream-recorded split — same rm-436/rm-520 semantics as its
+    /// siblings, for the token class the catalog formula now prices.
+    #[serde(skip_serializing_if = "zero_i64")]
+    pub upstream_priced_cache_w_1h: i64,
     #[serde(skip_serializing_if = "zero_i64")]
     pub upstream_priced_cache_r: i64,
     /// Parse-time disclosure counters: journal facts the accounting
@@ -814,6 +829,9 @@ pub struct ModelAttribution {
     pub output_tokens: i64,
     pub cache_w: i64,
     pub cache_r: i64,
+    /// rm-164 arm 3 (run d2775a7e): the block's >1h-tier cache-write
+    /// tokens, priced at the row's `cw_1h` billed rate.
+    pub cache_w_1h: i64,
     pub cost_usd: f64,
 }
 
@@ -1658,6 +1676,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     let mut upstream_priced_input = 0i64;
     let mut upstream_priced_output = 0i64;
     let mut upstream_priced_cache_w = 0i64;
+    let mut upstream_priced_cache_w_1h = 0i64;
     let mut upstream_priced_cache_r = 0i64;
     // rm-450 first minted the workbuddy basis disclosures into the
     // line_skips family so they degraded confidence; rm-538 moves them
@@ -1752,6 +1771,11 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             metrics.tokens_cache_r = metrics
                 .tokens_cache_r
                 .saturating_add(usage_tokens("cache_read_input_tokens"));
+            // rm-164 arm 3: the 1h-tier class folds into its OWN
+            // counter — it never inflates the 5m cache-write total.
+            metrics.tokens_cache_w_1h = metrics
+                .tokens_cache_w_1h
+                .saturating_add(usage_tokens("cache_write_1h_tokens"));
             if !event.model_used.is_empty() && event.model_used != "unknown" {
                 usage_models.insert(event.model_used.clone());
             }
@@ -1802,6 +1826,11 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     metrics.tokens_cache_r = metrics
                         .tokens_cache_r
                         .saturating_add(usage_tokens("cache_read_input_tokens"));
+                    // rm-164 arm 3: same own-counter fold in the meta
+                    // lane.
+                    metrics.tokens_cache_w_1h = metrics
+                        .tokens_cache_w_1h
+                        .saturating_add(usage_tokens("cache_write_1h_tokens"));
                     if !event.model_used.is_empty() && event.model_used != "unknown" {
                         usage_models.insert(event.model_used.clone());
                     }
@@ -1869,6 +1898,8 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                         upstream_priced_output.saturating_add(usage_tokens("output_tokens"));
                     upstream_priced_cache_w = upstream_priced_cache_w
                         .saturating_add(usage_tokens("cache_creation_input_tokens"));
+                    upstream_priced_cache_w_1h = upstream_priced_cache_w_1h
+                        .saturating_add(usage_tokens("cache_write_1h_tokens"));
                     upstream_priced_cache_r = upstream_priced_cache_r
                         .saturating_add(usage_tokens("cache_read_input_tokens"));
                 }
@@ -2020,9 +2051,18 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // published-rate sessions price byte-identically.
     let (catalog_cw, _) = catalog_price.cache_write_billed();
     let (catalog_cr, _) = catalog_price.cache_read_billed();
+    // rm-164 arm 3: the 1h tier bills at its own class — the row's
+    // published `cw_1h`, or the 5m billed rate with the loud
+    // `cache_write_1h_5m_assumed` disclosure when the row publishes
+    // none. Term order unchanged; published-rate sessions without
+    // 1h-tier tokens price byte-identically.
+    let (catalog_cw_1h, catalog_cw_1h_assumed) = catalog_price.cache_write_1h_billed();
     let catalog_cache_w = metrics
         .tokens_cache_w
         .saturating_sub(upstream_priced_cache_w);
+    let catalog_cache_w_1h = metrics
+        .tokens_cache_w_1h
+        .saturating_sub(upstream_priced_cache_w_1h);
     let catalog_cache_r = metrics
         .tokens_cache_r
         .saturating_sub(upstream_priced_cache_r);
@@ -2032,7 +2072,8 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             + metrics.tokens_output.saturating_sub(upstream_priced_output) as f64 / 1e6
                 * catalog_price.output
             + catalog_cache_w as f64 / 1e6 * catalog_cw
-            + catalog_cache_r as f64 / 1e6 * catalog_cr,
+            + catalog_cache_r as f64 / 1e6 * catalog_cr
+            + catalog_cache_w_1h as f64 / 1e6 * catalog_cw_1h,
     );
     // rm-1508: the fallback is a disclosure, not a guess — count it on
     // the session's non-loss disclosure channel so the governance
@@ -2041,6 +2082,14 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         *metrics
             .disclosure_counters
             .entry("cache_rate_fallback".to_string())
+            .or_insert(0) += 1;
+    }
+    // rm-164 arm 3: the 5m-assumed 1h tier is a disclosure, not a
+    // guess — count it only when 1h-tier tokens were actually billed.
+    if catalog_cw_1h_assumed && catalog_cache_w_1h > 0 {
+        *metrics
+            .disclosure_counters
+            .entry("cache_write_1h_5m_assumed".to_string())
             .or_insert(0) += 1;
     }
     // rm-520: persist which token classes the journal priced upstream
@@ -2052,6 +2101,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     metrics.upstream_priced_input = upstream_priced_input;
     metrics.upstream_priced_output = upstream_priced_output;
     metrics.upstream_priced_cache_w = upstream_priced_cache_w;
+    metrics.upstream_priced_cache_w_1h = upstream_priced_cache_w_1h;
     metrics.upstream_priced_cache_r = upstream_priced_cache_r;
     // rm-438: when the usage blocks themselves disagree about which
     // model produced them (pi model_change journals), pricing the whole
@@ -2098,14 +2148,14 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // recorded-cost arm.
     // rm-1052 rider (run 80e8beb6 cycle 1): the counter is a LOWER
     // BOUND on suppressed spend, and the docs must say so. The
-    // suppressed estimate prices the same four buckets as the
-    // estimate formula (input/output/cache-write/cache-read) —
-    // Claude's 1h-tier cache writes (`ephemeral_1h_input_tokens`)
-    // have no catalog rate yet (tier-aware pricing is rm-176), so a
-    // 1h-dominated gateway block suppresses an estimate that never
-    // counted its 1h bytes. The recorded number stays authoritative;
-    // the gap is disclosed in README's estimates paragraph, not
-    // hidden behind a tidy counter.
+    // suppressed estimate prices the same five buckets as the
+    // estimate formula (input/output/cache-write-5m/cache-write-1h/
+    // cache-read) — the 1h tier gained its own catalog class in rm-164
+    // arm 3 (run d2775a7e), so a 1h-dominated gateway block's
+    // suppressed counterfactual finally counts its 1h bytes. The
+    // recorded number stays authoritative; any remaining gap is
+    // disclosed in README's estimates paragraph, not hidden behind a
+    // tidy counter.
     for event in events.iter().filter(|event| {
         event
             .recorded_cost_usd
@@ -2129,6 +2179,11 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         // not suppressed counterfactuals.
         let (suppressed_cw, _) = suppressed_price.cache_write_billed();
         let (suppressed_cr, _) = suppressed_price.cache_read_billed();
+        // rm-164 arm 3: the counterfactual prices the 1h tier at the
+        // same billed rate real billing would use (published cw_1h or
+        // 5m-assumed) — no disclosure counter for counterfactuals,
+        // mirroring the rm-1508 stance above.
+        let (suppressed_cw_1h, _) = suppressed_price.cache_write_1h_billed();
         let suppressed_estimate =
             event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64 / 1e6
                 * suppressed_price.input
@@ -2148,6 +2203,14 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     .max(0) as f64
                     / 1e6
                     * suppressed_cw
+                + event
+                    .usage
+                    .get("cache_write_1h_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as f64
+                    / 1e6
+                    * suppressed_cw_1h
                 + event
                     .usage
                     .get("cache_read_input_tokens")
@@ -2210,6 +2273,16 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     .unwrap_or(0)
                     .max(0),
             );
+            // rm-164 arm 3: the 1h tier rides the attribution beside
+            // its 5m sibling.
+            entry.cache_w_1h = entry.cache_w_1h.saturating_add(
+                event
+                    .usage
+                    .get("cache_write_1h_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0),
+            );
             entry.cache_r = entry.cache_r.saturating_add(
                 event
                     .usage
@@ -2253,10 +2326,26 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 .copied()
                 .unwrap_or(0)
                 .max(0);
+            let block_cache_w_1h = event
+                .usage
+                .get("cache_write_1h_tokens")
+                .copied()
+                .unwrap_or(0)
+                .max(0);
             if pricing::cache_fallback_fired(&block_price, block_cache_w, block_cache_r) {
                 *metrics
                     .disclosure_counters
                     .entry("cache_rate_fallback".to_string())
+                    .or_insert(0) += 1;
+            }
+            // rm-164 arm 3: per-block 5m-assumed disclosure — a billed
+            // estimate, so the fallback here DOES fire, once per
+            // affected block.
+            let (block_cw_1h, block_cw_1h_assumed) = block_price.cache_write_1h_billed();
+            if block_cw_1h_assumed && block_cache_w_1h > 0 {
+                *metrics
+                    .disclosure_counters
+                    .entry("cache_write_1h_5m_assumed".to_string())
                     .or_insert(0) += 1;
             }
             let block_cost = event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64
@@ -2271,7 +2360,8 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     / 1e6
                     * block_price.output
                 + block_cache_w as f64 / 1e6 * block_cw
-                + block_cache_r as f64 / 1e6 * block_cr;
+                + block_cache_r as f64 / 1e6 * block_cr
+                + block_cache_w_1h as f64 / 1e6 * block_cw_1h;
             per_block_cost += block_cost;
             entry.cost_usd = round4(entry.cost_usd + block_cost);
         }
@@ -2303,6 +2393,10 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         metrics.tokens_output,
         metrics.tokens_reasoning,
         metrics.tokens_cache_w,
+        // rm-164 arm 3: the 1h tier feeds the estimate like its 5m
+        // sibling, so its saturation is a clamp the provenance must
+        // disclose the same way.
+        metrics.tokens_cache_w_1h,
         metrics.tokens_cache_r,
     ]
     .contains(&i64::MAX)
@@ -4233,6 +4327,42 @@ mod tests {
         )
         .expect("session");
         assert_eq!(exact.metrics.provenance.cost, "calculated_from_tokens");
+    }
+
+    #[test]
+    fn clamped_cache_write_1h_flags_the_cost_provenance() {
+        // rm-164 arm 3: the 1h-tier class feeds the catalog estimate
+        // like its 5m sibling, so a session whose ONLY saturated class
+        // is cache_write_1h_tokens must still disclose the clamp —
+        // pre-batch the array did not contain the 1h class and the
+        // provenance silently claimed exact arithmetic.
+        let saturated = session_from_events(
+            "clamp-1h",
+            "clamp-1h.jsonl",
+            vec![
+                Event {
+                    role: "session_meta".to_string(),
+                    usage: BTreeMap::from([
+                        ("cache_write_1h_tokens".to_string(), i64::MAX),
+                        ("input_tokens".to_string(), 10),
+                    ]),
+                    ..Event::default()
+                },
+                Event {
+                    role: "session_meta".to_string(),
+                    usage: BTreeMap::from([("cache_write_1h_tokens".to_string(), i64::MAX)]),
+                    ..Event::default()
+                },
+            ],
+        )
+        .expect("session");
+        assert_eq!(saturated.metrics.tokens_cache_w_1h, i64::MAX);
+        assert!(saturated.metrics.cost_estimated.is_finite());
+        assert!(saturated.metrics.cost_estimated >= 0.0);
+        assert_eq!(
+            saturated.metrics.provenance.cost, "calculated_from_tokens_clamped",
+            "a 1h-tier-only clamp must flag itself in cost provenance"
+        );
     }
 
     #[test]

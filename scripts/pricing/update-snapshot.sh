@@ -156,8 +156,12 @@ def trim(data):
         # upstream drops them; live-side rows get the distinction, and
         # tests/pricing_snapshot_hygiene.rs pins the counts so any
         # movement is conscious.
+        # rm-164 arm 3 (1h cache-write truth, run d2775a7e): the 1h-tier
+        # cache-write rate joins the omit-when-absent contract — same
+        # loop, same semantics (explicit 0 stays a published $0).
         for cache_field in (
             "cache_creation_input_token_cost",
+            "cache_creation_input_token_cost_above_1hr",
             "cache_read_input_token_cost",
         ):
             rate = value.get(cache_field)

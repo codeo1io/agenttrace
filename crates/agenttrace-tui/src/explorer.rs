@@ -1174,8 +1174,21 @@ fn cost_preview(session: &Session, language: Language) -> String {
         .component_cost_usd
         .as_ref()
         .map(|cost| {
+            // rm-164 arm 3: the 1h-tier class joins the split only
+            // when the session actually ran 1h-tier writes —
+            // noise-free for the every-session case, honest when it
+            // matters.
+            let one_hour = if audit.tokens.cache_write_1h > 0 {
+                format!(
+                    "  {} {}",
+                    text(language, "cache write 1h", "写缓存 1h"),
+                    format_compact_cost(cost.cache_write_1h)
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{} {}  {} {}  {} {}  {} {}",
+                "{} {}  {} {}  {} {}  {} {}{}",
                 text(language, "in", "输入"),
                 format_compact_cost(cost.input),
                 text(language, "out", "输出"),
@@ -1183,7 +1196,8 @@ fn cost_preview(session: &Session, language: Language) -> String {
                 text(language, "cache write", "写缓存"),
                 format_compact_cost(cost.cache_write),
                 text(language, "cache read", "读缓存"),
-                format_compact_cost(cost.cache_read)
+                format_compact_cost(cost.cache_read),
+                one_hour
             )
         })
         .unwrap_or_else(|| unavailable.to_string());
@@ -1191,8 +1205,19 @@ fn cost_preview(session: &Session, language: Language) -> String {
         .rates_per_million_usd
         .as_ref()
         .map(|rate| {
+            // rm-164 arm 3: the billed 1h-tier rate rides the same
+            // conditional — shown exactly when the class billed.
+            let one_hour = if audit.tokens.cache_write_1h > 0 {
+                format!(
+                    "  {} ${:.2}",
+                    text(language, "cache write 1h", "写缓存 1h"),
+                    rate.cache_write_1h
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{}  {} ${:.2}  {} ${:.2}  {} ${:.2}  {} ${:.2}",
+                "{}  {} ${:.2}  {} ${:.2}  {} ${:.2}  {} ${:.2}{}",
                 text(language, "Price per 1M tokens", "每百万 token 价格"),
                 text(language, "in", "输入"),
                 rate.input,
@@ -1201,7 +1226,8 @@ fn cost_preview(session: &Session, language: Language) -> String {
                 text(language, "cache write", "写缓存"),
                 rate.cache_write,
                 text(language, "cache read", "读缓存"),
-                rate.cache_read
+                rate.cache_read,
+                one_hour
             )
         })
         .unwrap_or_else(|| unavailable.to_string());
@@ -1233,6 +1259,11 @@ fn cost_preview(session: &Session, language: Language) -> String {
             "{}         {}",
             text(language, "cache read", "读取缓存"),
             format_tokens(audit.tokens.cache_read)
+        ),
+        format!(
+            "{}      {}",
+            text(language, "cache write 1h", "写缓存 1h"),
+            format_tokens(audit.tokens.cache_write_1h)
         ),
         format!(
             "{}     {}",

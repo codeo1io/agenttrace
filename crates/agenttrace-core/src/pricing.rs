@@ -18,7 +18,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-20";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -70,6 +70,16 @@ pub struct Price {
     /// $0 and bills as $0 (rm-1508).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cr: Option<f64>,
+    /// 1h-tier (above-1h) cache-write rate per million tokens (LiteLLM
+    /// `cache_creation_input_token_cost_above_1hr`, rm-164 arm 3):
+    /// the rate a `cacheWrite1h` block bills at. `None` = not
+    /// published — 1h-tier writes then bill at the 5m billed rate
+    /// ([`Price::cache_write_billed`]) with the loud
+    /// `cache_write_1h_5m_assumed` disclosure, never a silent $0;
+    /// `Some(0.0)` = a published $0. Same absent-vs-zero contract as
+    /// `cw`/`cr` (rm-1508).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cw_1h: Option<f64>,
     /// Vendor context window in input tokens (LiteLLM
     /// `max_input_tokens`), when the catalog entry carries one (rm-231).
     /// Absent on override files and pre-2026-10 snapshots; `skip`
@@ -145,6 +155,20 @@ impl Price {
             None => (self.input * CACHE_WRITE_FALLBACK_MULTIPLE, true),
         }
     }
+
+    /// The >1h-tier cache-write rate a session bills at, and whether
+    /// it is the 5m-assumed fallback (rm-164 arm 3): a row that
+    /// publishes no `*_above_1hr` rate bills its 1h-tier writes at
+    /// the 5m billed rate (itself possibly the rm-1508 absent-rate
+    /// fallback). Callers must disclose via
+    /// `cache_write_1h_5m_assumed` when the flag is set and 1h-tier
+    /// tokens were billed.
+    pub fn cache_write_1h_billed(&self) -> (f64, bool) {
+        match self.cw_1h {
+            Some(rate) => (rate, false),
+            None => (self.cache_write_billed().0, true),
+        }
+    }
 }
 
 /// rm-1508: whether pricing cache tokens at `price` bills any
@@ -189,6 +213,11 @@ struct LiteLlmModel {
     cache_write_cost: Option<f64>,
     #[serde(default, rename = "cache_read_input_token_cost")]
     cache_read_cost: Option<f64>,
+    // rm-164 arm 3: the >1h-tier cache-write rate — its OWN class,
+    // never folded into the 5m rate above (Anthropic prices it
+    // separately: $6.00/M against $3.75/M on sonnet-4-5).
+    #[serde(default, rename = "cache_creation_input_token_cost_above_1hr")]
+    cache_write_cost_1h: Option<f64>,
     #[serde(default)]
     mode: String,
     #[serde(default, rename = "litellm_provider")]
@@ -645,6 +674,13 @@ pub struct CacheRateCensus {
     pub cache_write_published: usize,
     pub cache_write_zero: usize,
     pub cache_write_absent: usize,
+    /// rm-164 arm 3 (run d2775a7e): the >1h-tier cache-write rate
+    /// census. `absent` is the NORMAL state — most rows publish no
+    /// `*_above_1hr` rate — so the pin worth keeping is the published
+    /// count moving ONLY through a sanctioned refresh.
+    pub cache_write_1h_published: usize,
+    pub cache_write_1h_zero: usize,
+    pub cache_write_1h_absent: usize,
     pub cache_read_published: usize,
     pub cache_read_zero: usize,
     pub cache_read_absent: usize,
@@ -668,6 +704,11 @@ pub fn cache_rate_census() -> CacheRateCensus {
                 Some(rate) if rate > 0.0 => census.cache_read_published += 1,
                 Some(_) => census.cache_read_zero += 1,
                 None => census.cache_read_absent += 1,
+            }
+            match price.cw_1h {
+                Some(rate) if rate > 0.0 => census.cache_write_1h_published += 1,
+                Some(_) => census.cache_write_1h_zero += 1,
+                None => census.cache_write_1h_absent += 1,
             }
         }
         census
@@ -749,8 +790,10 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
         // rate never collides with a published one, including $0.
         // This changes the identity for every catalog (one-time
         // warm-cache invalidation), which is the point: the fallback
-        // reprices.
-        for slot in [price.cw, price.cr] {
+        // reprices. The rm-164 arm-3 `cw_1h` slot rides the same loop
+        // (run d2775a7e): a catalog gaining or losing a 1h-tier rate
+        // must reprice too.
+        for slot in [price.cw, price.cr, price.cw_1h] {
             hash = fnv1a(&[slot.is_some() as u8], hash);
             if let Some(value) = slot {
                 hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
@@ -1096,6 +1139,21 @@ pub fn render_test_match() -> String {
                 "      cache: rates not published — billed at input-rate fallback (cr) / 1.25× input (cw), disclosed per session\n",
             );
         }
+        // rm-164 arm 3 (run d2775a7e): the 1h-tier cache-write rate —
+        // the rate a `cacheWrite1h` block bills at. A published rate
+        // renders plainly; a row publishing none bills its 1h-tier
+        // writes at the 5m billed rate and SAYS so (the
+        // cache_write_1h_5m_assumed disclosure), never a silent gap.
+        let (cw_1h, cw_1h_assumed) = p.cache_write_1h_billed();
+        out.push_str(&format!(
+            "      1h: cw1h=${:>6.2}/M{}\n",
+            cw_1h,
+            if cw_1h_assumed {
+                " (5m-assumed — no published >1h rate, disclosed per session)"
+            } else {
+                ""
+            }
+        ));
         // rm-610 (+ cycle-2 ultrafast rider): disclose the tier rates
         // when the row carries them, so the rate a
         // `service_tier: "flex"`/`"ultrafast"` turn bills at is
@@ -1986,6 +2044,10 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             // never a silent $0.
             cw: model.cache_write_cost.map(|rate| rate * 1e6),
             cr: model.cache_read_cost.map(|rate| rate * 1e6),
+            // rm-164 arm 3: the 1h-tier slot scales like the standard
+            // cache rates and keeps the same absent-vs-published-$0
+            // contract (an explicit 0 stays `Some(0.0)`).
+            cw_1h: model.cache_write_cost_1h.map(|rate| rate * 1e6),
             // Vendor context window and deprecation date ride along
             // when the source carries them (rm-231 / rm-419); zero or
             // empty values normalize to absent.
@@ -2022,7 +2084,8 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             // rm-1508: an absent cache rate (None) is legitimate — only
             // a present-but-non-finite rate poisons the entry.
             && price.cw.is_none_or(f64::is_finite)
-            && price.cr.is_none_or(f64::is_finite))
+            && price.cr.is_none_or(f64::is_finite)
+            && price.cw_1h.is_none_or(f64::is_finite))
         {
             continue;
         }
@@ -3990,10 +4053,15 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // The window pin (rm-231's motivating case). Moved with the
+        // rm-176 reconcile of 2026-10-20 (run d2775a7e): upstream
+        // revised the row to a 200k window and set deprecation_date
+        // 2026-11-30 — the refresh carries both; the pin holds the
+        // refreshed vendor value so a future refresh moving it again
+        // is a conscious diff, not drift.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 
