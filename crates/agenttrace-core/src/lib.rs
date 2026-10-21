@@ -3514,8 +3514,24 @@ fn is_zero_f64(value: &f64) -> bool {
 /// this quantum via largest-remainder, so every bucket is exact at the
 /// precision every lane renders and sum(by_model.cost) equals the billed
 /// total by construction, not by luck.
+///
+/// F1r (rm-1500 family, run e55cef2d cycle 5): the 10000.0 scale-up must
+/// never MANUFACTURE a non-finite from a finite input. Above ~f64::MAX/1e4
+/// the multiplication overflows to ±inf (and `fract`/`trunc` then keep it
+/// non-finite), so a hostile-but-finite cost — a recorded `cost_usd` of
+/// 1.8e304, or a finite product at this seam inside
+/// `estimate_cost_from_tokens` — surfaced as `inf` downstream: JSON lanes
+/// null/strip it, `{:.4}` lanes render a 300+-digit literal, and the
+/// rm-1500 folds misread our own inf as a poisoned session. Above the
+/// overflow magnitude one ulp already exceeds the 1e-4 quantum by ~290
+/// orders of magnitude, so the input IS exact at the quantum and is
+/// returned unchanged. Non-finite inputs pass through unchanged so the
+/// rm-1500 counters keep seeing them.
 pub fn round4(value: f64) -> f64 {
     let scaled = value * 10000.0;
+    if !scaled.is_finite() {
+        return value;
+    }
     let rounded = if scaled.fract().abs() >= 0.5 - 1e-9 {
         scaled.trunc() + scaled.signum()
     } else {
@@ -5490,5 +5506,65 @@ mod quota_tests {
         // 6h span, 5h window overlap: $6.00 x 5/6 = $5.00, weekly $6.00.
         assert_eq!(report["five_hour"]["spend_usd"], 5.0);
         assert_eq!(report["weekly"]["spend_usd"], 6.0);
+    }
+
+    // F1r (rm-1500 family, run e55cef2d cycle 5): round4 must never
+    // manufacture a non-finite from a finite input. The 10000.0 scale-up
+    // overflows to ±inf above ~f64::MAX/1e4; pre-cure the function laundered
+    // hostile-but-finite costs (recorded `cost_usd` of 1.8e304) into inf,
+    // which JSON lanes null out and `{:.4}` lanes render as a 300+-digit
+    // literal. Above the overflow magnitude one ulp already exceeds the
+    // 1e-4 quantum, so the input IS exact at the quantum: returned
+    // unchanged, bit-for-bit.
+    #[test]
+    fn round4_never_manufactures_non_finite_from_finite_input() {
+        for value in [
+            1.8e304,
+            -1.8e304,
+            f64::MAX,
+            -f64::MAX,
+            f64::MIN,
+            -0.0,
+            0.0,
+        ] {
+            assert!(value.is_finite());
+            let rounded = round4(value);
+            assert!(
+                rounded.is_finite(),
+                "round4({value:e}) manufactured non-finite {rounded:e}"
+            );
+            assert_eq!(
+                rounded.to_bits(),
+                value.to_bits(),
+                "at the overflow magnitude the input is already exact at the 1e-4 quantum; round4 must return it unchanged (and preserve -0.0)"
+            );
+        }
+        // Just BELOW the overflow boundary the scale-up stays finite and
+        // the rm-949 discipline path keeps running.
+        let near = f64::MAX / 10000.0;
+        assert!(near.is_finite() && round4(near).is_finite());
+    }
+
+    #[test]
+    fn round4_passes_non_finite_through_unchanged() {
+        // rm-1500 keeps its meaning: a genuinely poisoned cost stays
+        // visible to the skip-while-counting folds instead of round4
+        // silently reshaping it.
+        assert!(round4(f64::NAN).is_nan());
+        assert_eq!(round4(f64::INFINITY), f64::INFINITY);
+        assert_eq!(round4(f64::NEG_INFINITY), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn round4_half_away_from_zero_discipline_is_unchanged() {
+        // rm-949 pins at the quantum, both signs, plus the epsilon arm.
+        assert_eq!(round4(1.23456), 1.2346);
+        assert_eq!(round4(-1.23456), -1.2346);
+        assert_eq!(round4(1.00005), 1.0001);
+        assert_eq!(round4(-1.00005), -1.0001);
+        assert_eq!(round4(1.00004), 1.0);
+        assert_eq!(round4(0.0), 0.0);
+        // A value already at the quantum never re-rounds (epsilon arm).
+        assert_eq!(round4(2.5e-4), 2.5e-4);
     }
 }

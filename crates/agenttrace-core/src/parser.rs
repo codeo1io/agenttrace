@@ -285,8 +285,32 @@ fn zstd_decode_cap_label() -> String {
     format!("{} MiB", ZSTD_ROLLOUT_DECODE_MAX_BYTES / (1024 * 1024))
 }
 
-/// Decode one zstd-compressed Codex rollout, bounded by
-/// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`] of TOTAL decompressed output.
+/// Why a bounded zstd rollout decode refused the file.
+pub(crate) enum ZstdRolloutRefusal {
+    /// The decompressed output crossed the caller's bound mid-decode;
+    /// the decode stopped at the crossing chunk instead of
+    /// materializing the whole body. `work` is the decompression work
+    /// actually done at the stop — everything materialized plus the
+    /// crossing chunk (produced into the read buffer, then discarded) —
+    /// so the caller can charge it instead of pretending the refused
+    /// decode was free; `message` carries the bound's named-format
+    /// refusal so the fixed-cap wrapper keeps its exact wording.
+    OverMax { work: u64, message: String },
+    /// Corrupt/empty/trailing-bytes failure — the named-format wording
+    /// the cap lane has always used.
+    Failed(anyhow::Error),
+}
+
+/// Decode one zstd-compressed Codex rollout, bounded by `max_bytes` of
+/// TOTAL decompressed output, stopping AT the bound instead of
+/// materializing the whole body first (rm-1872 residual, run e55cef2d
+/// cycle 5: a hostile corpus of tiny compressed bombs must not be able
+/// to make the caller do bound-sized decompression work file after
+/// file). Callers wanting the fixed ingest cap use
+/// [`decode_zstd_rollout_bounded`], which keeps this implementation's
+/// byte-for-byte wording; the transcript scan passes its REMAINING
+/// budget so the aggregate decompression work stays inside the scan
+/// budget.
 /// A rollout is not guaranteed to be a single frame: Codex appends by
 /// materializing the journal and re-encoding it, and upstream's own
 /// reader explicitly tolerates CONCATENATED zstd frames
@@ -303,14 +327,13 @@ fn zstd_decode_cap_label() -> String {
 /// trailing bytes that are not a frame are refused with their offset
 /// (exactly like `zstd -d`, which fails such files with `unsupported
 /// format` instead of parsing a prefix), skippable frames are skipped
-/// (also like `zstd -d`), an empty decode says so, and an over-cap file
-/// names the cap.
-/// `pub(crate)`: the rm-402 replay scanner (`codex_replay.rs`) shares this
-/// exact decoder so fingerprinting and parsing always see the same bytes —
-/// one decode lane, one cap, one refusal wording (and therefore the same
-/// multi-frame truth: a concatenated rollout parses and fingerprints as
-/// the whole journal on both lanes).
-pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
+/// (also like `zstd -d`), an empty decode says so, and an over-bound
+/// file names the bound.
+pub(crate) fn decode_zstd_rollout_capped(
+    raw: Vec<u8>,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ZstdRolloutRefusal> {
     use std::io::Read;
     let total_len = raw.len();
     // `rest` always points at the next not-yet-decoded frame; each
@@ -339,11 +362,11 @@ pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::
                 // run (review finding 3), and a <8-byte remainder must
                 // bail outright rather than risk the slice below.
                 if rest.len() < 8 || length as usize > rest.len() - 8 {
-                    bail!(
+                    return Err(ZstdRolloutRefusal::Failed(anyhow::anyhow!(
                         "session file {} is zstd-compressed (Codex rollout format) but a skippable frame at byte {} declares more bytes than the file holds; the file is truncated — decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
                         label,
                         offset
-                    );
+                    )));
                 }
                 // Guarded above: 8 + length <= rest.len() here, so the
                 // sum cannot wrap past the slice on any target width.
@@ -361,43 +384,61 @@ pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::
             | Err(ruzstd::decoding::errors::FrameDecoderError::ReadFrameHeaderError(
                 ruzstd::decoding::errors::ReadFrameHeaderError::MagicNumberReadError(_),
             )) => {
-                bail!(
+                return Err(ZstdRolloutRefusal::Failed(anyhow::anyhow!(
                     "session file {} is zstd-compressed (Codex rollout format) but has trailing bytes after the last frame: byte {} onward is not a zstd frame; `zstd -d` refuses this file too — decompress what did decode manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
                     label,
                     offset
-                );
+                )));
             }
-            Err(err) => bail!(
-                "session file {} is zstd-compressed (Codex rollout format) but frame {} (at byte {}) failed to decode: {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
-                label,
-                frame_no,
-                offset,
-                err
-            ),
+            Err(err) => {
+                return Err(ZstdRolloutRefusal::Failed(anyhow::anyhow!(
+                    "session file {} is zstd-compressed (Codex rollout format) but frame {} (at byte {}) failed to decode: {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                    label,
+                    frame_no,
+                    offset,
+                    err
+                )));
+            }
         };
         let mut chunk = [0u8; 64 * 1024];
         loop {
             let n = match decoder.read(&mut chunk) {
                 Ok(n) => n,
-                Err(err) => bail!(
-                    "session file {} is zstd-compressed (Codex rollout format) but decoding failed mid-stream in frame {} (at byte {}): {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
-                    label,
-                    frame_no,
-                    offset,
-                    err
-                ),
+                Err(err) => {
+                    return Err(ZstdRolloutRefusal::Failed(anyhow::anyhow!(
+                        "session file {} is zstd-compressed (Codex rollout format) but decoding failed mid-stream in frame {} (at byte {}): {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                        label,
+                        frame_no,
+                        offset,
+                        err
+                    )));
+                }
             };
             if n == 0 {
                 break;
             }
-            if decoded.len() + n > ZSTD_ROLLOUT_DECODE_MAX_BYTES {
-                bail!(
-                    "session file {} is zstd-compressed (Codex rollout format) and would decompress past the {} cap ({} bytes decoded so far, still in frame {}); refusing the unbounded decode — decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
-                    label,
-                    zstd_decode_cap_label(),
-                    decoded.len(),
-                    frame_no
-                );
+            if decoded.len() + n > max_bytes {
+                // rm-1872 residual (F2r, run e55cef2d cycle 5): stop AT
+                // the caller's bound instead of materializing the whole
+                // body first. `work` counts the true decompression work
+                // done at the stop — everything materialized plus the
+                // crossing chunk (produced into the read buffer, then
+                // discarded): charging only the materialized bytes would
+                // leave sub-chunk bodies — a whole 22 KiB rollout arrives
+                // in ONE 64 KiB read — uncharged and the aggregate work
+                // unbounded again.
+                let bound_label = if max_bytes == ZSTD_ROLLOUT_DECODE_MAX_BYTES {
+                    zstd_decode_cap_label()
+                } else {
+                    format!("{}-byte", max_bytes)
+                };
+                return Err(ZstdRolloutRefusal::OverMax {
+                    work: (decoded.len() + n) as u64,
+                    message: format!(
+                        "session file {label} is zstd-compressed (Codex rollout format) and would decompress past the {bound_label} cap ({} bytes decoded so far, still in frame {frame_no}); refusing the unbounded decode — decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                        decoded.len()
+                    ),
+                });
             }
             decoded.extend_from_slice(&chunk[..n]);
         }
@@ -411,12 +452,30 @@ pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::
         rest = decoder.into_parts().0;
     }
     if decoded.is_empty() {
-        bail!(
+        return Err(ZstdRolloutRefusal::Failed(anyhow::anyhow!(
             "session file {} is zstd-compressed (Codex rollout format) but decompressed to 0 bytes; nothing to parse",
             label
-        );
+        )));
     }
     Ok(decoded)
+}
+
+/// The fixed-cap ingest/replay entry: [`decode_zstd_rollout_capped`] at
+/// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`], with the over-cap refusal rendered
+/// as the exact anyhow error this lane has always surfaced (numeral
+/// derived from the constant, rm-1025). `pub(crate)`: the rm-402 replay
+/// scanner (`codex_replay.rs`) shares this exact decoder so
+/// fingerprinting and parsing always see the same bytes — one decode
+/// lane, one cap, one refusal wording (and therefore the same
+/// multi-frame truth: a concatenated rollout parses and fingerprints as
+/// the whole journal on both lanes).
+pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
+    decode_zstd_rollout_capped(raw, label, ZSTD_ROLLOUT_DECODE_MAX_BYTES).map_err(
+        |refusal| match refusal {
+            ZstdRolloutRefusal::OverMax { message, .. } => anyhow::anyhow!("{message}"),
+            ZstdRolloutRefusal::Failed(error) => error,
+        },
+    )
 }
 
 /// Parse one session stream piped on stdin (rm-503, `agenttrace … -`):
