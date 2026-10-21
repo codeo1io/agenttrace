@@ -645,6 +645,19 @@ fn lock_journal_with_deadline(journal: &fs::File, deadline: std::time::Instant) 
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
+                // Windows: LockFileEx reports ERROR_ACCESS_DENIED (os
+                // error 5) transiently when a scanner/AV or the shell
+                // briefly holds a newly created journal — the same
+                // "try again shortly" contract as WouldBlock, not a
+                // permanent refusal. Retry inside the deadline instead
+                // of failing the host status line on first contact.
+                #[cfg(windows)]
+                {
+                    if error.raw_os_error() == Some(5) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                }
                 if error.kind() != io::ErrorKind::WouldBlock {
                     return Err(error);
                 }

@@ -2983,8 +2983,12 @@ fn output_flag_refusal_names_the_directory_and_target() {
         stderr.contains(target.to_str().expect("path is UTF-8")),
         "error must name the requested -o target: {stderr}"
     );
+    // The OS cause stays disclosed (rm-610) — spelled differently per
+    // platform: Linux mkdir(2) under a file parent reports EEXIST ("File
+    // exists"); Windows CreateDirectoryW reports ERROR_ALREADY_EXISTS
+    // ("Cannot create a file when that file already exists").
     assert!(
-        stderr.contains("File exists"),
+        stderr.contains("File exists") || (cfg!(windows) && stderr.contains("file already exists")),
         "the OS cause stays disclosed (rm-610): {stderr}"
     );
 

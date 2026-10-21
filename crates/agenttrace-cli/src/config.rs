@@ -113,20 +113,21 @@ fn resolve_user_config_path(
         .and_then(|value| value.to_str())
         // rm-248: the XDG Base Directory Specification says a relative
         // $XDG_CONFIG_HOME is ignored as if unset — a cwd-relative
-        // `.config` must not silently become the config root.
-        .filter(|value| value.starts_with('/'));
+        // `.config` must not silently become the config root. Absolute
+        // in EITHER sense relocates the root: a spec-shaped POSIX
+        // absolute ('/xdg', what the spec defines and what the pinned
+        // table uses) or a platform-absolute value ('C:\...' on
+        // Windows, what a real Windows user sets).
+        .filter(|value| value.starts_with('/') || std::path::Path::new(value).is_absolute());
     let base = match xdg {
         Some(base) => base.to_string(),
         None => {
             let home = home
                 .filter(|value| !value.is_empty())
-                .and_then(|value| value.to_str())?;
-            if home.starts_with('~') {
-                // Test/fixture homes use real paths; only a literal '~'
-                // prefix would need expansion, which HOME itself already
-                // provides — treat non-absolute homes as absent.
-                return None;
-            }
+                .and_then(|value| value.to_str())
+                .filter(|value| {
+                    value.starts_with('/') || std::path::Path::new(value).is_absolute()
+                })?;
             format!("{home}/.config")
         }
     };
