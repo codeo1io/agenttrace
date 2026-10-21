@@ -1088,11 +1088,16 @@ pub(crate) fn find_session_files_cached(
     retain_single_cline_session_per_id(&mut all);
     // rm-1886: content dedup at admission — a byte-identical journal
     // at a second path re-emits the same events and double-banks every
-    // aggregate it feeds. First-seen survivor wins (deterministic: the
-    // walk yields sorted per-directory files, roots in registration
-    // order); a file whose bytes cannot be read is KEPT — the parse
-    // lane owns unreadable files and discloses them, dedup must not
-    // silently drop what it cannot verify. Unreadable-file stance
+    // aggregate it feeds. rm-1888 amended acceptance (macOS CI red at
+    // 9ebd0460, run 39394440216: the same twin corpus disclosed
+    // `alpha/a.jsonl <- beta/b.jsonl` on Linux but the reverse on
+    // darwin): the survivor of a signature class is the
+    // lexicographically smallest path — first-seen used to inherit
+    // the per-root newest-mtime order of the collect walk, so mtime
+    // granularity (ns on darwin) or walk order flipped the disclosure
+    // across platforms; a file whose bytes cannot be read is KEPT — the
+    // parse lane owns unreadable files and discloses them, dedup must
+    // not silently drop what it cannot verify. Unreadable-file stance
     // keeps this pass observable: suppressed copies are counted and
     // the first pairs named.
     let mut deduped: Vec<PathBuf> = Vec::with_capacity(all.len());
@@ -1119,12 +1124,25 @@ pub(crate) fn find_session_files_cached(
             continue;
         };
         match signatures.entry(signature) {
-            std::collections::hash_map::Entry::Occupied(survivor) => {
+            std::collections::hash_map::Entry::Occupied(mut survivor) => {
                 suppressed.duplicate_session_files += 1;
+                let pair = if path < *survivor.get() {
+                    // Lexical-min takes over as the survivor so the
+                    // disclosure never depends on which duplicate the
+                    // mtime-ordered walk surfaced first; the demoted
+                    // twin joins the named pairs and the admitted list
+                    // follows the new survivor (it is re-sorted by
+                    // mtime at the end of this pass).
+                    let demoted = survivor.insert(path.clone());
+                    if let Some(slot) = deduped.iter_mut().find(|p| **p == demoted) {
+                        *slot = path.clone();
+                    }
+                    (path, demoted)
+                } else {
+                    (survivor.get().clone(), path)
+                };
                 if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
-                    suppressed
-                        .duplicate_session_file_pairs
-                        .push((survivor.get().clone(), path));
+                    suppressed.duplicate_session_file_pairs.push(pair);
                 }
             }
             std::collections::hash_map::Entry::Vacant(slot) => {

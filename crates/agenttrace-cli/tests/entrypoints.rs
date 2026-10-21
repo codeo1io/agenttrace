@@ -870,6 +870,11 @@ fn statusline_host_mode_never_fails_the_host() {
     let _ = std::fs::remove_dir_all(cache);
 }
 
+// ci/master-reds-cure (macOS red at :887, run 39394440216): /dev/full
+// is a Linux-only device — darwin's open() reports ENOENT and Windows
+// has no devfs at all — so the write-failure lane can only be exercised
+// where the device exists.
+#[cfg(target_os = "linux")]
 #[test]
 fn statusline_host_mode_survives_stdout_write_failure() {
     // Review F2 (cycle 7): the host contract is exit 0 for any input —
@@ -2656,6 +2661,13 @@ fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ci/master-reds-cure: the ENOSPC arm drives -o /dev/full — a
+// Linux-only device. On darwin the atomic writer cannot create its
+// temp sibling inside /dev and the honest cause is EACCES (an
+// explicitly accepted spelling below), so this lane KEEPS running
+// there; Windows resolves \dev\full to os error 3 with no accepted
+// spelling, so only that host is excluded.
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn error_stderr_carries_the_anyhow_cause_chain() {
     // rm-610: the top-level handler printed `Error: {err}`, and

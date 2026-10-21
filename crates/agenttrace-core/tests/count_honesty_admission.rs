@@ -35,6 +35,10 @@ use agenttrace_core::{
 };
 use std::collections::BTreeMap;
 use std::fs;
+// ci/master-reds-cure (wall 9ebd0460): unix-gated — the Windows job's
+// fresh-cache rustc census (run 39419593000) fails E0433 on the bare
+// import and E0599 on Permissions::from_mode below.
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -416,6 +420,69 @@ fn byte_identical_copy_is_suppressed_with_disclosure() {
 }
 
 #[test]
+fn duplicate_survivor_is_the_lexically_smallest_path_on_every_platform() {
+    // rm-1888 amended acceptance (ci/master-reds-cure; live macOS CI red
+    // at 9ebd0460, run 39394440216): with the survivor chosen by
+    // first-seen-in-mtime-order, the same twin corpus disclosed
+    // `alpha/a.jsonl <- beta/b.jsonl` on Linux (mtime ties fell back to
+    // walk order) and `beta/b.jsonl <- alpha/a.jsonl` on darwin
+    // (nanosecond mtimes surfaced the last-written twin first). The
+    // survivor is now the lexicographically smallest path of the
+    // signature class — pinned here by writing the twins so the
+    // lexically LARGER one is also strictly the newest (spacing sleep:
+    // no filesystem can tie these mtimes), cold AND warm cache.
+    let home = temp_home("dup-lexical");
+    let journal = pi_journal_with_cost("0.0038");
+    let survivor_path = write(
+        &home.join(".pi/agent/sessions/aa-proj/twin.jsonl"),
+        &journal,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    let newest_path = write(
+        &home.join(".pi/agent/sessions/zz-proj/twin.jsonl"),
+        &journal,
+    );
+    let mut cold_pair: Option<(PathBuf, PathBuf)> = None;
+    with_pinned_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(report.sessions.len(), 1, "twins collapse to one session");
+        assert_eq!(report.duplicate_session_files, 1);
+        assert_eq!(report.duplicate_session_file_pairs.len(), 1);
+        let (survivor, suppressed) = &report.duplicate_session_file_pairs[0];
+        assert_eq!(
+            survivor, &survivor_path,
+            "the lexically smallest twin survives, not the newest-mtime one"
+        );
+        assert_eq!(
+            suppressed, &newest_path,
+            "the named suppressed copy is the other twin"
+        );
+        assert_eq!(
+            Path::new(&report.sessions[0].path),
+            survivor_path.as_path(),
+            "the admitted session is the named survivor"
+        );
+        cold_pair = Some((survivor.clone(), suppressed.clone()));
+    });
+    // Warm-cache regime: the session cache is now populated by the cold
+    // pass; the disclosure must be re-derived identically, not
+    // re-decided by a different mtime sort input.
+    with_pinned_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(report.duplicate_session_file_pairs.len(), 1);
+        let (survivor, suppressed) = &report.duplicate_session_file_pairs[0];
+        let (cold_survivor, cold_suppressed) =
+            cold_pair.take().expect("the cold pass recorded its pair");
+        assert_eq!(
+            survivor, &cold_survivor,
+            "warm cache keeps the cold survivor"
+        );
+        assert_eq!(suppressed, &cold_suppressed);
+    });
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn distinct_content_of_the_same_size_is_not_suppressed() {
     // The ledger keys content, not size: same byte-length journals
     // with different content are two real sessions.
@@ -475,6 +542,10 @@ fn explicit_dir_lane_keeps_duplicate_copies() {
     let _ = fs::remove_dir_all(&home);
 }
 
+// cfg(unix): Permissions::from_mode has no Windows form (E0599, run
+// 39419593000) — the unreadable-file stance is still exercised on every
+// unix CI lane.
+#[cfg(unix)]
 #[test]
 fn unreadable_journal_is_kept_and_never_a_duplicate() {
     // A journal whose bytes cannot be read (permissions) has no
