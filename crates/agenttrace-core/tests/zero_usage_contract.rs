@@ -161,7 +161,13 @@ fn stale_schema_22_cache_cannot_mask_the_disclosure() {
     // entry fingerprint FRESH against the file (matching mod_time/size),
     // cached session WITHOUT the zero_usage_events field.
     let metadata = fs::metadata(&session_path).expect("stat fixture");
-    let mod_time = metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec();
+    // rm-2244: mirror the production cache key (saturating — a hostile
+    // far-future mtime must not panic the seeder or drift from the key
+    // the store will recompute).
+    let mod_time = metadata
+        .mtime()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(metadata.mtime_nsec());
     let session_path_str = session_path.to_string_lossy().to_string();
     let mut entries = serde_json::Map::new();
     entries.insert(

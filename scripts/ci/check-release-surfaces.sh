@@ -38,6 +38,29 @@ grep -q "cargo install" README.zh-CN.md ||
 	fail "README.zh-CN install paths must include cargo install"
 grep -q "brew install luoyuctl/tap/agenttrace" README.md ||
 	fail "README must document Homebrew installation"
+# rm-2243 (2026-10-21): the in-tree Homebrew formula carried only a
+# HEAD source stanza, so a repo-local
+# `brew install --formula ./homebrew/Formula/agenttrace.rb` silently
+# built the (frozen) upstream master instead of any released binary,
+# and no gate noticed the formula had no stable arm. The formula now
+# mirrors the shape render-channels.sh pushes to the tap; pin it: the
+# HEAD stanza stays (dev channel), stable release-artifact urls, one
+# sha256 per platform arm, an explicit version (the urls are
+# extensionless, so brew cannot derive it), and version parity with
+# install.sh's AGENTTRACE_SOURCE_REF default (the rm-1038 chain).
+formula="homebrew/Formula/agenttrace.rb"
+grep -q 'head "https://github.com/luoyuctl/agenttrace.git", branch: "master"' "$formula" ||
+	fail "in-tree Homebrew formula must keep the HEAD source stanza (dev channel)"
+grep -q 'url "https://github.com/luoyuctl/agenttrace/releases/download/' "$formula" ||
+	fail "in-tree Homebrew formula must pin stable release-artifact urls (rm-2243)"
+[[ "$(grep -c 'sha256 "' "$formula")" -eq 4 ]] ||
+	fail "in-tree Homebrew formula must pin exactly one sha256 per platform arm"
+grep -q 'version "' "$formula" ||
+	fail "in-tree Homebrew formula must declare the stable version (urls are extensionless)"
+formula_version="$(grep -m1 -oE 'version "[0-9]+\.[0-9]+\.[0-9]+"' "$formula" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+install_ref="$(grep -m1 -oE 'AGENTTRACE_SOURCE_REF:-[^}"]+' install.sh | sed 's/.*:-//' || true)"
+[[ -n "$formula_version" && "${install_ref#v}" = "$formula_version" ]] ||
+	fail "in-tree Homebrew formula stable version '${formula_version:-missing}' must track install.sh's release default '$install_ref'"
 # WinGet is no longer a release channel (adopted upstream v0.10.1 #301/#312
 # channel decision): install.ps1 / install.cmd serve Windows instead.
 if grep -R -qi "winget" .github/workflows scripts/release README.md README.zh-CN.md; then

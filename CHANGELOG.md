@@ -1013,6 +1013,27 @@
 
 ### Fixed
 
+- Filesystem-and-channel truth wave (rm-2244 + rm-2243 + the
+  rm-1500 clipboard arm, run d6554846 cycle 5): a corpus file whose
+  mtime sits past ~year 2262 made `mtime * 1_000_000_000` overflow
+  i64 — a debug panic and a silent wrap in release — in both
+  cache-freshness lanes (`session_cache.rs` and `doctor.rs`) and the
+  TUI test twin; the unix arms now honor the overflow discipline
+  their non-unix twins already had (saturate for the cache key, and
+  `None` — unverifiable, so the doctor recounts — for the doctor
+  check). The TUI clipboard summary rendered a poisoned non-finite
+  cost estimate as a literal `$NaN`; it now renders the `—` null
+  marker like every other human lane. And the in-tree Homebrew
+  formula carried only a HEAD source stanza at the frozen upstream
+  master — a repo-local
+  `brew install --formula ./homebrew/Formula/agenttrace.rb`
+  silently built that source instead of any released binary; the
+  formula now pins the published v0.10.1 release artifacts (url +
+  sha256 per platform, the same shape `render-channels.sh` pushes to
+  the tap) with the HEAD stanza kept, and `check-release-surfaces.sh`
+  fails if the stable arm, its four sha256s, or its version parity
+  with the installer default ever regress.
+
 - Codex compressed rollouts are admitted by name, survive the compress/restore flip, and disclose their decode (rm-992, run d57c2e56 cycle 1, batch "Codex compressed-rollout truth: admit, decode, search, disclose"): stable Codex 0.162.x migrates cold rollouts under `~/.codex/sessions`/`~/.codex/archived_sessions` to `.jsonl.zst` names while writing compressed rollouts by default stays feature-flagged upstream (reader tolerance since ≥0.152 via #41357, merged 2026-10-13; #53732 rode the 0.163 alphas and the flag was still off at tag rust-v0.163.0, per this tree's own rm-1518 correction) — so compressed history is already on real users' disks, the wall ccusage hit same-class (#1888, fixed #1890) — but the session-file NAME gate kept `.jsonl`/`.json` only, so the migrated cold history was invisible BEFORE any content sniff: the assess PoC planted 4 compressed lanes and discovered 0, with `--doctor` disclosing nothing. `is_session_file_name` (discovery.rs) now admits exactly the `.jsonl.zst` sibling (bare `.zst` still excluded; the walkers are lane-agnostic so the suffix lands at the shared gate while the parser's magic probe stays the decider), and `parse_file` retries the compress/restore sibling on a NotFound — codex compresses by RENAMING (`x.jsonl` → `x.jsonl.zst`) and restores on demand, so a path handed over by an earlier walk can be gone at read time; with no pair the error still names the REQUESTED path (the encoding-fallback ccusage's codex reader ships). Every decode discloses: the parse carries a `zstd_rollout_decoded` counter on the session, flowing through the doctor's generic disclosure fold into the `--doctor` map and both renders. New fixture `rollout.jsonl.zst` (a byte-identical copy of the golden frame under the migrated name) separates admission-by-name from decode-by-content, and the parser/README comments keep the reconciled threshold truth (migration on stable 0.162.x; write flag off at 0.163.0 stable; main-head #54930 spreads zstd to app-server WebSockets). Pinned red-first in `discovery_contract.rs` (one-pass admit+decode: 1 of 1 file discovered, `codex_cli`, non-zero tokens, disclosed), `zstd_rollout_decode.rs` (sibling fallback in both directions; no-pair error names the requested path; a plain-sibling read is NOT a decode — no counter), and `doctor_honesty_contract.rs` (report map + json render carry the disclosure).
 
   Integration seam (2026-10-20, conflict case ae49eb7a, landing onto a

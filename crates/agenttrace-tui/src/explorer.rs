@@ -1961,7 +1961,17 @@ fn render_help_overlay(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 // Deliberately exclude titles, paths, arguments and log excerpts from clipboard output.
 fn share_summary(session: &Session) -> String {
-    format!("AgentTrace\nHealth: {}\nEstimated cost: ${:.4}\nDuration: {:.1}s\nTool failures: {}\nAnomalies: {}\n", session.health, session.metrics.cost_estimated, session.metrics.duration_sec, session.metrics.tool_calls_fail, session.anomalies.len())
+    // rm-1500 lane (rm-2244 wave): the clipboard summary is a human
+    // lane — a poisoned (non-finite) cost estimate renders as the
+    // null marker, never `$NaN` (which reads as a broken tool) and
+    // never `$0.0000` (which reads as a clean zero-spend session);
+    // the same contract `format_cost` holds on every other human lane.
+    let cost = if session.metrics.cost_estimated.is_finite() {
+        format!("${:.4}", session.metrics.cost_estimated)
+    } else {
+        "\u{2014}".to_string()
+    };
+    format!("AgentTrace\nHealth: {}\nEstimated cost: {}\nDuration: {:.1}s\nTool failures: {}\nAnomalies: {}\n", session.health, cost, session.metrics.duration_sec, session.metrics.tool_calls_fail, session.anomalies.len())
 }
 
 /// Bound on how long the TUI waits for a clipboard helper to exit after
@@ -2979,5 +2989,25 @@ mod interaction_tests {
         let summary = share_summary(app.explorer_session().unwrap());
         assert!(!summary.contains("beta"));
         assert!(!summary.contains(&app.explorer_session().unwrap().name));
+    }
+
+    #[test]
+    fn share_summary_renders_non_finite_cost_as_the_null_marker() {
+        // rm-1500 lane (rm-2244 wave): the clipboard summary is a human
+        // lane. A poisoned non-finite cost estimate used to render as
+        // a literal `$NaN`; it now renders the `—` null marker — the
+        // same contract `format_cost` holds — never `$NaN` (reads as a
+        // broken tool) and never `$0.0000` (reads as a clean zero
+        // spend).
+        let mut sessions = agenttrace_core::demo_sessions().unwrap();
+        sessions[0].metrics.cost_estimated = f64::NAN;
+        let summary = share_summary(&sessions[0]);
+        assert!(summary.contains("Estimated cost: —"), "{summary}");
+        assert!(!summary.contains("$NaN"), "{summary}");
+        sessions[0].metrics.cost_estimated = 0.12345;
+        assert!(
+            share_summary(&sessions[0]).contains("Estimated cost: $0.1235"),
+            "the finite arm keeps its full-precision shape"
+        );
     }
 }

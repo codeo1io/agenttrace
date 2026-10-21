@@ -3651,7 +3651,20 @@ fn is_fresh(path: &Path, entry: &CacheEntryHeader) -> bool {
 #[cfg(unix)]
 fn file_mod_time_nanos(metadata: &fs::Metadata) -> i64 {
     use std::os::unix::fs::MetadataExt;
-    metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec()
+    mtime_nanos_saturating(metadata.mtime(), metadata.mtime_nsec())
+}
+
+/// rm-2244: the cache-freshness key arithmetic, split out so the
+/// overflow bounds pin without a filesystem. `mtime() * 1_000_000_000`
+/// overflows i64 once the seconds pass ~9.22e9 (year 2262) — a debug
+/// panic, a silent wrap in release, and either way a garbage key. The
+/// saturation mirrors the clamp the non-unix twin below already
+/// applies (`min(i64::MAX)`), so a hostile far-future mtime stays a
+/// stable, comparable key instead of invalidating the warm cache on
+/// every read (or panicking outright).
+#[cfg(unix)]
+fn mtime_nanos_saturating(seconds: i64, nanos: i64) -> i64 {
+    seconds.saturating_mul(1_000_000_000).saturating_add(nanos)
 }
 
 #[cfg(not(unix))]
@@ -6576,5 +6589,75 @@ mod tests {
         let again = GoSession::from_session(&back);
         assert_eq!(again.org, back.org);
         assert_eq!(again.org_email, back.org_email);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mtime_nanos_saturating_pins_both_overflow_directions() {
+        // rm-2244: the freshness-key arithmetic itself, pinned without
+        // a filesystem — the far-future direction saturates high, the
+        // far-past (mtime well before the epoch) saturates low, and
+        // the representable band is exact.
+        assert_eq!(mtime_nanos_saturating(0, 0), 0);
+        assert_eq!(mtime_nanos_saturating(1, 500_000_000), 1_500_000_000);
+        assert_eq!(
+            mtime_nanos_saturating(9_223_372_035, 500_000_000),
+            9_223_372_035_500_000_000
+        );
+        assert_eq!(mtime_nanos_saturating(9_223_372_036, 854_775_807), i64::MAX);
+        assert_eq!(mtime_nanos_saturating(200_000_000_000, 5), i64::MAX);
+        // mtime_nsec() is always in [0, 1e9), so the far-past direction
+        // saturates the multiply and adds the nanos back on top.
+        assert_eq!(mtime_nanos_saturating(-200_000_000_000, 5), i64::MIN + 5);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hostile_far_future_mtime_stays_a_stable_saturating_cache_key() {
+        // rm-2244: `mtime() * 1_000_000_000` overflows i64 once the
+        // seconds pass ~9.22e9 (year 2262) — a debug panic here, a
+        // silent wrap in release, and either way a garbage
+        // cache-freshness key. A corpus file touched into the far
+        // future (filesystems may clamp the plant to their own max,
+        // e.g. ext4's year 2446 — still past the overflow bound) must
+        // saturate like the non-unix arm and stay a comparable,
+        // stable key across reads.
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-hostile-mtime-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("hostile.jsonl");
+        fs::write(&journal, b"{}").expect("write journal");
+        let far_future =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(200_000_000_000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&journal)
+            .expect("open journal")
+            .set_times(std::fs::FileTimes::new().set_modified(far_future))
+            .expect("plant hostile mtime");
+        let metadata = fs::metadata(&journal).expect("journal metadata");
+        let nanos = file_mod_time_nanos(&metadata);
+        if metadata.mtime() > i64::MAX / 1_000_000_000 {
+            // The stored seconds really do overflow: saturation is the
+            // contract (the same clamp the non-unix arm applies).
+            assert_eq!(nanos, i64::MAX);
+        } else {
+            // This filesystem clamped the plant below the overflow
+            // bound; the key is then the plain nanos.
+            assert_eq!(
+                nanos,
+                metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec()
+            );
+        }
+        // Stable across reads: the same untouched file must keep
+        // validating (not invalidating) a warm cache entry.
+        let again = fs::metadata(&journal).expect("journal metadata re-read");
+        assert_eq!(nanos, file_mod_time_nanos(&again));
+        let _ = fs::remove_dir_all(&root);
     }
 }

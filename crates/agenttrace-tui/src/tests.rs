@@ -2107,7 +2107,13 @@ fn with_session_cache_dir_for_test(cache_dir: &std::path::Path, run: impl FnOnce
 #[cfg(unix)]
 fn file_mod_time_nanos_for_test(metadata: &fs::Metadata) -> i64 {
     use std::os::unix::fs::MetadataExt;
-    metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec()
+    // rm-2244: mirrors the production `session_cache.rs` key — a
+    // far-future mtime saturates instead of overflowing (the non-unix
+    // twin below already clamps the same way).
+    metadata
+        .mtime()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(metadata.mtime_nsec())
 }
 
 #[cfg(not(unix))]

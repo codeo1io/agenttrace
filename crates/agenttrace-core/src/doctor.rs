@@ -1921,7 +1921,16 @@ fn valid_cached_session_count(paths: &[PathBuf], cache: &SessionCacheReport) -> 
 #[cfg(unix)]
 fn file_mod_time_nanos(metadata: &std::fs::Metadata) -> Option<i64> {
     use std::os::unix::fs::MetadataExt;
-    Some(metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec())
+    // rm-2244: `mtime() * 1_000_000_000` overflows i64 once the
+    // seconds pass ~9.22e9 (year 2262) — a debug panic, a wrapped
+    // garbage value in release. An unrepresentable mtime is `None`,
+    // the same contract the non-unix arm below holds for pre-epoch
+    // stamps, so `valid_cached_session_count` treats the entry as
+    // unverifiable and recounts instead of certifying garbage.
+    metadata
+        .mtime()
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(metadata.mtime_nsec()))
 }
 
 #[cfg(not(unix))]
@@ -1964,6 +1973,45 @@ mod tests {
     /// rm-512 dedup/budget/surface semantics under test are unchanged.
     fn unresolved_session(encoded_dir: &str) -> Session {
         session_at("", &format!("/nowhere/projects/-{encoded_dir}/s.jsonl"))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hostile_far_future_mtime_is_unverifiable_not_certified() {
+        // rm-2244: mtime seconds past ~9.22e9 (year 2262) overflowed
+        // the unix `file_mod_time_nanos` — a debug panic, a wrapped
+        // garbage value in release — and `valid_cached_session_count`
+        // would certify a cache entry against it. An unrepresentable
+        // mtime is now `None` (the same contract the non-unix arm
+        // holds for pre-epoch stamps), so the doctor recounts instead
+        // of certifying.
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-doctor-hostile-mtime-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("hostile.jsonl");
+        std::fs::write(&journal, b"{}").expect("write journal");
+        let far_future =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(200_000_000_000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&journal)
+            .expect("open journal")
+            .set_times(std::fs::FileTimes::new().set_modified(far_future))
+            .expect("plant hostile mtime");
+        let metadata = std::fs::metadata(&journal).expect("journal metadata");
+        if metadata.mtime() > i64::MAX / 1_000_000_000 {
+            assert_eq!(file_mod_time_nanos(&metadata), None);
+        } else {
+            // This filesystem clamped the plant below the overflow
+            // bound; the stamp stays representable and verifiable.
+            assert!(file_mod_time_nanos(&metadata).is_some());
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

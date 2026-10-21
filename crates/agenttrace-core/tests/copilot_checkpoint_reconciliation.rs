@@ -247,7 +247,13 @@ fn stale_schema_32_cache_cannot_mask_the_agent_lane_rollup() {
     // the pre-batch metrics for this exact journal — content-based token
     // ESTIMATE, model "default", NO credit_usd.
     let metadata = std::fs::metadata(&session_path).expect("stat fixture");
-    let mod_time = metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec();
+    // rm-2244: mirror the production cache key (saturating — a hostile
+    // far-future mtime must not panic the seeder or drift from the key
+    // the store will recompute).
+    let mod_time = metadata
+        .mtime()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(metadata.mtime_nsec());
     let session_path_str = session_path.to_string_lossy().to_string();
     let mut entries = serde_json::Map::new();
     entries.insert(
@@ -347,7 +353,13 @@ fn stale_schema_35_cache_cannot_mask_the_hostile_value_folds() {
     // copilot_credit_nonfinite counter (it did not exist pre-batch) and
     // the null credit the poisoned +inf sum serialized to.
     let metadata = std::fs::metadata(&session_path).expect("stat fixture");
-    let mod_time = metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec();
+    // rm-2244: mirror the production cache key (saturating — a hostile
+    // far-future mtime must not panic the seeder or drift from the key
+    // the store will recompute).
+    let mod_time = metadata
+        .mtime()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(metadata.mtime_nsec());
     let session_path_str = session_path.to_string_lossy().to_string();
     let mut entries = serde_json::Map::new();
     entries.insert(
