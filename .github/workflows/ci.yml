@@ -82,6 +82,14 @@ jobs:
         # `###` kinds — first-per-section consumers drop the later blocks.
         run: scripts/ci/check-changelog-structure.sh
 
+      - name: File size budget gate
+        # rm-2118: every tracked crates/**.rs file is pinned to a
+        # line-count ceiling (allow-list at measured counts rounded up,
+        # default cap 5,000 for unlisted files); growth past a ceiling
+        # is a conscious, dated allow-list diff — never silent
+        # accretion on the six >5k-line concentrates.
+        run: scripts/ci/check-file-size-budget.sh
+
       - name: npm files pack gate
         # rm-1037: every npm/package.json files entry must match something
         # in the tree (lib/ is a postinstall artifact, never packed).

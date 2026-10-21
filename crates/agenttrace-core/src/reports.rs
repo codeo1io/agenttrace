@@ -225,6 +225,12 @@ pub fn report_json_with_language(session: &Session, language: ReportLanguage) ->
         "    \"cache_write\": {},\n",
         metrics.tokens_cache_w
     ));
+    // rm-164 arm 3: the >1h-tier cache-write class — always present
+    // beside its 5m sibling so the report shape is stable.
+    out.push_str(&format!(
+        "    \"cache_write_1h\": {},\n",
+        metrics.tokens_cache_w_1h
+    ));
     out.push_str(&format!("    \"input\": {},\n", metrics.tokens_input));
     out.push_str(&format!("    \"output\": {},\n", metrics.tokens_output));
     out.push_str(&format!("    \"total\": {}\n", total_tokens));

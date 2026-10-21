@@ -300,12 +300,16 @@ prioritized recommendations, MCP governance, context trends, and delivery
 signals in JSON, Markdown, and HTML output. All cost and delivery fields are
 explicitly estimates or heuristics; they are not provider billing or proof that
 a commit reached `main`. When a gateway records its own cost, agenttrace
-uses it and counts — never silently — the estimates it suppresses; one
-honest gap in that counter: the suppressed estimate prices the same four
-buckets as the estimate formula (input/output/cache-write/cache-read), so
-1h-tier cache writes (Claude's `ephemeral_1h_input_tokens`) are not in it
-and a 1h-dominated gateway block can suppress less than its true catalog
-cost — the counter is a lower bound until tier-aware pricing lands (rm-176).
+uses it and counts — never silently — the estimates it suppresses. The
+suppressed estimate prices the same five buckets as the estimate formula
+(input/output/cache-write/cache-write-1h/cache-read): 1h-tier cache writes
+(Claude's `ephemeral_1h_input_tokens`) bill at the row's published >1h
+catalog rate, or at the 5m cache-write rate with a loud per-session
+`cache_write_1h_5m_assumed` disclosure when the row publishes none — so
+the counter is a true catalog-cost counterfactual on those buckets, no
+longer a lower bound (the >1h class was silently unpriced before the
+2026-10-20 snapshot re-base landed its rates; rm-164's remaining tier
+zoo stays open and disclosed).
 
 <a id="pricing"></a>
 

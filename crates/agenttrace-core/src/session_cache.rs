@@ -1422,6 +1422,12 @@ struct GoMetrics {
     tokens_reasoning: i64,
     #[serde(default, rename = "TokensCacheW")]
     tokens_cache_w: i64,
+    /// rm-164 arm 3 (run d2775a7e): the >1h-tier cache-write class.
+    /// Defaulted so pre-existing cache rows deserialize as 0 — the
+    /// catalog-identity stamp (which now hashes the `cw_1h` slot)
+    /// retires those rows rather than replaying them as truth.
+    #[serde(default, rename = "TokensCacheW1h")]
+    tokens_cache_w_1h: i64,
     #[serde(default, rename = "TokensCacheR")]
     tokens_cache_r: i64,
     #[serde(default, rename = "GapsSec")]
@@ -1511,6 +1517,8 @@ struct GoMetrics {
     upstream_priced_output: i64,
     #[serde(default, rename = "UpstreamPricedCacheW")]
     upstream_priced_cache_w: i64,
+    #[serde(default, rename = "UpstreamPricedCacheW1h")]
+    upstream_priced_cache_w_1h: i64,
     #[serde(default, rename = "UpstreamPricedCacheR")]
     upstream_priced_cache_r: i64,
     /// rm-436/rm-437: parse-time disclosure counters (pi journals),
@@ -3416,6 +3424,7 @@ impl GoMetrics {
             tokens_output: metrics.tokens_output,
             tokens_reasoning: metrics.tokens_reasoning,
             tokens_cache_w: metrics.tokens_cache_w,
+            tokens_cache_w_1h: metrics.tokens_cache_w_1h,
             tokens_cache_r: metrics.tokens_cache_r,
             gaps_sec: metrics.gaps_sec.clone(),
             model_used: metrics.model_used.clone(),
@@ -3441,6 +3450,7 @@ impl GoMetrics {
             upstream_priced_input: metrics.upstream_priced_input,
             upstream_priced_output: metrics.upstream_priced_output,
             upstream_priced_cache_w: metrics.upstream_priced_cache_w,
+            upstream_priced_cache_w_1h: metrics.upstream_priced_cache_w_1h,
             upstream_priced_cache_r: metrics.upstream_priced_cache_r,
             disclosure_counters: metrics.disclosure_counters.clone(),
             wire_metadata: metrics.wire_metadata.clone(),
@@ -3473,6 +3483,7 @@ impl GoMetrics {
             tokens_output: self.tokens_output,
             tokens_reasoning: self.tokens_reasoning,
             tokens_cache_w: self.tokens_cache_w,
+            tokens_cache_w_1h: self.tokens_cache_w_1h,
             tokens_cache_r: self.tokens_cache_r,
             timestamps: Vec::new(),
             gaps_sec: self.gaps_sec,
@@ -3505,6 +3516,7 @@ impl GoMetrics {
             upstream_priced_input: self.upstream_priced_input,
             upstream_priced_output: self.upstream_priced_output,
             upstream_priced_cache_w: self.upstream_priced_cache_w,
+            upstream_priced_cache_w_1h: self.upstream_priced_cache_w_1h,
             upstream_priced_cache_r: self.upstream_priced_cache_r,
             disclosure_counters: self.disclosure_counters,
             wire_metadata: self.wire_metadata,

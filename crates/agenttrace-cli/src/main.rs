@@ -2765,6 +2765,14 @@ fn render_test_match_json() -> anyhow::Result<String> {
             // (billed at the disclosed fallback), 0.0 = published $0;
             // the *_billed fields carry the exact rate a cache-token
             // turn bills at including that fallback.
+            //
+            // rm-164 arm 3 (run d2775a7e): the >1h-tier cache-write
+            // slot joins the same row shape — null when the row
+            // publishes no >1h rate (1h-tier writes then bill at the
+            // 5m billed rate, flagged by cache_write_1h_5m_assumed
+            // and disclosed per session as
+            // cache_write_1h_5m_assumed).
+            let (cw_1h_billed, cw_1h_assumed) = price.cache_write_1h_billed();
             serde_json::json!({
                 "model": model,
                 "input_per_million": price.input,
@@ -2773,6 +2781,9 @@ fn render_test_match_json() -> anyhow::Result<String> {
                 "cache_read_per_million": price.cr,
                 "cache_write_billed_per_million": price.cache_write_billed().0,
                 "cache_read_billed_per_million": price.cache_read_billed().0,
+                "cache_write_1h_per_million": price.cw_1h,
+                "cache_write_1h_billed_per_million": cw_1h_billed,
+                "cache_write_1h_5m_assumed": cw_1h_assumed,
                 "flex_input_per_million": price.input_flex,
                 "flex_output_per_million": price.output_flex,
                 "flex_cache_write_per_million": price.cw_flex,

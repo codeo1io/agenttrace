@@ -196,20 +196,34 @@ fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_publishe
     // --- census: the population is answerable without code -------
     // The override rows merged into the bundled catalog, so absolute
     // totals are bundle-vintage-dependent (pricing_snapshot_hygiene.rs
-    // pins those). What this binary pins: the classification itself —
-    // exactly the absent rows it contributes (the 2026-10-08 bundle
-    // zero-fills, so every bundled row classifies published), and the
-    // per-class sum invariant absent + zero + nonzero == total.
+    // pins those). What this binary pins: the classification itself.
+    // Since the 2026-10-20 rm-176 reconcile (run d2775a7e) the bundle
+    // carries genuinely-absent cache rows — the vendored census pins
+    // 3354 absent cw / 2229 absent cr bundle-side — so this process's
+    // absent counts are those plus exactly the one absent row this
+    // test's override contributes, and the per-class sum invariant
+    // absent + zero + nonzero == total still holds for every class,
+    // including the rm-164 arm-3 1h tier (215 published bundle rows:
+    // the anthropic families and their bedrock/vertex/gateway
+    // shadows; a sanctioned-refresh-only mover like the others).
     let census: CacheRateCensus = cache_rate_census();
     assert_eq!(
-        census.cache_read_absent, 1,
-        "the absent-rate row must classify as absent: {census:?}"
+        census.cache_read_absent, 2230,
+        "2229 vendored + this test's one absent row: {census:?}"
     );
-    // rm-1508: the only absent rates in this process's catalog are
-    // the ones this test's override contributes — the 2026-10-08
-    // bundle zero-fills and upstream even publishes an explicit $0 on
-    // the gpt-5.3-codex rows, so the vend row is Some(0.0) too.
-    assert_eq!(census.cache_write_absent, 1);
+    assert_eq!(
+        census.cache_write_absent, 3355,
+        "3354 vendored (the 3 qwen3.7-max twins publish a write rate on the \
+         final 2026-10-20 live basis; -4 merged with their base-row winner) \
+         + this test's one absent row: {census:?}"
+    );
+    assert_eq!(census.cache_write_1h_published, 215);
+    assert_eq!(census.cache_write_1h_zero, 0);
+    assert_eq!(
+        census.cache_write_1h_absent + census.cache_write_1h_zero + census.cache_write_1h_published,
+        census.models,
+        "the 1h class must partition the catalog like the 5m classes"
+    );
     assert_eq!(
         census.cache_read_absent + census.cache_read_zero + census.cache_read_published,
         census.models,
@@ -219,6 +233,53 @@ fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_publishe
         census.cache_write_absent + census.cache_write_zero + census.cache_write_published,
         census.models,
         "write classes must partition the catalog"
+    );
+
+    // --- rm-164 arm 3: the 1h cache-write tier (run d2775a7e) ------
+    // claude-sonnet-4-5 publishes a DISTINCT >1h cache-write rate
+    // ($6.00/M against the $3.75/M 5m rate in the 2026-10-20 bundle):
+    // the 1h class must bill at its own rate, while a row publishing
+    // no 1h rate (rm1508-absent) bills 1h tokens at its 5m billed
+    // rate and fires the loud 5m-assumed disclosure.
+    let mut sonnet_event = usage_event("claude-sonnet-4-5", 1_000_000, 1_000_000, 200_000, 0);
+    sonnet_event
+        .usage
+        .insert("cache_write_1h_tokens".to_string(), 300_000);
+    let sonnet_metrics = analyze(&[sonnet_event], "claude-sonnet-4-5");
+    assert_eq!(
+        sonnet_metrics.cost_estimated, 20.55,
+        "3 in + 15 out + 0.2×3.75 cw + 0.3×6.00 cw1h"
+    );
+    assert!(
+        !sonnet_metrics
+            .disclosure_counters
+            .contains_key("cache_write_1h_5m_assumed"),
+        "a row publishing a 1h rate must not fire the 5m-assumed disclosure"
+    );
+
+    let mut absent_event = usage_event("rm1508-absent", 1_000_000, 1_000_000, 200_000, 0);
+    absent_event
+        .usage
+        .insert("cache_write_1h_tokens".to_string(), 300_000);
+    let absent_1h_metrics = analyze(&[absent_event], "rm1508-absent");
+    assert_eq!(
+        absent_1h_metrics.cost_estimated, 46.25,
+        "10 in + 30 out + 0.2×12.5 cw + 0.3×12.5 cw1h (5m-assumed)"
+    );
+    assert_eq!(
+        absent_1h_metrics
+            .disclosure_counters
+            .get("cache_write_1h_5m_assumed"),
+        Some(&1),
+        "the 5m-assumed fallback must fire the disclosure exactly once"
+    );
+    // The probe lane answers the tier from the same string (rm-1508
+    // probe discipline): a published 1h rate renders, never a silent
+    // gap.
+    let rendered = agenttrace_core::render_test_match();
+    assert!(
+        rendered.contains("cw1h=$  6.00/M"),
+        "the 1h rate must render in the probe: {rendered}"
     );
 
     // --- hygiene: no scratch left behind --------------------------
