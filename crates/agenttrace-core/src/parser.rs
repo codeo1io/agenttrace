@@ -1482,10 +1482,8 @@ struct AntigravityModelId {
 /// pricing still rides the catalog's normal lookup, so a mapped id whose
 /// model is absent from the catalog degrades through the disclosed
 /// unknown-model path rather than this table inventing a price.
-const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
-    (1417, "gemini-4-argon"),
-    (1050, "gemini-3.1-flash-lite"),
-];
+const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] =
+    &[(1417, "gemini-4-argon"), (1050, "gemini-3.1-flash-lite")];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
 /// number, but the float spelling stringifies as `"1417.0"` — the
@@ -9059,7 +9057,7 @@ fn push_salvage_null(
 /// rm-2045 (run f5db7fd4 cycle 1, assess a53de7ec M2): rescue a JSONL
 /// line whose strict/lenient parse failed ONLY because of a number the
 /// `f64` realm cannot carry — an out-of-range literal (`1e400`, a
-/// >308-digit integer, anything that parses to ±∞) or a bare
+/// \>308-digit integer, anything that parses to ±∞) or a bare
 /// non-finite token JavaScript emits and JSON forbids (`NaN`,
 /// `Infinity`, `-Infinity`, plus the Python-flavored `inf`/`-inf`).
 /// Walks the line with a string-aware byte scanner (string contents
@@ -9072,9 +9070,7 @@ fn push_salvage_null(
 /// and the counters if it still fails, so the counters can never name
 /// a drop that did not actually happen. The distinct-key cap of
 /// rm-594 applies at the mint site.
-pub(crate) fn salvage_out_of_range_numbers(
-    line: &str,
-) -> Option<(String, Vec<(String, usize)>)> {
+pub(crate) fn salvage_out_of_range_numbers(line: &str) -> Option<(String, Vec<(String, usize)>)> {
     let bytes = line.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut drops: Vec<(String, usize)> = Vec::new();
@@ -9132,23 +9128,47 @@ pub(crate) fn salvage_out_of_range_numbers(
                 i += 1;
             }
             b'N' if line[i..].starts_with("NaN") => {
-                push_salvage_null(&mut out, &mut drops, last_key.as_deref(), "number_not_finite");
+                push_salvage_null(
+                    &mut out,
+                    &mut drops,
+                    last_key.as_deref(),
+                    "number_not_finite",
+                );
                 pending_key = None;
                 i += 3;
             }
             b'I' if line[i..].starts_with("Infinity") => {
-                push_salvage_null(&mut out, &mut drops, last_key.as_deref(), "number_not_finite");
+                push_salvage_null(
+                    &mut out,
+                    &mut drops,
+                    last_key.as_deref(),
+                    "number_not_finite",
+                );
                 pending_key = None;
                 i += 8;
             }
             b'i' if line[i..].starts_with("inf") => {
-                push_salvage_null(&mut out, &mut drops, last_key.as_deref(), "number_not_finite");
+                push_salvage_null(
+                    &mut out,
+                    &mut drops,
+                    last_key.as_deref(),
+                    "number_not_finite",
+                );
                 pending_key = None;
                 i += 3;
             }
             b'-' if line[i..].starts_with("-Infinity") || line[i..].starts_with("-inf") => {
-                let width = if line[i..].starts_with("-Infinity") { 9 } else { 4 };
-                push_salvage_null(&mut out, &mut drops, last_key.as_deref(), "number_not_finite");
+                let width = if line[i..].starts_with("-Infinity") {
+                    9
+                } else {
+                    4
+                };
+                push_salvage_null(
+                    &mut out,
+                    &mut drops,
+                    last_key.as_deref(),
+                    "number_not_finite",
+                );
                 pending_key = None;
                 i += width;
             }

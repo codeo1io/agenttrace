@@ -31,7 +31,7 @@ pub use diagnostics::{
     loop_waste_percent, needs_attention, predict_cost_anomaly, session_findings,
     unpriced_model_census, ContextUtilization, CostAlert, Diagnostics, FindingEvidence,
     FixSuggestion, InspectFirst, LargeParam, LoopCost, LoopCostBasis, LoopFingerprint,
-    SessionFinding, StuckPattern, ToolLatency, TraceStep, UnusedTool, UnpricedModelRow,
+    SessionFinding, StuckPattern, ToolLatency, TraceStep, UnpricedModelRow, UnusedTool,
 };
 pub use filters::{
     matches_numeric_filter, parse_finite_f64, parse_numeric_filter, parse_numeric_filter_i32,
@@ -1215,12 +1215,9 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         let (mut value, salvaged_drops) = match parser::parse_jsonl_value_lenient(line) {
             Some(value) => (value, None),
             None => {
-                match parser::salvage_out_of_range_numbers(line).and_then(
-                    |(repaired, drops)| {
-                        parser::parse_jsonl_value_lenient(&repaired)
-                            .map(|value| (value, drops))
-                    },
-                ) {
+                match parser::salvage_out_of_range_numbers(line).and_then(|(repaired, drops)| {
+                    parser::parse_jsonl_value_lenient(&repaired).map(|value| (value, drops))
+                }) {
                     Some((value, drops)) => (value, Some(drops)),
                     None => {
                         count_skip("unparseable_line", &mut line_skips);
@@ -3170,9 +3167,7 @@ fn quota_cutoff(sessions: &[Session]) -> (Option<DateTime<Utc>>, usize, usize) {
                 // cutoff and still overflow the window subtraction.
                 .find(|ts| plausible(**ts))
                 .copied()
-                .or_else(|| {
-                    parse_ts(&session.metrics.session_start).filter(|ts| plausible(*ts))
-                });
+                .or_else(|| parse_ts(&session.metrics.session_start).filter(|ts| plausible(*ts)));
             if let Some(ts) = rescued {
                 cutoff = Some(cutoff.map_or(ts, |c: DateTime<Utc>| c.max(ts)));
             }
@@ -4257,11 +4252,17 @@ mod tests {
             "both salvageable lines recover"
         );
         assert_eq!(
-            session.metrics.line_skips.get("number_out_of_range:junk_metric"),
+            session
+                .metrics
+                .line_skips
+                .get("number_out_of_range:junk_metric"),
             Some(&1)
         );
         assert_eq!(
-            session.metrics.line_skips.get("number_not_finite:py_metric"),
+            session
+                .metrics
+                .line_skips
+                .get("number_not_finite:py_metric"),
             Some(&1)
         );
         assert_eq!(
@@ -5527,11 +5528,7 @@ mod quota_tests {
                 &["2026-10-12T10:00:00Z", "2026-10-12T10:30:00Z"],
                 1.52,
             ),
-            quota_session(
-                "hostile-past",
-                &["-262143-01-01T00:00:00"],
-                9.99,
-            ),
+            quota_session("hostile-past", &["-262143-01-01T00:00:00"], 9.99),
         ];
         let report = quota_report(&sessions);
         assert_eq!(
@@ -5571,11 +5568,7 @@ mod quota_tests {
         // of `quota_future_only_corpus_discloses_null_cutoff`, and the
         // exact shape of the assess PoC corpus floor.jsonl (whose
         // pre-fix fate was a panic, rc101).
-        let sessions = vec![quota_session(
-            "floor",
-            &["-262143-01-01T00:00:00"],
-            5.0,
-        )];
+        let sessions = vec![quota_session("floor", &["-262143-01-01T00:00:00"], 5.0)];
         let report = quota_report(&sessions);
         assert!(
             report["corpus"]["cutoff_utc"].is_null(),

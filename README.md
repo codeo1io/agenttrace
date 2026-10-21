@@ -459,6 +459,19 @@ still carries, and a corpus with no plausible instant renders undefined
 windows with the discard count rather than a future-anchored zero-spend
 masquerade.
 
+The mirror holds at the past edge: timestamps before 1970-01-01 UTC are
+discarded at a hostile-stamp guard (rm-2040) — a pre-epoch stamp is meter
+corruption, not calendar truth (none of the tools this corpus models
+recorded anything before 1970), and one such line used to anchor the
+cutoff at chrono's minimum representable instant, where the window
+arithmetic overflows — a 94-byte journal stamped `-262143-01-01` panicked
+`--quota` and the overview SVG instead of reporting. The guard's effect is
+disclosed the same way: `corpus.past_discarded_sessions` counts the
+discarded sessions, `corpus.cutoff_basis` names the floor, a discarded
+session falls back to the oldest at-or-after-floor instant it still
+carries, and a corpus with no plausible instant renders undefined windows
+with the discard count rather than crashing.
+
 `-f json` emits the stable `agenttrace.quota/1` schema; the default text
 lane summarizes the same numbers. The view is corpus-scope: `--range`,
 `--sample`, and the history flags do not apply to it and are refused

@@ -1254,13 +1254,15 @@ pub fn unpriced_model_census(sessions: &[Session]) -> Vec<UnpricedModelRow> {
     }
     let mut census: Vec<UnpricedModelRow> = rows
         .into_iter()
-        .map(|(model, (sessions, tokens_input, tokens_output))| UnpricedModelRow {
-            model: model.to_string(),
-            sessions,
-            tokens_input,
-            tokens_output,
-            priced_base_hint: crate::pricing::specific_base_for_unpriced(model),
-        })
+        .map(
+            |(model, (sessions, tokens_input, tokens_output))| UnpricedModelRow {
+                model: model.to_string(),
+                sessions,
+                tokens_input,
+                tokens_output,
+                priced_base_hint: crate::pricing::specific_base_for_unpriced(model),
+            },
+        )
         .collect();
     census.sort_by(|a, b| {
         b.sessions

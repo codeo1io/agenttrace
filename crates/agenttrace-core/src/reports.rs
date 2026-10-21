@@ -973,10 +973,7 @@ fn card_label(value: &str, max_chars: usize) -> String {
 /// caller instead; the anchor is the newest at-or-after-floor day, so
 /// the subtraction can never overflow for any trailing window the
 /// card renders.
-fn card_daily_series(
-    sessions: &[Session],
-    days: usize,
-) -> (Vec<(chrono::NaiveDate, f64)>, usize) {
+fn card_daily_series(sessions: &[Session], days: usize) -> (Vec<(chrono::NaiveDate, f64)>, usize) {
     let floor = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid date");
     let mut latest: Option<chrono::NaiveDate> = None;
     let mut past_discarded: usize = 0;
