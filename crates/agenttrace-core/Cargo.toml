@@ -21,3 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+
+[dev-dependencies]
+# rm-2201: shared per-invocation-unique temp-path helper for the test
+# mods (parser.rs, statusline.rs) and the integration tests
+# (tests/discovery_contract.rs). Dev-only; ships in no artifact.
+agenttrace-testkit = { version = "0.0.0-dev", path = "../agenttrace-testkit" }

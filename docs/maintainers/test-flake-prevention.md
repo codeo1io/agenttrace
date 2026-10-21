@@ -213,3 +213,24 @@ authority. Numbered 11 at mint: sibling run 5c144613's unlanded band
 every `.git` ancestor; pristine-base triage) — theirs keep 9–10 at any
 fold where both land, this stays 11 (the Rule 7→8 renumber precedent).
 
+## Rule 12 — never a fixed-name path under a shared tempdir (2026-10-20)
+
+Run ed693341 cycle-4 assess (attempt ade37cda) proved the class live, and
+the implement batch (rm-2201) reproduced it deterministically: two
+concurrent invocations of the same test binary against one TMPDIR failed
+13/30 pairs on the pristine tree (panics in
+`discovery_contract.rs`' cline dedup pin), green 30/30 after. The
+mechanism: a fixed fixture name (`temp_dir().join("agenttrace-rm1881-…")`)
+plus a leading `remove_dir_all` means process B deletes process A's
+in-flight fixture mid-assertion — env-var reentry, CI retries, and any
+parallel harness trigger it, and it will look like a flaky assertion, not
+a fixture bug. Rule: test fixtures derive per-invocation-unique paths from
+the shared helper `agenttrace_testkit::unique_temp_path(prefix)` (pid +
+atomic counter — the rm-1065 `fixture_dir()` and `temp_root()` precedents
+generalized); a fixed name under `std::env::temp_dir()` is a defect, not a
+style choice. Diagnose per rm-1889's flake-ledger protocol: capture the
+failing pair with `--nocapture` BEFORE rerunning anything, and fix only on
+a reproducer — the red-first 13/30 figure is only meaningful because it
+was banked before the helper landed. Numbered 12 at mint per the Rule
+7→8 renumber precedent.
+

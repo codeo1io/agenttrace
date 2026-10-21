@@ -692,7 +692,12 @@ fn journal_descriptor_is_live(path: &Path, journal: &fs::File) -> bool {
 /// open-file-description lock is not reentrant across handles) calls the
 /// locked core directly; no production caller needs the standalone entry
 /// yet, so it is exercised by the journal race fixtures.
-#[allow(dead_code)]
+///
+/// rm-2202: the allowance is scoped to non-test builds only — the eight
+/// test callers (the journal race fixtures below) keep the entry live in
+/// every `cfg(test)` compile, so a rename or signature drift fails the
+/// test build instead of silently rotting behind `#[allow(dead_code)]`.
+#[cfg_attr(not(test), allow(dead_code))]
 fn compact_statusline_capture_under(path: &Path, keep_under: u64) -> io::Result<()> {
     let journal = open_locked_journal(path)?;
     let compacted = compact_statusline_capture_locked(path, keep_under);
@@ -2431,6 +2436,7 @@ mod tests {
         assert_eq!(sanitize_output_document("a\nb\tc\rd"), "a\nb\tc\rd");
     }
     use super::*;
+    use agenttrace_testkit::unique_temp_path;
 
     fn budget_capture(session: &str, captured_at: i64, cost: f64) -> CapturedStatusline {
         let payload: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
@@ -4506,7 +4512,7 @@ mod tests {
         // on B8, one byte into the 3-byte char.
         let contents = format!("{head}\u{4E2D}{tail}");
         let total = head_len + 3 + tail_len;
-        let journal = std::env::temp_dir().join("agenttrace-test-statusline-torn-utf8.jsonl");
+        let journal = unique_temp_path("agenttrace-test-statusline-torn-utf8.jsonl");
         std::fs::write(&journal, contents.as_bytes()).unwrap();
         let stats = statusline_journal_stats(&journal);
         // The walk advances B8 -> AD and stops at the '\n' (an ASCII start):

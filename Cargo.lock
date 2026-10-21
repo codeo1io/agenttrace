@@ -25,6 +25,7 @@ dependencies = [
 name = "agenttrace-core"
 version = "0.0.0-dev"
 dependencies = [
+ "agenttrace-testkit",
  "anyhow",
  "chrono",
  "rusqlite",
@@ -34,6 +35,10 @@ dependencies = [
  "thiserror 2.0.21",
  "ureq",
 ]
+
+[[package]]
+name = "agenttrace-testkit"
+version = "0.0.0-dev"
 
 [[package]]
 name = "agenttrace-tui"

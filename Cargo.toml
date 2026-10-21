@@ -3,6 +3,7 @@ members = [
   "crates/agenttrace-core",
   "crates/agenttrace-cli",
   "crates/agenttrace-tui",
+  "crates/agenttrace-testkit",
 ]
 resolver = "2"
 

@@ -5,6 +5,7 @@ use agenttrace_core::{
     load_sessions_with_progress, parse_file, render_waste_report, search_sessions,
     session_cache_path, session_capability, total_tokens, LoadOptions,
 };
+use agenttrace_testkit::unique_temp_path;
 use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
@@ -4718,8 +4719,8 @@ fn cline_cli_canonical_store_discovers_envelope_sessions_end_to_end() {
     // `hooks.jsonl` as noise. Only the transcript is admitted now, and
     // its metrics fold through the role walk (rm-1884 identity basis,
     // re-anchored at integration off the batch's rm-600 net fold).
-    let home = std::env::temp_dir().join("agenttrace-rm1881-canonical-home");
-    let cache = std::env::temp_dir().join("agenttrace-rm1881-canonical-cache");
+    let home = unique_temp_path("agenttrace-rm1881-canonical-home");
+    let cache = unique_temp_path("agenttrace-rm1881-canonical-cache");
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cache);
     let root = home.join(".cline").join("data").join("sessions");
@@ -4786,7 +4787,7 @@ fn cline_cli_store_root_relocates_via_env_and_empty_falls_back() {
     // rm-1881 arm b: `CLINE_SESSION_DATA_DIR` relocates the store root
     // (OpenClaw `OPENCLAW_STATE_DIR` discipline); a trimmed-empty value
     // falls back to the default root rather than a relative "" walk.
-    let home = std::env::temp_dir().join("agenttrace-rm1881-relocate-home");
+    let home = unique_temp_path("agenttrace-rm1881-relocate-home");
     let _ = fs::remove_dir_all(&home);
     let relocated = home.join("elsewhere").join("sessions");
     seed_cline_cli_session(
@@ -4795,9 +4796,9 @@ fn cline_cli_store_root_relocates_via_env_and_empty_falls_back() {
         &cline_cli_envelope(400, 100, 0, 0, 0.02),
     );
 
-    let cache_a = std::env::temp_dir().join("agenttrace-rm1881-relocate-cache-a");
-    let cache_b = std::env::temp_dir().join("agenttrace-rm1881-relocate-cache-b");
-    let cache_c = std::env::temp_dir().join("agenttrace-rm1881-relocate-cache-c");
+    let cache_a = unique_temp_path("agenttrace-rm1881-relocate-cache-a");
+    let cache_b = unique_temp_path("agenttrace-rm1881-relocate-cache-b");
+    let cache_c = unique_temp_path("agenttrace-rm1881-relocate-cache-c");
     for cache in [&cache_a, &cache_b, &cache_c] {
         let _ = fs::remove_dir_all(cache);
     }
@@ -4847,8 +4848,8 @@ fn cline_cli_gates_reject_generic_messages_json_false_positives() {
     // under the canonical root with the `<dirName>.messages.json` name
     // AND the `session.json` manifest present — never by bare filename.
     // Hostile corpus: same extension and near-shape names, no session.
-    let home = std::env::temp_dir().join("agenttrace-rm1881-hostile-home");
-    let cache = std::env::temp_dir().join("agenttrace-rm1881-hostile-cache");
+    let home = unique_temp_path("agenttrace-rm1881-hostile-home");
+    let cache = unique_temp_path("agenttrace-rm1881-hostile-cache");
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cache);
 
@@ -4923,8 +4924,8 @@ fn cline_canonical_session_supersedes_legacy_task_dir_duplicate() {
     // and the legacy VS Code tasks root renders ONE session — the
     // canonical store wins (the rm-338 alias dedup only collapses path
     // aliases, not the same id materialized under two roots).
-    let home = std::env::temp_dir().join("agenttrace-rm1881-dedup-home");
-    let cache = std::env::temp_dir().join("agenttrace-rm1881-dedup-cache");
+    let home = unique_temp_path("agenttrace-rm1881-dedup-home");
+    let cache = unique_temp_path("agenttrace-rm1881-dedup-cache");
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cache);
 
@@ -5023,8 +5024,8 @@ fn cline_cli_gates_hold_for_relative_custom_dir_paths() {
         rel
     }
 
-    let home = std::env::temp_dir().join("agenttrace-rm1881-relative-home");
-    let cache = std::env::temp_dir().join("agenttrace-rm1881-relative-cache");
+    let home = unique_temp_path("agenttrace-rm1881-relative-home");
+    let cache = unique_temp_path("agenttrace-rm1881-relative-cache");
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cache);
     let root = home.join(".cline").join("data").join("sessions");
@@ -5096,8 +5097,8 @@ fn cline_cli_gates_hold_for_a_relative_env_store_root() {
         rel
     }
 
-    let home = std::env::temp_dir().join("agenttrace-rm1881-relenv-home");
-    let cache = std::env::temp_dir().join("agenttrace-rm1881-relenv-cache");
+    let home = unique_temp_path("agenttrace-rm1881-relenv-home");
+    let cache = unique_temp_path("agenttrace-rm1881-relenv-cache");
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cache);
     let root = home.join(".cline").join("data").join("sessions");

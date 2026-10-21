@@ -9700,6 +9700,7 @@ fn session_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agenttrace_testkit::unique_temp_path;
     use std::fs;
 
     #[test]
@@ -12114,7 +12115,7 @@ mod tests {
         // 0 tokens / $0.00 into every rollup. The carrier folds through
         // a session_meta usage event (pi `recorded_cost_usd` precedent),
         // keeping the text-event stream byte-identical.
-        let dir = std::env::temp_dir().join("agenttrace-rm1430-carriers");
+        let dir = unique_temp_path("agenttrace-rm1430-carriers");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("ui_messages.json"),
@@ -12412,7 +12413,7 @@ mod tests {
         // rm-1430 zero-delta pin: a metrics-free store renders exactly
         // as before the carrier work — no session_meta event, no cline
         // counters, zero usage.
-        let dir = std::env::temp_dir().join("agenttrace-rm1430-zero-delta");
+        let dir = unique_temp_path("agenttrace-rm1430-zero-delta");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("ui_messages.json"),
@@ -12457,7 +12458,7 @@ mod tests {
         // $0.00 with zero disclosures. The envelope has no
         // `type`/`say` entries, so the ui lane rm-1430 wired cannot
         // reach it.
-        let dir = std::env::temp_dir().join("agenttrace-rm1881-role-walk");
+        let dir = unique_temp_path("agenttrace-rm1881-role-walk");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("1784094124598_rruoq.messages.json");
         std::fs::write(
@@ -12517,7 +12518,7 @@ mod tests {
         // metrics are never overwritten or dropped), and unknown
         // additive fields (a newer contract field) are tolerated
         // without counting as parse loss.
-        let dir = std::env::temp_dir().join("agenttrace-rm1881-retries");
+        let dir = unique_temp_path("agenttrace-rm1881-retries");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("retry-s1.messages.json");
         std::fs::write(
@@ -12573,7 +12574,7 @@ mod tests {
         // walk renders exactly as pre-fix — estimated tokens (the
         // estimation path is untouched), no session_meta usage event,
         // no cline counters.
-        let dir = std::env::temp_dir().join("agenttrace-rm1881-zero-delta");
+        let dir = unique_temp_path("agenttrace-rm1881-zero-delta");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("plain-s2.messages.json");
         std::fs::write(
@@ -12701,7 +12702,7 @@ mod tests {
         // keeps claude-only keys (parentUuid here), so is_qwen_code_jsonl must
         // not claim the file and parse_claude_code_jsonl must — the session
         // classifies claude_code instead of qwen_code.
-        let dir = std::env::temp_dir().join("agenttrace-rm345-claude-stripped");
+        let dir = unique_temp_path("agenttrace-rm345-claude-stripped");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stripped.jsonl");
         std::fs::write(
@@ -12743,7 +12744,7 @@ mod tests {
         // overview normalizes it to the "unknown" bucket), and a
         // journal with no gitBranch parses with an empty branch —
         // never a panic, never an invented value.
-        let dir = std::env::temp_dir().join("agenttrace-rm585-git-branch");
+        let dir = unique_temp_path("agenttrace-rm585-git-branch");
         std::fs::create_dir_all(&dir).unwrap();
 
         let branchy = dir.join("branchy.jsonl");
