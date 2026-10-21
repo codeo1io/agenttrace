@@ -97,6 +97,8 @@ RATE_FIELDS = (
     "output_cost_per_token",
     "cache_creation_input_token_cost",
     "cache_read_input_token_cost",
+    "output_cost_per_reasoning_token",
+    "explicit_cache_read_input_token_cost",
 )
 
 
@@ -156,13 +158,36 @@ def trim(data):
         # upstream drops them; live-side rows get the distinction, and
         # tests/pricing_snapshot_hygiene.rs pins the counts so any
         # movement is conscious.
+        # rm-164 arm 3 (1h cache-write truth, run d2775a7e): the 1h-tier
+        # cache-write rate joins the omit-when-absent contract — same
+        # loop, same semantics (explicit 0 stays a published $0).
         for cache_field in (
             "cache_creation_input_token_cost",
+            "cache_creation_input_token_cost_above_1hr",
             "cache_read_input_token_cost",
         ):
             rate = value.get(cache_field)
             if isinstance(rate, (int, float)) and not isinstance(rate, bool):
                 entry[cache_field] = rate
+        # Reasoning/explicit-cache cost axes (rm-176 + rm-2249, run
+        # dc3f8ff2 cycle 6): reasoning output bills at its own per-token
+        # rate wherever upstream publishes one (71 models 2026-10-21;
+        # qwen-plus class at 3.3x the standard output rate — pricing the
+        # axis at the output rate was the mispricing), and explicit-cache
+        # reads bill at their own rate on the 3 providers that publish
+        # one. Same contract as the cache family: the key rides along
+        # only when the source carries a number; an explicit 0 stays a
+        # published $0. Absent means not-published — the Rust ingest
+        # then bills reasoning at the standard output rate under the
+        # `reasoning_billed_at_output` disclosure (pricing.rs), never a
+        # silent free pass.
+        for axis_field in (
+            "output_cost_per_reasoning_token",
+            "explicit_cache_read_input_token_cost",
+        ):
+            axis_rate = value.get(axis_field)
+            if isinstance(axis_rate, (int, float)) and not isinstance(axis_rate, bool):
+                entry[axis_field] = axis_rate
         max_input = value.get("max_input_tokens")
         if isinstance(max_input, int) and max_input > 0:
             entry["max_input_tokens"] = max_input

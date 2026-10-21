@@ -18,7 +18,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-21";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -70,6 +70,40 @@ pub struct Price {
     /// $0 and bills as $0 (rm-1508).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cr: Option<f64>,
+    /// 1h-tier (above-1h) cache-write rate per million tokens (LiteLLM
+    /// `cache_creation_input_token_cost_above_1hr`, rm-164 arm 3):
+    /// the rate a `cacheWrite1h` block bills at. `None` = not
+    /// published — 1h-tier writes then bill at the 5m billed rate
+    /// ([`Price::cache_write_billed`]) with the loud
+    /// `cache_write_1h_5m_assumed` disclosure, never a silent $0;
+    /// `Some(0.0)` = a published $0. Same absent-vs-zero contract as
+    /// `cw`/`cr` (rm-1508).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cw_1h: Option<f64>,
+    /// Reasoning (thinking) output rate per million tokens (LiteLLM
+    /// `output_cost_per_reasoning_token`, rm-2250): the rate the
+    /// reasoning subset of `output_tokens` bills at. The parser keeps
+    /// `reasoning_tokens` a breakdown of the inclusive output class
+    /// (CU-20 convention), so billing splits the subset out: when the
+    /// row publishes this rate the reasoning subset bills at it, and
+    /// when it publishes none (`None`) reasoning bills at the
+    /// standard output rate with the `reasoning_billed_at_output`
+    /// disclosure, never a silent $0. `Some(0.0)` = a published $0
+    /// (free reasoning output) and bills as $0. Same absent-vs-zero
+    /// contract as `cw`/`cr` (rm-1508).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_reasoning: Option<f64>,
+    /// Explicit-cache read rate per million tokens (LiteLLM
+    /// `explicit_cache_read_input_token_cost`, rm-2249): the rate an
+    /// explicitly-written cache entry reads at — a distinct tier from
+    /// the implicit `cr` above (qwen3.7-max publishes both). `None` =
+    /// not published; explicit-cache reads then price only through
+    /// the dedicated `explicit_cache_read_input_tokens` usage class,
+    /// which no parser lane emits yet (rate ingested, pinned and
+    /// drift-checked now so the day a source carries the class it
+    /// prices at the published tier instead of the input rate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ecr: Option<f64>,
     /// Vendor context window in input tokens (LiteLLM
     /// `max_input_tokens`), when the catalog entry carries one (rm-231).
     /// Absent on override files and pre-2026-10 snapshots; `skip`
@@ -145,6 +179,35 @@ impl Price {
             None => (self.input * CACHE_WRITE_FALLBACK_MULTIPLE, true),
         }
     }
+
+    /// The >1h-tier cache-write rate a session bills at, and whether
+    /// it is the 5m-assumed fallback (rm-164 arm 3): a row that
+    /// publishes no `*_above_1hr` rate bills its 1h-tier writes at
+    /// the 5m billed rate (itself possibly the rm-1508 absent-rate
+    /// fallback). Callers must disclose via
+    /// `cache_write_1h_5m_assumed` when the flag is set and 1h-tier
+    /// tokens were billed.
+    pub fn cache_write_1h_billed(&self) -> (f64, bool) {
+        match self.cw_1h {
+            Some(rate) => (rate, false),
+            None => (self.cache_write_billed().0, true),
+        }
+    }
+
+    /// rm-2250: the output-class rate reasoning (thinking) tokens
+    /// bill at, and whether it is the CU-20 assumption. The parser
+    /// keeps `reasoning_tokens` a breakdown of the inclusive output
+    /// class, so callers split the subset: `(rate, false)` = the
+    /// published reasoning tier bills it; `(output rate, true)` = no
+    /// published tier, reasoning bills at the standard output rate
+    /// and the caller fires the `reasoning_billed_at_output`
+    /// disclosure when reasoning tokens were actually billed.
+    pub fn reasoning_output_billed(&self) -> (f64, bool) {
+        match self.out_reasoning {
+            Some(rate) => (rate, false),
+            None => (self.output, true),
+        }
+    }
 }
 
 /// rm-1508: whether pricing cache tokens at `price` bills any
@@ -189,6 +252,21 @@ struct LiteLlmModel {
     cache_write_cost: Option<f64>,
     #[serde(default, rename = "cache_read_input_token_cost")]
     cache_read_cost: Option<f64>,
+    // rm-164 arm 3: the >1h-tier cache-write rate — its OWN class,
+    // never folded into the 5m rate above (Anthropic prices it
+    // separately: $6.00/M against $3.75/M on sonnet-4-5).
+    #[serde(default, rename = "cache_creation_input_token_cost_above_1hr")]
+    cache_write_cost_1h: Option<f64>,
+    // rm-2250: the reasoning-output rate — its OWN class, never
+    // folded into `output_cost` (qwen-plus publishes $1.2/M reasoning
+    // against $4.0/M output; folding the subset at the output rate
+    // overstated reasoning turns by 3.33x).
+    #[serde(default, rename = "output_cost_per_reasoning_token")]
+    output_cost_reasoning: Option<f64>,
+    // rm-2249: explicit-cache read rate — distinct from the implicit
+    // `cache_read_cost` tier above (qwen3.7-max publishes both).
+    #[serde(default, rename = "explicit_cache_read_input_token_cost")]
+    explicit_cache_read_cost: Option<f64>,
     #[serde(default)]
     mode: String,
     #[serde(default, rename = "litellm_provider")]
@@ -645,6 +723,13 @@ pub struct CacheRateCensus {
     pub cache_write_published: usize,
     pub cache_write_zero: usize,
     pub cache_write_absent: usize,
+    /// rm-164 arm 3 (run d2775a7e): the >1h-tier cache-write rate
+    /// census. `absent` is the NORMAL state — most rows publish no
+    /// `*_above_1hr` rate — so the pin worth keeping is the published
+    /// count moving ONLY through a sanctioned refresh.
+    pub cache_write_1h_published: usize,
+    pub cache_write_1h_zero: usize,
+    pub cache_write_1h_absent: usize,
     pub cache_read_published: usize,
     pub cache_read_zero: usize,
     pub cache_read_absent: usize,
@@ -668,6 +753,11 @@ pub fn cache_rate_census() -> CacheRateCensus {
                 Some(rate) if rate > 0.0 => census.cache_read_published += 1,
                 Some(_) => census.cache_read_zero += 1,
                 None => census.cache_read_absent += 1,
+            }
+            match price.cw_1h {
+                Some(rate) if rate > 0.0 => census.cache_write_1h_published += 1,
+                Some(_) => census.cache_write_1h_zero += 1,
+                None => census.cache_write_1h_absent += 1,
             }
         }
         census
@@ -749,8 +839,18 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
         // rate never collides with a published one, including $0.
         // This changes the identity for every catalog (one-time
         // warm-cache invalidation), which is the point: the fallback
-        // reprices.
-        for slot in [price.cw, price.cr] {
+        // reprices. The rm-164 arm-3 `cw_1h` slot rides the same loop
+        // (run d2775a7e): a catalog gaining or losing a 1h-tier rate
+        // must reprice too. So do the rm-2250/rm-2249 reasoning and
+        // explicit-cache tiers (run dc3f8ff2 cycle 6): a gained or
+        // lost tier must reprice cached sessions.
+        for slot in [
+            price.cw,
+            price.cr,
+            price.cw_1h,
+            price.out_reasoning,
+            price.ecr,
+        ] {
             hash = fnv1a(&[slot.is_some() as u8], hash);
             if let Some(value) = slot {
                 hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
@@ -1096,6 +1196,21 @@ pub fn render_test_match() -> String {
                 "      cache: rates not published — billed at input-rate fallback (cr) / 1.25× input (cw), disclosed per session\n",
             );
         }
+        // rm-164 arm 3 (run d2775a7e): the 1h-tier cache-write rate —
+        // the rate a `cacheWrite1h` block bills at. A published rate
+        // renders plainly; a row publishing none bills its 1h-tier
+        // writes at the 5m billed rate and SAYS so (the
+        // cache_write_1h_5m_assumed disclosure), never a silent gap.
+        let (cw_1h, cw_1h_assumed) = p.cache_write_1h_billed();
+        out.push_str(&format!(
+            "      1h: cw1h=${:>6.2}/M{}\n",
+            cw_1h,
+            if cw_1h_assumed {
+                " (5m-assumed — no published >1h rate, disclosed per session)"
+            } else {
+                ""
+            }
+        ));
         // rm-610 (+ cycle-2 ultrafast rider): disclose the tier rates
         // when the row carries them, so the rate a
         // `service_tier: "flex"`/`"ultrafast"` turn bills at is
@@ -1128,6 +1243,12 @@ pub(crate) fn token_cost(
     output: i64,
     cache_write: i64,
     cache_read: i64,
+    // rm-2250: the reasoning subset of `output` (CU-20 breakdown) —
+    // clamped to the inclusive output class so a hostile breakdown
+    // larger than its total can never price a negative standard
+    // output share. Callers without a reasoning breakdown pass 0
+    // (byte-identical to the pre-rm-2250 formula).
+    reasoning: i64,
     model: &str,
     service_tier: Option<&str>,
 ) -> f64 {
@@ -1138,9 +1259,18 @@ pub(crate) fn token_cost(
     // models price identically.
     let (cw, _) = price.cache_write_billed();
     let (cr, _) = price.cache_read_billed();
+    // rm-2250: absent reasoning rates bill the subset at the standard
+    // output rate (the CU-20 assumption this estimate lane has always
+    // made — the in-memory per-block arm fires the
+    // `reasoning_billed_at_output` disclosure for it; this aggregate
+    // helper has no per-turn counters, so the assumption is the
+    // documented behavior here).
+    let (reasoning_rate, _) = price.reasoning_output_billed();
+    let reasoning = reasoning.clamp(0, output.max(0));
     round4(
         input as f64 / 1e6 * price.input
-            + output as f64 / 1e6 * price.output
+            + (output - reasoning) as f64 / 1e6 * price.output
+            + reasoning as f64 / 1e6 * reasoning_rate
             + cache_write as f64 / 1e6 * cw
             + cache_read as f64 / 1e6 * cr,
     )
@@ -1829,6 +1959,8 @@ fn validate_override_price(model: &str, price: &Price) -> Result<(), String> {
     for (field, value) in [
         ("cw", price.cw),
         ("cr", price.cr),
+        ("out_reasoning", price.out_reasoning),
+        ("ecr", price.ecr),
         ("input_flex", price.input_flex),
         ("output_flex", price.output_flex),
         ("cw_flex", price.cw_flex),
@@ -1986,6 +2118,16 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             // never a silent $0.
             cw: model.cache_write_cost.map(|rate| rate * 1e6),
             cr: model.cache_read_cost.map(|rate| rate * 1e6),
+            // rm-164 arm 3: the 1h-tier slot scales like the standard
+            // cache rates and keeps the same absent-vs-published-$0
+            // contract (an explicit 0 stays `Some(0.0)`).
+            cw_1h: model.cache_write_cost_1h.map(|rate| rate * 1e6),
+            // rm-2250 / rm-2249: the reasoning and explicit-cache
+            // tiers scale like the standard rates and keep the same
+            // absent-vs-published-$0 contract (an explicit 0 stays
+            // `Some(0.0)`).
+            out_reasoning: model.output_cost_reasoning.map(|rate| rate * 1e6),
+            ecr: model.explicit_cache_read_cost.map(|rate| rate * 1e6),
             // Vendor context window and deprecation date ride along
             // when the source carries them (rm-231 / rm-419); zero or
             // empty values normalize to absent.
@@ -2022,7 +2164,12 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             // rm-1508: an absent cache rate (None) is legitimate — only
             // a present-but-non-finite rate poisons the entry.
             && price.cw.is_none_or(f64::is_finite)
-            && price.cr.is_none_or(f64::is_finite))
+            && price.cr.is_none_or(f64::is_finite)
+            && price.cw_1h.is_none_or(f64::is_finite)
+            // rm-2250/rm-2249: same rule for the reasoning and
+            // explicit-cache tiers.
+            && price.out_reasoning.is_none_or(f64::is_finite)
+            && price.ecr.is_none_or(f64::is_finite))
         {
             continue;
         }
@@ -3333,6 +3480,121 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_tier_bills_the_subset_at_the_published_rate() {
+        // rm-2250 (run dc3f8ff2 cycle 6): dashscope publishes a
+        // reasoning tier PRICIER than its output rate ($4.0/M vs
+        // $1.2/M on qwen-plus). CU-20 folded the reasoning subset into
+        // the output rate and undercounted the turn by 1.7x on a
+        // 30%-reasoning workload. The subset splits: (output −
+        // reasoning)·out + reasoning·tier.
+        let price = lookup_price("dashscope/qwen-plus-2025-04-28");
+        assert_eq!(price.out_reasoning, Some(4.0), "tier must be pinned");
+        assert!((price.output - 1.2).abs() < 1e-12);
+        // 700k standard output + 300k reasoning: $0.84 + $1.20 = $2.04.
+        assert_eq!(
+            token_cost(
+                0,
+                1_000_000,
+                0,
+                0,
+                300_000,
+                "dashscope/qwen-plus-2025-04-28",
+                None
+            ),
+            2.04
+        );
+        // Pre-rm-2250 behavior (reasoning billed at the output rate):
+        // a flat 1M·$1.2 = $1.20 — the undercount this fix removes.
+        assert_eq!(
+            token_cost(
+                0,
+                1_000_000,
+                0,
+                0,
+                0,
+                "dashscope/qwen-plus-2025-04-28",
+                None
+            ),
+            1.2
+        );
+    }
+
+    #[test]
+    fn absent_reasoning_rate_keeps_cu20_identity() {
+        // rm-2250: rows without a published tier keep CU-20 exactly —
+        // a reasoning breakdown bills identically with or without the
+        // breakdown (the whole output class at the output rate).
+        let no_tier = "claude-haiku-5-5";
+        assert_eq!(lookup_price(no_tier).out_reasoning, None);
+        assert_eq!(
+            token_cost(1000, 500, 0, 0, 200, no_tier, None),
+            token_cost(1000, 500, 0, 0, 0, no_tier, None)
+        );
+    }
+
+    #[test]
+    fn reasoning_breakdown_clamps_to_the_output_class() {
+        // rm-2250: `reasoning_tokens` is a breakdown of the inclusive
+        // output class. A hostile breakdown larger than its total
+        // clamps to the total — it can never price a negative standard
+        // output share nor pay twice for one token.
+        let model = "dashscope/qwen-plus-2025-04-28";
+        assert_eq!(
+            token_cost(0, 1_000_000, 0, 0, 2_000_000, model, None),
+            token_cost(0, 1_000_000, 0, 0, 1_000_000, model, None)
+        );
+    }
+
+    #[test]
+    fn reasoning_output_billed_flags_the_cu20_assumption() {
+        // rm-2250: the helper mirrors the rm-1508 tier helpers —
+        // (rate, false) for a published tier, (output rate, true) when
+        // the assumption fires.
+        let published = lookup_price("dashscope/qwen-plus-2025-04-28");
+        assert_eq!(published.reasoning_output_billed(), (4.0, false));
+        let absent = lookup_price("claude-haiku-5-5");
+        assert_eq!(
+            absent.reasoning_output_billed(),
+            (absent.output, true)
+        );
+    }
+
+    #[test]
+    fn explicit_cache_tier_is_ingested_and_distinct_from_implicit() {
+        // rm-2249: qwen3.7-max publishes an explicit-cache read tier
+        // ($0.25/M) distinct from BOTH the implicit cache-read tier
+        // ($0.5/M) and the input rate ($2.5/M). The rate rides the
+        // catalog now so the day a parser emits the token class it
+        // prices at the published tier instead of the input rate.
+        let price = lookup_price("dashscope/qwen3.7-max");
+        assert_eq!(price.ecr, Some(0.25));
+        assert_eq!(price.cr.unwrap(), 0.5);
+        assert!((price.input - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bundled_snapshot_reasoning_and_explicit_cache_axes_are_pinned() {
+        // rm-2250/rm-2249 hygiene: the 2026-10-21 bundle carries 68
+        // reasoning-tier rows and 3 explicit-cache rows. A refresh that
+        // drops the extraction axes (update-snapshot.sh stops pinning
+        // the fields) goes red here instead of silently repricing the
+        // tier models at CU-20.
+        let snapshot: serde_json::Value =
+            serde_json::from_str(PRICING_SNAPSHOT_JSON).expect("bundled snapshot parses");
+        let map = snapshot.as_object().expect("snapshot is an object");
+        let reasoning = map
+            .values()
+            .filter(|v| v.get("output_cost_per_reasoning_token").is_some())
+            .count();
+        let explicit = map
+            .values()
+            .filter(|v| v.get("explicit_cache_read_input_token_cost").is_some())
+            .count();
+        assert_eq!(reasoning, 68, "reasoning-tier rows in the bundle");
+        assert_eq!(explicit, 3, "explicit-cache rows in the bundle");
+    }
+
+    #[test]
     fn bundled_snapshot_prices_claude_haiku_5_5_exactly() {
         // rm-006 cycle-1 refresh: claude-haiku-5-5 was missing from the
         // 2026-10-04 bundle, so a 1000-in/500-out haiku-5-5 session fell
@@ -3354,12 +3616,12 @@ mod tests {
         // disclosed as $0.0004 by token_cost's 4-decimal rounding.
         // (Tier argument `None`: the tier-less world is byte-identical.)
         assert_eq!(
-            token_cost(1000, 500, 0, 0, "claude-haiku-5-5", None),
+            token_cost(1000, 500, 0, 0, 0, "claude-haiku-5-5", None),
             0.0004
         );
         // The fallback this replaces charged 30x more on this workload.
         assert_eq!(
-            token_cost(1000, 500, 0, 0, "nonexistent-model-xyz", None),
+            token_cost(1000, 500, 0, 0, 0, "nonexistent-model-xyz", None),
             0.0105
         );
     }
@@ -3990,10 +4252,15 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // The window pin (rm-231's motivating case). Moved with the
+        // rm-176 reconcile of 2026-10-20 (run d2775a7e): upstream
+        // revised the row to a 200k window and set deprecation_date
+        // 2026-11-30 — the refresh carries both; the pin holds the
+        // refreshed vendor value so a future refresh moving it again
+        // is a conscious diff, not drift.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 
@@ -4532,15 +4799,15 @@ mod tests {
         // the $18.00 the disclosed $3/$15 default billed the SAME
         // traffic (the PoC's measured ~4.86x understatement ratio).
         assert_eq!(
-            token_cost(1_000_000, 1_000_000, 0, 0, "gpt-daybreak-red-latest", None),
+            token_cost(1_000_000, 1_000_000, 0, 0, 0, "gpt-daybreak-red-latest", None),
             87.5
         );
         assert_eq!(
-            token_cost(1_000_000, 1_000_000, 0, 0, "gpt-daybreak-blue-latest", None),
+            token_cost(1_000_000, 1_000_000, 0, 0, 0, "gpt-daybreak-blue-latest", None),
             24.0
         );
         assert_eq!(
-            token_cost(1_000_000, 1_000_000, 0, 0, "zzz-unknown-xyz", None),
+            token_cost(1_000_000, 1_000_000, 0, 0, 0, "zzz-unknown-xyz", None),
             18.0,
             "the fallback default's own 1M+1M bill — the understated side of the 4.86x ratio"
         );
@@ -4549,8 +4816,8 @@ mod tests {
     #[test]
     fn token_cost_applies_the_tier() {
         // 1M input, nothing else: $2 at flex, $4 at standard.
-        assert_eq!(token_cost(1_000_000, 0, 0, 0, "gpt-5.6", Some("flex")), 2.0);
-        assert_eq!(token_cost(1_000_000, 0, 0, 0, "gpt-5.6", None), 4.0);
+        assert_eq!(token_cost(1_000_000, 0, 0, 0, 0, "gpt-5.6", Some("flex")), 2.0);
+        assert_eq!(token_cost(1_000_000, 0, 0, 0, 0, "gpt-5.6", None), 4.0);
     }
 
     #[test]

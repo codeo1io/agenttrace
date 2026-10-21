@@ -113,12 +113,14 @@ def kept(catalog):
     return out
 
 # Field-comparison rule: drift is only meaningful on the fields the builder actually PINS
-# (update-snapshot.sh writes input/output per-token costs, cache_creation/cache_read costs, mode,
+# (update-snapshot.sh writes input/output per-token costs, cache_creation/cache_read costs, the
+# reasoning/explicit-cache axis rates, mode,
 # litellm_provider, max_input_tokens when int>0, deprecation_date when set). Comparing anything
 # else (e.g. max_output_tokens, which the builder drops) produced 2,802 phantom diffs — diagnosed
 # 2026-10-05 against the real bundle; see the cycle-1 record.
 COST_FIELDS = ["input_cost_per_token", "output_cost_per_token",
-               "cache_creation_input_token_cost", "cache_read_input_token_cost"]
+               "cache_creation_input_token_cost", "cache_read_input_token_cost",
+               "output_cost_per_reasoning_token", "explicit_cache_read_input_token_cost"]
 
 try:
     live_kept, bundle_kept = kept(live), kept(bundle)

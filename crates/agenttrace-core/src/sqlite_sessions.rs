@@ -20,6 +20,10 @@ struct RoleCounts {
 #[derive(Debug, Default)]
 struct SqliteSessionAgg {
     id: String,
+    /// rm-2250: reasoning-token subtotal (CU-20 breakdown of
+    /// `output_tokens`) aggregated from per-turn maps — drives the
+    /// split-rate estimate in `session_from_sqlite_agg`.
+    reasoning_tokens: i64,
     /// rm-791: opencode `session.parent_id` — links a subagent child row
     /// to its parent row within the same database. `None` for hermes rows
     /// and for opencode schemas without the column.
@@ -1298,13 +1302,21 @@ fn add_opencode_sqlite_message_tokens(
     let Some(tokens) = doc.get("tokens").and_then(Value::as_object) else {
         return false;
     };
-    let (input, output, cache_read, cache_write) = add_opencode_tokens_from_map(agg, tokens);
+    let (input, output, cache_read, cache_write, reasoning) =
+        add_opencode_tokens_from_map(agg, tokens);
     let mut model = opencode_sqlite_message_model(doc);
     if model.is_empty() {
         model = agg.model.clone();
     }
     if !model.is_empty() {
-        agg.usage_cost += token_cost_raw(input, output, cache_write, cache_read, &model);
+        agg.usage_cost += token_cost_raw(
+            input,
+            output,
+            cache_write,
+            cache_read,
+            reasoning,
+            &model,
+        );
         agg.usage_cost_set = true;
     }
     true
@@ -1317,9 +1329,17 @@ fn add_opencode_step_finish_tokens(
     let Some(tokens) = doc.get("tokens").and_then(Value::as_object) else {
         return;
     };
-    let (input, output, cache_read, cache_write) = add_opencode_tokens_from_map(agg, tokens);
+    let (input, output, cache_read, cache_write, reasoning) =
+        add_opencode_tokens_from_map(agg, tokens);
     if !agg.model.is_empty() {
-        agg.usage_cost += token_cost_raw(input, output, cache_write, cache_read, &agg.model);
+        agg.usage_cost += token_cost_raw(
+            input,
+            output,
+            cache_write,
+            cache_read,
+            reasoning,
+            &agg.model,
+        );
         agg.usage_cost_set = true;
     }
 }
@@ -1327,11 +1347,14 @@ fn add_opencode_step_finish_tokens(
 fn add_opencode_tokens_from_map(
     agg: &mut SqliteSessionAgg,
     tokens: &serde_json::Map<String, Value>,
-) -> (i64, i64, i64, i64) {
+) -> (i64, i64, i64, i64, i64) {
     let cache = tokens.get("cache").and_then(Value::as_object);
     let input = number_as_i64(tokens.get("input"));
-    let output =
-        number_as_i64(tokens.get("output")).saturating_add(number_as_i64(tokens.get("reasoning")));
+    // rm-2250: keep the CU-20 fold (output stays reasoning-inclusive)
+    // but also surface the reasoning subtotal so the estimate can
+    // split it at the row's published reasoning tier.
+    let reasoning = number_as_i64(tokens.get("reasoning")).max(0);
+    let output = number_as_i64(tokens.get("output")).saturating_add(reasoning);
     let cache_read = cache
         .map(|cache| number_as_i64(cache.get("read")))
         .unwrap_or(0);
@@ -1343,9 +1366,10 @@ fn add_opencode_tokens_from_map(
     // negative in release.
     agg.input_tokens = agg.input_tokens.saturating_add(input);
     agg.output_tokens = agg.output_tokens.saturating_add(output);
+    agg.reasoning_tokens = agg.reasoning_tokens.saturating_add(reasoning);
     agg.cache_read_tokens = agg.cache_read_tokens.saturating_add(cache_read);
     agg.cache_write_tokens = agg.cache_write_tokens.saturating_add(cache_write);
-    (input, output, cache_read, cache_write)
+    (input, output, cache_read, cache_write, reasoning)
 }
 
 fn opencode_tool_failed(doc: &serde_json::Map<String, Value>) -> bool {
@@ -1539,6 +1563,11 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         agg.output_tokens,
         agg.cache_write_tokens,
         agg.cache_read_tokens,
+        // rm-2250: the reasoning breakdown aggregated from per-turn
+        // maps — per-turn opencode reasoning sits folded inside
+        // `output_tokens` and is NOT double-counted; the split keeps
+        // the class total: (output − reasoning)·out + reasoning·tier.
+        agg.reasoning_tokens,
         &model,
         // rm-610: stored sqlite sessions carry no per-turn tier;
         // aggregate estimates stay at standard rates.
@@ -1668,9 +1697,27 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     }
 }
 
-fn token_cost_raw(input: i64, output: i64, cache_write: i64, cache_read: i64, model: &str) -> f64 {
+fn token_cost_raw(
+    input: i64,
+    output: i64,
+    cache_write: i64,
+    cache_read: i64,
+    // rm-2250: reasoning subset of `output` (CU-20 breakdown) —
+    // bills at the row's published reasoning tier when it carries
+    // one, else the standard output rate.
+    reasoning: i64,
+    model: &str,
+) -> f64 {
     // rm-610: sqlite stores carry no per-turn service tier; standard rates.
-    token_cost(input, output, cache_write, cache_read, model, None)
+    token_cost(
+        input,
+        output,
+        cache_write,
+        cache_read,
+        reasoning,
+        model,
+        None,
+    )
 }
 
 fn unix_seconds_rfc3339(value: f64) -> String {

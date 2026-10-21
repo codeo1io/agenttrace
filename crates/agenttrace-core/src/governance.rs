@@ -95,6 +95,9 @@ pub struct TokenBreakdown {
     /// thinking count.
     pub reasoning: i64,
     pub cache_write: i64,
+    /// rm-164 arm 3 (run d2775a7e): the >1h-tier cache-write class —
+    /// priced at its own rate, never inside `cache_write`.
+    pub cache_write_1h: i64,
     pub cache_read: i64,
     pub total: i64,
 }
@@ -104,6 +107,10 @@ pub struct PriceBreakdown {
     pub input: f64,
     pub output: f64,
     pub cache_write: f64,
+    /// rm-164 arm 3 (run d2775a7e): the billed >1h-tier cache-write
+    /// rate — the row's published `cw_1h`, or the 5m billed rate when
+    /// the row publishes none (disclosed in the source arm).
+    pub cache_write_1h: f64,
     pub cache_read: f64,
     pub total: f64,
 }
@@ -141,6 +148,7 @@ struct RecordedCostBasis {
     input: i64,
     output: i64,
     cache_write: i64,
+    cache_write_1h: i64,
     cache_read: i64,
     usd: f64,
 }
@@ -151,6 +159,7 @@ impl RecordedCostBasis {
             input: metrics.upstream_priced_input,
             output: metrics.upstream_priced_output,
             cache_write: metrics.upstream_priced_cache_w,
+            cache_write_1h: metrics.upstream_priced_cache_w_1h,
             cache_read: metrics.upstream_priced_cache_r,
             usd: metrics.upstream_cost_usd,
         }
@@ -232,10 +241,16 @@ fn current_cost_estimate(
     // source arm so the census carries the decision.
     let (cw_billed, cw_absent) = rate.cache_write_billed();
     let (cr_billed, cr_absent) = rate.cache_read_billed();
+    // rm-164 arm 3: the 1h tier re-prices at its own billed class —
+    // the drift check must not fold 1h tokens into the 5m rate
+    // (that would false-flag every 1h-heavy session after the
+    // estimate formula gained the class).
+    let (cw_1h_billed, cw_1h_assumed) = rate.cache_write_1h_billed();
     let rates = PriceBreakdown {
         input: rate.input,
         output: rate.output,
         cache_write: cw_billed,
+        cache_write_1h: cw_1h_billed,
         cache_read: cr_billed,
         total: 0.0,
     };
@@ -244,6 +259,13 @@ fn current_cost_estimate(
         output: round4(tokens.output.saturating_sub(recorded.output) as f64 / 1e6 * rate.output),
         cache_write: round4(
             tokens.cache_write.saturating_sub(recorded.cache_write) as f64 / 1e6 * cw_billed,
+        ),
+        cache_write_1h: round4(
+            tokens
+                .cache_write_1h
+                .saturating_sub(recorded.cache_write_1h) as f64
+                / 1e6
+                * cw_1h_billed,
         ),
         cache_read: round4(
             tokens.cache_read.saturating_sub(recorded.cache_read) as f64 / 1e6 * cr_billed,
@@ -259,6 +281,7 @@ fn current_cost_estimate(
         components.input
             + components.output
             + components.cache_write
+            + components.cache_write_1h
             + components.cache_read
             + recorded.usd,
     );
@@ -276,6 +299,16 @@ fn current_cost_estimate(
     // fallback, so published-rate rows render unchanged.
     let source = if cw_absent || cr_absent {
         format!("{source}; cache rates not published — fallback (cr=input, cw=1.25×input)")
+    } else {
+        source
+    };
+    // rm-164 arm 3: carry the 5m-assumed 1h tier the same way — only
+    // when the row publishes no >1h rate AND the session actually
+    // billed 1h-tier tokens does the note say so (the estimate-side
+    // `cache_write_1h_5m_assumed` disclosure is gated identically);
+    // token-less rows keep their source string unchanged.
+    let source = if cw_1h_assumed && tokens.cache_write_1h > 0 {
+        format!("{source}; 1h cache-write rate not published — 1h tier billed at the 5m rate")
     } else {
         source
     };
@@ -803,6 +836,7 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         output: session.metrics.tokens_output,
         reasoning: session.metrics.tokens_reasoning,
         cache_write: session.metrics.tokens_cache_w,
+        cache_write_1h: session.metrics.tokens_cache_w_1h,
         cache_read: session.metrics.tokens_cache_r,
         total: total_tokens(session),
     };
@@ -817,6 +851,7 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         || session.metrics.upstream_priced_input > 0
         || session.metrics.upstream_priced_output > 0
         || session.metrics.upstream_priced_cache_w > 0
+        || session.metrics.upstream_priced_cache_w_1h > 0
         || session.metrics.upstream_priced_cache_r > 0;
     // rm-610: a single-model session that mixed service tiers priced
     // each usage block on the tier that produced it (the analyze()

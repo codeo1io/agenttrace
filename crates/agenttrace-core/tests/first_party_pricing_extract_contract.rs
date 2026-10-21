@@ -114,16 +114,24 @@ fn extract_ids_are_specific_prices_not_fallbacks() {
 fn reseller_qualified_ids_keep_their_reseller_rows() {
     // The session itself scoped these ids to a reseller lane: the
     // extract must NOT override an explicit qualification (it speaks
-    // only for the bare first-party form).
-    let openrouter = lookup_price("openrouter/claude-sonnet-4-20250514");
+    // only for the bare first-party form). Re-scoped with the rm-176
+    // reconcile of 2026-10-20 (run d2775a7e): upstream retired every
+    // openrouter/* key in the key-space restructure, so the qualified
+    // id no longer has its own raw row and the raw-first ladder's
+    // base-model collapse now ends at the lowest-priority reseller
+    // winner still standing — vercel_ai_gateway/anthropic/claude-sonnet-4
+    // (same list input rate, 3.0/M). The property under test is
+    // unchanged: a reseller lane still serves and attributes at a
+    // reseller, and the extract still does not hijack it.
+    let reseller = lookup_price("openrouter/claude-sonnet-4-20250514");
     assert!(
-        (openrouter.input - 3.0).abs() < 1e-9,
-        "the openrouter row forwards the same list input rate"
+        (reseller.input - 3.0).abs() < 1e-9,
+        "the reseller-collapse winner forwards the same list input rate"
     );
     assert_eq!(
         provider_for("openrouter/claude-sonnet-4-20250514").as_deref(),
-        Some("openrouter"),
-        "a reseller-qualified id attributes to the reseller"
+        Some("vercel_ai_gateway"),
+        "a reseller-qualified id attributes to the reseller lane that serves it"
     );
     assert!(
         !pricing_source_for("openrouter/claude-sonnet-4-20250514")

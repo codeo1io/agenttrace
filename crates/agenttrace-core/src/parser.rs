@@ -1564,7 +1564,18 @@ struct AntigravityModelId {
 /// pricing still rides the catalog's normal lookup, so a mapped id whose
 /// model is absent from the catalog degrades through the disclosed
 /// unknown-model path rather than this table inventing a price.
-const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[(1417, "gemini-4-argon")];
+// ccusage 20.0.x numeric map (checked first-hand 2026-10-21, run dc3f8ff2
+// cycle 6, rm-1533): upstream maps the whole `1417..=1419` block to
+// gemini-4-argon and `1050` to gemini-3.1-flash-lite. The array keeps
+// one entry per id (no range syntax) — the block rides as three rows.
+// 1416 stays unmapped: upstream leaves it unknown and the table never
+// invents an id.
+const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
+    (1417, "gemini-4-argon"),
+    (1418, "gemini-4-argon"),
+    (1419, "gemini-4-argon"),
+    (1050, "gemini-3.1-flash-lite"),
+];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
 /// number, but the float spelling stringifies as `"1417.0"` — the
