@@ -17,6 +17,20 @@ use agenttrace_core::{
     SvgCardTheme,
 };
 
+mod support;
+
+// rm-1954 extension (run 2cdd052c cycle 7): every catalog-consuming
+// test below renders cards whose footer/legend derive from the pricing
+// catalog, and the catalog PREFERS a machine cache
+// (`~/.cache/agenttrace/pricing.json`, pricing.rs load_pricing_cache)
+// over this repository's bundled snapshot — on a fleet host with a
+// machine cache the golden footer flips ("(bundled); 215 of 4443" →
+// "(cached catalog); 291 of 3938") and the pin fails for reasons the
+// repository cannot control. Every consumer runs under
+// `support::with_isolated_pricing_env`, pinning the card to the
+// bundled catalog the goldens were generated from. The theme-parser
+// test reads no catalog and stays bare.
+
 const GOLDEN_DIR: &str = "tests/fixtures/svg-card";
 
 fn card_of(theme: SvgCardTheme) -> String {
@@ -27,6 +41,10 @@ fn card_of(theme: SvgCardTheme) -> String {
 
 #[test]
 fn golden_bytes_are_pinned_for_the_demo_corpus() {
+    support::with_isolated_pricing_env(golden_bytes_are_pinned_for_the_demo_corpus_body);
+}
+
+fn golden_bytes_are_pinned_for_the_demo_corpus_body() {
     for (name, theme) in [
         ("demo-auto.svg", SvgCardTheme::Auto),
         ("demo-dark.svg", SvgCardTheme::Dark),
@@ -47,6 +65,10 @@ fn golden_bytes_are_pinned_for_the_demo_corpus() {
 
 #[test]
 fn rendering_twice_from_a_fresh_aggregation_is_byte_identical() {
+    support::with_isolated_pricing_env(rendering_twice_from_a_fresh_aggregation_is_byte_identical_body);
+}
+
+fn rendering_twice_from_a_fresh_aggregation_is_byte_identical_body() {
     let first = card_of(SvgCardTheme::Auto);
     let second = card_of(SvgCardTheme::Auto);
     assert_eq!(first, second, "card output is not byte-deterministic");
@@ -56,6 +78,10 @@ fn rendering_twice_from_a_fresh_aggregation_is_byte_identical() {
 
 #[test]
 fn hostile_model_and_project_names_render_inert() {
+    support::with_isolated_pricing_env(hostile_model_and_project_names_render_inert_body);
+}
+
+fn hostile_model_and_project_names_render_inert_body() {
     let mut sessions = demo_sessions().expect("demo sessions parse");
     sessions[0].metrics.model_used = "\"><script>alert(1)</script>".to_string();
     sessions[1].metrics.model_used = "<img src=x onerror=alert(2)>".to_string();
@@ -80,6 +106,10 @@ fn hostile_model_and_project_names_render_inert() {
 
 #[test]
 fn control_bytes_never_reach_the_document_raw() {
+    support::with_isolated_pricing_env(control_bytes_never_reach_the_document_raw_body);
+}
+
+fn control_bytes_never_reach_the_document_raw_body() {
     let mut sessions = demo_sessions().expect("demo sessions parse");
     sessions[0].metrics.model_used = "ctrl\x01\x02model".to_string();
     let overview = compute_overview(&sessions);
@@ -96,6 +126,10 @@ fn control_bytes_never_reach_the_document_raw() {
 
 #[test]
 fn auto_theme_embeds_media_query_and_light_fallback() {
+    support::with_isolated_pricing_env(auto_theme_embeds_media_query_and_light_fallback_body);
+}
+
+fn auto_theme_embeds_media_query_and_light_fallback_body() {
     let auto = card_of(SvgCardTheme::Auto);
     assert!(
         auto.contains("@media (prefers-color-scheme: dark)"),
@@ -125,6 +159,10 @@ fn auto_theme_embeds_media_query_and_light_fallback() {
 
 #[test]
 fn themes_render_distinct_documents() {
+    support::with_isolated_pricing_env(themes_render_distinct_documents_body);
+}
+
+fn themes_render_distinct_documents_body() {
     let light = card_of(SvgCardTheme::Light);
     let dark = card_of(SvgCardTheme::Dark);
     let auto = card_of(SvgCardTheme::Auto);
@@ -135,6 +173,10 @@ fn themes_render_distinct_documents() {
 
 #[test]
 fn empty_corpus_renders_a_valid_card() {
+    support::with_isolated_pricing_env(empty_corpus_renders_a_valid_card_body);
+}
+
+fn empty_corpus_renders_a_valid_card_body() {
     let overview = compute_overview(&[]);
     let card = report_overview_svg(&overview, &[], SvgCardTheme::Auto);
     assert!(card.starts_with("<?xml version=\"1.0\""));
@@ -151,6 +193,10 @@ fn empty_corpus_renders_a_valid_card() {
 
 #[test]
 fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
+    support::with_isolated_pricing_env(sparkline_is_anchored_to_the_corpus_clock_not_wall_clock_body);
+}
+
+fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock_body() {
     let mut sessions = demo_sessions().expect("demo sessions parse");
     let anchor = chrono::DateTime::parse_from_rfc3339("2026-01-20T12:00:00Z")
         .expect("fixed anchor")
@@ -185,6 +231,10 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
 
 #[test]
 fn with_context_carries_the_disclosure_footer() {
+    support::with_isolated_pricing_env(with_context_carries_the_disclosure_footer_body);
+}
+
+fn with_context_carries_the_disclosure_footer_body() {
     let sessions = demo_sessions().expect("demo sessions parse");
     let overview = compute_overview(&sessions);
     let health = agenttrace_core::data_health(&sessions, sessions.len(), 0);
@@ -220,6 +270,10 @@ fn theme_parser_rejects_unknown_values() {
 
 #[test]
 fn daily_series_survives_the_warm_cache_replay_shape() {
+    support::with_isolated_pricing_env(daily_series_survives_the_warm_cache_replay_shape_body);
+}
+
+fn daily_series_survives_the_warm_cache_replay_shape_body() {
     // rm-911 (assess F1): `SessionMetrics::timestamps` is
     // #[serde(skip)], so the warm session cache replays sessions with
     // an EMPTY timestamp list while `session_start`/`session_end`

@@ -5685,6 +5685,36 @@ fn claude_org_identity(obj: &JsonObject) -> Option<(String, String)> {
     Some((org.to_string(), email.to_string()))
 }
 
+/// rm-601 id-class split (ccusage #1838 parity, cycle 7 "count-truth
+/// restoration"): which key a Claude Code journal row folds under.
+///
+/// Real Anthropic message ids (`msg_…`, and `resp_…` requestless
+/// responses per ccusage #1934/#1935) ARE the stream identity — they
+/// fold by bare id across timestamps. Every other non-empty spelling
+/// is a gateway/proxy placeholder, and two DISTINCT messages inside
+/// one session can reuse it, so those fold per (id, timestamp): an
+/// exact duplicate row or a streaming re-emission (same id, same
+/// timestamp) still folds, while distinct messages (same id, later
+/// timestamp) each count. Structurally disjoint variants — a wire id
+/// can never alias another message's key.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum MessageFoldKey {
+    Real(String),
+    Placeholder { id: String, ts: String },
+}
+
+/// The fold key for one journal row (see [`MessageFoldKey`]).
+fn claude_message_fold_key(message_id: &str, ts: &str) -> MessageFoldKey {
+    if message_id.starts_with("msg_") || message_id.starts_with("resp_") {
+        MessageFoldKey::Real(message_id.to_string())
+    } else {
+        MessageFoldKey::Placeholder {
+            id: message_id.to_string(),
+            ts: ts.to_string(),
+        }
+    }
+}
+
 fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
@@ -5696,14 +5726,22 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // 5-block stream tripled the reported output). Exact duplicates
     // collapse to the same values; id-less messages keep the legacy
     // behavior of counting every emission (pinned by fixture).
+    // rm-601 id-class split (ccusage #1838 parity, cycle 7): keying on
+    // the bare id also undercounted GATEWAYS — a proxy can reuse one
+    // placeholder spelling across distinct messages, and the bare-id
+    // fold max-merged them into one. Real ids (`msg_`/`resp_`) keep
+    // folding by bare id; other non-empty spellings fold per
+    // (id, timestamp) via [`MessageFoldKey`] — same id + same timestamp
+    // still folds (duplicate rows, same-timestamp re-emissions), a
+    // growing re-emission keeps the max, distinct messages each count.
     // rm-834: the fold is not usage-only — a re-emission is a full
     // SNAPSHOT of the message, so the per-id assistant event is replaced
     // in place by the latest (richest) snapshot and the meta slot's
     // timestamp advances to the last emission. Turns, tool calls and
     // session_end/duration therefore describe the message once, at its
     // final state — instead of once per streamed block.
-    let mut usage_by_message: BTreeMap<String, usize> = BTreeMap::new();
-    let mut assistant_by_message: BTreeMap<String, usize> = BTreeMap::new();
+    let mut usage_by_message: BTreeMap<MessageFoldKey, usize> = BTreeMap::new();
+    let mut assistant_by_message: BTreeMap<MessageFoldKey, usize> = BTreeMap::new();
     // rm-300 reserved-namespace arm (run 57c491338818): the fold keys for
     // journal-supplied tool_use_ids and for synthesized id-less rows are
     // structurally disjoint enum variants — a hostile wire id literally
@@ -5715,13 +5753,17 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         Wire(String),
         Idless(usize),
     }
-    let mut tool_results_by_message: BTreeSet<(String, ToolResultFoldKey)> = BTreeSet::new();
+    let mut tool_results_by_message: BTreeSet<(MessageFoldKey, ToolResultFoldKey)> =
+        BTreeSet::new();
     let mut tool_result_refolds: BTreeMap<String, i64> = BTreeMap::new();
     // rm-406 (dated 2026-10-07 arm): message ids whose usage.iterations[]
     // array was already mined — the streaming re-emission problem rm-601
     // solved for top-level usage applies to the iterations array verbatim
-    // (every re-emission repeats it in full).
-    let mut iterations_mined: BTreeSet<String> = BTreeSet::new();
+    // (every re-emission repeats it in full). The miner rides the
+    // same rm-601 id-class split as the usage fold — a placeholder id
+    // reused by distinct gateway messages never swallows the second
+    // message's advisor array.
+    let mut iterations_mined: BTreeSet<MessageFoldKey> = BTreeSet::new();
     let mut cwd = String::new();
     // rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
     // org identity capture — `$.session.identity` rides any line
@@ -5840,7 +5882,8 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 }
                 if let Some(usage) = message.get("usage").and_then(usage_from_value) {
                     let message_id = string(message.get("id")).unwrap_or("");
-                    match usage_by_message.get(message_id).copied() {
+                    let fold_key = claude_message_fold_key(message_id, &ts);
+                    match usage_by_message.get(&fold_key).copied() {
                         Some(index) => {
                             for (key, value) in usage {
                                 let slot = events[index].usage.entry(key).or_insert(0);
@@ -5857,7 +5900,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         }
                         None => {
                             if !message_id.is_empty() {
-                                usage_by_message.insert(message_id.to_string(), events.len());
+                                usage_by_message.insert(fold_key, events.len());
                             }
                             events.push(Event {
                                 role: "meta".to_string(),
@@ -5937,8 +5980,10 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                                 ToolResultFoldKey::Wire(tool_use_id.clone())
                             };
                             if !message_id.is_empty()
-                                && !tool_results_by_message
-                                    .insert((message_id.to_string(), dedup_key))
+                                && !tool_results_by_message.insert((
+                                    claude_message_fold_key(message_id, &ts),
+                                    dedup_key,
+                                ))
                             {
                                 let label = if idless {
                                     format!("#{ordinal}")
@@ -5970,6 +6015,8 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     || !reasoning_parts.is_empty()
                     || !tool_calls.is_empty()
                 {
+                    let message_id = string(message.get("id")).unwrap_or("");
+                    let fold_key = claude_message_fold_key(message_id, &ts);
                     let assistant_event = Event {
                         role: "assistant".to_string(),
                         content: assistant_parts.join("\n"),
@@ -5984,12 +6031,14 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     // re-emission (the complete one) replaces the earlier
                     // partial snapshot in place, so turns, tool calls,
                     // anomalies and spans see the message once. Id-less
-                    // rows keep one event per row (pinned legacy).
-                    let message_id = string(message.get("id")).unwrap_or("");
+                    // rows keep one event per row (pinned legacy). The
+                    // snapshot fold rides the same rm-601 id-class key
+                    // as usage, so placeholder-reusing gateways keep one
+                    // snapshot per distinct message.
                     if message_id.is_empty() {
                         events.push(assistant_event);
                     } else {
-                        match assistant_by_message.get_mut(message_id) {
+                        match assistant_by_message.get_mut(&fold_key) {
                             Some(index) => {
                                 // rm-891: the fold is keep-max for usage
                                 // but used to be last-wins for content — a
@@ -6015,7 +6064,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                                 }
                             }
                             None => {
-                                assistant_by_message.insert(message_id.to_string(), events.len());
+                                assistant_by_message.insert(fold_key, events.len());
                                 events.push(assistant_event);
                             }
                         }
@@ -6163,14 +6212,16 @@ fn claude_iterations_events(
     message: &JsonObject,
     ts: &str,
     model: &str,
-    mined: &mut BTreeSet<String>,
+    mined: &mut BTreeSet<MessageFoldKey>,
     events: &mut Vec<Event>,
 ) {
     let message_id = string(message.get("id")).unwrap_or("");
     // Id-less messages mirror the legacy rm-601 behavior for top-level
     // usage (every emission counts); an id-bearing message is mined
-    // exactly once no matter how many streaming rows repeat the array.
-    if !message_id.is_empty() && !mined.insert(message_id.to_string()) {
+    // exactly once no matter how many streaming rows repeat the array —
+    // keyed by the rm-601 id-class split, so a placeholder id reused
+    // by distinct gateway messages still mines each message's array.
+    if !message_id.is_empty() && !mined.insert(claude_message_fold_key(message_id, ts)) {
         return;
     }
     let Some(iterations) = message
@@ -10661,6 +10712,251 @@ mod tests {
         let usage = meta[0].usage.clone();
         assert_eq!(usage["input_tokens"], 10, "later valid usage counts once");
         assert_eq!(usage["output_tokens"], 7);
+    }
+
+    #[test]
+    fn claude_placeholder_ids_do_not_fold_across_distinct_messages() {
+        // rm-601 id-class split (run 2cdd052c cycle 7; ccusage #1838
+        // parity): every fold in this lane used to key on the BARE
+        // message id, so a gateway/proxy that reuses one placeholder id
+        // across DISTINCT streamed messages inside a session max-merged
+        // them into a single meta event — the second message's tokens
+        // vanished (17/8 true → 10/5 reported). A placeholder id (any
+        // spelling other than `msg_…`/`resp_…`) folds per
+        // (id, timestamp): every distinct message counts.
+        let first = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:00Z",
+            "message": {
+                "id": "gateway-1",
+                "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "content": [{"type": "text", "text": "first response"}]
+            }
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:05Z",
+            "message": {
+                "id": "gateway-1",
+                "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 7, "output_tokens": 3},
+                "content": [{"type": "text", "text": "second response"}]
+            }
+        })
+        .to_string();
+        let raw = [first, second].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events =
+            parse_claude_code_jsonl(&objs).expect("claude placeholder rows are recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(
+            meta.len(),
+            2,
+            "distinct messages reusing a placeholder id each count"
+        );
+        let mut input = 0;
+        let mut output = 0;
+        for event in &meta {
+            input += event.usage.get("input_tokens").copied().unwrap_or(0);
+            output += event.usage.get("output_tokens").copied().unwrap_or(0);
+        }
+        assert_eq!(input, 17, "both messages' input tokens count (never max-merged)");
+        assert_eq!(output, 8, "both messages' output tokens count (never max-merged)");
+        let assistant: Vec<_> = events
+            .iter()
+            .filter(|event| event.role == "assistant")
+            .collect();
+        assert_eq!(
+            assistant.len(),
+            2,
+            "assistant snapshots fold per message, not per reused id"
+        );
+        let session = parse_raw_session("ph", "ph.jsonl", &raw).expect("session parses");
+        assert_eq!(session.metrics.tokens_input, 17);
+        assert_eq!(session.metrics.tokens_output, 8);
+    }
+
+    #[test]
+    fn claude_placeholder_exact_duplicate_rows_still_fold() {
+        // The split must NOT switch the placeholder class to per-row
+        // counting: exact duplicate emissions of the SAME message (same
+        // id AND same timestamp) still fold to one count — the ccusage
+        // #1635/#1799 per-emission truth is anchored to the
+        // (id, timestamp) pair, which an exact duplicate shares.
+        let row = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:00Z",
+            "message": {
+                "id": "gateway-1",
+                "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "content": [{"type": "text", "text": "same response"}]
+            }
+        })
+        .to_string();
+        let raw = [row.clone(), row].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events =
+            parse_claude_code_jsonl(&objs).expect("claude duplicate rows are recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(meta.len(), 1, "an exact duplicate folds to one meta event");
+        assert_eq!(meta[0].usage.get("input_tokens").copied().unwrap_or(0), 10);
+        assert_eq!(meta[0].usage.get("output_tokens").copied().unwrap_or(0), 5);
+    }
+
+    #[test]
+    fn claude_placeholder_growing_reemission_at_one_timestamp_keeps_max() {
+        // rm-601/rm-834 semantics survive inside one placeholder
+        // message: streaming re-emissions at the SAME timestamp grow
+        // monotonically and fold with keep-max per token class.
+        let first = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:00Z",
+            "message": {
+                "id": "gateway-1",
+                "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 3},
+                "content": [{"type": "text", "text": "partial"}]
+            }
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:00Z",
+            "message": {
+                "id": "gateway-1",
+                "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 8},
+                "content": [{"type": "text", "text": "complete"}]
+            }
+        })
+        .to_string();
+        let raw = [first, second].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events =
+            parse_claude_code_jsonl(&objs).expect("claude growing rows are recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(meta.len(), 1, "one (id, timestamp) pair folds to one meta event");
+        assert_eq!(meta[0].usage.get("input_tokens").copied().unwrap_or(0), 10);
+        assert_eq!(meta[0].usage.get("output_tokens").copied().unwrap_or(0), 8);
+    }
+
+    #[test]
+    fn claude_real_msg_and_resp_ids_still_fold_across_timestamps() {
+        // The Anthropic class is unchanged: `msg_…` (and `resp_…`, ccusage
+        // #1934/#1935 requestless responses) folds by the bare id — a
+        // streamed turn re-emitted at a LATER timestamp (running total)
+        // still max-merges into one event, never one-per-row.
+        for id in ["msg_1", "resp_1"] {
+            let first = serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-10-01T10:00:00Z",
+                "message": {
+                    "id": id,
+                    "model": "claude-sonnet-4-5",
+                    "usage": {"input_tokens": 10, "output_tokens": 3},
+                    "content": [{"type": "text", "text": "partial"}]
+                }
+            })
+            .to_string();
+            let second = serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-10-01T10:00:09Z",
+                "message": {
+                    "id": id,
+                    "model": "claude-sonnet-4-5",
+                    "usage": {"input_tokens": 10, "output_tokens": 8},
+                    "content": [{"type": "text", "text": "complete"}]
+                }
+            })
+            .to_string();
+            let raw = [first, second].join("\n");
+            let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+            let events =
+                parse_claude_code_jsonl(&objs).expect("claude msg rows are recognized");
+            let meta: Vec<_> =
+                events.iter().filter(|event| event.role == "meta").collect();
+            assert_eq!(meta.len(), 1, "real Anthropic ids fold by bare id ({id})");
+            assert_eq!(
+                meta[0].usage.get("input_tokens").copied().unwrap_or(0),
+                10
+            );
+            assert_eq!(
+                meta[0].usage.get("output_tokens").copied().unwrap_or(0),
+                8,
+                "keep-max across timestamps ({id})"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_placeholder_tool_results_do_not_refold_across_messages() {
+        // The tool-result fold rides the same split: a gateway reusing a
+        // placeholder id across distinct messages previously dropped the
+        // second message's tool result as a `tool_result_refold` (same
+        // wire tool_use_id, same bare id) — count truth loses the whole
+        // second tool call.
+        let first = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-10-01T10:00:02Z",
+            "message": {
+                "id": "gateway-1",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01", "content": "result one"}
+                ]
+            }
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-10-01T10:00:07Z",
+            "message": {
+                "id": "gateway-1",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01", "content": "result two"}
+                ]
+            }
+        })
+        .to_string();
+        let raw = [first, second].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events =
+            parse_claude_code_jsonl(&objs).expect("claude tool-result rows are recognized");
+        let tools: Vec<_> = events.iter().filter(|event| event.role == "tool").collect();
+        assert_eq!(
+            tools.len(),
+            2,
+            "distinct messages keep both tool results (no cross-message refold)"
+        );
+        let refolds = events
+            .iter()
+            .flat_map(|event| event.disclosure_counters.keys())
+            .filter(|key| key.starts_with("tool_result_refold"))
+            .count();
+        assert_eq!(refolds, 0, "no refold is disclosed for distinct messages");
+    }
+
+    #[test]
+    fn claude_id_less_rows_never_fold_even_with_repeated_usage() {
+        // The None class is the legacy lane, pinned: every id-less
+        // emission counts, even with identical usage maps.
+        let row = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:00Z",
+            "message": {
+                "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "content": [{"type": "text", "text": "response"}]
+            }
+        })
+        .to_string();
+        let raw = [row.clone(), row].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events = parse_claude_code_jsonl(&objs).expect("claude id-less rows are recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(meta.len(), 2, "id-less rows never fold (legacy per-emission)");
     }
 
     #[test]

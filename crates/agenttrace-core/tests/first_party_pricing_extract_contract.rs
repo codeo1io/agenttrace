@@ -32,6 +32,17 @@ use agenttrace_core::{
 };
 use std::sync::OnceLock;
 
+mod support;
+
+// rm-1954 extension (run 2cdd052c cycle 7): every pin below asserts
+// rates/provenance against THIS repository's bundled catalogs, but the
+// pricing catalog PREFERS a machine cache (`~/.cache/agenttrace/
+// pricing.json`, pricing.rs load_pricing_cache) over the bundled
+// snapshot — on a fleet host with a machine cache, the extract lanes
+// and the LiteLLM rows underneath them both serve the cache's bytes
+// and the contract fails for reasons the repository cannot control.
+// Every consumer runs under `support::with_isolated_pricing_env`.
+
 /// The three dated ids the extract carries, with their published list
 /// rates in $/M (input, output, cache_read, cache_write) — the vendor
 /// list prices models.dev publishes, identical to what the reseller
@@ -69,6 +80,10 @@ fn expect_price(price: agenttrace_core::Price, input: f64, output: f64, cr: f64,
 
 #[test]
 fn extract_ids_bill_at_first_party_list_rates() {
+    support::with_isolated_pricing_env(extract_ids_bill_at_first_party_list_rates_body);
+}
+
+fn extract_ids_bill_at_first_party_list_rates_body() {
     for (id, input, output, cr, cw) in EXTRACT_ROWS {
         expect_price(lookup_price(id), *input, *output, *cr, *cw);
     }
@@ -76,6 +91,10 @@ fn extract_ids_bill_at_first_party_list_rates() {
 
 #[test]
 fn extract_ids_attribute_to_their_vendor() {
+    support::with_isolated_pricing_env(extract_ids_attribute_to_their_vendor_body);
+}
+
+fn extract_ids_attribute_to_their_vendor_body() {
     for (id, ..) in EXTRACT_ROWS {
         assert_eq!(
             provider_for(id).as_deref(),
@@ -87,6 +106,10 @@ fn extract_ids_attribute_to_their_vendor() {
 
 #[test]
 fn extract_service_is_disclosed_at_the_provenance_line() {
+    support::with_isolated_pricing_env(extract_service_is_disclosed_at_the_provenance_line_body);
+}
+
+fn extract_service_is_disclosed_at_the_provenance_line_body() {
     for (id, ..) in EXTRACT_ROWS {
         let source = pricing_source_for(id);
         assert!(
@@ -102,6 +125,10 @@ fn extract_service_is_disclosed_at_the_provenance_line() {
 
 #[test]
 fn extract_ids_are_specific_prices_not_fallbacks() {
+    support::with_isolated_pricing_env(extract_ids_are_specific_prices_not_fallbacks_body);
+}
+
+fn extract_ids_are_specific_prices_not_fallbacks_body() {
     for (id, ..) in EXTRACT_ROWS {
         assert!(
             has_specific_price(id),
@@ -112,6 +139,10 @@ fn extract_ids_are_specific_prices_not_fallbacks() {
 
 #[test]
 fn reseller_qualified_ids_keep_their_reseller_rows() {
+    support::with_isolated_pricing_env(reseller_qualified_ids_keep_their_reseller_rows_body);
+}
+
+fn reseller_qualified_ids_keep_their_reseller_rows_body() {
     // The session itself scoped these ids to a reseller lane: the
     // extract must NOT override an explicit qualification (it speaks
     // only for the bare first-party form).
@@ -134,6 +165,12 @@ fn reseller_qualified_ids_keep_their_reseller_rows() {
 
 #[test]
 fn first_party_ids_the_primary_catalog_carries_still_price_at_litellm() {
+    support::with_isolated_pricing_env(
+        first_party_ids_the_primary_catalog_carries_still_price_at_litellm_body,
+    );
+}
+
+fn first_party_ids_the_primary_catalog_carries_still_price_at_litellm_body() {
     // The extract is a gap-filler: an id LiteLLM prices first-party
     // (a current dated sonnet) must be byte-identical to the
     // pre-extract behavior — LiteLLM rates, LiteLLM source.
@@ -155,6 +192,10 @@ fn first_party_ids_the_primary_catalog_carries_still_price_at_litellm() {
 
 #[test]
 fn unknown_ids_still_fall_through_to_the_default() {
+    support::with_isolated_pricing_env(unknown_ids_still_fall_through_to_the_default_body);
+}
+
+fn unknown_ids_still_fall_through_to_the_default_body() {
     let unknown = "totally-unknown-model-9000";
     assert!(
         !has_specific_price(unknown),
@@ -170,6 +211,10 @@ fn unknown_ids_still_fall_through_to_the_default() {
 
 #[test]
 fn catalog_identity_folds_the_extract_bytes() {
+    support::with_isolated_pricing_env(catalog_identity_folds_the_extract_bytes_body);
+}
+
+fn catalog_identity_folds_the_extract_bytes_body() {
     // rm-1532: the extract can reprice and re-attribute ids, so its
     // bytes must ride the identity the session cache freshness-key
     // consumes — a changed extract (new binary) invalidates cached
@@ -194,6 +239,10 @@ fn catalog_identity_folds_the_extract_bytes() {
 
 #[test]
 fn extract_json_carries_its_provenance_note() {
+    support::with_isolated_pricing_env(extract_json_carries_its_provenance_note_body);
+}
+
+fn extract_json_carries_its_provenance_note_body() {
     // The file documents WHERE its rates came from and the retirement
     // condition (LiteLLM shipping a first-party row ends the search).
     // If the note is gone the file was machine-edited blind — fail
