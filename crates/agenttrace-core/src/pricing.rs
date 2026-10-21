@@ -18,7 +18,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-19";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-20";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -188,6 +188,18 @@ struct LiteLlmModel {
     cache_write_cost: Option<f64>,
     #[serde(default, rename = "cache_read_input_token_cost")]
     cache_read_cost: Option<f64>,
+    // rm-176 (2026-10-20 refresh, live fad31403): the EXPLICIT
+    // cache-read rate, which upstream now publishes separately from
+    // the implicit `cache_read_input_token_cost` (the qwen3.7-max
+    // family: dashscope/ qwencloud/ qwen_ai_platform/). Enumerated —
+    // not silently dropped — so the vendored ledger stays
+    // priced-or-disclosed: parsed here, censused via
+    // `bundled_snapshot_explicit_cache_rate_rows`, and watched by
+    // drift-check.sh COST_FIELDS. Billing keeps using the implicit
+    // cache-read rate until a parser lane reports explicit-cache
+    // reads as a distinct token class (open arm on the rm-176 row).
+    #[serde(default, rename = "explicit_cache_read_input_token_cost")]
+    explicit_cache_read_cost: Option<f64>,
     #[serde(default)]
     mode: String,
     #[serde(default, rename = "litellm_provider")]
@@ -555,6 +567,33 @@ pub fn bundled_snapshot_source_commit() -> &'static str {
                     .map(str::to_string)
             })
             .unwrap_or_default()
+    })
+}
+
+/// rm-176 (2026-10-20 refresh): how many bundled rows carry the
+/// EXPLICIT cache-read rate `explicit_cache_read_input_token_cost`.
+/// Enumerated through the same ingest shape (`LiteLlmModel`) the
+/// pricing ladder uses, so the census is proof the Rust side PARSES
+/// the key rather than silently dropping it — the 2026-10-19
+/// reconcile trimmed it out before the builder carried the field
+/// (research fad31403: exactly the 3 qwen3.7-max rows then). Pinned
+/// by tests/pricing_snapshot_hygiene.rs; moves only with a
+/// sanctioned refresh, in the same commit as the bundle.
+pub fn bundled_snapshot_explicit_cache_rate_rows() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let Ok(Value::Object(source)) = serde_json::from_str::<Value>(PRICING_SNAPSHOT_JSON) else {
+            return 0;
+        };
+        source
+            .into_iter()
+            .filter(|(key, value)| {
+                key != "_snapshot"
+                    && serde_json::from_value::<LiteLlmModel>(value.to_owned())
+                        .map(|model| model.explicit_cache_read_cost.is_some())
+                        .unwrap_or(false)
+            })
+            .count()
     })
 }
 
@@ -3955,10 +3994,14 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // The 1M-window default class was rm-231's motivating case; the
+        // 2026-10-20 refresh carries upstream's lowered 200k window for
+        // claude-sonnet-4-5 (every provider row moved together) — the
+        // pin tracks the bundled payload, and the assertion stays the
+        // ingestion contract: the vendor window survives the trim.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 

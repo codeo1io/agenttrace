@@ -272,3 +272,102 @@ fn effort_tier_marker_on_a_catalogued_sku_prices_exactly() {
     assert_eq!(effort_tier_of("aihubmix/gpt-5.4-high"), Some("high"));
     assert_eq!(specific_base_for_unpriced("aihubmix/gpt-5.4-high"), None);
 }
+
+/// rm-1533 red-first (cost half): ccusage v20.0.36 widened the numeric
+/// map (1050 → gemini-3.1-flash-lite PR #1902, 1418/1419 → gemini-4-argon
+/// PR #1905) and the 2026-10-20 snapshot refresh pinned both targets
+/// (gemini/gemini-3.1-flash-lite, gemini/gemini-4-argon) — the build
+/// order that made this arm landable same-day. Pre-fix, a numeric-1418
+/// corpus attributed to raw digits and priced through the fallback lane
+/// (no specific price, diluted unknown-model census). Post-fix the arm
+/// prices SPECIFICALLY at the catalog row, and a still-unmapped id
+/// (1277, unmapped upstream as of v20.0.37) keeps the WARN +
+/// cost-exclusion contract: fallback pricing, disclosed — never a
+/// silent $0.
+#[test]
+fn antigravity_numeric_id_arms_price_from_the_pinned_snapshot() {
+    for (id, model) in [
+        (1418, "gemini-4-argon"),
+        (1419, "gemini-4-argon"),
+        (1050, "gemini-3.1-flash-lite"),
+    ] {
+        let dir = fixture_dir("antigravity-numeric");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("conversations.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        use std::io::Write as _;
+        file.write_all(
+            br#"{"type":"USER_INPUT","step_index":0,"created_at":"2026-10-18T10:00:00Z","content":"plan"}"#,
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+        let line = format!(
+            r#"{{"type":"PLANNER_RESPONSE","step_index":1,"created_at":"2026-10-18T10:00:05Z","content":"done","modelConfigId":{id},"usageStats":{{"inputTokens":1000,"outputTokens":500}}}}"#
+        );
+        file.write_all(line.as_bytes()).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let session = parse_raw_session("conversations.jsonl", path.to_str().unwrap(), &raw)
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert_eq!(session.metrics.source_tool, "antigravity_cli");
+        assert_eq!(
+            session.metrics.model_used, model,
+            "numeric id {id} attributes through the proven ccusage arm"
+        );
+        // `rates` returns per-million dollars; cost is per token.
+        let (input, output) = rates(model);
+        let expected = (1000.0 * input + 500.0 * output) / 1_000_000.0;
+        assert_eq!(
+            session.metrics.cost_estimated, expected,
+            "numeric id {id} prices at the pinned catalog row, not a fallback"
+        );
+        assert!(
+            has_specific_price(&session.metrics.model_used),
+            "the mapped arm is a specifically priced model"
+        );
+        let health = data_health(std::slice::from_ref(&session), 1, 0);
+        assert_eq!(health.fallback_pricing, 0);
+        assert_eq!(health.unknown_models, 0);
+    }
+
+    // The unmapped arm: excluded from specific pricing, priced through
+    // the DISCLOSED fallback lane (unknown-model WARN), never silently $0.
+    let dir = fixture_dir("antigravity-numeric-unmapped");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("conversations.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    use std::io::Write as _;
+    file.write_all(
+        br#"{"type":"USER_INPUT","step_index":0,"created_at":"2026-10-18T11:00:00Z","content":"plan"}"#,
+    )
+    .unwrap();
+    file.write_all(b"\n").unwrap();
+    file.write_all(
+        br#"{"type":"PLANNER_RESPONSE","step_index":1,"created_at":"2026-10-18T11:00:05Z","content":"done","modelConfigId":1277,"usageStats":{"inputTokens":1000,"outputTokens":500}}"#,
+    )
+    .unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let session = parse_raw_session("conversations.jsonl", path.to_str().unwrap(), &raw)
+        .unwrap_or_else(|e| panic!("1277: {e}"));
+    assert_eq!(session.metrics.model_used, "1277");
+    assert!(!has_specific_price(&session.metrics.model_used));
+    let (input, output) = rates("totally-unknown-model");
+    assert_eq!(
+        session.metrics.cost_estimated,
+        (1000.0 * input + 500.0 * output) / 1_000_000.0,
+        "the unmapped id bills at the disclosed default fallback, not a silent $0"
+    );
+    let health = data_health(std::slice::from_ref(&session), 1, 0);
+    assert_eq!(
+        health.fallback_pricing, 1,
+        "the fallback estimate is WARNED"
+    );
+    assert_eq!(
+        health.fallback_with_base_available,
+        Vec::<String>::new(),
+        "a raw numeric spelling must never masquerade as an available base"
+    );
+}

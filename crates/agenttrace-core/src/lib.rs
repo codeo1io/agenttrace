@@ -68,10 +68,11 @@ pub use parser::{
     parse_file, parse_raw_session, parse_stdin_bytes, ReadCapRefused, FILE_READ_CAP_BYTES,
 };
 pub use pricing::{
-    cache_rate_census, catalog_identity, effort_tier_of, has_specific_price, list_pricing,
-    lookup_context_window, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
-    pricing_source_for, provider_for, render_model_pricing_list, render_test_match,
-    specific_base_for_unpriced, update_pricing, CacheRateCensus, Price,
+    bundled_snapshot_explicit_cache_rate_rows, cache_rate_census, catalog_identity, effort_tier_of,
+    has_specific_price, list_pricing, lookup_context_window, lookup_price, lookup_price_tiered,
+    pricing_cache_path, pricing_source, pricing_source_for, provider_for,
+    render_model_pricing_list, render_test_match, specific_base_for_unpriced, update_pricing,
+    CacheRateCensus, Price,
 };
 pub use reports::{
     add_baseline_comparison, guard_formula_json_leaves, report_compare, report_compare_json,

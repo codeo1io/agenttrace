@@ -376,6 +376,17 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     // content dedup so an id-level duplicate resolves by the canonical
     // store rather than first-seen path order, matching the cached walk.
     retain_single_cline_session_per_id(&mut all);
+    // rm-2074 (uncached mirror): the cached walk owns the disclosure;
+    // this lane must count the same corpus (rm-1886/rm-1887 mirror
+    // stance) — a `.jsonl.zst` journal whose plain `.jsonl` twin also
+    // survived is the same session in two encodings, so suppress the
+    // zst copy here too (see the cached walk for the full rationale).
+    let plain_journals: HashSet<PathBuf> = all
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .cloned()
+        .collect();
+    all.retain(|path| !zst_plain_twin(path).is_some_and(|plain| plain_journals.contains(&plain)));
     let mut signatures: HashSet<(i64, u64)> = HashSet::new();
     all.retain(|path| {
         // Unreadable: keep (the parse lane owns and discloses those).
@@ -980,6 +991,44 @@ pub(crate) fn find_session_files_cached(
     // duplicates resolve by the canonical store, then byte-level copies
     // collapse first-seen, so both landed rules stay observable.
     retain_single_cline_session_per_id(&mut all);
+
+    // rm-2074: a `.jsonl.zst` journal whose plain `.jsonl` twin is
+    // also admitted is the SAME session in two encodings — the zst
+    // file is the compressed image of the plain bytes (codex
+    // `migrate_rollouts` leaves both behind mid-migration; manual
+    // archivers do the same), and both `content_signature` (raw
+    // bytes) and `canonical_identity` (path-keyed) are
+    // encoding-blind, so admitting the pair double-banks every
+    // aggregate (assess c922fe9d F1 at wall df7c2590: one rollout
+    // → 2 sessions, 2×$0.0042, `--overview` footing "2 Sessions",
+    // same for a claude/pi-lane journal twin). Prefer the plain
+    // twin — decodable, greppable, the copy every other consumer
+    // names — suppress the zst image, and disclose it through the
+    // rm-1886 duplicate-pairs ledger. The twin check is scoped to
+    // pairs that BOTH admitted, so a zst journal with no plain
+    // twin is kept (rm-992: a zst-only home must still count) and
+    // the `-d` explicit-dir lane keeps both files (rm-548 stance).
+    let plain_journals: HashSet<PathBuf> = all
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .cloned()
+        .collect();
+    all.retain(|path| {
+        let Some(plain_twin) = zst_plain_twin(path) else {
+            return true;
+        };
+        if !plain_journals.contains(&plain_twin) {
+            return true;
+        }
+        suppressed.duplicate_session_files += 1;
+        if suppressed.duplicate_session_file_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
+            suppressed
+                .duplicate_session_file_pairs
+                .push((plain_twin, path.clone()));
+        }
+        false
+    });
+
     // rm-1886: content dedup at admission — a byte-identical journal
     // at a second path re-emits the same events and double-banks every
     // aggregate it feeds. First-seen survivor wins (deterministic: the
@@ -1497,6 +1546,24 @@ pub fn is_session_file_name(name: &str) -> bool {
     // lands in skipped_files with the honest `zstd-compressed` error (see
     // discovery_contract's raw-magic test).
     name.ends_with(".jsonl") || name.ends_with(".jsonl.zst") || name.ends_with(".json")
+}
+
+/// rm-2074: the plain `.jsonl` twin of a `.jsonl.zst` journal — same
+/// directory, same stem: `session.jsonl.zst` → `session.jsonl`
+/// (Rust's `with_extension("jsonl")` would yield the WRONG sibling
+/// `session.jsonl.jsonl` — the stem of a doubly-suffixed name keeps
+/// the inner suffix — so the `.zst` suffix is stripped instead).
+/// Returns `None` for every other name class (including other `.zst`
+/// names the walk never admits, e.g. a hypothetical `.json.zst`).
+fn zst_plain_twin(path: &Path) -> Option<PathBuf> {
+    if !path.extension().is_some_and(|ext| ext == "zst") {
+        return None;
+    }
+    let plain = path.with_extension("");
+    plain
+        .extension()
+        .is_some_and(|ext| ext == "jsonl")
+        .then_some(plain)
 }
 
 fn max_session_dir_depth(dir: &Path) -> usize {

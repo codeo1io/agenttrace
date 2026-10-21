@@ -679,3 +679,136 @@ fn doctor_and_audit_disclose_the_admission_ledger() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+/// rm-2074: raw fixture bytes for the zst stem-twin pair (a pi/claude
+/// lane journal and its real zstd image — the encoder is not a crate
+/// dependency, so the compressed twin ships as a checked-in fixture
+/// exactly like discovery_contract's zstd corpus).
+fn zst_twin_fixture_bytes(rel: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{rel}: {e}"))
+}
+
+#[test]
+fn zst_stem_twin_collapses_to_the_plain_journal_with_disclosure() {
+    // rm-2074 red-first flip of assess c922fe9d F1 (wall df7c2590;
+    // independently re-proven by sibling assess 8db7fab5 N1 at
+    // 9ebd0460): one session stored as BOTH `session.jsonl` and its
+    // zstd image `session.jsonl.zst` in the same directory admitted
+    // TWO sessions (double-banked cost) because `content_signature`
+    // hashes raw bytes and `canonical_identity` keys paths — both
+    // encoding-blind. The plain twin must win, the zst image must
+    // ride the rm-1886 duplicate ledger, and the same corpus must
+    // count identically through the uncached aggregation lane.
+    let home = temp_home("zst-twin");
+    let dir = home.join(".pi/agent/sessions/zwin");
+    fs::create_dir_all(&dir).expect("create parent");
+    let plain = dir.join("session.jsonl");
+    fs::write(
+        &plain,
+        zst_twin_fixture_bytes("tests/fixtures/zst-twin/session.jsonl"),
+    )
+    .expect("plain twin");
+    fs::write(
+        dir.join("session.jsonl.zst"),
+        zst_twin_fixture_bytes("tests/fixtures/zst-twin/session.jsonl.zst"),
+    )
+    .expect("zst twin");
+    with_pinned_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "the twin pair renders one session"
+        );
+        assert_eq!(
+            report.duplicate_session_files, 1,
+            "the zst image is counted"
+        );
+        assert_eq!(report.duplicate_session_file_pairs.len(), 1);
+        let (survivor, suppressed) = &report.duplicate_session_file_pairs[0];
+        assert_eq!(
+            survivor, &plain,
+            "the plain journal is the named survivor (prefer-plain)"
+        );
+        assert_eq!(
+            suppressed.file_name().and_then(|n| n.to_str()),
+            Some("session.jsonl.zst"),
+            "the suppressed copy is the zst image"
+        );
+        assert_eq!(
+            Path::new(&report.sessions[0].path),
+            plain.as_path(),
+            "the admitted session is the plain journal"
+        );
+        // The uncached aggregation lane counts the same corpus.
+        assert_eq!(
+            find_session_files(None).len(),
+            1,
+            "the uncached aggregation suppresses the zst image too"
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn zst_journal_without_a_plain_twin_still_counts() {
+    // rm-992 stance preserved: the suppression is TWIN-SCOPED, not a
+    // zst ban — a home carrying ONLY the compressed journal keeps
+    // rendering it (codex 0.163.0 `migrate_rollouts` compress-only
+    // homes, and the zst half of any split pair on its own).
+    let home = temp_home("zst-only");
+    let dir = home.join(".pi/agent/sessions/zonly");
+    fs::create_dir_all(&dir).expect("create parent");
+    fs::write(
+        dir.join("solo.jsonl.zst"),
+        zst_twin_fixture_bytes("tests/fixtures/zst-twin/session.jsonl.zst"),
+    )
+    .expect("zst journal");
+    with_pinned_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "a zst-only home still counts the compressed journal"
+        );
+        assert_eq!(
+            report.duplicate_session_files, 0,
+            "no twin, no duplicate disclosure"
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn explicit_dir_lane_keeps_the_zst_twin_pair() {
+    // rm-548 stance: `-d` is the inspection lane — an explicitly
+    // requested directory keeps every file, including both encodings
+    // of the same journal, with no admission-side suppression.
+    let home = temp_home("zst-twin-explicit");
+    let dir = home.join("journal-home");
+    fs::create_dir_all(&dir).expect("create parent");
+    fs::write(
+        dir.join("session.jsonl"),
+        zst_twin_fixture_bytes("tests/fixtures/zst-twin/session.jsonl"),
+    )
+    .expect("plain twin");
+    fs::write(
+        dir.join("session.jsonl.zst"),
+        zst_twin_fixture_bytes("tests/fixtures/zst-twin/session.jsonl.zst"),
+    )
+    .expect("zst twin");
+    with_pinned_home(&home, || {
+        let report = load_sessions_with_progress(Some(&dir), &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.sessions.len(),
+            2,
+            "the explicit-dir lane keeps both encodings for inspection"
+        );
+        assert_eq!(
+            report.duplicate_session_files, 0,
+            "no duplicate disclosure in the inspection lane"
+        );
+    });
+    let _ = fs::remove_dir_all(&home);
+}

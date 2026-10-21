@@ -202,6 +202,21 @@ def trim(data):
         for cache_field in (
             "cache_creation_input_token_cost",
             "cache_read_input_token_cost",
+            # rm-176 2026-10-20 refresh (live fad31403): enumerate the
+            # EXPLICIT cache-read rate — upstream added
+            # `explicit_cache_read_input_token_cost` (distinct from the
+            # implicit `cache_read_input_token_cost`) on the qwen3.7-max
+            # family (dashscope/ qwencloud/ qwen_ai_platform/, 3 rows at
+            # the refresh). Carrying it keeps the vendored ledger
+            # priced-or-disclosed end to end: the builder pins it, the
+            # Rust ingest parses it (LiteLlmModel.explicit_cache_read_cost,
+            # surfaced via bundled_snapshot_explicit_cache_rate_rows),
+            # and drift-check.sh COST_FIELDS watches it, so a future
+            # upstream rate move on the key is gate-visible instead of a
+            # silent strip. Billing keeps using the implicit rate until a
+            # parser lane distinguishes explicit-cache reads (recorded in
+            # the rm-176 row).
+            "explicit_cache_read_input_token_cost",
         ):
             rate = value.get(cache_field)
             if isinstance(rate, (int, float)) and not isinstance(rate, bool):

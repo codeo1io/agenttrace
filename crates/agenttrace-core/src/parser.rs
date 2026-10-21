@@ -1471,12 +1471,29 @@ struct AntigravityModelId {
 
 /// rm-1864: numeric model ids observed in the wild and their proven
 /// model names. 1417 → gemini-4-argon is ccusage v20.0.34's first-party
-/// mapping (PR #1894, 2026-10-15); further ids arrive weekly (ccusage
-/// #1897 reports 1277/1050 unmapped). The map fixes IDENTITY only —
-/// pricing still rides the catalog's normal lookup, so a mapped id whose
-/// model is absent from the catalog degrades through the disclosed
+/// mapping (PR #1894, 2026-10-15); v20.0.36 (2026-10-18) widened argon
+/// to the 1418/1419 siblings (PR #1905, f6d28c56) and mapped 1050 →
+/// gemini-3.1-flash-lite (PR #1902, ce439e5e). rm-1533 maintenance
+/// record (2026-10-20): the upstream source of truth is ccusage's
+/// antigravity adapter `model_name_from_id` (rust/adapters/antigravity/
+/// src/parser.rs @ v20.0.37 — also 246/312/313/329/330, 281/282, 290/291,
+/// 333/334, 340/341, 342, 1071-1073, 1298-1300, 1318-1320, plus the
+/// ≥1000 `model_placeholder_m{N}` and `antigravity-model-{id}` fallback
+/// spellings); this table pins ONLY ids whose mapped model the bundled
+/// snapshot prices (gemini/gemini-4-argon and gemini/gemini-3.1-
+/// flash-lite both entered the 2026-10-20 refresh) — the remaining
+/// upstream ids stay unmapped here and land through the disclosed
+/// unknown-model path until their targets are pinned. 1277 remains
+/// unmapped upstream (#1897). The map fixes IDENTITY only — pricing
+/// still rides the catalog's normal lookup, so a mapped id whose model
+/// is absent from the catalog degrades through the disclosed
 /// unknown-model path rather than this table inventing a price.
-const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[(1417, "gemini-4-argon")];
+const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
+    (1050, "gemini-3.1-flash-lite"),
+    (1417, "gemini-4-argon"),
+    (1418, "gemini-4-argon"),
+    (1419, "gemini-4-argon"),
+];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
 /// number, but the float spelling stringifies as `"1417.0"` — the
@@ -11313,6 +11330,97 @@ mod tests {
                 .disclosure_counters
                 .get("antigravity_model:multi_model_last_wins"),
             Some(&2)
+        );
+    }
+
+    #[test]
+    fn antigravity_numeric_map_tracks_ccusage_v20_0_36_arms() {
+        // rm-1533 red-first (identity half): ccusage v20.0.36 (2026-10-18)
+        // widened the first-party numeric map — 1418/1419 join 1417 →
+        // gemini-4-argon (PR #1905) and 1050 → gemini-3.1-flash-lite
+        // (PR #1902) — while this fork carried 1417 alone (its own
+        // comment already named 1050 as observed). Pre-fix, sessions on
+        // the widened ids attributed to raw digits ("1418"), degraded to
+        // the fallback pricing lane, and diluted the unknown-model
+        // census. The widened arms must attribute exactly as upstream
+        // maps them, with the numeric sighting still disclosed. The
+        // cost half of the red-first pair lives in
+        // pricing_effort_alias_contract.rs.
+        for (id, model) in [
+            (1050, "gemini-3.1-flash-lite"),
+            (1417, "gemini-4-argon"),
+            (1418, "gemini-4-argon"),
+            (1419, "gemini-4-argon"),
+        ] {
+            let raw = serde_json::json!({
+                "trajectoryId": "44444444-4444-4444-5555-666666666666",
+                "steps": [
+                    {
+                        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                        "status": "COMPLETED",
+                        "metadata": { "createdAt": "2026-10-18T10:00:05Z" },
+                        "plannerResponse": {
+                            "response": "Widened-arm generation.",
+                            "usageStats": { "inputTokens": 11, "outputTokens": 7 },
+                            "modelConfigId": id
+                        }
+                    }
+                ]
+            })
+            .to_string();
+            let session =
+                parse_raw_session("numeric-widened-arms", "conversation.trajectory.json", &raw)
+                    .unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert_eq!(
+                session.metrics.model_used, model,
+                "numeric id {id} must attribute through the proven ccusage arm"
+            );
+            assert_eq!(
+                session
+                    .metrics
+                    .disclosure_counters
+                    .get("antigravity_model:numeric_id"),
+                Some(&1),
+                "mapped or not, every numeric sighting stays disclosed"
+            );
+        }
+        // The unmapped arm keeps the WARN + cost-exclusion contract: raw
+        // spelling attribution (never an invented model) plus the numeric
+        // disclosure — a corpus whose ONLY model is an unmapped numeric
+        // id must degrade through the disclosed unknown-model path.
+        let raw = serde_json::json!({
+            "trajectoryId": "44444444-4444-4444-5555-777777777777",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-18T11:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Still-unmapped generation.",
+                        "usageStats": { "inputTokens": 9, "outputTokens": 4 },
+                        "modelConfigId": 1277
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session = parse_raw_session(
+            "numeric-unmapped-1277",
+            "conversation.trajectory.json",
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(
+            session.metrics.model_used, "1277",
+            "an id with no proven arm keeps its raw spelling — 1277 is still unmapped upstream (v20.0.37)"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+            "the unmapped numeric sighting is WARNED through the disclosure ledger"
         );
     }
 

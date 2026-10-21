@@ -118,7 +118,8 @@ def kept(catalog):
 # else (e.g. max_output_tokens, which the builder drops) produced 2,802 phantom diffs — diagnosed
 # 2026-10-05 against the real bundle; see the cycle-1 record.
 COST_FIELDS = ["input_cost_per_token", "output_cost_per_token",
-               "cache_creation_input_token_cost", "cache_read_input_token_cost"]
+               "cache_creation_input_token_cost", "cache_read_input_token_cost",
+               "explicit_cache_read_input_token_cost"]
 
 try:
     live_kept, bundle_kept = kept(live), kept(bundle)
@@ -169,7 +170,7 @@ print(f"  bundled: {len(bundle_kept)} costed-chat models, _snapshot.date={bundle
 print(f"  live   : {len(live_kept)} costed-chat models", file=out)
 print(f"  new-costed: {len(new_costed)}{' — ' + sample(new_costed) if new_costed else ''}", file=out)
 print(f"  retired   : {len(retired)}{' — ' + sample(retired) if retired else ''} (removal_guard={'SET' if removal_guard else 'clear'})", file=out)
-print(f"  rate-changed: {len(rate_changed)}{' — ' + sample(rate_changed) if rate_changed else ''} (4 cost fields incl. cache)", file=out)
+print(f"  rate-changed: {len(rate_changed)}{' — ' + sample(rate_changed) if rate_changed else ''} (5 cost fields incl. explicit cache — rm-176 2026-10-20)", file=out)
 print(f"  deprecation-new: {len(deprecation_new)}{' — ' + sample(deprecation_new) if deprecation_new else ''}", file=out)
 print(f"  context-window-changed (max_input only, informational): {len(context_changed)}{' — ' + sample(context_changed) if context_changed else ''}", file=out)
 print(f"  provider-changed (informational): {len(provider_changed)}{' — ' + sample(provider_changed) if provider_changed else ''}", file=out)
