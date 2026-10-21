@@ -72,6 +72,27 @@ pub struct LoadReport {
     /// capped at five, naming the paths so an operator can tell a
     /// copy from a coincidence.
     pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-1888 (twin arm, run a1c398e5 cycle 4): `.jsonl.zst` twins
+    /// suppressed as encoding duplicates of an admitted plain journal
+    /// — same bytes, different encoding, so the raw-signature dedup
+    /// above could not see the equivalence and admission banked the
+    /// journal twice. Disclosed separately from rm-1886 copies.
+    pub duplicate_session_twin_files: usize,
+    /// rm-1888 (twin arm): first suppressed twin pairs (plain
+    /// survivor, suppressed `.jsonl.zst` twin), capped at five; the
+    /// exact count rides `duplicate_session_twin_files`.
+    pub duplicate_session_twin_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-1888 (twin arm): same-directory stem twins KEPT because the
+    /// bounded decode proved the pair is NOT byte-equal (the plain
+    /// journal was appended after compression) or could not verify it
+    /// (over-cap / undecodable frame). Both files stay admitted —
+    /// they are genuinely different sessions — and the divergence is
+    /// disclosed so the second row reads "kept and named", never
+    /// silently merged.
+    pub divergent_twin_files: usize,
+    /// rm-1888 (twin arm): first divergent twin pairs, capped at five;
+    /// the exact count rides `divergent_twin_files`.
+    pub divergent_twin_pairs: Vec<(PathBuf, PathBuf)>,
     /// rm-451 walk-lane arm: opencode session info docs skipped because
     /// they exceed `OPENCODE_INFO_DOC_READ_CAP_BYTES` (rm-212 admits them
     /// by file-kind). The skip is disclosed here, never silent, and the
@@ -735,6 +756,10 @@ pub fn load_sessions_with_progress_from_cache_mode(
     let subagent_artifact_files = suppressed.subagent_artifact_files;
     let duplicate_session_files = suppressed.duplicate_session_files;
     let duplicate_session_file_pairs = suppressed.duplicate_session_file_pairs;
+    let duplicate_session_twin_files = suppressed.duplicate_session_twin_files;
+    let duplicate_session_twin_pairs = suppressed.duplicate_session_twin_pairs;
+    let divergent_twin_files = suppressed.divergent_twin_files;
+    let divergent_twin_pairs = suppressed.divergent_twin_pairs;
     if dir.is_none() {
         let (sqlite_sessions, ingest) =
             crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
@@ -823,6 +848,10 @@ pub fn load_sessions_with_progress_from_cache_mode(
         subagent_artifact_files,
         duplicate_session_files,
         duplicate_session_file_pairs,
+        duplicate_session_twin_files,
+        duplicate_session_twin_pairs,
+        divergent_twin_files,
+        divergent_twin_pairs,
         opencode_info_docs_skipped_over_cap,
         parse_failures,
         first_parse_failure,
@@ -897,6 +926,27 @@ pub struct SuppressedSessions {
     /// capped at [`MAX_DUPLICATE_PAIR_SAMPLES`]; the full count rides
     /// `duplicate_session_files`.
     pub duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-1888 (twin arm, run a1c398e5 cycle 4): `.jsonl.zst` twins
+    /// suppressed as encoding duplicates of an admitted plain journal
+    /// (same-directory stem pair, bounded decoded-content equivalence
+    /// proven at admission — see the admission-site comment). A twin
+    /// is a DIFFERENT admission class from an rm-1886 byte copy, so
+    /// it rides its own counters instead of inflating
+    /// `duplicate_session_files`.
+    pub duplicate_session_twin_files: usize,
+    /// rm-1888 (twin arm): first suppressed twin pairs (plain
+    /// survivor, suppressed `.jsonl.zst` twin), capped at
+    /// [`MAX_DUPLICATE_PAIR_SAMPLES`].
+    pub duplicate_session_twin_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-1888 (twin arm): same-directory stem twins KEPT because the
+    /// bounded decode proved the pair NOT byte-equal (plain journal
+    /// appended after compression) or could not verify it (over-cap /
+    /// undecodable frame) — both stay admitted as genuinely different
+    /// sessions, and the kept-divergent pair is disclosed by name.
+    pub divergent_twin_files: usize,
+    /// rm-1888 (twin arm): first divergent twin pairs (plain,
+    /// `.jsonl.zst`), capped at [`MAX_DUPLICATE_PAIR_SAMPLES`].
+    pub divergent_twin_pairs: Vec<(PathBuf, PathBuf)>,
 }
 
 /// rm-1886: cap on the named duplicate pairs carried for disclosure —
@@ -982,6 +1032,109 @@ fn content_signature_cached(path: &Path, cache: &mut SessionCache) -> Option<(i6
     let signature = content_signature(path)?;
     crate::session_cache::store_content_signature(path, signature.0, signature.1, cache);
     Some(signature)
+}
+
+/// rm-1888 (twin arm, run a1c398e5 cycle 4): the stem of a rollout
+/// twin candidate — `(is_plain, stem)` for files named `<stem>.jsonl`
+/// (plain) or `<stem>.jsonl.zst` (compressed twin), `None` for every
+/// other admitted name. Only same-directory pairs of the two shapes
+/// are twin candidates; a bare `.jsonl.zst` with no plain sibling is
+/// a normal compressed rollout and stays admitted untouched.
+fn twin_stem_of(path: &Path) -> Option<(bool, std::ffi::OsString)> {
+    let name = path.file_name()?;
+    let bytes = name.to_string_lossy();
+    if let Some(stem) = bytes.strip_suffix(".jsonl") {
+        return Some((true, std::ffi::OsString::from(stem)));
+    }
+    if let Some(stem) = bytes.strip_suffix(".jsonl.zst") {
+        return Some((false, std::ffi::OsString::from(stem)));
+    }
+    None
+}
+
+/// rm-1888 (twin arm): decoded-content signature of a `.jsonl.zst`
+/// rollout twin — `(decoded byte length, FNV-1a-64 of the decoded
+/// bytes)`, mirroring [`content_signature`] but computed over the
+/// bounded decode lane the parser already owns (one decoder, one
+/// cap, so admission equivalence and parsing can never disagree
+/// about what the file says). The raw read is bounded by the shared
+/// file read cap exactly like [`content_signature`]. `None` when the
+/// frame is undecodable or exceeds either cap — the pair is then NOT
+/// verified equal, and the safe stance keeps both twins admitted
+/// (disclosed as divergent), never a silent merge.
+fn decoded_twin_signature(path: &Path) -> Option<(i64, u64)> {
+    use std::io::Read;
+    let cap = crate::parser::file_read_cap_bytes();
+    if fs::metadata(path).ok()?.len() > cap {
+        return None;
+    }
+    let mut raw = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() as u64 > cap {
+        return None;
+    }
+    let decoded = crate::parser::decode_zstd_rollout_bounded(raw, "twin dedup").ok()?;
+    Some((decoded.len() as i64, fnv1a64(&decoded)))
+}
+
+/// rm-1888 (twin arm): resolve every same-directory stem pair
+/// (`<stem>.jsonl` + `<stem>.jsonl.zst`) among the ADMITTED files by
+/// bounded decoded-content equivalence. Returns `(equal, divergent)`
+/// — equal pairs are encoding duplicates whose `.zst` side the caller
+/// suppresses; divergent pairs (bytes differ, or equivalence could
+/// not be verified) stay fully admitted and are disclosed by name.
+/// Grouping is by `(parent directory, stem)`, so cross-directory
+/// copies remain an rm-1886 raw-signature concern and a compressed
+/// rollout with no plain sibling is never touched (no decode is paid
+/// unless a twin pair actually exists).
+fn split_twin_stem_pairs(
+    admitted: &[PathBuf],
+    cache: &mut SessionCache,
+) -> (Vec<(PathBuf, PathBuf)>, Vec<(PathBuf, PathBuf)>) {
+    let mut plains: HashMap<(PathBuf, std::ffi::OsString), PathBuf> = HashMap::new();
+    let mut twins: HashMap<(PathBuf, std::ffi::OsString), PathBuf> = HashMap::new();
+    for path in admitted {
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        match twin_stem_of(path) {
+            Some((true, stem)) => {
+                plains.insert((parent.to_path_buf(), stem), path.clone());
+            }
+            Some((false, stem)) => {
+                twins.insert((parent.to_path_buf(), stem), path.clone());
+            }
+            None => {}
+        }
+    }
+    let mut equal = Vec::new();
+    let mut divergent = Vec::new();
+    for (key, plain) in plains {
+        let Some(zst) = twins.remove(&key) else {
+            continue;
+        };
+        let plain_signature = content_signature_cached(&plain, cache);
+        let decoded_signature = decoded_twin_signature(&zst);
+        match (plain_signature, decoded_signature) {
+            (Some(plain_sig), Some(decoded_sig)) if plain_sig == decoded_sig => {
+                equal.push((plain, zst));
+            }
+            _ => {
+                divergent.push((plain, zst));
+            }
+        }
+    }
+    // Determinism: HashMap iteration order must never decide which
+    // pairs ride the capped sample lists — both results are ordered
+    // by the plain survivor's path (and the suppressed twin's path
+    // as tiebreak, so two stems in one directory are stable too).
+    equal.sort();
+    divergent.sort();
+    (equal, divergent)
 }
 
 pub(crate) fn find_session_files_cached(
@@ -1086,15 +1239,26 @@ pub(crate) fn find_session_files_cached(
     // duplicates resolve by the canonical store, then byte-level copies
     // collapse first-seen, so both landed rules stay observable.
     retain_single_cline_session_per_id(&mut all);
+    // rm-2241/rm-2232 (run a1c398e5 cycle 4, "twin truth" survivor
+    // arm): the dedup input is now sorted LEXICALLY, so the
+    // first-seen survivor is the lexically-smallest path — the same
+    // corpus yields the same survivor whatever the filesystem says
+    // about mtimes or write order. The previous claim ("sorted walk,
+    // registration order, newest-first cache sort") made the survivor
+    // an mtime artifact: two files written in either order, or one
+    // `touch`, flipped which copy survived and which was named the
+    // suppressed one (proved live — the pinned CLI disclosure test
+    // flaked exactly this way). Newest-first ordering stays a
+    // DISPLAY concern only (the final `sort_paths_by_cache` below).
+    all.sort();
     // rm-1886: content dedup at admission — a byte-identical journal
     // at a second path re-emits the same events and double-banks every
     // aggregate it feeds. First-seen survivor wins (deterministic: the
-    // walk yields sorted per-directory files, roots in registration
-    // order); a file whose bytes cannot be read is KEPT — the parse
-    // lane owns unreadable files and discloses them, dedup must not
-    // silently drop what it cannot verify. Unreadable-file stance
-    // keeps this pass observable: suppressed copies are counted and
-    // the first pairs named.
+    // dedup input is lexically sorted above); a file whose bytes
+    // cannot be read is KEPT — the parse lane owns unreadable files
+    // and discloses them, dedup must not silently drop what it cannot
+    // verify. Unreadable-file stance keeps this pass observable:
+    // suppressed copies are counted and the first pairs named.
     let mut deduped: Vec<PathBuf> = Vec::with_capacity(all.len());
     let mut signatures: HashMap<(i64, u64), PathBuf> = HashMap::new();
     for path in all {
@@ -1131,6 +1295,44 @@ pub(crate) fn find_session_files_cached(
                 slot.insert(path.clone());
                 deduped.push(path);
             }
+        }
+    }
+    // rm-1888 (twin arm, run a1c398e5 cycle 4, "twin truth"): codex's
+    // cold-rollout compression publishes `<stem>.jsonl.zst` beside the
+    // source `<stem>.jsonl` and removes the source only afterwards —
+    // upstream itself tracks that removal step as a failure metric
+    // (codex-rs rollout "remove_source"), so a crash, failure, or
+    // cross-process race mid-sequence leaves BOTH twins on disk. The
+    // raw-byte signatures above cannot see the equivalence (identical
+    // content, different encoding), so admission used to bank the
+    // journal exactly twice with zero disclosure. Same-directory stem
+    // pairs are now resolved by BOUNDED decoded-content equivalence:
+    // the `.jsonl.zst` twin is decoded under the parser's existing
+    // rollout decode cap and compared byte-for-byte against the plain
+    // journal. Equal -> keep the plain journal (deterministic
+    // preference — it is the file the writer keeps appending to) and
+    // suppress the twin into its own disclosure class. NOT equal or
+    // unverifiable -> keep BOTH (genuinely different sessions) and
+    // disclose the divergent pair by name — never silently merged,
+    // never silently dropped.
+    let (equal_twins, divergent_twins) = split_twin_stem_pairs(&deduped, cache);
+    if !equal_twins.is_empty() {
+        let suppressed_twins: std::collections::HashSet<PathBuf> = equal_twins
+            .iter()
+            .map(|(_, zst)| zst.clone())
+            .collect();
+        deduped.retain(|path| !suppressed_twins.contains(path));
+        for (plain, zst) in equal_twins {
+            suppressed.duplicate_session_twin_files += 1;
+            if suppressed.duplicate_session_twin_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
+                suppressed.duplicate_session_twin_pairs.push((plain, zst));
+            }
+        }
+    }
+    for (plain, zst) in divergent_twins {
+        suppressed.divergent_twin_files += 1;
+        if suppressed.divergent_twin_pairs.len() < MAX_DUPLICATE_PAIR_SAMPLES {
+            suppressed.divergent_twin_pairs.push((plain, zst));
         }
     }
     (

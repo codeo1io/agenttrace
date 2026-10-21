@@ -1589,6 +1589,40 @@ fn attach_admission_disclosures(
                 .collect::<Vec<_>>()),
         );
     }
+    // rm-1888 (twin arm): encoding-duplicate twins (suppressed) and
+    // divergent stem twins (kept) disclose on the same surfaces, with
+    // their OWN keys — a compressed twin is not a byte copy, and a
+    // kept divergent twin is not a suppression at all.
+    if report.duplicate_session_twin_files > 0 {
+        map.insert(
+            "duplicate_session_twin_files".to_string(),
+            serde_json::json!(report.duplicate_session_twin_files),
+        );
+        map.insert(
+            "duplicate_session_twin_pairs".to_string(),
+            serde_json::json!(report
+                .duplicate_session_twin_pairs
+                .iter()
+                .take(5)
+                .map(|(plain, twin)| format!("{} <- {}", plain.display(), twin.display()))
+                .collect::<Vec<_>>()),
+        );
+    }
+    if report.divergent_twin_files > 0 {
+        map.insert(
+            "divergent_twin_files".to_string(),
+            serde_json::json!(report.divergent_twin_files),
+        );
+        map.insert(
+            "divergent_twin_pairs".to_string(),
+            serde_json::json!(report
+                .divergent_twin_pairs
+                .iter()
+                .take(5)
+                .map(|(plain, twin)| format!("{} <- {}", plain.display(), twin.display()))
+                .collect::<Vec<_>>()),
+        );
+    }
     let negative_rejected: usize = sessions
         .iter()
         .filter_map(|session| {

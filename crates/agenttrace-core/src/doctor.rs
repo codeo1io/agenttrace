@@ -219,6 +219,22 @@ pub struct DoctorReport {
     /// byte-identical copies were found.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub duplicate_session_file_pairs: Vec<String>,
+    /// rm-1888 (twin arm, run a1c398e5 cycle 4): first
+    /// `.jsonl.zst` twins suppressed as encoding duplicates of an
+    /// admitted plain journal, rendered `plain survivor <- suppressed
+    /// .jsonl.zst twin` — capped at five, the exact count rides
+    /// `disclosures["duplicate_session_twin_files"]`. Empty when no
+    /// encoding twins were resolved.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_session_twin_pairs: Vec<String>,
+    /// rm-1888 (twin arm): first same-directory stem twins KEPT
+    /// because the bounded decode proved the pair NOT byte-equal (or
+    /// could not verify it — over-cap / undecodable frame), rendered
+    /// `plain <- divergent .jsonl.zst twin`. Both stay admitted as
+    /// genuinely different sessions; the exact count rides
+    /// `disclosures["divergent_twin_files"]`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub divergent_twin_pairs: Vec<String>,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
     /// `agenttrace statusline` has been configured as the statusLine
@@ -335,6 +351,10 @@ struct DoctorDiscovery {
     subagent_artifact_files: usize,
     duplicate_session_files: usize,
     duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    duplicate_session_twin_files: usize,
+    duplicate_session_twin_pairs: Vec<(PathBuf, PathBuf)>,
+    divergent_twin_files: usize,
+    divergent_twin_pairs: Vec<(PathBuf, PathBuf)>,
     opencode_info_docs_skipped_over_cap: usize,
     /// rm-1978: set exactly when the bundled demo corpus failed to
     /// parse under `--doctor --demo` (build-time content corruption,
@@ -382,6 +402,10 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             subagent_artifact_files: 0,
             duplicate_session_files: 0,
             duplicate_session_file_pairs: Vec::new(),
+            duplicate_session_twin_files: 0,
+            duplicate_session_twin_pairs: Vec::new(),
+            divergent_twin_files: 0,
+            divergent_twin_pairs: Vec::new(),
             opencode_info_docs_skipped_over_cap: 0,
             demo_corpus_error,
         };
@@ -443,6 +467,10 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         subagent_artifact_files: suppressed.subagent_artifact_files,
         duplicate_session_files: suppressed.duplicate_session_files,
         duplicate_session_file_pairs: suppressed.duplicate_session_file_pairs,
+        duplicate_session_twin_files: suppressed.duplicate_session_twin_files,
+        duplicate_session_twin_pairs: suppressed.duplicate_session_twin_pairs,
+        divergent_twin_files: suppressed.divergent_twin_files,
+        divergent_twin_pairs: suppressed.divergent_twin_pairs,
         opencode_info_docs_skipped_over_cap,
         demo_corpus_error: None,
     }
@@ -472,6 +500,10 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         subagent_artifact_files,
         duplicate_session_files,
         duplicate_session_file_pairs,
+        duplicate_session_twin_files,
+        duplicate_session_twin_pairs,
+        divergent_twin_files,
+        divergent_twin_pairs,
         opencode_info_docs_skipped_over_cap,
         demo_corpus_error,
     } = doctor_discovery(dir, demo);
@@ -536,6 +568,21 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         disclosures.insert(
             "duplicate_session_files".to_string(),
             duplicate_session_files,
+        );
+    }
+    // rm-1888 (twin arm): the encoding-duplicate twin classes ride
+    // their OWN keys (a twin is not an rm-1886 byte copy), same
+    // count-in-map / names-in-field discipline as above.
+    if duplicate_session_twin_files > 0 {
+        disclosures.insert(
+            "duplicate_session_twin_files".to_string(),
+            duplicate_session_twin_files,
+        );
+    }
+    if divergent_twin_files > 0 {
+        disclosures.insert(
+            "divergent_twin_files".to_string(),
+            divergent_twin_files,
         );
     }
     // rm-451 walk-lane arm: the over-cap info-doc skip is disclosed with
@@ -608,6 +655,16 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             .map(|(survivor, suppressed)| {
                 format!("{} <- {}", survivor.display(), suppressed.display())
             })
+            .collect(),
+        duplicate_session_twin_pairs: duplicate_session_twin_pairs
+            .iter()
+            .take(5)
+            .map(|(plain, twin)| format!("{} <- {}", plain.display(), twin.display()))
+            .collect(),
+        divergent_twin_pairs: divergent_twin_pairs
+            .iter()
+            .take(5)
+            .map(|(plain, twin)| format!("{} <- {}", plain.display(), twin.display()))
             .collect(),
         project_decode,
         zero_usage,
@@ -1547,6 +1604,27 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
             ));
         }
     }
+    // rm-1888 (twin arm): encoding-duplicate `.jsonl.zst` twins
+    // suppressed at admission — codex's own compression sequence can
+    // leave the pair on disk, and both used to bank the journal.
+    if let Some(&count) = report.disclosures.get("duplicate_session_twin_files") {
+        if count > 0 {
+            recommendations.push(format!(
+                "{} compressed rollout twin/twins (.jsonl.zst beside the .jsonl journal, decoded content identical) were counted once; delete the stale twin or let codex finish compressing — the plain journal was kept.",
+                count
+            ));
+        }
+    }
+    // rm-1888 (twin arm): divergent twins stay admitted BY DESIGN —
+    // the disclosure is the cure; tell the operator what kept both.
+    if let Some(&count) = report.disclosures.get("divergent_twin_files") {
+        if count > 0 {
+            recommendations.push(format!(
+                "{} stem twin/twins (.jsonl beside .jsonl.zst) were NOT byte-equal after bounded decode, so BOTH were kept — the plain journal was appended after compression; archive or split them once you decide which journal is canonical.",
+                count
+            ));
+        }
+    }
     if demo {
         recommendations.push(
             "Demo sessions are bundled in memory, so cache reuse does not apply in this mode."
@@ -1687,6 +1765,39 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
                 .unwrap_or(report.duplicate_session_file_pairs.len()),
             report
                 .duplicate_session_file_pairs
+                .iter()
+                .map(|pair| format!("    {}\n", guard_formula_cell(pair)))
+                .collect::<String>()
+        ));
+    }
+    // rm-1888 (twin arm): suppressed encoding twins and kept divergent
+    // twins each get their own named tier so an audit reader can tell
+    // "suppressed, counted once" from "kept both, contents differ".
+    if !report.duplicate_session_twin_pairs.is_empty() {
+        out.push_str(&format!(
+            "Duplicate rollout twins (rm-1888 twin arm): {}\n{}",
+            report
+                .disclosures
+                .get("duplicate_session_twin_files")
+                .copied()
+                .unwrap_or(report.duplicate_session_twin_pairs.len()),
+            report
+                .duplicate_session_twin_pairs
+                .iter()
+                .map(|pair| format!("    {}\n", guard_formula_cell(pair)))
+                .collect::<String>()
+        ));
+    }
+    if !report.divergent_twin_pairs.is_empty() {
+        out.push_str(&format!(
+            "Divergent rollout twins kept (rm-1888 twin arm): {}\n{}",
+            report
+                .disclosures
+                .get("divergent_twin_files")
+                .copied()
+                .unwrap_or(report.divergent_twin_pairs.len()),
+            report
+                .divergent_twin_pairs
                 .iter()
                 .map(|pair| format!("    {}\n", guard_formula_cell(pair)))
                 .collect::<String>()
