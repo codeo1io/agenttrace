@@ -25,12 +25,22 @@
 //! * no writes outside artifact roots — the only write is the session
 //!   cache the CLI itself maintains
 //!   (`AGENTTRACE_SESSION_CACHE_DIR`), which loading may refresh.
-//! * protocol currency (rm-780) — the server speaks the MCP revisions
-//!   in [`SUPPORTED_PROTOCOL_VERSIONS`], newest first. `initialize`
+//! * protocol currency (rm-780 + rm-455, run f62ee197 cycle 4) —
+//!   the server speaks the MCP revisions in
+//!   [`SUPPORTED_PROTOCOL_VERSIONS`], newest first. `initialize`
 //!   answers the newest revision the client also declared, never a
-//!   client-supplied echo; an unknown or absent client version falls
-//!   back to the newest supported revision with a one-line stderr
-//!   disclosure (stdout stays protocol-only).
+//!   client-supplied echo; the requested version may arrive as the
+//!   `protocolVersion` member OR inline under the reserved
+//!   per-request `_meta` key
+//!   `io.modelcontextprotocol/protocolVersion`, honored statelessly
+//!   on EVERY request. An unsupported version answers the 2026-07-28
+//!   schema's typed `UnsupportedProtocolVersionError` (`-32022`,
+//!   `data {requested, supported}`) — never a success result; an
+//!   absent version still falls back to the newest supported
+//!   revision with a one-line stderr disclosure (stdout stays
+//!   protocol-only). The revision's one mandatory server RPC
+//!   `server/discover` answers the stateless discovery surface (see
+//!   [`discover_result`]).
 //! * wire discipline (rm-782 + landed rm-923) — notifications are
 //!   never answered; unknown methods answer `-32601`; malformed
 //!   input answers `-32700` and the server stays up, including a
@@ -85,6 +95,28 @@ const CODE_PARSE_ERROR: i64 = -32700;
 const CODE_INVALID_REQUEST: i64 = -32600;
 const CODE_METHOD_NOT_FOUND: i64 = -32601;
 const CODE_INVALID_PARAMS: i64 = -32602;
+/// The 2026-07-28 revision's typed version-negotiation failure
+/// (rm-455, run f62ee197 cycle 4). The code and the `data` shape
+/// are fixed by the schema (`UnsupportedProtocolVersionError`):
+/// `requested` (string — what the client asked for) plus
+/// `supported` (the revisions this server speaks, newest first).
+/// The message text is NOT schema-fixed — the base `Error` shape
+/// only asks for "a concise single sentence".
+const CODE_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// Reserved per-request `_meta` member (2026-07-28): every request
+/// may carry its protocol version inline under this canonical
+/// reserved key, and a server honors it statelessly. The
+/// `io.modelcontextprotocol/` prefix is spec-reserved — a BARE
+/// `protocolVersion` `_meta` member is client-chosen, not reserved,
+/// and is deliberately ignored here (honoring it would let a
+/// non-version member flip the negotiated dialect).
+const META_PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// Reserved `_meta` member carrying server identity (the same
+/// `serverInfo` object `initialize` returns) on results that can
+/// reach a host without a handshake.
+const META_SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 
 /// MCP protocol revisions this server speaks, NEWEST FIRST — the
 /// order is the negotiation preference (rm-780). `initialize` answers
@@ -421,8 +453,31 @@ fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
             ));
         }
     };
+    // A2+A3 (rm-455, run f62ee197 cycle 4): resolve the requested
+    // version from the `protocolVersion` member OR the reserved
+    // canonical `_meta` key — the `_meta` lane is stateless and
+    // applies to EVERY method, matching the revision's
+    // inline-negotiation rule. An unsupported version answers the
+    // schema's typed error; the old fall-back-to-newest answered a
+    // client that cannot speak this wire with a success result — a
+    // lie on both ends (assess F1 probe: `1999-99-99` negotiated
+    // "successfully").
+    if let Some(requested) = requested_protocol_version(&params) {
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+            return Some(unsupported_protocol_version_response(id, requested));
+        }
+    }
     let result = match method {
         "initialize" => initialize_result(params),
+        // A1 (rm-455, run f62ee197 cycle 4): the 2026-07-28
+        // revision's ONE mandatory server RPC — `DiscoverRequest`'s
+        // schema description reads "Servers MUST implement
+        // `server/discover`. Clients MAY call it but are not required
+        // to — version negotiation can also happen inline via
+        // per-request `_meta`." Stateless: no `initialize` needed
+        // first. `resultType` rides the central [`with_result_type`]
+        // seam like every other result.
+        "server/discover" => Ok(discover_result()),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list_result()),
         "tools/call" => call_tool(params, root),
@@ -477,19 +532,30 @@ fn with_result_type(result: Value) -> Value {
 /// `initialize` result (rm-780): answer with the newest protocol
 /// revision BOTH sides speak. A client-declared version in
 /// [`SUPPORTED_PROTOCOL_VERSIONS`] is answered with itself (that IS
-/// the mutually supported one); any other value — unknown or absent —
-/// falls back to the newest revision this server supports, with a
-/// one-line stderr disclosure so the host's log explains what
-/// happened. A client echo is never returned: the old behavior told a
+/// the mutually supported one); the requested version may also arrive
+/// inline under the reserved canonical `_meta` key (see
+/// [`requested_protocol_version`] — rm-455, run f62ee197 cycle 4).
+/// An unsupported value never reaches this function: the typed
+/// `-32022` gate answers it before dispatch. An ABSENT version falls
+/// back to the newest revision this server supports, with a one-line
+/// stderr disclosure so the host's log explains what happened. A
+/// client echo is never returned: the old behavior told a
 /// 2026-07-28 host "supported" and then served it the older wire the
 /// server was actually built for (assess F5a PoC: `1999-99-99` was
 /// echoed back verbatim).
 fn initialize_result(params: Value) -> Result<Value, (i64, String)> {
-    let requested = params.get("protocolVersion").and_then(Value::as_str);
+    let requested = requested_protocol_version(&params);
     let answered = match requested {
         Some(version) if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => version,
         unsupported => {
-            // stdout is protocol-only; the disclosure rides stderr.
+            // Reachable only for an ABSENT version (rm-455, run
+            // f62ee197 cycle 4): unsupported values — member or
+            // `_meta` — are answered with the typed -32022 error at
+            // the dispatch gate before this function runs. Absent
+            // stays permissive on purpose: the strict reading would
+            // lock out exactly the legacy clients the fallback
+            // serves. stdout is protocol-only; the disclosure rides
+            // stderr.
             eprintln!(
                 "agenttrace mcp: client requested protocol version {}, which this \
                  server does not speak; answering with its newest supported revision \
@@ -515,6 +581,85 @@ fn initialize_result(params: Value) -> Result<Value, (i64, String)> {
     by_model_breakdown (cost and sessions per model). The server is offline \
     and stdio-only; it writes nothing outside the agenttrace session cache."
     }))
+}
+
+/// A2+A3 helper (rm-455, run f62ee197 cycle 4): resolve the
+/// requested protocol version for ANY request — the
+/// `protocolVersion` member when present (precedence: the explicit
+/// legacy member wins over `_meta`), else the reserved canonical
+/// `_meta` key. A non-string member is not a version signal and is
+/// ignored (the schema types both members as string). A bare,
+/// non-reserved `protocolVersion` `_meta` spelling is deliberately
+/// ignored too — see [`META_PROTOCOL_VERSION_KEY`].
+fn requested_protocol_version(params: &Value) -> Option<&str> {
+    params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params
+                .get("_meta")
+                .and_then(Value::as_object)
+                .and_then(|meta| meta.get(META_PROTOCOL_VERSION_KEY))
+                .and_then(Value::as_str)
+        })
+}
+
+/// A2 (rm-455, run f62ee197 cycle 4): the typed version-negotiation
+/// failure. Fixed by the 2026-07-28 schema: code `-32022` and the
+/// `data` object with `requested` (what the client asked for) and
+/// `supported` (the same newest-first list `server/discover`
+/// advertises, so the client can recover without a second round
+/// trip). The message text is this server's choice ("Unsupported
+/// version") — the schema fixes the code and `data`, not the
+/// message.
+fn unsupported_protocol_version_response(id: Value, requested: &str) -> String {
+    wire_sanitize(
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": CODE_UNSUPPORTED_PROTOCOL_VERSION,
+                "message": "Unsupported version",
+                "data": {
+                    "requested": requested,
+                    "supported": SUPPORTED_PROTOCOL_VERSIONS,
+                }
+            }
+        })
+        .to_string(),
+    )
+}
+
+/// A1 (rm-455, run f62ee197 cycle 4): the `server/discover` result.
+/// The 2026-07-28 schema's `DiscoverResult` requires all five
+/// members; `supportedVersions` is the same newest-first
+/// negotiation list `initialize` uses; `capabilities` is the honest
+/// static surface (two read-only tools, never invalidated
+/// mid-session — `listChanged: false`); the cache-hint pair reuses
+/// [`TOOLS_LIST_TTL_MS`] for the same compile-time-static rationale
+/// (this surface changes only with a binary upgrade). The reserved
+/// `_meta` server-info key carries the identity a host that skips
+/// `initialize` still needs. `resultType` is inserted centrally by
+/// [`with_result_type`] ("complete" — discovery is not an
+/// incremental shape).
+fn discover_result() -> Value {
+    let mut meta = Map::new();
+    meta.insert(
+        META_SERVER_INFO_KEY.to_string(),
+        json!({
+            "name": "agenttrace",
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+    );
+    json!({
+        "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+        "capabilities": {
+            "tools": { "listChanged": false }
+        },
+        "ttlMs": TOOLS_LIST_TTL_MS,
+        "cacheScope": "public",
+        "_meta": Value::Object(meta),
+    })
 }
 
 /// `tools/list` result. Descriptions state the read-only posture so a

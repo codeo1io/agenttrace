@@ -4,6 +4,59 @@
 
 ### Added
 
+- The MCP server speaks the 2026-07-28 revision's wire truth
+  end to end (rm-455, run f62ee197 cycle 4): `server/discover` — the
+  revision's ONE mandatory server RPC, whose schema description reads
+  "Servers MUST implement `server/discover`" — is implemented and
+  stateless (no `initialize` needed first), answering `supportedVersions`,
+  `capabilities` (two read-only tools, `listChanged: false`), the
+  required cache-hint pair (`ttlMs`, `cacheScope: public`), and the
+  reserved `_meta` server-info key; `resultType` rides the existing
+  central seam. Per-request version negotiation under the reserved
+  canonical `_meta` key `io.modelcontextprotocol/protocolVersion` is
+  honored on every method (previously silently ignored — the server
+  answered with its newest revision regardless), with the explicit
+  `protocolVersion` member taking precedence and non-reserved bare
+  spellings ignored. An unsupported requested version — member or
+  `_meta`, any method — now answers the schema's typed
+  `UnsupportedProtocolVersionError` (`-32022`, message
+  `Unsupported version`, `data {requested, supported}`) instead of the
+  success-with-newest fallback that claimed a session in a dialect
+  neither side speaks (first-party demand: the claude-code 2.1.303
+  changelog fixes servers over this exact 2026-07-28 negotiation
+  surface). An absent version keeps the rm-780 fallback with its
+  stderr disclosure for legacy clients. Pinned by
+  `server_discover_answers_the_mandatory_rpc_statelessly` and
+  `per_request_meta_version_negotiates_statelessly_and_typed`, with the
+  unknown-version arm of `protocol_version_is_negotiated_never_echoed`
+  flipped to the typed contract.
+
+  Integration seam (2026-10-21, conflict case 0f9ceec678464b219423f454d5b76a04,
+  landing onto a wall 14 commits / 6 integration landings past this run's
+  base de3168de): the only textual conflict was this changelog row itself —
+  both sides had prepended to the Unreleased Added list — and the row lands
+  atop the list as the newest landing commit. The mechanics compose
+  unchanged with the advanced wall: since de3168de the wall touched none of
+  the batch's other three files (mcp.rs, tests/mcp_server.rs,
+  docs/guides/mcp-server.md — empty wall-side diff) and made zero
+  mcp-mentioning changes to main.rs, so the validated candidate delta merges
+  byte-identical with nothing to re-anchor and no superseded mechanics; the
+  landed MCP family it builds on (rm-780/781/782 hardening, rm-976 jsonrpc
+  member, rm-998 literal-numeral pin) is untouched. The run's roadmap and
+  compound band (roadmap 0788c9c1, superseded by compound 4be3898d with the
+  rm-2124 webpki-advisory mint) was swept from the spool and cache before
+  any gate could apply it and never reached this wall — its carry-forwards
+  stay unlanded and are NOT re-minted here: the RUSTSEC-2026-0381/-0382
+  cure is already claimed by sibling lane 56ce6fe7's lock bump (not an
+  ancestor of this wall; reconcile by title at its own gate), and rm-455's
+  status flip stays reserved (rm-012) with a dated landing rider on its
+  ROADMAP row recording this seam. Independent-review round (2026-10-22,
+  conflict case 97922a676a6e4c7681377ebf4fa8d8a5) fixed the one latent
+  seam it found: the guide's worked example still described the superseded
+  unknown-version fallback and omitted the unconditional `resultType`
+  member; corrected in docs/guides/mcp-server.md prose only — code
+  untouched, byte-identical to the validated candidate.
+
 - Zst stem twins count once, with disclosure (rm-2056, run 18f9b98a
   cycle 2, assess 9158ade7): codex 0.163's rollout migration leaves a
   journal present as BOTH `<stem>.jsonl` and `<stem>.jsonl.zst` — one
@@ -147,7 +200,6 @@
   rm-548 F7 "uncapped" claim is superseded-in-part by the landed
   info-doc read cap; the rm-451 F6 and rm-992 coordinates moved
   with landed code and stand).
-
 - Compressed codex rollouts (`.jsonl.zst`) are admitted by discovery and
   decoded (rm-992, run e4209f0c cycle 5): upstream codex `migrate_rollouts`
   compresses rollouts to `<name>.jsonl.zst` (compression stable-adjacent
