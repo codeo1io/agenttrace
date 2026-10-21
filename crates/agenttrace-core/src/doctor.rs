@@ -3,9 +3,8 @@ use crate::sqlite_sessions::{
     load_sqlite_backed_sessions_reported_bounded, SqlitePartialDb, SqliteScanBudget,
 };
 use crate::{
-    cache_dir::user_cache_dir, cached_session, find_session_files, known_session_dirs,
-    load_session_cache, parse_file, save_session_cache, store_session, Session, SqliteIngestReport,
-    VERSION,
+    cache_dir::user_cache_dir, cached_session, known_session_dirs, load_session_cache, parse_file,
+    store_session, Session, SqliteIngestReport, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -335,6 +334,17 @@ struct DoctorDiscovery {
     subagent_artifact_files: usize,
     duplicate_session_files: usize,
     duplicate_session_file_pairs: Vec<(PathBuf, PathBuf)>,
+    /// rm-2126 (run 82a64f5a cycle 2): directories the walk's depth
+    /// bound refused whose peek still found eligible content — the
+    /// doctor's `-d` arm was a proven silent lane for these.
+    depth_clipped_dirs: usize,
+    /// rm-2127: directories whose read_dir/stat failed for a reason
+    /// other than NotFound (EACCES subtree, EIO).
+    unreadable_dirs: usize,
+    /// rm-1888 arm: same-inode alias files suppressed at walk
+    /// admission (hardlink/symlink aliases; distinct from the
+    /// content-duplicate counter above).
+    same_inode_files_suppressed: usize,
     opencode_info_docs_skipped_over_cap: usize,
     /// rm-1978: set exactly when the bundled demo corpus failed to
     /// parse under `--doctor --demo` (build-time content corruption,
@@ -382,6 +392,9 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             subagent_artifact_files: 0,
             duplicate_session_files: 0,
             duplicate_session_file_pairs: Vec::new(),
+            depth_clipped_dirs: 0,
+            unreadable_dirs: 0,
+            same_inode_files_suppressed: 0,
             opencode_info_docs_skipped_over_cap: 0,
             demo_corpus_error,
         };
@@ -390,13 +403,21 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, suppressed, opencode_info_docs_skipped_over_cap) = if dir.is_none() {
+    // rm-2126/rm-2127/rm-1888 arm (run 82a64f5a cycle 2, "nothing
+    // read-side is silent"): BOTH doctor arms carry the walk
+    // disclosure now — the explicit `-d` arm was one of the assess
+    // PoCs' silent lanes (a rollout nested past the depth bound and a
+    // mode-000 subdir each vanished with zero output), so it must not
+    // be the lane that still hides them.
+    let (files, suppressed, opencode_info_docs_skipped_over_cap, walk) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
+        let (files, walk) = crate::discovery::find_session_files_reported(dir);
         (
-            find_session_files(dir),
+            files,
             crate::discovery::SuppressedSessions::default(),
             0,
+            walk,
         )
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
@@ -443,6 +464,9 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         subagent_artifact_files: suppressed.subagent_artifact_files,
         duplicate_session_files: suppressed.duplicate_session_files,
         duplicate_session_file_pairs: suppressed.duplicate_session_file_pairs,
+        depth_clipped_dirs: walk.depth_clipped_dirs,
+        unreadable_dirs: walk.unreadable_dirs,
+        same_inode_files_suppressed: walk.same_inode_files_suppressed,
         opencode_info_docs_skipped_over_cap,
         demo_corpus_error: None,
     }
@@ -472,6 +496,9 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         subagent_artifact_files,
         duplicate_session_files,
         duplicate_session_file_pairs,
+        depth_clipped_dirs,
+        unreadable_dirs,
+        same_inode_files_suppressed,
         opencode_info_docs_skipped_over_cap,
         demo_corpus_error,
     } = doctor_discovery(dir, demo);
@@ -545,6 +572,25 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         disclosures.insert(
             "opencode_info_docs_skipped_over_cap".to_string(),
             opencode_info_docs_skipped_over_cap,
+        );
+    }
+    // rm-2126/rm-2127/rm-1888 arm (run 82a64f5a cycle 2, "nothing
+    // read-side is silent"): the walk's own suppression classes —
+    // depth-bound clips that lost content, unreadable subtrees,
+    // same-inode aliases — were the last counters that never reached
+    // this map. Same-key discipline with the loader's LoadReport (the
+    // --audit JSON attaches the identical keys), so all three
+    // surfaces agree.
+    if depth_clipped_dirs > 0 {
+        disclosures.insert("depth_clipped_dirs".to_string(), depth_clipped_dirs);
+    }
+    if unreadable_dirs > 0 {
+        disclosures.insert("unreadable_dirs".to_string(), unreadable_dirs);
+    }
+    if same_inode_files_suppressed > 0 {
+        disclosures.insert(
+            "same_inode_files_suppressed".to_string(),
+            same_inode_files_suppressed,
         );
     }
     let mut report = DoctorReport {
@@ -942,12 +988,19 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
 
 fn find_reportable_session_files(
     dir: Option<&Path>,
-) -> (Vec<PathBuf>, crate::discovery::SuppressedSessions, usize) {
+) -> (
+    Vec<PathBuf>,
+    crate::discovery::SuppressedSessions,
+    usize,
+    crate::discovery::WalkDisclosure,
+) {
     if dir.is_some() {
+        let (files, walk) = crate::discovery::find_session_files_reported(dir);
         return (
-            find_session_files(dir),
+            files,
             crate::discovery::SuppressedSessions::default(),
             0,
+            walk,
         );
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
@@ -964,12 +1017,15 @@ fn find_reportable_session_files(
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, suppressed, opencode_info_docs_skipped_over_cap) =
+    let (files, suppressed, opencode_info_docs_skipped_over_cap, walk) =
         crate::discovery::find_session_files_cached(None, &mut cache, true);
-    // A cache write failure must never fail the doctor (the cache is
-    // an optimization; the inventory answer is already correct).
-    let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, suppressed, opencode_info_docs_skipped_over_cap)
+    // rm-367 arm (run 82a64f5a cycle 2): a cache write failure must
+    // still never fail the doctor (the cache is an optimization; the
+    // inventory answer is already correct) — but it is no longer
+    // silent either: one stderr note names the path, so a read-only
+    // cache dir stops looking like a mysteriously slow cold start.
+    crate::session_cache::persist_session_cache_disclosed(&mut cache);
+    (files, suppressed, opencode_info_docs_skipped_over_cap, walk)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite
@@ -1155,8 +1211,11 @@ fn doctor_directories(
     // cache but never wrote it, so every rerun re-parsed every
     // session from source. Stages b-d (finder-level reuse of the
     // walk itself) stay open on the row.
+    // rm-367 arm (run 82a64f5a cycle 2): the save rides
+    // `persist_session_cache_disclosed` — a failed write (read-only
+    // cache dir) prints one stderr note instead of vanishing.
     if cache.is_dirty() {
-        let _ = save_session_cache(&mut cache);
+        crate::session_cache::persist_session_cache_disclosed(&mut cache);
     }
     dirs.extend(doctor_sqlite_directories(sessions, sqlite_ingest));
     // SQLite-backed sessions (and, under `--demo`, the bundled corpus)
@@ -1543,6 +1602,44 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
         if count > 0 {
             recommendations.push(format!(
                 "{} byte-identical session file copy/copies were counted once (content signature match); keep ONE canonical copy per journal so tooling that ignores content identity stays honest.",
+                count
+            ));
+        }
+    }
+    // rm-2126 (run 82a64f5a cycle 2): the depth bound is a shape
+    // heuristic, not a semantic one — a corpus nested past it loses
+    // files with no other trace. The counter is exact (only clips
+    // whose peek found eligible content), the loss is not: name the
+    // escape hatch so the fix is actionable.
+    if let Some(&count) = report.disclosures.get("depth_clipped_dirs") {
+        if count > 0 {
+            recommendations.push(format!(
+                "{} nested director{} past the session-walk depth bound held file(s) the walk refused; counts may be low. Point `--dir` at the deepest level (the explicit lane walks it from scratch) or split the tree.",
+                count,
+                if count == 1 { "y lies" } else { "ies lie" }
+            ));
+        }
+    }
+    // rm-2127: an unreadable subtree (mode-000 dir, EIO mount) hides
+    // everything beneath it; unlike the depth clip this one is
+    // usually a permissions accident, so the repair is on the tree.
+    if let Some(&count) = report.disclosures.get("unreadable_dirs") {
+        if count > 0 {
+            recommendations.push(format!(
+                "{} director{} could not be read (permission or I/O error); session files beneath them are not counted. Check ownership/modes if that subtree should be scanned.",
+                count,
+                if count == 1 { "y was" } else { "ies were" }
+            ));
+        }
+    }
+    // rm-1888 arm: same-inode aliases are suppressed at walk
+    // admission so one physical transcript banks once — if the
+    // operator intends them as separate sessions, the disclosure is
+    // where they learn the tool disagreed.
+    if let Some(&count) = report.disclosures.get("same_inode_files_suppressed") {
+        if count > 0 {
+            recommendations.push(format!(
+                "{} same-inode session file alias(es) (hardlink/symlink) were counted once; each alias re-states one physical transcript.",
                 count
             ));
         }

@@ -5757,7 +5757,33 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             }
                         }
                         None => {
-                            if !message_id.is_empty() {
+                            // rm-2128 (run 82a64f5a cycle 2, "nothing
+                            // read-side is silent" — the requestless
+                            // count-once probe): this emission carries
+                            // usage but NO message id, so the rm-601
+                            // fold above has no key to fold it under
+                            // and the legacy behavior stands — every
+                            // streamed block of a requestless message
+                            // banks its own meta event (the exact
+                            // inflation class ccusage fixed for
+                            // requestless resp_ rows in 20.0.37,
+                            // issue #1935; see also the #1838 law two
+                            // folds up). We do NOT change the banking
+                            // — a fixture pins it and inventing a key
+                            // risks merging genuinely distinct
+                            // messages — but the hole is no longer
+                            // silent: one counter per journal states
+                            // how many usage emissions were admitted
+                            // without a fold key, riding the lane's
+                            // existing one-carrier disclosure channel
+                            // (same carrier as
+                            // `claude_unmatched_type:*`). A healthy
+                            // corpus emits zero of these.
+                            if message_id.is_empty() {
+                                *tool_result_refolds
+                                    .entry("claude_unkeyed_usage_emissions".to_string())
+                                    .or_insert(0) += 1;
+                            } else {
                                 usage_by_message.insert(message_id.to_string(), events.len());
                             }
                             events.push(Event {

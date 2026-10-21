@@ -40,10 +40,11 @@ pub use filters::{
 
 pub use codex_replay::{reconcile_codex_multiagent_replays, CodexReplayAdjustment};
 pub use discovery::{
-    collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
-    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,
-    load_sessions_with_progress_from_cache, load_sessions_with_progress_from_cache_mode,
-    KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
+    collect_session_files, discover_session_dirs, find_session_files, find_session_files_reported,
+    known_session_dirs, load_sessions_from_dir, load_sessions_with_options,
+    load_sessions_with_progress, load_sessions_with_progress_from_cache,
+    load_sessions_with_progress_from_cache_mode, KnownSessionDir, LoadOptions, LoadProgress,
+    LoadReport, WalkDisclosure,
 };
 pub use doctor::{
     build_doctor_report, doctor_report_text, render_doctor_report, DoctorDirReport, DoctorReport,
@@ -93,9 +94,9 @@ pub use search::{
 };
 pub use session_cache::{
     cached_session, clear_session_cache, effective_session_cache_entries, load_cached_sessions,
-    load_cached_sessions_from_cache, load_session_cache, save_session_cache,
-    session_cache_entries_source, session_cache_path, store_session, SessionCache,
-    MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES, MAX_SESSION_CACHE_ENTRIES,
+    load_cached_sessions_from_cache, load_session_cache, persist_session_cache_disclosed,
+    save_session_cache, session_cache_entries_source, session_cache_path, store_session,
+    SessionCache, MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES, MAX_SESSION_CACHE_ENTRIES,
     MIN_CONFIGURED_SESSION_CACHE_ENTRIES, SESSION_CACHE_SCHEMA_VERSION,
 };
 pub use sqlite_sessions::{

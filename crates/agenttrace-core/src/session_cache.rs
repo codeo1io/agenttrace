@@ -2439,7 +2439,11 @@ pub fn load_cached_sessions_from_cache(
         .filter_map(|path| cached_session(&path, cache))
         .collect();
     if cache.is_dirty() {
-        let _ = save_session_cache(cache);
+        // rm-367 arm (run 82a64f5a cycle 2): this is the read lane's
+        // silent `let _ =` the row was minted on — a cache write
+        // failure (read-only cache dir, full disk) must not fail the
+        // read, but it may not be invisible either.
+        persist_session_cache_disclosed(cache);
     }
     sessions
 }
@@ -3241,6 +3245,36 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
         return Ok(());
     }
     Ok(())
+}
+
+/// rm-367 arm (run 82a64f5a cycle 2, "nothing read-side is silent"):
+/// the disclosed wrapper for read-lane cache persists.
+///
+/// Every read lane that ends with "save what we learned so the next
+/// run is warm" previously did `let _ = save_session_cache(&mut
+/// cache)` — correct on the happy path, but a write failure (a
+/// read-only `AGENTTRACE_SESSION_CACHE_DIR`, a full disk, a lost
+/// permissions race) vanished completely: the next run re-parsed the
+/// world and nothing anywhere said why. The assess-phase PoC (run
+/// 82a64f5a cycle 1, probe p7) planted exactly this — a read-only
+/// cache dir — and observed a silent cold start.
+///
+/// Contract:
+/// - NEVER returns an error and never panics: the cache is an
+///   optimization, and the inventory/answer the caller already
+///   produced stays correct without it.
+/// - On failure, prints exactly ONE stderr note naming the cache path
+///   and the error, so a mysteriously slow cold start has a visible
+///   cause. The note goes to stderr (not stdout) so JSON consumers on
+///   stdout stay clean; one line per process per failed save.
+pub fn persist_session_cache_disclosed(cache: &mut SessionCache) {
+    if let Err(error) = save_session_cache(cache) {
+        eprintln!(
+            "agenttrace: session cache not saved to {} ({}); reads still succeeded, but every run will re-parse from source",
+            cache.path.display(),
+            error
+        );
+    }
 }
 
 pub fn cached_session(path: &Path, cache: &mut SessionCache) -> Option<Session> {

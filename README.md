@@ -518,7 +518,7 @@ fails when the README table drifts from the binary's actual flag count
 | --- | --- | --- |
 | `-f, --format <FORMAT>` | `text` | Output format for the requested view: text (default), json, csv, markdown/md, html, svg (the shareable usage card; requires --overview), otel (the OTLP-JSON export of the whole corpus; requires --overview), or tsv (the --sessions table, byte-identical to its default text render; requires --sessions). Unsupported combinations fail loudly instead of falling back to text |
 | `--card-theme <CARD_THEME>` | `auto` | rm-576: color scheme of the SVG usage card (`-f svg`). `auto` ships the light palette plus a `prefers-color-scheme` override so the static file adapts to the viewer; bytes stay deterministic |
-| `-d, --dir <DIR>` |  | Session directory to scan instead of auto-discovered agent homes |
+| `-d, --dir <DIR>` |  | Session directory to scan instead of auto-discovered agent homes. rm-2126/rm-2127 (run 82a64f5a cycle 2): this walk is bounded (`max_session_dir_depth`, default 4) and a subtree that refuses reads is skipped — both classes are now disclosed (`depth_clipped_dirs`, `unreadable_dirs`, `same_inode_files_suppressed`) in `--doctor`, the `--overview -f json` admission disclosures, and `--audit`, never dropped silently; point `-d` at the deepest level to walk a deeper tree in full |
 | `--compare` |  | Compare the inspected session against the healthy-baseline summary (narrative framed for `-m`) |
 | `--audit` |  | Render the governance audit report across matching sessions (tool-authority drift and spend oversight; `--sample` bounds it) |
 | `--recommend` |  | Render cost and efficiency recommendations derived from the session corpus |

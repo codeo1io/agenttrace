@@ -1589,6 +1589,28 @@ fn attach_admission_disclosures(
                 .collect::<Vec<_>>()),
         );
     }
+    // rm-2126/rm-2127/rm-1888 arm (run 82a64f5a cycle 2, "nothing
+    // read-side is silent"): the walk's own suppression classes reach
+    // the audit JSON under the SAME keys `--doctor` renders, so
+    // automation and the human report share one vocabulary.
+    if report.depth_clipped_dirs > 0 {
+        map.insert(
+            "depth_clipped_dirs".to_string(),
+            serde_json::json!(report.depth_clipped_dirs),
+        );
+    }
+    if report.unreadable_dirs > 0 {
+        map.insert(
+            "unreadable_dirs".to_string(),
+            serde_json::json!(report.unreadable_dirs),
+        );
+    }
+    if report.same_inode_files_suppressed > 0 {
+        map.insert(
+            "same_inode_files_suppressed".to_string(),
+            serde_json::json!(report.same_inode_files_suppressed),
+        );
+    }
     let negative_rejected: usize = sessions
         .iter()
         .filter_map(|session| {
