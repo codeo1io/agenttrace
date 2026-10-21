@@ -2874,49 +2874,89 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .sum();
         if attributed_total > 0.0 && cost_finite {
             let scale = 1.0e4_f64;
-            let total_units = (session.metrics.cost_estimated * scale).round() as i64;
-            let attribution_items: Vec<_> = session.metrics.model_attribution.iter().collect();
-            let mut shares: Vec<i64> = Vec::with_capacity(attribution_items.len());
-            let mut remainders: Vec<(usize, f64)> = Vec::with_capacity(attribution_items.len());
-            let mut allocated: i64 = 0;
-            for (idx, (_, attribution)) in attribution_items.iter().enumerate() {
-                let exact = attribution.cost_usd / attributed_total * total_units as f64;
-                let floor = exact.floor() as i64;
-                shares.push(floor);
-                allocated += floor;
-                remainders.push((idx, exact - floor as f64));
-            }
-            let mut leftover = total_units - allocated;
-            // Largest remainder first; ties break on attribution weight
-            // (bigger share wins the extra unit) then model name — both
-            // independent of the map's iteration order (HashMap order is
-            // per-process), so the split is deterministic across runs.
-            remainders.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(
-                        attribution_items[b.0]
-                            .1
-                            .cost_usd
-                            .partial_cmp(&attribution_items[a.0].1.cost_usd)
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
-                    .then(attribution_items[a.0].0.cmp(attribution_items[b.0].0))
-            });
-            let mut ri = 0;
-            while leftover > 0 && !remainders.is_empty() {
-                let (idx, _) = remainders[ri % remainders.len()];
-                shares[idx] += 1;
-                leftover -= 1;
-                ri += 1;
-            }
-            for ((attributed_model, _), units) in attribution_items.iter().zip(&shares) {
-                let entry = overview
-                    .by_model
-                    .entry((*attributed_model).clone())
-                    .or_default();
-                entry.sessions += 1;
-                entry.cost += *units as f64 / scale;
+            let total_units_f = (session.metrics.cost_estimated * scale).round();
+            // rm-2249: `as i64` silently saturates at i64::MAX once
+            // |cost_estimated| crosses ~9.2e14 — hostile recorded costs
+            // reach exactly that band, collapsing every bucket onto the
+            // saturated units while the billed total renders at full
+            // magnitude. The unit lattice cannot represent a split that
+            // large, so apportion proportionally in f64 and pin the
+            // largest bucket so the buckets still sum to the rounded
+            // billed total (relative exactness; ulp drift at that scale
+            // is far below every rendering lane's precision).
+            if total_units_f.abs() >= 9.0e18 {
+                let billed_total = round4(session.metrics.cost_estimated);
+                let overflow_items: Vec<_> = session.metrics.model_attribution.iter().collect();
+                let mut overflow_shares: Vec<f64> = overflow_items
+                    .iter()
+                    .map(|(_, attribution)| {
+                        round4(
+                            attribution.cost_usd / attributed_total
+                                * session.metrics.cost_estimated,
+                        )
+                    })
+                    .collect();
+                let apportioned: f64 = overflow_shares.iter().sum();
+                if let Some((largest_idx, _)) = overflow_shares
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    overflow_shares[largest_idx] += billed_total - apportioned;
+                }
+                for ((attributed_model, _), share) in overflow_items.iter().zip(&overflow_shares) {
+                    let entry = overview
+                        .by_model
+                        .entry((*attributed_model).clone())
+                        .or_default();
+                    entry.sessions += 1;
+                    entry.cost += *share;
+                }
+            } else {
+                let total_units = total_units_f as i64;
+                let attribution_items: Vec<_> = session.metrics.model_attribution.iter().collect();
+                let mut shares: Vec<i64> = Vec::with_capacity(attribution_items.len());
+                let mut remainders: Vec<(usize, f64)> = Vec::with_capacity(attribution_items.len());
+                let mut allocated: i64 = 0;
+                for (idx, (_, attribution)) in attribution_items.iter().enumerate() {
+                    let exact = attribution.cost_usd / attributed_total * total_units as f64;
+                    let floor = exact.floor() as i64;
+                    shares.push(floor);
+                    allocated += floor;
+                    remainders.push((idx, exact - floor as f64));
+                }
+                let mut leftover = total_units - allocated;
+                // Largest remainder first; ties break on attribution weight
+                // (bigger share wins the extra unit) then model name — both
+                // independent of the map's iteration order (HashMap order is
+                // per-process), so the split is deterministic across runs.
+                remainders.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(
+                            attribution_items[b.0]
+                                .1
+                                .cost_usd
+                                .partial_cmp(&attribution_items[a.0].1.cost_usd)
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                        )
+                        .then(attribution_items[a.0].0.cmp(attribution_items[b.0].0))
+                });
+                let mut ri = 0;
+                while leftover > 0 && !remainders.is_empty() {
+                    let (idx, _) = remainders[ri % remainders.len()];
+                    shares[idx] += 1;
+                    leftover -= 1;
+                    ri += 1;
+                }
+                for ((attributed_model, _), units) in attribution_items.iter().zip(&shares) {
+                    let entry = overview
+                        .by_model
+                        .entry((*attributed_model).clone())
+                        .or_default();
+                    entry.sessions += 1;
+                    entry.cost += *units as f64 / scale;
+                }
             }
         } else {
             for attributed_model in session.metrics.model_attribution.keys() {
@@ -3487,6 +3527,14 @@ pub fn format_cost(value: f64) -> String {
     }
     let value = value + 0.0;
     let abs = value.abs();
+    // rm-2249: extreme-magnitude display band. Above ~1e15 the scaled
+    // unit suffixes would still expand to a 300+ digit literal (`{:.1}`
+    // never switches to exponent form), so render scientific notation
+    // instead — the value stays exact and readable, never a monster
+    // string, and it agrees numerically with the JSON/CSV lanes.
+    if abs >= 1.0e15 {
+        return format!("${value:.2e}");
+    }
     if abs >= 999_950_000_000.0 {
         format!("${:.1}T", value / 1_000_000_000_000.0)
     } else if abs >= 999_950_000.0 {
@@ -3515,7 +3563,21 @@ fn is_zero_f64(value: &f64) -> bool {
 /// precision every lane renders and sum(by_model.cost) equals the billed
 /// total by construction, not by luck.
 pub fn round4(value: f64) -> f64 {
+    // rm-2249: finite-in => finite-out closure. `value * 10000.0`
+    // overflows to +/-inf for finite |value| >= ~1.79e304 (a hostile
+    // recorded `cost.total` that passes the parser's finite/>=0
+    // admission guard), which used to poison every downstream fold
+    // with a manufactured non-finite total (`Estimated cost: —` on
+    // text, `null` in JSON, a bare `inf` cell in CSV). At that
+    // magnitude the 4-decimal lattice is unrepresentable in f64
+    // anyway (no fractional information survives above 2^53/1e4), so
+    // returning `value` unchanged is exact, not a precision loss.
+    // NaN/inf inputs (never admitted by the parser; defensive) pass
+    // through and are disclosed by the non-finite counters instead.
     let scaled = value * 10000.0;
+    if !scaled.is_finite() {
+        return value;
+    }
     let rounded = if scaled.fract().abs() >= 0.5 - 1e-9 {
         scaled.trunc() + scaled.signum()
     } else {

@@ -177,3 +177,78 @@ fn overview_render_lanes_disclose_the_excluded_cost_sessions() {
             ..(json.find("\"summary\"").map(|i| i + 400).unwrap_or(400)).min(json.len())]
     );
 }
+
+// --- rm-2249: round4 total closure + extreme-magnitude honesty ----
+
+#[test]
+fn round4_stays_finite_on_the_scaled_overflow_band() {
+    // Red-first corpus: these finite magnitudes overflow `value * 1e4`
+    // to +/-inf and used to manufacture a non-finite total that
+    // poisoned every downstream fold (text `—` / JSON null / CSV inf).
+    let overflow_band = [1.7e308, -1.7e308, 1.0e308, f64::MAX, f64::MIN];
+    for value in overflow_band {
+        let rounded = agenttrace_core::round4(value);
+        assert!(
+            rounded.is_finite(),
+            "round4({value:e}) must never manufacture a non-finite total, got {rounded:e}"
+        );
+        // The scaled lattice carries no fractional information at this
+        // magnitude, so returning the input unchanged is exact.
+        assert_eq!(rounded, value);
+    }
+    // Just below the band the scaled value stays finite: still finite
+    // out, with rounding semantics unchanged.
+    let near_band = agenttrace_core::round4(1.79e304);
+    assert!(near_band.is_finite());
+    assert_eq!(agenttrace_core::round4(0.12345), 0.1235);
+    assert_eq!(agenttrace_core::round4(-0.12345), -0.1235);
+    assert_eq!(agenttrace_core::round4(1.0), 1.0);
+}
+
+#[test]
+fn format_cost_extreme_band_renders_scientific_not_a_monster_literal() {
+    // Red-first corpus: a finite but astronomically large recorded cost
+    // rendered as a ~300-digit `{:.4}`-style literal on the text lanes
+    // (and, pre-closure, as the `—` marker once round4 turned it
+    // non-finite). The extreme band now renders compact scientific form.
+    assert_eq!(format_cost(1.7e308), "$1.70e308");
+    assert_eq!(format_cost(-1.7e308), "$-1.70e308");
+    assert_eq!(format_cost(1.0e15), "$1.00e15");
+    assert_eq!(format_cost(5.0e15), "$5.00e15");
+    // The existing bands and the non-finite marker are unchanged.
+    assert_eq!(format_cost(1.25), "$1.2500");
+    assert_eq!(format_cost(f64::NAN), "—");
+    assert_eq!(format_cost(f64::INFINITY), "—");
+}
+
+#[test]
+fn recorded_extreme_cost_stays_finite_and_agrees_across_lanes() {
+    // The exact manufacture corpus: a pi-v3 session journal whose
+    // assistant `message.usage.cost.total` carries a finite but
+    // astronomically large recorded cost. The parser admits it (finite,
+    // >= 0); every downstream lane must agree on the same finite value.
+    let raw = concat!(
+        "{\"id\":\"s1\",\"timestamp\":\"2026-10-20T10:00:00.000Z\",\"type\":\"session\",\"version\":3,\"cwd\":\"/tmp\"}\n",
+        "{\"id\":\"e1\",\"parentId\":\"s1\",\"timestamp\":\"2026-10-20T10:00:01.000Z\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"probe\"}}\n",
+        "{\"id\":\"e2\",\"parentId\":\"e1\",\"timestamp\":\"2026-10-20T10:00:05.000Z\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input\":10,\"output\":5,\"totalTokens\":15,\"cost\":{\"total\":1.7e308}}}}\n",
+    );
+    let path = std::env::temp_dir().join(format!("rm2249-poc-{}.jsonl", std::process::id()));
+    std::fs::write(&path, raw).unwrap();
+    let session = agenttrace_core::parse_file(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let cost = session.metrics.cost_estimated;
+    assert!(
+        cost.is_finite(),
+        "cost_estimated must stay finite, got {cost:e}"
+    );
+    // JSON lane: a number, never null.
+    let json = serde_json::to_value(cost).unwrap();
+    assert!(
+        json.is_number(),
+        "JSON lane must serialize a number, got {json}"
+    );
+    // Text lane: no null marker, compact scientific, same magnitude.
+    let rendered = format_cost(cost);
+    assert_ne!(rendered, "—");
+    assert_eq!(rendered, "$1.70e308");
+}

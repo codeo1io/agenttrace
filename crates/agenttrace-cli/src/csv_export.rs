@@ -90,17 +90,30 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             &row.data,
             &row.source,
             &row.model,
-            &format!("{:.4}", row.cost),
+            &csv_cost(row.cost),
             &row.tokens.to_string(),
             &row.fail.to_string(),
             &row.anomalies.to_string(),
             &row.zero_usage_events.to_string(),
             &row.subagents.to_string(),
-            &format!("{:.4}", row.subagent_cost),
+            &csv_cost(row.subagent_cost),
             &row.parent_session,
         ]));
     }
     out
+}
+
+/// rm-2249: cost cells serialize non-finite as the SAME `null` marker
+/// the JSON lane uses. `{:.4}` on inf/NaN emits a bare `inf`/`NaN`
+/// literal, which most CSV float parsers reject and which disagrees
+/// with the text lane's `—` and JSON's `null` for one underlying
+/// value; a machine lane must carry the marker, not a bogus number.
+fn csv_cost(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.4}")
+    } else {
+        "null".to_string()
+    }
 }
 
 /// rm-798: [`sessions_csv`] plus an explicit truncation statement.
@@ -132,7 +145,7 @@ pub fn overview_csv(overview: &Overview) -> String {
         &overview.healthy.to_string(),
         &overview.warning.to_string(),
         &overview.critical.to_string(),
-        &format!("{:.4}", overview.total_cost),
+        &csv_cost(overview.total_cost),
     ]));
     for (name, rows) in [
         // rm-895 policy: the csv surface is a MACHINE surface — these
@@ -164,7 +177,7 @@ pub fn overview_csv(overview: &Overview) -> String {
         }
         for (group, entry) in rows {
             let sessions = entry.sessions.to_string();
-            let cost = format!("{:.4}", entry.cost);
+            let cost = csv_cost(entry.cost);
             if model_basis {
                 let basis = match pricing_basis_label(group) {
                     None => "exact",
@@ -185,7 +198,7 @@ pub fn overview_csv(overview: &Overview) -> String {
             out.push_str(&csv_row(&[
                 task_type,
                 &entry.sessions.to_string(),
-                &format!("{:.4}", entry.cost),
+                &csv_cost(entry.cost),
                 &entry.tokens_input.to_string(),
                 &entry.tokens_output.to_string(),
             ]));
@@ -299,6 +312,19 @@ fn is_formula_introducer(first: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_cells_use_the_null_marker_for_non_finite_values() {
+        // rm-2249: the CSV lane must carry the SAME null marker the
+        // JSON lane uses for non-finite costs — never a bare `inf`/
+        // `NaN` literal (invalid in most CSV float parsers) and never
+        // a value-looking zero.
+        assert_eq!(csv_cost(f64::INFINITY), "null");
+        assert_eq!(csv_cost(f64::NEG_INFINITY), "null");
+        assert_eq!(csv_cost(f64::NAN), "null");
+        assert_eq!(csv_cost(1.25), "1.2500");
+        assert_eq!(csv_cost(0.0), "0.0000");
+    }
 
     #[test]
     fn quotes_embedded_commas_quotes_and_newlines() {
