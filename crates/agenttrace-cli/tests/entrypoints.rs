@@ -3566,3 +3566,101 @@ fn count_honesty_disclosures_in_cli_lanes() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn overview_discloses_admission_suppressions_on_the_dir_lane() {
+    // rm-2352 (run de92ccb4 cycle 7, "admission honesty on explicit-dir
+    // lanes") — the CLI end-to-end pin of the lead cure, exactly the
+    // assess F1 PoC shape: `--overview -d <twin-dir>` used to admit
+    // BOTH encodings of one codex rollout (2 sessions / $0.0084,
+    // twice the $0.0042 plain-only baseline) while carrying NO twin
+    // disclosure — the audit lane disclosed and the overview lane
+    // silently didn't. The twin now collapses on the `-d` loader arm
+    // AND the overview JSON carries the same admission keys the
+    // audit lane uses, so the report explains its own denominator.
+    // Clean corpora stay key-identical (nothing fires, nothing is
+    // attached) — pinned by the plain-only control arm here.
+    let core_fixture = |name: &str| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/agenttrace-core/tests/fixtures/codex-compressed-rollout")
+            .join(name)
+    };
+    let root =
+        std::env::temp_dir().join(format!("agenttrace-overview-parity-{}", std::process::id()));
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+    let twin_dir = root.join("twin-dir");
+    std::fs::create_dir_all(&twin_dir).expect("create twin dir");
+    for name in [
+        "rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl",
+        "rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst",
+    ] {
+        std::fs::copy(core_fixture(name), twin_dir.join(name)).expect("copy twin fixture");
+    }
+    let plain_dir = root.join("plain-dir");
+    std::fs::create_dir_all(&plain_dir).expect("create plain dir");
+    std::fs::copy(
+        core_fixture("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"),
+        plain_dir.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"),
+    )
+    .expect("copy plain fixture");
+
+    let run = |dir: &std::path::Path| {
+        let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args(["--overview", "-f", "json"])
+            .arg("-d")
+            .arg(dir)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("AGENTTRACE_SESSION_CACHE_DIR", root.join("cache"))
+            .output()
+            .expect("run agenttrace --overview -d");
+        assert!(
+            output.status.success(),
+            "overview must succeed on {}: {}{}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&output.stdout))
+            .expect("overview report is JSON")
+    };
+
+    let twin = run(&twin_dir);
+    assert_eq!(
+        twin["summary"]["total_sessions"], 1,
+        "F1 cured end to end: one codex session present as a stem pair admits exactly once"
+    );
+    let twin_cost = twin["summary"]["total_cost"].as_f64().expect("total_cost");
+    let plain = run(&plain_dir);
+    let plain_cost = plain["summary"]["total_cost"].as_f64().expect("total_cost");
+    assert_eq!(
+        plain["summary"]["total_sessions"], 1,
+        "control: the plain-only corpus is one session"
+    );
+    assert_eq!(
+        twin_cost, plain_cost,
+        "the twin banks the session exactly once (${twin_cost} vs plain-only ${plain_cost})"
+    );
+    assert_eq!(
+        twin["zst_stem_twins"], 1,
+        "the overview JSON discloses the collapse under the audit lane's key"
+    );
+    let pairs = twin["zst_stem_twin_pairs"]
+        .as_array()
+        .expect("named pairs ride the twin disclosure");
+    assert_eq!(pairs.len(), 1, "one pair");
+    let pair = pairs[0].as_str().expect("pair renders as a string");
+    assert!(
+        pair.contains("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl <-")
+            && pair.ends_with(".jsonl.zst"),
+        "the pair names survivor <- suppressed: {pair}"
+    );
+    assert!(
+        plain.get("zst_stem_twins").is_none() && plain.get("zst_stem_twin_pairs").is_none(),
+        "clean corpora stay key-identical — nothing fires, nothing attaches"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

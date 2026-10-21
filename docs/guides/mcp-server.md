@@ -72,7 +72,7 @@ error naming the cap, and the messages after it still answer.
 
 | Method | Answers |
 | --- | --- |
-| `initialize` | `serverInfo`, `capabilities.tools`, and the newest **mutually supported** `protocolVersion` of `2026-07-28`, `2025-11-25`, `2025-06-18` — negotiated, never echoed; an unknown version answers the typed `UnsupportedProtocolVersionError` `-32022` (`data {requested, supported}`, message `Unsupported version`), an absent one falls back to the server's newest with a one-line stderr disclosure (rm-780, rm-455) |
+| `initialize` | `serverInfo`, `capabilities.tools`, and the newest **mutually supported** `protocolVersion` of `2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05` (the full official ladder; the two legacy rungs rejoined in the cycle-7 floor widening) — negotiated, never echoed; an unknown version answers the typed `UnsupportedProtocolVersionError` `-32022` (`data {requested, supported}`, message `Unsupported version`), an absent one falls back to the server's newest with a one-line stderr disclosure (rm-780, rm-455) |
 | `server/discover` | the 2026-07-28 revision's one mandatory server RPC, stateless — `supportedVersions`, `capabilities.tools` (`listChanged: false`), the cache-hint pair (`ttlMs`/`cacheScope: public`) the revision's cacheable-result rule requires, and the reserved `_meta` server-info key; `resultType` rides the central seam like every result (rm-455) |
 | `notifications/initialized` | silence (notifications are never answered) |
 | `ping` | `{}` |

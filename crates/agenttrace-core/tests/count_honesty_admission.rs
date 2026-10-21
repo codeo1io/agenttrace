@@ -21,6 +21,14 @@
 //!   disclosure; a well-formed 0.0 stays honored (gateway flat rate)
 //!   and a positive recorded cost still wins over the estimate.
 //!
+//! - rm-2352 (run de92ccb4 cycle 7, "admission honesty on explicit-dir
+//!   lanes"): the rm-2056 twin pass now runs on every `-d` arm too —
+//!   `find_session_files(Some)`, the loader's explicit arm, and the
+//!   doctor's `--dir` lane (via `find_session_files_reported`) — so a
+//!   stem pair pointed at explicitly admits ONCE and discloses, instead
+//!   of double-banking behind a zeroed ledger. The rm-548
+//!   keep-everything stance stays for the aggregation families above.
+//!
 //! The F1/F2 numbers pin the same red-first PoCs the assess phase
 //! proved on this corpus shape: F1 was "2 sessions / $0.0076 for one
 //! real session" (artifact mirror), F2 was "-5.0 silently folded".
@@ -831,35 +839,119 @@ fn zst_only_name_still_admits_without_a_plain_twin() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// rm-2352 (run de92ccb4 cycle 7, "admission honesty on explicit-dir
+/// lanes") — the lead red-first pin, explicit-dir edition. Before the
+/// cure, EVERY `-d` arm bypassed the rm-2056 pass: the walk kept both
+/// encodings, the loader's explicit arm returned a zeroed
+/// `SuppressedSessions`, and the doctor's `--dir` lane hardwired the
+/// same zero — the exact assess F1 PoC (`--overview -d twin-dir` = 2
+/// sessions / $0.0084, twice the $0.0042 plain-only baseline, while
+/// `--doctor` on the same directory printed `zst_stem_twin_pairs:
+/// []`). Parity now: the twin collapses on every explicit-dir arm and
+/// the LEDGER reaches the doctor through `find_session_files_reported`,
+/// so `-d` admits ONE session (the plain survivor) and discloses the
+/// collapse under the same keys the auto-home lane uses. The rm-548
+/// keep-everything stance stays for the AGGREGATION families — pinned
+/// separately by `explicit_dir_lane_keeps_duplicate_copies` and
+/// `explicit_dir_lane_keeps_subagent_artifacts`.
 #[test]
-fn explicit_dir_lane_keeps_zst_stem_twin() {
-    // rm-548 stance guard for rm-2056: `-d` is the inspection lane —
-    // an explicitly requested directory keeps every admitted file
-    // (same stance the byte-identical duplicate class carries), so the
-    // twin policy must not leak into it.
+fn explicit_dir_lane_admits_zst_twin_once_with_disclosure() {
     let home = temp_home("zst-twin-explicit");
-    let sessions = home.join(".codex/sessions");
-    fs::create_dir_all(sessions.join("2026/10/15")).expect("mkdir date tree");
-    fs::write(
-        sessions.join("2026/10/15/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"),
+    let day = home.join(".codex/sessions/2026/10/15");
+    let plain = write(
+        &day.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"),
         include_str!(
             "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"
         ),
-    )
-    .expect("write plain rollout");
+    );
+    let shadow = day.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst");
     fs::write(
-        sessions.join("2026/10/15/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"),
+        &shadow,
         include_bytes!(
             "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"
         ),
     )
-    .expect("write compressed twin");
+    .expect("write real-named compressed twin");
 
-    let found = find_session_files(Some(&sessions));
-    assert_eq!(
-        found.len(),
-        2,
-        "the -d inspection lane keeps both names (rm-548 stance): {found:?}"
-    );
+    with_pinned_home(&home, || {
+        // The uncached explicit walk collapses the twin (the same
+        // silent parity its auto-home arm always had).
+        let found = find_session_files(Some(&day));
+        assert_eq!(
+            found.len(),
+            1,
+            "one encoding admitted on -d, not two (rm-2352): {found:?}"
+        );
+        assert_eq!(found[0], plain, "the plain .jsonl survivor wins by name");
+
+        // The reported variant carries the ledger the doctor lane
+        // needs — twins counted, aggregation families still zero on
+        // the explicit arm (rm-548 stance, deliberately scoped).
+        let (reported, suppressed) = agenttrace_core::find_session_files_reported(Some(&day));
+        assert_eq!(reported.len(), 1);
+        assert_eq!(suppressed.zst_stem_twins, 1, "twin count disclosed");
+        assert_eq!(suppressed.zst_stem_twin_pairs.len(), 1);
+        assert_eq!(
+            suppressed.zst_stem_twin_pairs[0],
+            (plain.clone(), shadow.clone()),
+            "pair names survivor <- suppressed"
+        );
+        assert_eq!(
+            suppressed.duplicate_session_files, 0,
+            "rm-548: content copies still keep-everything on -d"
+        );
+        assert_eq!(
+            suppressed.subagent_artifact_files, 0,
+            "rm-548: artifact mirrors still keep-everything on -d"
+        );
+
+        // The loader's explicit arm: one session, cost banked ONCE —
+        // the F1 arithmetic cured at the source ($0.0042, not x2).
+        let report = load_sessions_with_progress(Some(&day), &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "F1 cured: one session admitted through the -d loader arm"
+        );
+        assert_eq!(
+            report.zst_stem_twins, 1,
+            "the collapse discloses through the LoadReport, not silently"
+        );
+        let total: f64 = report
+            .sessions
+            .iter()
+            .map(|session| session.metrics.cost_estimated)
+            .sum();
+        assert!(
+            (total - 0.0042).abs() < 1e-6,
+            "banks once on the -d lane too ({total}), matching the auto-home baseline"
+        );
+
+        // The doctor's `--dir` lane: same disclosures as auto-home
+        // (this is the arm that used to hardwire the zero ledger).
+        let doctor = build_doctor_report(Some(&day), false);
+        assert_eq!(
+            doctor.disclosures.get("zst_stem_twins"),
+            Some(&1),
+            "the --dir doctor report discloses the collapse"
+        );
+        assert_eq!(doctor.sessions, 1, "one session in the explicit inventory");
+        assert_eq!(
+            doctor.directories.len(),
+            1,
+            "one directory row (no phantom second encoding row)"
+        );
+        assert_eq!(
+            doctor.zst_stem_twin_pairs.len(),
+            1,
+            "doctor names the pair on the --dir lane too"
+        );
+        let pair = &doctor.zst_stem_twin_pairs[0];
+        assert!(
+            pair.contains("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl <-")
+                && pair.ends_with(".jsonl.zst"),
+            "pair renders survivor <- suppressed: {pair}"
+        );
+    });
     let _ = fs::remove_dir_all(&home);
 }

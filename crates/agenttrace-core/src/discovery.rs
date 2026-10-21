@@ -370,7 +370,20 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
         if is_cline_task_dir(dir) {
             return vec![dir.to_path_buf()];
         }
-        return collect_session_files(dir);
+        // rm-2352 (run de92ccb4 cycle 7, "admission honesty on
+        // explicit-dir lanes"): a `<stem>.jsonl` + `<stem>.jsonl.zst`
+        // pair is ONE session in two encodings, not two sessions —
+        // the rm-548 keep-everything stance is about AGGREGATION
+        // rules (fork copies, content duplicates, artifact mirrors:
+        // distinct files the operator may legitimately want listed),
+        // never about an encoding twin that double-banks the same
+        // rollout. The `-d` walk now runs the rm-2056 twin pass like
+        // every aggregation lane. This uncached arm carries no
+        // ledger (same silent parity as its None arm above); the
+        // reported variant below owns the counts that reach the
+        // operator.
+        let mut twins = SuppressedSessions::default();
+        return suppress_zst_stem_twins(collect_session_files(dir), &mut twins);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
@@ -394,8 +407,9 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     // rm-1887/rm-1886: aggregation admission mirrors the cached walk —
     // artifact mirrors skipped, byte-identical copies deduped — so the
     // uncached lane counts the same corpus (full reads; the memo is a
-    // cache-lane warm-run optimization only). The `-d` arm above keeps
-    // every file (rm-548 stance).
+    // cache-lane warm-run optimization only). The `-d` arm above
+    // keeps every file for those families (rm-548 stance) and collapses
+    // zst encoding twins (rm-2352), matching the cached walk.
     all.retain(|path| !is_subagent_artifact_path(path));
     // rm-1881: the same session id in both the canonical CLI store and
     // the legacy VS Code tasks root renders one session (canonical wins).
@@ -892,12 +906,39 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
     items.into_iter().map(|item| item.0).collect()
 }
 
+/// rm-2352 (run de92ccb4 cycle 7, "admission honesty on
+/// explicit-dir lanes"): the explicit-directory walk WITH its
+/// suppression ledger — the seam the doctor's `--dir` lane and any
+/// other disclosed consumer use, so a zst stem twin collapsing on
+/// `-d` reports the same `zst_stem_twins` / `zst_stem_twin_pairs`
+/// counts the auto-home lanes do instead of double-counting silently.
+/// Only the rm-2056 twin family is populated on this arm: the rm-548
+/// keep-everything stances for fork copies, byte-identical content
+/// duplicates, and artifact mirrors stay (a `-d` probe of a copy or
+/// a mirror still renders it), so their counters read zero by
+/// design. The `None` arm returns the silent aggregation walk and a
+/// zeroed ledger — the cached lane owns the auto-home counts.
+pub fn find_session_files_reported(dir: Option<&Path>) -> (Vec<PathBuf>, SuppressedSessions) {
+    let Some(dir) = dir else {
+        return (find_session_files(None), SuppressedSessions::default());
+    };
+    if is_cline_task_dir(dir) {
+        return (vec![dir.to_path_buf()], SuppressedSessions::default());
+    }
+    let mut suppressed = SuppressedSessions::default();
+    let files = suppress_zst_stem_twins(collect_session_files(dir), &mut suppressed);
+    (files, suppressed)
+}
+
 /// rm-1887/rm-1886 (run 77ca5de0 cycle 5, "count-honesty ledger"):
 /// what AGGREGATION admission suppressed before enumeration, so the
 /// disclosure channel can report each class — never silently. The
-/// explicit-directory lane (`-d`) keeps every file (rm-548 stance:
-/// the exclusions are aggregation rules, not parse blocks) and
-/// reports a zero-valued struct.
+/// explicit-directory lane (`-d`) keeps every file for the rm-548
+/// families (fork copies, content duplicates, artifact mirrors: the
+/// exclusions are aggregation rules, not parse blocks) and reports
+/// a zero-valued struct — except the rm-2056 zst encoding twins,
+/// which collapse on every lane (rm-2352: one session in two
+/// encodings is never two sessions).
 #[derive(Debug, Clone, Default)]
 pub struct SuppressedSessions {
     /// rm-548: opencode fork copies (session info docs whose
@@ -1084,18 +1125,23 @@ pub(crate) fn find_session_files_cached(
         if is_cline_task_dir(dir) {
             return (vec![dir.to_path_buf()], SuppressedSessions::default(), 0);
         }
-        // rm-548: an explicitly requested directory keeps every file —
-        // a forked copy loaded by explicit path still renders (the
-        // exclusion is an aggregation rule, not a parse block). Same
-        // stance for rm-1886 content duplicates and rm-1887 artifact
-        // mirrors: `-d` is the inspection lane. rm-451 keeps the
-        // over-cap counter zero here too — an explicit `-d` probe reads
-        // the doc through the parse lane, which owns its own read caps.
-        return (
-            collect_session_files_cached(dir, cache),
-            SuppressedSessions::default(),
-            0,
-        );
+        // rm-548: an explicitly requested directory keeps every file
+        // for the AGGREGATION families — a forked copy loaded by
+        // explicit path still renders, and so do byte-identical
+        // content duplicates (rm-1886) and artifact mirrors
+        // (rm-1887): `-d` is the inspection lane for those. rm-451
+        // keeps the over-cap counter zero here too — an explicit `-d`
+        // probe reads the doc through the parse lane, which owns its
+        // own read caps. rm-2352 (run de92ccb4 cycle 7): zst stem
+        // twins are NOT an aggregation family — the plain and
+        // compressed names hold ONE codex session — so the twin pass
+        // runs here too, and its ledger rides the LoadReport so the
+        // explicit-dir lane discloses exactly like the auto-home
+        // lane instead of double-counting with a silent zero.
+        let mut suppressed = SuppressedSessions::default();
+        let files =
+            suppress_zst_stem_twins(collect_session_files_cached(dir, cache), &mut suppressed);
+        return (files, suppressed, 0);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;

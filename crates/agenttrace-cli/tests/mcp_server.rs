@@ -536,6 +536,17 @@ fn protocol_version_is_negotiated_never_echoed() {
         "the recovery list ships in the error — no second round trip"
     );
     assert!(
+        responses[1]["error"]["data"]["supported"]
+            .as_array()
+            .expect("supported list")
+            .iter()
+            .any(|v| v.as_str() == Some("2024-11-05")),
+        "rm floor-widening (cycle 7): the recovery list reaches the
+         bottom rung, so a legacy client can self-heal in one round
+         trip: {:?}",
+        responses[1]["error"]["data"]["supported"]
+    );
+    assert!(
         responses[1]["result"].is_null(),
         "the typed error is never accompanied by a success result"
     );
@@ -553,6 +564,63 @@ fn protocol_version_is_negotiated_never_echoed() {
         stderr.contains("<none>") && stderr.contains("does not speak"),
         "only the ABSENT arm discloses on stderr now (the unknown arm
          is answered on the wire): {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn legacy_revisions_negotiate_instead_of_being_refused() {
+    // rm floor-widening (run de92ccb4 cycle 7, rider A): the two
+    // legacy rungs of the official ladder — 2025-03-26 and 2024-11-05
+    // — used to be missing from SUPPORTED_PROTOCOL_VERSIONS while
+    // the every-request -32022 gate refused every DECLARED revision
+    // outside the set. The result punished exactly the honest
+    // declarers: a client that declared `2025-03-26` was refused on
+    // every request (assess F5b live probes: initialize and ping both
+    // answered -32022), while a client that declared NOTHING was
+    // served. Both rungs are explicit members now, so a declaring
+    // legacy client negotiates its own revision through the normal
+    // arm — member AND reserved `_meta` spelling — and never sees the
+    // typed error again.
+    let (home, cache) = seed_home("legacy-floor", false);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"ping","_meta":{"protocolVersion":"2025-03-26"}}"#,
+        "\n",
+    );
+    let (code, responses, stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(3, responses.len());
+    let answered = |index: usize| responses[index]["result"]["protocolVersion"].as_str();
+    assert_eq!(
+        Some("2025-03-26"),
+        answered(0),
+        "declared legacy rung negotiates itself (was -32022 before the widening)"
+    );
+    assert!(
+        responses[0].get("error").is_none(),
+        "no typed refusal on the declared legacy member: {}",
+        responses[0]
+    );
+    assert_eq!(
+        Some("2024-11-05"),
+        answered(1),
+        "the bottom rung of the official ladder is spoken too"
+    );
+    // The `_meta` spelling rides the same widened floor: a legacy
+    // per-request version pin (2025-03-26) answers a RESULT, not the
+    // -32022 the assess live probe drew.
+    assert!(
+        responses[2].get("result").is_some() && responses[2]["error"].is_null(),
+        "ping with the reserved _meta legacy version serves: {}",
+        responses[2]
+    );
+    assert!(
+        !stderr.contains("-32022") && !stderr.contains("Unsupported"),
+        "no refusal diagnostics on the legacy floor: {stderr}"
     );
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));
 }
@@ -592,8 +660,11 @@ fn server_discover_answers_the_mandatory_rpc_statelessly() {
     assert!(
         versions.iter().any(|v| v.as_str() == Some("2026-07-28"))
             && versions.iter().any(|v| v.as_str() == Some("2025-11-25"))
-            && versions.iter().any(|v| v.as_str() == Some("2025-06-18")),
-        "the negotiation list matches initialize: {versions:?}"
+            && versions.iter().any(|v| v.as_str() == Some("2025-06-18"))
+            && versions.iter().any(|v| v.as_str() == Some("2025-03-26"))
+            && versions.iter().any(|v| v.as_str() == Some("2024-11-05")),
+        "the negotiation list matches initialize, full ladder included
+         (rm floor-widening, cycle 7): {versions:?}"
     );
     assert_eq!(
         Some(false),

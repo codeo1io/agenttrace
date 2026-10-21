@@ -3,9 +3,8 @@ use crate::sqlite_sessions::{
     load_sqlite_backed_sessions_reported_bounded, SqlitePartialDb, SqliteScanBudget,
 };
 use crate::{
-    cache_dir::user_cache_dir, cached_session, find_session_files, known_session_dirs,
-    load_session_cache, parse_file, save_session_cache, store_session, Session, SqliteIngestReport,
-    VERSION,
+    cache_dir::user_cache_dir, cached_session, known_session_dirs, load_session_cache, parse_file,
+    save_session_cache, store_session, Session, SqliteIngestReport, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -223,7 +222,10 @@ pub struct DoctorReport {
     /// admission, rendered `survivor.jsonl <- shadow.jsonl.zst` —
     /// capped at five, the exact count rides
     /// `disclosures["zst_stem_twins"]`. Empty when no twin pairs were
-    /// found (absent = nothing happened, the disclosure convention).
+    /// found (absent = nothing happened, the disclosure convention —
+    /// rm-2352 cycle 7 added the skip its sibling :220 already had, so
+    /// clean corpora stay key-identical to the pre-rm-2056 report).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub zst_stem_twin_pairs: Vec<String>,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
@@ -400,15 +402,8 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, suppressed, opencode_info_docs_skipped_over_cap) = if dir.is_none() {
-        find_reportable_session_files(None)
-    } else {
-        (
-            find_session_files(dir),
-            crate::discovery::SuppressedSessions::default(),
-            0,
-        )
-    };
+    let (files, suppressed, opencode_info_docs_skipped_over_cap) =
+        find_reportable_session_files(dir);
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
     // report alongside the sessions so doctor counters stop printing
@@ -972,11 +967,17 @@ fn find_reportable_session_files(
     dir: Option<&Path>,
 ) -> (Vec<PathBuf>, crate::discovery::SuppressedSessions, usize) {
     if dir.is_some() {
-        return (
-            find_session_files(dir),
-            crate::discovery::SuppressedSessions::default(),
-            0,
-        );
+        // rm-2352 (run de92ccb4 cycle 7, "admission honesty on
+        // explicit-dir lanes"): the `--dir` lane rides the REPORTED
+        // walk — zst stem twins collapse (one session in two
+        // encodings, never two) and their count/pairs disclose in the
+        // doctor report exactly like the auto-home lane, instead of
+        // the double-count + `zst_stem_twin_pairs: []` silence this
+        // seam previously produced. The rm-548 keep-everything
+        // families (fork copies, content duplicates, artifact
+        // mirrors) keep their zero-ledger stance on `-d`.
+        let (files, suppressed) = crate::discovery::find_session_files_reported(dir);
+        return (files, suppressed, 0);
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
     // inventory aggregates through the SAME loader primitive the CLI
@@ -989,8 +990,9 @@ fn find_reportable_session_files(
     // results; a rewritten doc always re-probes) instead of
     // re-reading every storage session info doc, and the exclusion
     // rides the disclosure channel instead of dying silently. An
-    // explicit `--dir` keeps every file (the exclusion is
-    // aggregation-only, same rule as the loader).
+    // explicit `--dir` keeps every file for those aggregation
+    // families (same rule as the loader) while zst encoding twins
+    // collapse and disclose on both lanes (rm-2352).
     let mut cache = crate::session_cache::load_session_cache();
     let (files, suppressed, opencode_info_docs_skipped_over_cap) =
         crate::discovery::find_session_files_cached(None, &mut cache, true);

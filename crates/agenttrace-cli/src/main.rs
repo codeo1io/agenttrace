@@ -1126,17 +1126,41 @@ fn run() -> anyhow::Result<()> {
             // valid (non-zero) span id; see agenttrace_core::otel for
             // the recorded input-token basis and snapshot date.
             "otel" => agenttrace_core::report_otel_export(&sessions),
-            "json" => report_overview_json_with_context(
-                &overview,
-                &sessions,
-                Some(&health),
-                range,
-                args.include_history,
-                // Pinned epoch keeps --demo JSON byte-deterministic (CI
-                // determinism check); real runs stamp the wall clock.
-                args.demo.then_some(agenttrace_core::DEMO_REPORT_EPOCH),
-                args.limit,
-            ),
+            "json" => {
+                let rendered = report_overview_json_with_context(
+                    &overview,
+                    &sessions,
+                    Some(&health),
+                    range,
+                    args.include_history,
+                    // Pinned epoch keeps --demo JSON byte-deterministic (CI
+                    // determinism check); real runs stamp the wall clock.
+                    args.demo.then_some(agenttrace_core::DEMO_REPORT_EPOCH),
+                    args.limit,
+                );
+                // rm-2352 (run de92ccb4 cycle 7, "admission honesty on
+                // explicit-dir lanes"): twin-key parity with the --audit
+                // lane — the overview JSON explains its own denominators
+                // when aggregation admission suppressed anything (zst
+                // stem twins included, which the `-d` lane now collapses
+                // and counts instead of double-banking). Nothing fires on
+                // a clean corpus, so the rendered bytes pass through
+                // untouched (determinism and golden fences hold); keys
+                // append only when a disclosure is real.
+                match load_report
+                    .as_ref()
+                    .filter(|report| admission_disclosures_fired(report, &sessions))
+                {
+                    Some(report) => {
+                        let mut value: serde_json::Value = serde_json::from_str(&rendered)
+                            .context("overview report serializes")?;
+                        attach_admission_disclosures_report(&mut value, report, &sessions);
+                        serde_json::to_string_pretty(&value)
+                            .context("overview disclosure serializes")?
+                    }
+                    None => rendered,
+                }
+            }
             "markdown" | "md" => report_overview_markdown_with_context(
                 &overview,
                 &sessions,
@@ -1544,6 +1568,32 @@ fn audit_coverage_phrase(value: &serde_json::Value) -> String {
     }
 }
 
+/// rm-2352 (run de92ccb4 cycle 7, "admission honesty on
+/// explicit-dir lanes"): does this load carry ANY admission
+/// disclosure (the three loader families plus the per-session
+/// negative-recorded-cost rejections the audit lane already names)?
+/// The overview JSON lane parses + re-serializes its payload only
+/// when the answer is yes, so a clean corpus (and the pinned-epoch
+/// demo corpus) stays byte-identical while a double-count cure on a
+/// `-d` lane still discloses through the same keys the audit lane
+/// uses.
+fn admission_disclosures_fired(report: &LoadReport, sessions: &[Session]) -> bool {
+    let negative_rejected: usize = sessions
+        .iter()
+        .filter_map(|session| {
+            session
+                .metrics
+                .disclosure_counters
+                .get("recorded_costs_negative_rejected")
+                .copied()
+        })
+        .sum();
+    report.subagent_artifact_files > 0
+        || report.duplicate_session_files > 0
+        || report.zst_stem_twins > 0
+        || negative_rejected > 0
+}
+
 /// rm-1886/rm-1887/rm-1888 (run 77ca5de0 cycle 5, "count-honesty
 /// ledger"): the `--audit` report carries what aggregation admission
 /// SUPPRESSED before enumeration (artifact mirror files, content
@@ -1558,9 +1608,16 @@ fn attach_admission_disclosures(
     report: &Option<LoadReport>,
     sessions: &[Session],
 ) {
-    let Some(report) = report else {
-        return;
-    };
+    if let Some(report) = report {
+        attach_admission_disclosures_report(value, report, sessions);
+    }
+}
+
+fn attach_admission_disclosures_report(
+    value: &mut serde_json::Value,
+    report: &LoadReport,
+    sessions: &[Session],
+) {
     let Some(map) = value.as_object_mut() else {
         return;
     };
@@ -1883,8 +1940,10 @@ fn keyword_help_text(keyword: &str) -> String {
             "sessions per model), with the CLI's layered configuration\n",
             "(config.toml layers, --pricing-file, --history-dir) applied\n",
             "identically (rm-781). The server speaks MCP protocol\n",
-            "revisions 2026-07-28, 2025-11-25, and 2025-06-18, answering\n",
-            "initialize with the newest mutually supported revision\n",
+            "revisions 2026-07-28, 2025-11-25, 2025-06-18, 2025-03-26,\n",
+            "and 2024-11-05 (the official ladder, floor widened rm\n",
+            "floor-widening, cycle 7), answering initialize with the\n",
+            "newest mutually supported revision\n",
             "(rm-780). It opens no sockets, performs no network probes,\n",
             "and writes nothing outside the agenttrace session cache; it\n",
             "serves until stdin closes. Note: this keyword is unrelated\n",
