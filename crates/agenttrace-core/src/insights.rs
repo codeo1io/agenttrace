@@ -720,11 +720,46 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
 
 // Linked worktrees carry a `.git` file ("gitdir: <repo>/.git/worktrees/<name>"); group them
 // under the main checkout so every agent worktree counts as the same project.
+//
+// rm-… read-cap (run 5cf06bab cycle 9, batch "host-state truth
+// hardening", prioritize 1d5fcc90 U2): the pointer read is
+// SIZE-BOUNDED. `read_to_string` slurped the marker whole, and a
+// hostile or misdirected `.git` file — any file on the walk path is
+// attacker-shaped there — is unbounded: the PoC (a 150 MB planted
+// marker) took peak RSS 32,868 KB → 338,984 KB in one resolve call.
+// A real pointer is a one-liner a few dozen bytes long, so 64 KiB is
+// three orders of magnitude of headroom while capping the slurp;
+// an over-cap marker is treated as a NON-pointer (`None`), and the
+// walk falls back to the marker's own directory — the honest answer
+// for a file that cannot be a worktree pointer. The read is
+// File+take (never a metadata preflight) so a lying size cannot
+// smuggle a larger body past the cap — the same convention as
+// parser.rs `FILE_READ_CAP_BYTES` (rm-451 named-file cap, rm-1025
+// decode cap), at pointer scale.
+const GIT_MARKER_READ_CAP_BYTES: u64 = 64 * 1024;
+
 fn worktree_main_root(marker: &Path) -> Option<PathBuf> {
-    let content = std::fs::read_to_string(marker).ok()?;
+    let content = read_gitdir_marker(marker)?;
     let gitdir = PathBuf::from(content.strip_prefix("gitdir:")?.trim());
     let git = gitdir.parent()?.parent()?;
     (git.file_name()? == ".git").then(|| git.parent().map(Path::to_path_buf))?
+}
+
+/// Bounded read of a `.git` pointer file: at most
+/// [`GIT_MARKER_READ_CAP_BYTES`] bytes are ever pulled into memory,
+/// and a marker longer than the cap reads as `None` (non-pointer —
+/// see the cap's rationale above). Unreadable and non-UTF-8 markers
+/// already read as `None`, exactly as they did unbounded.
+fn read_gitdir_marker(marker: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(marker).ok()?;
+    let mut buf = String::new();
+    // take(cap + 1): one byte past the cap is enough to prove the
+    // marker exceeds it without ever reading the body.
+    file.take(GIT_MARKER_READ_CAP_BYTES + 1)
+        .read_to_string(&mut buf)
+        .ok()?;
+    (buf.len() as u64 <= GIT_MARKER_READ_CAP_BYTES).then_some(buf)
 }
 
 pub fn filter_sessions(
@@ -1415,6 +1450,49 @@ mod tests {
         assert_eq!(
             resolved.root,
             lexical_normalize(&repo).to_string_lossy().to_string()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_over_cap_git_pointer_file_is_a_non_pointer_not_a_slurp() {
+        // rm-… read-cap red-first pin (run 5cf06bab cycle 9, batch
+        // "host-state truth hardening"): a `.git` file larger than
+        // GIT_MARKER_READ_CAP_BYTES must be treated as a NON-pointer —
+        // the walk falls back to the marker's own directory — and must
+        // never be slurped whole (the PoC: a 150 MB marker took peak
+        // RSS 32,868 KB → 338,984 KB). Red-first construction: the
+        // pointer line is legitimate and the PADDING sits after it, so
+        // pre-cap code read the whole file, `trim()` kept the padding
+        // only out of the path's last component, and the parse still
+        // grouped the worktree under the planted main repo — this pin
+        // failed. Post-cap the read stops at the cap, the marker reads
+        // as None, and the worktree keeps its own root.
+        let root = unique_decode_root("marker-cap");
+        let repo = root.join("main").join("my-repo");
+        fs::create_dir_all(repo.join(".git").join("worktrees").join("wt"))
+            .expect("plant main repo");
+        let worktree = root.join("wt").join("my-repo");
+        fs::create_dir_all(&worktree).expect("plant worktree");
+        // A legitimate pointer line, then 256 KiB of padding — far
+        // past the 64 KiB cap, a file no real git writes, tiny next to
+        // the PoC's 150 MB.
+        let mut marker = format!("gitdir: {}\n", repo.join(".git/worktrees/wt").display());
+        marker.push_str(&"x".repeat(256 * 1024));
+        fs::write(worktree.join(".git"), marker).expect("plant over-cap marker");
+
+        let main = resolve_project(&session_at(&repo.to_string_lossy(), "/x.jsonl"));
+        let linked = resolve_project(&session_at(&worktree.to_string_lossy(), "/x.jsonl"));
+        assert_eq!(main.display_name, "my-repo");
+        assert_ne!(
+            linked.id, main.id,
+            "an over-cap .git marker must NOT group the worktree under the main repo"
+        );
+        assert_eq!(
+            linked.root,
+            lexical_normalize(&worktree).to_string_lossy().to_string(),
+            "the fallback root is the marker's own directory"
         );
 
         let _ = fs::remove_dir_all(root);

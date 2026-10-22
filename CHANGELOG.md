@@ -4,6 +4,34 @@
 
 ### Added
 
+- catalog-lane suite determinism completed — the remaining four
+  pricing suites are immune to the machine pricing cache (rm-1954
+  completion, run 5cf06bab cycle 9, batch "host-state truth
+  hardening", prioritize 1d5fcc90): the cycle-1 guard landed for
+  `regional_pricing_contract` and one
+  `pricing_snapshot_hygiene` arm, but four more catalog-lane suites
+  still resolved their assertions through the PUBLIC lane — which
+  PREFERS a machine pricing cache (`~/.cache/agenttrace/pricing.json`,
+  a raw LiteLLM download) over the bundled snapshot and initializes
+  once per process on first lookup — so a developer host with a
+  populated cache silently ran them red (observed live 2026-10-21:
+  svg golden `2.304` vs `7.395` total cost, first-party extract
+  arms ×2, cache-rate census, token-conformance pack totals; the
+  same host runs green once the cache ages out, so the failure was
+  time-bombed into every developer loop). Every catalog-reading arm
+  in `svg_card_contract` (10), `cache_rate_truth_contract` (1 — the
+  override now seeds INSIDE the guard, after the machine-cache lane
+  is dead), `first_party_pricing_extract_contract` (8 of 9 — the
+  provenance-note arm reads the extract file directly), and
+  `token_conformance` (1 of 2 — the manifest arm reads files only)
+  now runs inside the shared `tests/support` guard, and a factored
+  `assert_poison_proof_standing` fixture gives each suite its own
+  standing spawned-probe pin — poisoned fresh machine cache seeded
+  at every default location under a scratch HOME: guarded leg serves
+  the bundled row, unguarded leg proves the poison mechanism stays
+  real — so both directions hold deterministically, never on
+  ambient host state. Zero `src/` change.
+
 - installer release pinning + hostile-timestamp no-panic + CSV/TUI
   pricing basis (rm-2014 + rm-2013 + rm-1574 extension, run 91066ba0
   cycle 2): `install.ps1`'s `-Version` parameter was unreachable under
@@ -1025,6 +1053,28 @@
   naming, singular/plural grammar).
 
 ### Fixed
+
+- the `.git` worktree-pointer read is size-bounded: a hostile marker
+  can no longer balloon the resolver's memory (read-cap kin of rm-451
+  named-file cap and rm-1025 decode cap, run 5cf06bab cycle 9, batch
+  "host-state truth hardening", prioritize 1d5fcc90 U2): project
+  resolution follows a `.git` FILE (a linked worktree pointer,
+  `gitdir: <main>/.git/worktrees/<name>`) by reading it with
+  `read_to_string` — unbounded, and any file on the walk path is
+  attacker-shaped there. The PoC: a planted 150 MB `.git` marker took
+  one resolve call from 32,868 KB to 338,984 KB peak RSS. The read is
+  now File+take at a 64 KiB cap (three orders of magnitude above any
+  real one-liner pointer; no metadata preflight, so a lying size
+  cannot smuggle a larger body past the cap) and an over-cap marker
+  reads as a non-pointer — the walk falls back to the marker's own
+  directory, the honest answer for a file that cannot be a worktree
+  pointer. Legitimate linked-worktree pointers resolve exactly as
+  before (existing contract pins stay green), and a red-first pin
+  plants an over-cap marker whose pointer line is legitimate but
+  padded past the cap — pre-fix code slurped it, kept the padding out
+  of only the path's last component, and still grouped the worktree
+  under the planted main repo; the pin now holds the fallback
+  behavior without the slurp.
 
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled

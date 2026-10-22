@@ -12,9 +12,20 @@
 /// - the daily-spend sparkline is anchored to the corpus's own clock, never
 ///   `Utc::now()`, so the card cannot drift between renders;
 /// - an empty corpus renders a valid card instead of panicking.
+///
+/// rm-1954 completion (run 5cf06bab cycle 9, batch "host-state truth
+/// hardening"): every card render embeds a pricing disclosure whose
+/// census and cost rows resolve through the public catalog lane — the
+/// lane that PREFERS a machine pricing cache over the bundled
+/// snapshot and initializes once per process — so every rendering
+/// test runs inside `support::with_isolated_pricing_env`
+/// (tests/support/mod.rs), and the standing poison-proof fixture pins
+/// both directions without relying on ambient host state.
+mod support;
+
 use agenttrace_core::{
-    compute_overview, demo_sessions, report_overview_svg, report_overview_svg_with_context,
-    SvgCardTheme,
+    compute_overview, demo_sessions, lookup_price, report_overview_svg,
+    report_overview_svg_with_context, SvgCardTheme,
 };
 
 const GOLDEN_DIR: &str = "tests/fixtures/svg-card";
@@ -27,6 +38,10 @@ fn card_of(theme: SvgCardTheme) -> String {
 
 #[test]
 fn golden_bytes_are_pinned_for_the_demo_corpus() {
+    support::with_isolated_pricing_env(golden_bytes_are_pinned_for_the_demo_corpus_body);
+}
+
+fn golden_bytes_are_pinned_for_the_demo_corpus_body() {
     for (name, theme) in [
         ("demo-auto.svg", SvgCardTheme::Auto),
         ("demo-dark.svg", SvgCardTheme::Dark),
@@ -47,6 +62,12 @@ fn golden_bytes_are_pinned_for_the_demo_corpus() {
 
 #[test]
 fn rendering_twice_from_a_fresh_aggregation_is_byte_identical() {
+    support::with_isolated_pricing_env(
+        rendering_twice_from_a_fresh_aggregation_is_byte_identical_body,
+    );
+}
+
+fn rendering_twice_from_a_fresh_aggregation_is_byte_identical_body() {
     let first = card_of(SvgCardTheme::Auto);
     let second = card_of(SvgCardTheme::Auto);
     assert_eq!(first, second, "card output is not byte-deterministic");
@@ -56,6 +77,10 @@ fn rendering_twice_from_a_fresh_aggregation_is_byte_identical() {
 
 #[test]
 fn hostile_model_and_project_names_render_inert() {
+    support::with_isolated_pricing_env(hostile_model_and_project_names_render_inert_body);
+}
+
+fn hostile_model_and_project_names_render_inert_body() {
     let mut sessions = demo_sessions().expect("demo sessions parse");
     sessions[0].metrics.model_used = "\"><script>alert(1)</script>".to_string();
     sessions[1].metrics.model_used = "<img src=x onerror=alert(2)>".to_string();
@@ -80,6 +105,10 @@ fn hostile_model_and_project_names_render_inert() {
 
 #[test]
 fn control_bytes_never_reach_the_document_raw() {
+    support::with_isolated_pricing_env(control_bytes_never_reach_the_document_raw_body);
+}
+
+fn control_bytes_never_reach_the_document_raw_body() {
     let mut sessions = demo_sessions().expect("demo sessions parse");
     sessions[0].metrics.model_used = "ctrl\x01\x02model".to_string();
     let overview = compute_overview(&sessions);
@@ -96,6 +125,10 @@ fn control_bytes_never_reach_the_document_raw() {
 
 #[test]
 fn auto_theme_embeds_media_query_and_light_fallback() {
+    support::with_isolated_pricing_env(auto_theme_embeds_media_query_and_light_fallback_body);
+}
+
+fn auto_theme_embeds_media_query_and_light_fallback_body() {
     let auto = card_of(SvgCardTheme::Auto);
     assert!(
         auto.contains("@media (prefers-color-scheme: dark)"),
@@ -125,6 +158,10 @@ fn auto_theme_embeds_media_query_and_light_fallback() {
 
 #[test]
 fn themes_render_distinct_documents() {
+    support::with_isolated_pricing_env(themes_render_distinct_documents_body);
+}
+
+fn themes_render_distinct_documents_body() {
     let light = card_of(SvgCardTheme::Light);
     let dark = card_of(SvgCardTheme::Dark);
     let auto = card_of(SvgCardTheme::Auto);
@@ -135,6 +172,10 @@ fn themes_render_distinct_documents() {
 
 #[test]
 fn empty_corpus_renders_a_valid_card() {
+    support::with_isolated_pricing_env(empty_corpus_renders_a_valid_card_body);
+}
+
+fn empty_corpus_renders_a_valid_card_body() {
     let overview = compute_overview(&[]);
     let card = report_overview_svg(&overview, &[], SvgCardTheme::Auto);
     assert!(card.starts_with("<?xml version=\"1.0\""));
@@ -151,6 +192,12 @@ fn empty_corpus_renders_a_valid_card() {
 
 #[test]
 fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
+    support::with_isolated_pricing_env(
+        sparkline_is_anchored_to_the_corpus_clock_not_wall_clock_body,
+    );
+}
+
+fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock_body() {
     let mut sessions = demo_sessions().expect("demo sessions parse");
     let anchor = chrono::DateTime::parse_from_rfc3339("2026-01-20T12:00:00Z")
         .expect("fixed anchor")
@@ -185,6 +232,10 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
 
 #[test]
 fn with_context_carries_the_disclosure_footer() {
+    support::with_isolated_pricing_env(with_context_carries_the_disclosure_footer_body);
+}
+
+fn with_context_carries_the_disclosure_footer_body() {
     let sessions = demo_sessions().expect("demo sessions parse");
     let overview = compute_overview(&sessions);
     let health = agenttrace_core::data_health(&sessions, sessions.len(), 0);
@@ -220,6 +271,10 @@ fn theme_parser_rejects_unknown_values() {
 
 #[test]
 fn daily_series_survives_the_warm_cache_replay_shape() {
+    support::with_isolated_pricing_env(daily_series_survives_the_warm_cache_replay_shape_body);
+}
+
+fn daily_series_survives_the_warm_cache_replay_shape_body() {
     // rm-911 (assess F1): `SessionMetrics::timestamps` is
     // #[serde(skip)], so the warm session cache replays sessions with
     // an EMPTY timestamp list while `session_start`/`session_end`
@@ -252,4 +307,46 @@ fn daily_series_survives_the_warm_cache_replay_shape() {
         "the card must not depend on cache-dropped fields: same corpus, \
          timestamps present vs replay-shape, byte-identical render"
     );
+}
+
+// rm-1954 completion: the standing poison-proof fixture. `card_of`
+// renders the pricing disclosure from the serving catalog, so a
+// mutated machine pricing cache at the default user-cache location
+// re-points demo-corpus costs (the observed cycle-9 host red: svg
+// golden `2.304` vs `7.395` total cost under the 2026-10-21 machine
+// cache). The fixture seeds a mutated bundled snapshot — the demo
+// corpus's primary model `claude-sonnet-4-5` with a tripled input
+// rate — under a scratch HOME and proves BOTH legs: guarded the card
+// prices from the bundled row, unguarded the poison still wins.
+#[test]
+fn mutated_machine_cache_does_not_flip_the_card_pricing() {
+    support::assert_poison_proof_standing("svg_card_poison_probe", &mutated_machine_cache_bytes());
+}
+
+fn mutated_machine_cache_bytes() -> String {
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(include_str!("../src/pricing_snapshot.json")).unwrap();
+    snapshot["claude-sonnet-4-5"]["input_cost_per_token"] = serde_json::json!(9.5e-6);
+    snapshot.to_string()
+}
+
+// Spawned by the fixture above; runs only under its sentinel env —
+// deliberately UNGUARDED: the fixture isolates via spawned env, not
+// the in-process guard. Asserts the representative card-pricing
+// truth: the demo corpus's primary model prices from the bundled row.
+#[test]
+fn svg_card_poison_probe() {
+    if std::env::var_os("AGENTTRACE_TEST_PRICING_PROBE").is_none() {
+        return;
+    }
+    let bundled: serde_json::Value =
+        serde_json::from_str(include_str!("../src/pricing_snapshot.json")).unwrap();
+    let row = &bundled["claude-sonnet-4-5"];
+    let p = lookup_price("claude-sonnet-4-5");
+    assert_eq!(
+        p.input,
+        row["input_cost_per_token"].as_f64().unwrap(),
+        "card pricing must serve the bundled row"
+    );
+    assert_eq!(p.output, row["output_cost_per_token"].as_f64().unwrap());
 }

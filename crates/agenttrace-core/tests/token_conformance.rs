@@ -14,6 +14,17 @@
 //! one round4 step — a snapshot refresh that moves a used model's rates
 //! forces a pack refresh instead of silently re-blessing old totals.
 //!
+//! rm-1954 completion (run 5cf06bab cycle 9, batch "host-state truth
+//! hardening"): that re-derivation runs through the public catalog,
+//! which PREFERS a machine pricing cache over the bundled snapshot and
+//! initializes once per process — so a developer host with
+//! `~/.cache/agenttrace/pricing.json` (a raw LiteLLM download with
+//! drifted rates) silently flipped the pack's totals. The priced arm
+//! now runs inside `support::with_isolated_pricing_env`
+//! (tests/support/mod.rs) — the manifest-consistency arm reads files
+//! only and needs no guard — and the standing poison-proof fixture
+//! pins both directions without relying on ambient host state.
+//!
 //! Case 012 is xfail-pinned to rm-663 (the parser currently freezes the
 //! first assistant model onto every usage meta, so the per-block truth
 //! is not reachable yet). When rm-663 lands, that case matches truth and
@@ -24,6 +35,8 @@
 //! Binary-level twins of these assertions live in
 //! `scripts/conformance/run.sh` (end-to-end CLI shape), and the CI gate
 //! lives in `.github/workflows/ci.yml` (`conformance` job).
+
+mod support;
 
 use agenttrace_core::{lookup_price, parse_file, round4};
 use serde_json::Value;
@@ -149,6 +162,10 @@ fn conformance_pack_manifest_is_internally_consistent() {
 
 #[test]
 fn conformance_pack_holds_against_parser_and_pricing() {
+    support::with_isolated_pricing_env(conformance_pack_holds_against_parser_and_pricing_body);
+}
+
+fn conformance_pack_holds_against_parser_and_pricing_body() {
     let tolerance = manifest()["pricing_basis"]["formula_tolerance"]
         .as_f64()
         .expect("formula tolerance");
@@ -242,4 +259,51 @@ fn conformance_pack_holds_against_parser_and_pricing() {
     }
 
     assert!(asserted >= 13, "every manifest case was asserted");
+}
+
+// rm-1954 completion: the standing poison-proof fixture. The pack's
+// priced cases ride `claude-sonnet-4-5` (cases 007/008/009/011/012),
+// so a machine cache with drifted rates re-derives their totals away
+// from the manifest literals. The fixture seeds a mutated bundled
+// snapshot — `claude-sonnet-4-5` with a skewed output rate — under a
+// scratch HOME and proves BOTH legs: guarded the pack re-derives from
+// the bundled row, unguarded the poison wins.
+#[test]
+fn mutated_machine_cache_does_not_flip_the_pack_totals() {
+    support::assert_poison_proof_standing(
+        "token_conformance_poison_probe",
+        &mutated_machine_cache_bytes(),
+    );
+}
+
+fn mutated_machine_cache_bytes() -> String {
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(include_str!("../src/pricing_snapshot.json")).unwrap();
+    snapshot["claude-sonnet-4-5"]["output_cost_per_token"] = serde_json::json!(2.5e-5);
+    snapshot.to_string()
+}
+
+// Spawned by the fixture above; runs only under its sentinel env —
+// deliberately UNGUARDED: the fixture isolates via spawned env, not
+// the in-process guard. Asserts the representative pack truth: the
+// priced cases' primary model serves the bundled row.
+#[test]
+fn token_conformance_poison_probe() {
+    if std::env::var_os("AGENTTRACE_TEST_PRICING_PROBE").is_none() {
+        return;
+    }
+    let bundled: serde_json::Value =
+        serde_json::from_str(include_str!("../src/pricing_snapshot.json")).unwrap();
+    let row = &bundled["claude-sonnet-4-5"];
+    let p = lookup_price("claude-sonnet-4-5");
+    assert_eq!(
+        p.input,
+        row["input_cost_per_token"].as_f64().unwrap(),
+        "the pack must re-derive from the bundled row"
+    );
+    assert_eq!(
+        p.output,
+        row["output_cost_per_token"].as_f64().unwrap(),
+        "the pack must re-derive from the bundled row"
+    );
 }

@@ -51,6 +51,94 @@ pub struct PricingEnvGuard {
     _lock: MutexGuard<'static, ()>,
 }
 
+/// rm-1954 completion (run 5cf06bab cycle 9, batch "host-state truth
+/// hardening"): the standing poison-proof fixture for every wired
+/// catalog-lane suite, factored from the landed
+/// `mutated_machine_cache_does_not_flip_the_census`
+/// (regional_pricing_contract.rs) so each suite pins its OWN
+/// representative catalog assertion the same deterministic way, with
+/// no reliance on ambient host state:
+///
+///   guarded   — poison seeded at every default machine-cache
+///               location under a scratch HOME, session cache
+///               relocated to a fresh empty scratch: the probe must
+///               PASS (the bundled snapshot serves the catalog).
+///   unguarded — the same poisoned HOME, no relocation: the probe
+///               must FAIL (cache preference is real product
+///               behavior; if this leg ever turns green the threat
+///               model changed — re-adjudicate the fixture, never
+///               delete the isolation guard).
+///
+/// `probe_filter` names the sentinel-gated `#[test]` in the caller's
+/// binary that carries the suite's representative assertion;
+/// `poisoned_cache_json` is machine-cache bytes (a mutated copy of
+/// the bundled snapshot) that deterministically flips that assertion
+/// when the cache lane is allowed to serve it.
+///
+/// `#[allow(dead_code)]`: only the four rm-1954-completion suites
+/// call this; `pricing_snapshot_hygiene` and
+/// `regional_pricing_contract` compile `mod support` too (for the
+/// guard) but keep their own landed fixtures.
+#[allow(dead_code)]
+pub fn assert_poison_proof_standing(probe_filter: &str, poisoned_cache_json: &str) {
+    let tmp = std::env::temp_dir();
+    let poison_home = tmp.join(format!(
+        "at-poison-home-{}-{}",
+        std::process::id(),
+        probe_filter
+    ));
+    let clean_session = tmp.join(format!(
+        "at-clean-session-{}-{}",
+        std::process::id(),
+        probe_filter
+    ));
+    for dir in [&poison_home, &clean_session] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    // Seed every platform default machine-cache location under the
+    // scratch HOME (the cache lane resolves ~/.cache on Linux,
+    // ~/Library/Caches on macOS — seed both so the fixture is
+    // portable either way, exactly as the landed fixture does).
+    for rel in [".cache/agenttrace", "Library/Caches/agenttrace"] {
+        let dir = poison_home.join(rel);
+        std::fs::create_dir_all(&dir).expect("poison cache dir");
+        std::fs::write(dir.join("pricing.json"), poisoned_cache_json).expect("seed poison");
+    }
+    std::fs::create_dir_all(&clean_session).expect("clean session scratch");
+
+    let run_probe = |session_cache_dir: Option<&std::path::PathBuf>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        cmd.arg("--exact")
+            .arg(probe_filter)
+            .env("AGENTTRACE_TEST_PRICING_PROBE", "1")
+            .env("HOME", &poison_home)
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("AGENTTRACE_PRICING_FILE");
+        match session_cache_dir {
+            Some(dir) => cmd.env("AGENTTRACE_SESSION_CACHE_DIR", dir),
+            None => cmd.env_remove("AGENTTRACE_SESSION_CACHE_DIR"),
+        };
+        cmd.output().expect("spawn probe")
+    };
+
+    let guarded = run_probe(Some(&clean_session));
+    assert!(
+        guarded.status.success(),
+        "guarded catalog must ignore a poisoned default machine cache:\n{}",
+        String::from_utf8_lossy(&guarded.stderr)
+    );
+
+    let unguarded = run_probe(None);
+    assert!(
+        !unguarded.status.success(),
+        "the poison mechanism must stay real: the unguarded probe passed, so \
+         the cache-preference contract changed — re-adjudicate this fixture"
+    );
+
+    let _ = std::fs::remove_dir_all(&poison_home);
+    let _ = std::fs::remove_dir_all(&clean_session);
+}
+
 impl PricingEnvGuard {
     fn acquire() -> Self {
         // Poison-tolerant: a panicking census test must not brick the

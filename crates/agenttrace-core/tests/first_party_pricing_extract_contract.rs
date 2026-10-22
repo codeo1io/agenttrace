@@ -26,6 +26,21 @@
 //!    report no specific price;
 //! 5. `catalog_identity` folds the extract bytes in, so a changed
 //!    extract (new binary) reprices cached sessions.
+//!
+//! rm-1954 completion (run 5cf06bab cycle 9, batch "host-state truth
+//! hardening"): every extract-lane lookup resolves through the public
+//! catalog, which PREFERS a machine pricing cache (raw LiteLLM
+//! download — 4,244 keys and drifted reseller rows) over the bundled
+//! snapshot and initializes once per process, so a developer host
+//! with `~/.cache/agenttrace/pricing.json` silently re-pointed these
+//! arms (observed cycle-9 host red: two arms under the 2026-10-21
+//! machine cache). Every catalog-reading arm now runs inside
+//! `support::with_isolated_pricing_env` (tests/support/mod.rs) — the
+//! provenance-note arm reads the extract file directly and needs no
+//! guard — and the standing poison-proof fixture pins both directions
+//! without relying on ambient host state.
+
+mod support;
 
 use agenttrace_core::{
     catalog_identity, has_specific_price, lookup_price, pricing_source_for, provider_for,
@@ -69,6 +84,10 @@ fn expect_price(price: agenttrace_core::Price, input: f64, output: f64, cr: f64,
 
 #[test]
 fn extract_ids_bill_at_first_party_list_rates() {
+    support::with_isolated_pricing_env(extract_ids_bill_at_first_party_list_rates_body);
+}
+
+fn extract_ids_bill_at_first_party_list_rates_body() {
     for (id, input, output, cr, cw) in EXTRACT_ROWS {
         expect_price(lookup_price(id), *input, *output, *cr, *cw);
     }
@@ -76,6 +95,10 @@ fn extract_ids_bill_at_first_party_list_rates() {
 
 #[test]
 fn extract_ids_attribute_to_their_vendor() {
+    support::with_isolated_pricing_env(extract_ids_attribute_to_their_vendor_body);
+}
+
+fn extract_ids_attribute_to_their_vendor_body() {
     for (id, ..) in EXTRACT_ROWS {
         assert_eq!(
             provider_for(id).as_deref(),
@@ -87,6 +110,10 @@ fn extract_ids_attribute_to_their_vendor() {
 
 #[test]
 fn extract_service_is_disclosed_at_the_provenance_line() {
+    support::with_isolated_pricing_env(extract_service_is_disclosed_at_the_provenance_line_body);
+}
+
+fn extract_service_is_disclosed_at_the_provenance_line_body() {
     for (id, ..) in EXTRACT_ROWS {
         let source = pricing_source_for(id);
         assert!(
@@ -102,6 +129,10 @@ fn extract_service_is_disclosed_at_the_provenance_line() {
 
 #[test]
 fn extract_ids_are_specific_prices_not_fallbacks() {
+    support::with_isolated_pricing_env(extract_ids_are_specific_prices_not_fallbacks_body);
+}
+
+fn extract_ids_are_specific_prices_not_fallbacks_body() {
     for (id, ..) in EXTRACT_ROWS {
         assert!(
             has_specific_price(id),
@@ -112,6 +143,10 @@ fn extract_ids_are_specific_prices_not_fallbacks() {
 
 #[test]
 fn reseller_qualified_ids_keep_their_reseller_rows() {
+    support::with_isolated_pricing_env(reseller_qualified_ids_keep_their_reseller_rows_body);
+}
+
+fn reseller_qualified_ids_keep_their_reseller_rows_body() {
     // The session itself scoped these ids to a reseller lane: the
     // extract must NOT override an explicit qualification (it speaks
     // only for the bare first-party form).
@@ -134,6 +169,12 @@ fn reseller_qualified_ids_keep_their_reseller_rows() {
 
 #[test]
 fn first_party_ids_the_primary_catalog_carries_still_price_at_litellm() {
+    support::with_isolated_pricing_env(
+        first_party_ids_the_primary_catalog_carries_still_price_at_litellm_body,
+    );
+}
+
+fn first_party_ids_the_primary_catalog_carries_still_price_at_litellm_body() {
     // The extract is a gap-filler: an id LiteLLM prices first-party
     // (a current dated sonnet) must be byte-identical to the
     // pre-extract behavior — LiteLLM rates, LiteLLM source.
@@ -155,6 +196,10 @@ fn first_party_ids_the_primary_catalog_carries_still_price_at_litellm() {
 
 #[test]
 fn unknown_ids_still_fall_through_to_the_default() {
+    support::with_isolated_pricing_env(unknown_ids_still_fall_through_to_the_default_body);
+}
+
+fn unknown_ids_still_fall_through_to_the_default_body() {
     let unknown = "totally-unknown-model-9000";
     assert!(
         !has_specific_price(unknown),
@@ -170,6 +215,10 @@ fn unknown_ids_still_fall_through_to_the_default() {
 
 #[test]
 fn catalog_identity_folds_the_extract_bytes() {
+    support::with_isolated_pricing_env(catalog_identity_folds_the_extract_bytes_body);
+}
+
+fn catalog_identity_folds_the_extract_bytes_body() {
     // rm-1532: the extract can reprice and re-attribute ids, so its
     // bytes must ride the identity the session cache freshness-key
     // consumes — a changed extract (new binary) invalidates cached
@@ -214,4 +263,49 @@ fn extract_json_carries_its_provenance_note() {
             "the extract must carry the qualified row {qualified}"
         );
     }
+}
+
+// rm-1954 completion: the standing poison-proof fixture. Pin 3 is the
+// one a machine cache attacks first — a fresh raw-LiteLLM cache both
+// carries its own (drifted) row for the dated sonnet and shifts the
+// census the extract's consult-window depends on. The fixture seeds a
+// mutated bundled snapshot — `claude-sonnet-4-5-20250929` with a
+// tripled input rate — under a scratch HOME and proves BOTH legs:
+// guarded the ladder still serves the bundled list rate, unguarded
+// the poison wins.
+#[test]
+fn mutated_machine_cache_does_not_flip_the_extract_ladder() {
+    support::assert_poison_proof_standing(
+        "first_party_extract_poison_probe",
+        &mutated_machine_cache_bytes(),
+    );
+}
+
+fn mutated_machine_cache_bytes() -> String {
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(include_str!("../src/pricing_snapshot.json")).unwrap();
+    snapshot["claude-sonnet-4-5-20250929"]["input_cost_per_token"] = serde_json::json!(9.5e-6);
+    snapshot.to_string()
+}
+
+// Spawned by the fixture above; runs only under its sentinel env —
+// deliberately UNGUARDED: the fixture isolates via spawned env, not
+// the in-process guard. Asserts the representative ladder truth: a
+// first-party id the bundled LiteLLM catalog carries prices at the
+// bundled list rate (the extract is a gap-filler, not a shadow).
+#[test]
+fn first_party_extract_poison_probe() {
+    if std::env::var_os("AGENTTRACE_TEST_PRICING_PROBE").is_none() {
+        return;
+    }
+    let bundled: serde_json::Value =
+        serde_json::from_str(include_str!("../src/pricing_snapshot.json")).unwrap();
+    let row = &bundled["claude-sonnet-4-5-20250929"];
+    let p = lookup_price("claude-sonnet-4-5-20250929");
+    assert_eq!(
+        p.input,
+        row["input_cost_per_token"].as_f64().unwrap(),
+        "a primary-catalog id must price at the bundled LiteLLM rate"
+    );
+    assert_eq!(p.output, row["output_cost_per_token"].as_f64().unwrap());
 }

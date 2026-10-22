@@ -12,6 +12,18 @@
 //! catalog is a process-global `OnceLock` seeded from
 //! `AGENTTRACE_PRICING_FILE` on first use, so the override has to be
 //! in place before any lookup and must not race sibling tests.
+//!
+//! rm-1954 completion (run 5cf06bab cycle 9, batch "host-state truth
+//! hardening"): the override merges over the machine-cache lane, so a
+//! fresh host cache (`~/.cache/agenttrace/pricing.json` — a raw
+//! LiteLLM download, absent rates intact) polluted the census the
+//! moment the override was seeded. The contract now runs inside
+//! `support::with_isolated_pricing_env` FIRST (kills the machine-cache
+//! lane, relocates HOME), and the body seeds its own override after
+//! acquire; the standing poison-proof fixture pins both directions
+//! without relying on ambient host state.
+
+mod support;
 
 use agenttrace_core::{analyze, cache_rate_census, lookup_price, CacheRateCensus};
 use std::collections::BTreeMap;
@@ -41,6 +53,12 @@ fn usage_event(
 
 #[test]
 fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero() {
+    support::with_isolated_pricing_env(
+        absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero_body,
+    );
+}
+
+fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero_body() {
     // The override catalog merges per-entry over the bundled one, so
     // three synthetic rows pin all three states without touching any
     // real model's rates. All three share input $10/M, output $30/M.
@@ -225,4 +243,49 @@ fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_publishe
     std::env::remove_var("AGENTTRACE_PRICING_FILE");
     std::fs::remove_file(&override_path).ok();
     std::fs::remove_dir(&dir).ok();
+}
+
+// rm-1954 completion: the standing poison-proof fixture. The census's
+// bundled zero-fill (`absent == 0`, pinned in pricing_snapshot_hygiene)
+// is exactly what a raw LiteLLM machine cache flips — a fresh download
+// carries genuinely absent cache rates. The fixture seeds a mutated
+// bundled snapshot with `gpt-4o`'s `cache_read_input_token_cost` key
+// deleted (absent 0 → 1) under a scratch HOME and proves BOTH legs:
+// guarded the census stays bundled-shaped, unguarded the poison wins.
+#[test]
+fn mutated_machine_cache_does_not_flip_the_cache_rate_census() {
+    support::assert_poison_proof_standing(
+        "cache_rate_census_poison_probe",
+        &mutated_machine_cache_bytes(),
+    );
+}
+
+fn mutated_machine_cache_bytes() -> String {
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(include_str!("../src/pricing_snapshot.json")).unwrap();
+    snapshot["gpt-4o"]
+        .as_object_mut()
+        .unwrap()
+        .remove("cache_read_input_token_cost");
+    snapshot.to_string()
+}
+
+// Spawned by the fixture above; runs only under its sentinel env —
+// deliberately UNGUARDED: the fixture isolates via spawned env, not
+// the in-process guard. Asserts the representative census truth: the
+// bundled catalog publishes zero absent cache rates.
+#[test]
+fn cache_rate_census_poison_probe() {
+    if std::env::var_os("AGENTTRACE_TEST_PRICING_PROBE").is_none() {
+        return;
+    }
+    let census = cache_rate_census();
+    assert_eq!(
+        census.cache_read_absent, 0,
+        "the bundled catalog must publish zero absent cache-read rates"
+    );
+    assert_eq!(
+        census.cache_write_absent, 0,
+        "the bundled catalog must publish zero absent cache-write rates"
+    );
 }
