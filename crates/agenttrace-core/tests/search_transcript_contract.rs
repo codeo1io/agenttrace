@@ -203,6 +203,16 @@ fn codex_compressed_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-zstd/rollout.jsonl")
 }
 
+/// rm-2277: the codex-zstd fixture family by name — the bomb twins
+/// (`rollout-bomb.jsonl`, `rollout-bomb-multiframe.jsonl`) exist to pin
+/// admission and cap behavior against real frames without checking in
+/// anything new.
+fn codex_zstd_fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-zstd")
+        .join(name)
+}
+
 #[test]
 fn compressed_transcript_is_decoded_and_matchable() {
     // Golden-parity twin of fixtures/codex-custom-tools/rollout.jsonl:
@@ -355,4 +365,116 @@ fn decompressed_budget_charge_saturates() {
         "budget exhaustion must be disclosed, got: {}",
         text
     );
+}
+
+// ============================================================
+// rm-2277: scan-budget admission must PRECEDE the zstd decode.
+// The rm-1872 order decoded every frame first and asked the budget
+// question on the finished body — so each frame the scan was about to
+// refuse had already paid its full decompression (a 32-frame
+// 16 MiB-bomb corpus cost 2.49 s against a 235 µs control, ~10,000×).
+// Admission now happens before the work: from the frame header's
+// DECLARED content size when the header carries one, and by aborting
+// the decode at the budget boundary when it does not. Refused frames
+// touch only the skip counters — never the decode counters.
+// ============================================================
+
+#[test]
+fn zstd_bomb_with_a_declared_size_is_refused_before_any_decode() {
+    // Preflight arm. `rollout-bomb-multiframe.jsonl`'s first frame
+    // header DECLARES 40 MiB of decompressed body (verified at
+    // generation time, `zstd -l`: 2 frames / 80 MiB total) against an
+    // 8 MiB remaining budget. The old order paid the full 64 MiB
+    // decode and then mis-filed the file as a DECODE refusal
+    // (skipped_zstd — the decode hit the 64 MiB cap before the budget
+    // was ever consulted); the header preflight must refuse the file
+    // as a BUDGET skip with the decode counters untouched.
+    let bomb = codex_zstd_fixture("rollout-bomb-multiframe.jsonl");
+    let bytes = std::fs::read(&bomb).unwrap();
+    assert_eq!(
+        &bytes[..4],
+        &[0x28, 0xB5, 0x2F, 0xFD],
+        "fixture hygiene: the bomb must really be a zstd frame"
+    );
+    let mut session = parse_file(&fixture("body-only.jsonl")).unwrap();
+    // The query matches the session NAME so the row survives into
+    // results — a vacuously-true `all()` over zero rows would pin
+    // nothing about the refusal.
+    session.name = "innocuous-session".to_string();
+    session.path = bomb.to_string_lossy().to_string();
+    let report = search_sessions_detailed(
+        &[session],
+        "innocuous",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        8 * 1024 * 1024,
+    );
+    assert_eq!(report.results.len(), 1, "the name match must keep the row");
+    assert_eq!(
+        report.results[0].transcript_scan,
+        "skipped: read budget exhausted (decompressed body over remaining budget)",
+        "a header-declared over-budget frame must disclose the budget skip"
+    );
+    assert_eq!(
+        report.scan.skipped_budget, 1,
+        "the declared 40 MiB body over an 8 MiB budget is a budget skip"
+    );
+    assert_eq!(
+        report.scan.skipped_zstd, 0,
+        "the decoder must never reach a block: the old decode-first order paid the full 64 MiB decode here and mis-filed it as skipped_zstd"
+    );
+    assert_eq!(
+        report.scan.zstd_decoded_files, 0,
+        "a refused frame never touches the decode counters (rm-2277)"
+    );
+    assert_eq!(report.scan.zstd_decoded_bytes, 0);
+    assert_eq!(report.scan.scanned_files, 0);
+}
+
+#[test]
+fn zstd_bomb_without_a_declared_size_aborts_at_the_budget_boundary() {
+    // Backstop arm. `rollout-bomb.jsonl` is stream-compressed, so its
+    // frame header omits the content size (`zstd -l` shows no
+    // uncompressed size) — no header preflight can answer the budget
+    // question for it. The decode itself must then abort AT the
+    // remaining-budget boundary: the old order decoded all 64 MiB to
+    // the decoder's own cap and mis-filed the file as skipped_zstd;
+    // the bounded decode stops at the budget and discloses a budget
+    // skip with the decode counters untouched.
+    let bomb = codex_zstd_fixture("rollout-bomb.jsonl");
+    let bytes = std::fs::read(&bomb).unwrap();
+    assert_eq!(
+        &bytes[..4],
+        &[0x28, 0xB5, 0x2F, 0xFD],
+        "fixture hygiene: the bomb must really be a zstd frame"
+    );
+    let mut session = parse_file(&fixture("body-only.jsonl")).unwrap();
+    session.name = "innocuous-session".to_string();
+    session.path = bomb.to_string_lossy().to_string();
+    let report = search_sessions_detailed(
+        &[session],
+        "innocuous",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        1 << 20,
+    );
+    assert_eq!(report.results.len(), 1, "the name match must keep the row");
+    assert_eq!(
+        report.results[0].transcript_scan,
+        "skipped: read budget exhausted (decompressed body over remaining budget)",
+        "an over-budget unknown-size frame must disclose the budget skip"
+    );
+    assert_eq!(
+        report.scan.skipped_budget, 1,
+        "the unknown-size bomb is refused on the budget boundary"
+    );
+    assert_eq!(
+        report.scan.skipped_zstd, 0,
+        "the decode aborts at the budget boundary — it must not run to the 64 MiB cap and get mis-filed as a decode refusal"
+    );
+    assert_eq!(
+        report.scan.zstd_decoded_files, 0,
+        "a refused frame never touches the decode counters (rm-2277)"
+    );
+    assert_eq!(report.scan.zstd_decoded_bytes, 0);
 }

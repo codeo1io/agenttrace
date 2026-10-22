@@ -310,7 +310,53 @@ fn zstd_decode_cap_label() -> String {
 /// one decode lane, one cap, one refusal wording (and therefore the same
 /// multi-frame truth: a concatenated rollout parses and fingerprints as
 /// the whole journal on both lanes).
+/// rm-2277 adds ONE admission parameter that changes no refusal above:
+/// an optional scan budget (`decode_zstd_rollout_bounded_for_scan`, used
+/// only by the transcript-search lane). A frame whose header DECLARES a
+/// content size that would push the total decompressed output past the
+/// budget is refused before any block is decoded, and a frame whose
+/// header omits the size is aborted at the budget boundary mid-decode —
+/// the search lane used to pay the full decode of every frame it was
+/// about to refuse (a 32-frame 16 MiB-bomb corpus cost 2.49 s against a
+/// 235 µs control). Budget refusals return `Ok(None)` so the caller
+/// files them as budget skips, never as decode refusals; with no budget
+/// (every pre-existing caller) behavior and wordings are byte-for-byte
+/// unchanged.
 pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
+    // No scan-budget admission on this lane: the hard decode cap is the
+    // only bound and every refusal keeps its rm-992/rm-1516 wording
+    // byte-for-byte (pinned by tests/zstd_rollout_decode.rs).
+    match decode_zstd_rollout_inner(raw, label, None)? {
+        Some(decoded) => Ok(decoded),
+        // Only the scan lane passes a budget, so admission can never
+        // refuse here; the hard cap in the inner loop stays the only
+        // bound on this lane.
+        None => unreachable!("scan-budget admission is inert without a budget"),
+    }
+}
+
+/// rm-2277 scan-lane variant: decode bounded BOTH by
+/// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`] and by `scan_budget_left` of total
+/// decompressed output. `Ok(None)` means the frames would exceed the
+/// scan budget — decided from the frame header's declared content size
+/// when it carries one (no block decode at all: admission reads only
+/// the header `StreamingDecoder::new` already read) and by aborting the
+/// decode at the budget boundary when it does not. `Ok(None)` is a
+/// budget refusal, never a decode failure: the caller discloses it as
+/// a budget skip and must leave its decode counters untouched.
+pub(crate) fn decode_zstd_rollout_bounded_for_scan(
+    raw: Vec<u8>,
+    label: &str,
+    scan_budget_left: u64,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    decode_zstd_rollout_inner(raw, label, Some(scan_budget_left))
+}
+
+fn decode_zstd_rollout_inner(
+    raw: Vec<u8>,
+    label: &str,
+    scan_budget_left: Option<u64>,
+) -> anyhow::Result<Option<Vec<u8>>> {
     use std::io::Read;
     let total_len = raw.len();
     // `rest` always points at the next not-yet-decoded frame; each
@@ -375,6 +421,18 @@ pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::
                 err
             ),
         };
+        // rm-2277 preflight: `new` above has already read (only) this
+        // frame's header, so the decoder's `content_size()` is the
+        // frame's DECLARED decompressed size — the admission question
+        // costs a header read, never a block decode. A header that
+        // omits the size reports 0 and falls through to the in-flight
+        // abort below, which bounds that arm at the same boundary.
+        if let Some(budget_left) = scan_budget_left {
+            let declared = decoder.decoder.content_size();
+            if declared != 0 && decoded.len() as u64 + declared > budget_left {
+                return Ok(None);
+            }
+        }
         let mut chunk = [0u8; 64 * 1024];
         loop {
             let n = match decoder.read(&mut chunk) {
@@ -399,6 +457,17 @@ pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::
                     frame_no
                 );
             }
+            // rm-2277 in-flight abort (headers that omit the content
+            // size): stop AT the budget boundary — the old order kept
+            // decoding to the hard cap and the caller mis-filed the
+            // file as a decode refusal. Checked after the cap so a
+            // frame past the 64 MiB decode cap stays the CAP refusal
+            // (Err) in every lane, exactly as before rm-2277.
+            if let Some(budget_left) = scan_budget_left {
+                if decoded.len() as u64 + n as u64 > budget_left {
+                    return Ok(None);
+                }
+            }
             decoded.extend_from_slice(&chunk[..n]);
         }
         // Recover the exact end-of-frame position: the decoder advanced
@@ -416,7 +485,7 @@ pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::
             label
         );
     }
-    Ok(decoded)
+    Ok(Some(decoded))
 }
 
 /// Parse one session stream piped on stdin (rm-503, `agenttrace … -`):
@@ -14068,5 +14137,95 @@ mod zstd_cap_label_tests {
         // can take (the derivation must not silently produce "0 MiB" or
         // a fraction if the cap is ever retuned).
         assert_eq!(ZSTD_ROLLOUT_DECODE_MAX_BYTES % (1024 * 1024), 0);
+    }
+}
+
+/// rm-2277: the scan-budget admission contract of
+/// `decode_zstd_rollout_bounded_for_scan`, pinned at the decoder so the
+/// search lane's counters (skipped_budget vs skipped_zstd vs the decode
+/// counters) rest on a named seam. The honest-frame arm is the rm-1872
+/// verdict contract: admission must never change which bytes a frame
+/// within budget decodes to.
+#[cfg(test)]
+mod zstd_scan_budget_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex-zstd")
+            .join(name)
+    }
+
+    #[test]
+    fn honest_frame_within_budget_decodes_identically_to_the_no_budget_lane() {
+        let raw = std::fs::read(fixture("rollout.jsonl")).unwrap();
+        // 22,652 declared bytes (zstd -l) inside a 1 MiB budget: admitted,
+        // and the body is byte-identical to the unbudgeted lane.
+        let unbudgeted = decode_zstd_rollout_bounded(raw.clone(), "x").unwrap();
+        let budgeted = decode_zstd_rollout_bounded_for_scan(raw, "x", 1 << 20)
+            .unwrap()
+            .expect("an honest frame within budget must decode");
+        assert_eq!(budgeted.len(), 22_652);
+        assert_eq!(budgeted, unbudgeted);
+    }
+
+    #[test]
+    fn known_size_frame_over_budget_is_refused_without_decoding() {
+        let raw = std::fs::read(fixture("rollout.jsonl")).unwrap();
+        // 22,652 declared bytes against a 5,000-byte budget: the header
+        // alone answers the admission question — Ok(None), never a
+        // partial decode, never a decode refusal.
+        assert!(
+            decode_zstd_rollout_bounded_for_scan(raw, "x", 5_000)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn budget_admission_boundary_admits_equal_and_refuses_one_more() {
+        // The boundary matches the search lane's strict-greater refusal
+        // (decoded_len > budget_left): exactly-equal bodies are scanned.
+        let raw = std::fs::read(fixture("rollout-multiframe.jsonl")).unwrap();
+        let at_boundary = decode_zstd_rollout_bounded_for_scan(raw.clone(), "x", 22_652)
+            .unwrap()
+            .expect("a body exactly equal to the budget is admitted");
+        assert_eq!(at_boundary.len(), 22_652);
+        assert!(
+            decode_zstd_rollout_bounded_for_scan(raw, "x", 22_651)
+                .unwrap()
+                .is_none(),
+            "one byte under the body must refuse — the budget spans ALL frames"
+        );
+    }
+
+    #[test]
+    fn unknown_size_frame_over_budget_aborts_at_the_boundary() {
+        // rollout-bomb.jsonl is stream-compressed: no content size in the
+        // header, so no preflight can answer. The decode must abort AT
+        // the budget boundary instead of running to the 64 MiB cap.
+        let raw = std::fs::read(fixture("rollout-bomb.jsonl")).unwrap();
+        assert!(
+            decode_zstd_rollout_bounded_for_scan(raw, "x", 1 << 20)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cap_refusal_wins_when_the_budget_still_has_room() {
+        // Precedence: with room left in the scan budget, a frame past the
+        // 64 MiB decode cap is still the CAP refusal (Err) — the same
+        // file the no-budget lane refuses, never a budget skip, so the
+        // search lane keeps filing these as decode refusals exactly as
+        // before rm-2277.
+        let raw = std::fs::read(fixture("rollout-bomb-multiframe.jsonl")).unwrap();
+        let err = decode_zstd_rollout_bounded_for_scan(raw, "x", 256 << 20).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("64 MiB"),
+            "the cap refusal must stay the binding refusal when the budget has room: {msg}"
+        );
+        assert!(!msg.contains("read budget"), "not a budget refusal: {msg}");
     }
 }

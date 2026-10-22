@@ -585,25 +585,40 @@ fn transcript_evidence(
     // frame hides behind (rm-1872).
     let charged: u64;
     if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        match crate::parser::decode_zstd_rollout_bounded(bytes, path) {
-            Ok(decoded) => {
+        // rm-2277: admission BEFORE work. The frame header's declared
+        // content size (and, for headers that omit it, the decode itself
+        // at the budget boundary) must clear the remaining scan budget
+        // BEFORE the decode runs — the old order paid the full decode of
+        // every frame it was about to refuse (a 32-frame 16 MiB-bomb
+        // corpus cost 2.49 s against a 235 µs control) and mis-filed
+        // cap-crossing frames as decode refusals. `Ok(None)` is the
+        // budget refusal: the file is disclosed as a budget skip and
+        // the decode counters stay untouched.
+        match crate::parser::decode_zstd_rollout_bounded_for_scan(bytes, path, *budget_left) {
+            Ok(Some(decoded)) => {
                 let decoded_len = decoded.len() as u64;
-                if decoded_len > *budget_left {
-                    scan.skipped_budget += 1;
-                    return (
-                        Vec::new(),
-                        "skipped: read budget exhausted (decompressed body over remaining budget)"
-                            .to_string(),
-                    );
-                }
                 scan.zstd_decoded_files += 1;
                 scan.zstd_decoded_bytes += decoded_len;
-                *budget_left -= decoded_len;
+                // Admission above guarantees decoded_len <= budget_left
+                // (header preflight for frames that declare a size,
+                // abort-at-boundary for those that do not), so this
+                // charge cannot wrap — the rm-1993 wrap shape. Saturate
+                // anyway so a future admission regression can never buy
+                // a free scan on a wrapped budget.
+                *budget_left = budget_left.saturating_sub(decoded_len);
                 charged = decoded_len;
                 scan.scanned_files += 1;
                 scan.scanned_bytes += decoded_len;
                 // Lossy decode: a torn multibyte tail must not abort the scan.
                 content = std::borrow::Cow::Owned(String::from_utf8_lossy(&decoded).into_owned());
+            }
+            Ok(None) => {
+                scan.skipped_budget += 1;
+                return (
+                    Vec::new(),
+                    "skipped: read budget exhausted (decompressed body over remaining budget)"
+                        .to_string(),
+                );
             }
             Err(reason) => {
                 scan.skipped_zstd += 1;
