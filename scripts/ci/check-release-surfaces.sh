@@ -39,12 +39,10 @@ grep -q "cargo install" README.zh-CN.md ||
 grep -q "brew install luoyuctl/tap/agenttrace" README.md ||
 	fail "README must document Homebrew installation"
 # WinGet is no longer a release channel (adopted upstream v0.10.1 #301/#312
-# channel decision): install.ps1 / install.cmd serve Windows instead.
+# channel decision): install.ps1 serves Windows instead.
 if grep -R -qi "winget" .github/workflows scripts/release README.md README.zh-CN.md; then
 	fail "WinGet is no longer a release channel; use install.ps1 on Windows"
 fi
-grep -q "install.ps1" install.cmd ||
-	fail "install.cmd must delegate to install.ps1"
 grep -q "npm install -g @zack78/agenttrace" README.md ||
 	fail "README must document npm installation"
 grep -q "npm install -g @zack78/agenttrace" README.zh-CN.md ||

@@ -37,7 +37,7 @@ ref_default="$(grep -m1 -oE 'AGENTTRACE_SOURCE_REF:-[^}"]+' "$install_sh" | head
 	fail "install.sh REF default '$ref_default' is not a vX.Y.Z tag"
 
 violations=""
-for surface in install.cmd README.md README.zh-CN.md; do
+for surface in README.md README.zh-CN.md; do
 	file="$repo_root/$surface"
 	[ -f "$file" ] || fail "$surface not found at $file"
 	while IFS=: read -r lineno literal _rest; do
@@ -57,4 +57,4 @@ zh="$(grep -c "$ref_default" "$repo_root/README.zh-CN.md" || true)"
 [ "${zh:-0}" -gt 0 ] ||
 	fail "README.zh-CN.md does not cite the installer default '$ref_default' (en/zh parity)"
 
-echo "check-release-pins: install.cmd and README*.md version examples all match the installer default '$ref_default' (en $en / zh $zh mentions)"
+echo "check-release-pins: README*.md version examples all match the installer default '$ref_default' (en $en / zh $zh mentions)"

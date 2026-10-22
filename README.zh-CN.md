@@ -82,12 +82,6 @@ Windows PowerShell：
 irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
-Windows CMD：
-
-```bat
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
-```
-
 安装脚本会下载对应平台的发布版程序，并在安装前按发布的校验和验证
 SHA-256。脚本从不修改你的 shell 配置文件——只会打印加入 PATH 的方法
 （`~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\agenttrace`）。

@@ -29,10 +29,25 @@ if (-not $InstallDir) { $InstallDir = "$env:LOCALAPPDATA\agenttrace" }
 $REPO = "luoyuctl/agenttrace"
 $BIN = "agenttrace.exe"
 
-# Detect architecture
-$ARCH = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
-    "X64"   { "amd64" }
-    "Arm64" { "arm64" }
+# Detect architecture (rm-550, upstream #314/828bf6cb): read the
+# OS architecture defensively — on hosts where PSReadLine loads an
+# older System.Runtime.InteropServices.RuntimeInformation assembly
+# the property read can throw or come back empty — and fall back to
+# the well-known PROCESSOR_ARCHITEW6432 / PROCESSOR_ARCHITECTURE
+# environment variables before giving up. OSArchitecture (not the
+# process architecture) is the right signal here: a 32-bit shell on
+# a 64-bit OS must still fetch the 64-bit binary. X64 machines may
+# report the legacy AMD64 alias and the env vars spell ARM64 in
+# uppercase, so the switch accepts every spelling; anything else
+# still throws — an unknown arch is never guessed.
+$archRaw = try { "$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)" } catch { "" }
+if (-not $archRaw) {
+    $archRaw = "$env:PROCESSOR_ARCHITEW6432"
+    if (-not $archRaw) { $archRaw = "$env:PROCESSOR_ARCHITECTURE" }
+}
+$ARCH = switch ("$archRaw") {
+    { $_ -in "X64", "AMD64", "x64", "amd64" } { "amd64" }
+    { $_ -in "Arm64", "ARM64", "arm64" }      { "arm64" }
     default { throw "Unsupported architecture: $_" }
 }
 

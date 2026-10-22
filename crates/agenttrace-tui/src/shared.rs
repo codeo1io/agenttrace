@@ -17,6 +17,20 @@ pub(super) struct InspectFirstItem {
     pub(super) index: usize,
 }
 
+/// rm-1500 (run 18f9b98a cycle 2, assess 9158ade7 F1): the
+/// finiteness-gate wave (0ff02e09) covered every CLI fold but none of
+/// agenttrace-tui — a poisoned session cost (NaN/inf) NaN'd every
+/// TUI aggregate it touched while the CLI lanes clamped with
+/// disclosure. Same clamp here: a non-finite cost contributes 0.0;
+/// the session itself still counts.
+pub(super) fn finite_cost(cost: f64) -> f64 {
+    if cost.is_finite() {
+        cost
+    } else {
+        0.0
+    }
+}
+
 pub(super) fn cache_state_label() -> String {
     match agenttrace_core::session_cache_path().metadata() {
         Ok(metadata) if metadata.len() > 0 => "cache warm".to_string(),

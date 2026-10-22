@@ -7104,6 +7104,21 @@ fn gemini_chats_message_events(record: &JsonObject, events: &mut Vec<Event>) {
     let mut content: Vec<String> = Vec::new();
     let mut reasoning: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    // rm-715 (gemini 0.65.0 resume-dedup truth): every modern gemini-cli
+    // journal (>= 0.63) records a tool call twice — inline in `content`
+    // (the API response parts, the reader's source of truth) and mirrored
+    // in the dedicated `toolCalls` metadata array. The upstream reader
+    // (`sessionUtils.ts` convertSessionToClientHistory, `hasCallsInContent`
+    // guard — fix #29618/486ae2cd, stable v0.65.0 2026-10-20) never re-adds
+    // the array when content already carries the calls, so a mirrored call
+    // is ONE logical call. Pre-0.65 resumed journals additionally replay
+    // the synthesized `<id>_response` turns into the file, but those carry
+    // only functionResponse parts — no text, no calls — so they are inert
+    // for accounting (pinned by the resumed-journal contract test). Fold
+    // by call id in the count path only (display state is not read here):
+    // the first carrier wins, the mirror is suppressed, one logical call
+    // counts once.
+    let mut seen_call_ids: HashSet<&str> = HashSet::new();
     match record.get("content") {
         // PartListUnion: bare string or array of Parts. Text parts
         // flow the same way the object lane's part walk does — a
@@ -7129,6 +7144,9 @@ fn gemini_chats_message_events(record: &JsonObject, events: &mut Vec<Event>) {
                             }
                         }
                         if let Some(call) = part.get("functionCall").and_then(Value::as_object) {
+                            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                                seen_call_ids.insert(id);
+                            }
                             gemini_chats_push_call(call, &mut tool_calls);
                         }
                     }
@@ -7140,7 +7158,9 @@ fn gemini_chats_message_events(record: &JsonObject, events: &mut Vec<Event>) {
     }
     // The dedicated toolCalls array (ToolCallRecord) is the 0.63 shape;
     // result/displayName/status are display state — name and args are
-    // the accounting truth.
+    // the accounting truth. A call the content walk already counted
+    // (same id) is the twin, not a second call; an array entry with no
+    // id cannot be proven a twin and still counts.
     for call in record
         .get("toolCalls")
         .and_then(Value::as_array)
@@ -7148,6 +7168,11 @@ fn gemini_chats_message_events(record: &JsonObject, events: &mut Vec<Event>) {
         .flatten()
     {
         if let Some(call) = call.as_object() {
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                if seen_call_ids.contains(id) {
+                    continue;
+                }
+            }
             gemini_chats_push_call(call, &mut tool_calls);
         }
     }

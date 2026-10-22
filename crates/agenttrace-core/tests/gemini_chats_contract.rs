@@ -200,6 +200,127 @@ fn patch_remove_ids_and_tool_calls_apply() {
     );
 }
 
+/// rm-715 (run eed2b388 cycle 3, batch "Upstream-trigger discharge +
+/// honesty tail"): modern gemini-cli journals (>= 0.63) mirror every
+/// tool call — the API response part inline in `content` AND the
+/// `toolCalls` metadata entry carry the same call id. The upstream
+/// reader (sessionUtils.ts convertSessionToClientHistory,
+/// `hasCallsInContent` guard — fix #29618/486ae2cd, stable v0.65.0
+/// 2026-10-20) never re-adds the array when content already carries the
+/// calls, so one logical call is ONE count. Fixture lifted from that
+/// upstream fix: a modern tool round with its recorded response turn.
+#[test]
+fn modern_tool_round_counts_each_call_once() {
+    let raw = format!(
+        "{METADATA_LINE}\n{}",
+        concat!(
+            r#"{"id":"m-u1","timestamp":"2026-10-12T10:00:00.000Z","type":"user","content":"List files"}"#,
+            "\n",
+            r#"{"id":"m-g1","timestamp":"2026-10-12T10:01:00.000Z","type":"gemini","model":"gemini-2.5-pro","content":[{"text":"Let me check."},{"functionCall":{"id":"call123","name":"ls","args":{"dir":"."}}}],"toolCalls":[{"id":"call123","name":"ls","args":{"dir":"."},"status":"Success","timestamp":"2026-10-12T10:01:05.000Z","result":"file.txt"}]"#,
+            "\n",
+            r#"{"id":"m-g1","timestamp":"2026-10-12T10:01:00.000Z","type":"gemini","model":"gemini-2.5-pro","content":[{"text":"Let me check."},{"functionCall":{"id":"call123","name":"ls","args":{"dir":"."}}}],"toolCalls":[{"id":"call123","name":"ls","args":{"dir":"."},"status":"Success","timestamp":"2026-10-12T10:01:05.000Z","result":"file.txt"}],"tokens":{"input":180,"output":54,"cached":10,"thoughts":0,"tool":0,"total":244}}"#,
+            "\n",
+            r#"{"id":"m-r1","timestamp":"2026-10-12T10:01:06.000Z","type":"user","content":[{"functionResponse":{"id":"call123","name":"ls","response":{"output":"file.txt"}}}]}}"#,
+            "\n",
+            r#"{"id":"m-u2","timestamp":"2026-10-12T10:02:00.000Z","type":"user","content":"thanks"}"#,
+            "\n",
+        )
+    );
+    let session = parse_one("session-modern.jsonl", &raw);
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    assert_eq!(
+        session.metrics.user_messages, 2,
+        "m-u1 and m-u2; the recorded tool-response turn m-r1 is not a human prompt"
+    );
+    assert_eq!(
+        session.metrics.tool_calls_total, 1,
+        "the call123 mirror (content part + toolCalls entry) is ONE logical call"
+    );
+    assert_eq!(session.metrics.tool_usage.get("ls"), Some(&1));
+    assert_eq!(session.metrics.tokens_input, 180);
+    assert_eq!(session.metrics.tokens_output, 54);
+    assert_eq!(session.metrics.tokens_cache_r, 10);
+    assert_eq!(
+        session.metrics.events_total, 4,
+        "one event per record: user, assistant(+call), usage, user — the response turn adds no event"
+    );
+}
+
+/// rm-715 parallel shape (upstream #29618 fixture): two distinct calls
+/// mirrored in both carriers must never count as four.
+#[test]
+fn parallel_tool_calls_count_once_each() {
+    let raw = format!(
+        "{METADATA_LINE}\n{}",
+        concat!(
+            r#"{"id":"m-u1","timestamp":"2026-10-12T10:00:00.000Z","type":"user","content":"Read both files"}"#,
+            "\n",
+            r#"{"id":"m-g1","timestamp":"2026-10-12T10:01:00.000Z","type":"gemini","model":"gemini-2.5-pro","content":[{"functionCall":{"id":"callA","name":"read_file","args":{"path":"a.txt"}}},{"functionCall":{"id":"callB","name":"read_file","args":{"path":"b.txt"}}}],"toolCalls":[{"id":"callA","name":"read_file","args":{"path":"a.txt"},"status":"Success","timestamp":"2026-10-12T10:01:05.000Z","result":"contents A"},{"id":"callB","name":"read_file","args":{"path":"b.txt"},"status":"Success","timestamp":"2026-10-12T10:01:05.000Z","result":"contents B"}]"#,
+            "\n",
+            r#"{"id":"m-g1","timestamp":"2026-10-12T10:01:00.000Z","type":"gemini","model":"gemini-2.5-pro","content":[{"functionCall":{"id":"callA","name":"read_file","args":{"path":"a.txt"}}},{"functionCall":{"id":"callB","name":"read_file","args":{"path":"b.txt"}}}],"toolCalls":[{"id":"callA","name":"read_file","args":{"path":"a.txt"},"status":"Success","timestamp":"2026-10-12T10:01:05.000Z","result":"contents A"},{"id":"callB","name":"read_file","args":{"path":"b.txt"},"status":"Success","timestamp":"2026-10-12T10:01:05.000Z","result":"contents B"}],"tokens":{"input":400,"output":80,"cached":0,"thoughts":0,"tool":0,"total":480}}"#,
+            "\n",
+            r#"{"id":"m-r1","timestamp":"2026-10-12T10:01:06.000Z","type":"user","content":[{"functionResponse":{"id":"callA","name":"read_file","response":{"output":"contents A"}}},{"functionResponse":{"id":"callB","name":"read_file","response":{"output":"contents B"}}}]}}"#,
+            "\n",
+        )
+    );
+    let session = parse_one("session-parallel.jsonl", &raw);
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    assert_eq!(session.metrics.user_messages, 1);
+    assert_eq!(
+        session.metrics.tool_calls_total, 2,
+        "two distinct calls, each mirrored once — never four"
+    );
+    assert_eq!(session.metrics.tool_usage.get("read_file"), Some(&2));
+    assert_eq!(session.metrics.tokens_input, 400);
+}
+
+/// rm-715 resumed-journal poison (upstream "already corrupted history"
+/// fixture, fix #29618): a pre-0.65 resume replayed the synthesized
+/// `<id>_response` turn into the file and duplicated the
+/// functionResponse parts, so the journal carries the call mirror AND
+/// two response-only user turns on top. Upstream's reader dedupes the
+/// response parts; for accounting those turns carry no text and no
+/// call, so the poisoned file must bill exactly like the clean round —
+/// and this contract pins that they stay inert (no future fold may
+/// start billing replayed response turns as prompts or events).
+#[test]
+fn resumed_poisoned_journal_twins_stay_honest() {
+    let resp =
+        r#"{"functionResponse":{"id":"call123","name":"ls","response":{"output":"file.txt"}}}"#;
+    let round = r#"{"id":"m-g1","timestamp":"2026-10-12T10:01:00.000Z","type":"gemini","model":"gemini-2.5-pro","content":[{"text":"Let me check."},{"functionCall":{"id":"call123","name":"ls","args":{"dir":"."}}}],"toolCalls":[{"id":"call123","name":"ls","args":{"dir":"."},"status":"Success","timestamp":"2026-10-12T10:01:05.000Z","result":"#;
+    let round_with_result = |suffix: &str| format!("{round}[{resp},{resp}]{suffix}");
+    let raw = format!(
+        "{METADATA_LINE}\n\
+         {{\"id\":\"m-u1\",\"timestamp\":\"2026-10-12T10:00:00.000Z\",\"type\":\"user\",\"content\":\"List files\"}}\n\
+         {}\n\
+         {}\n\
+         {{\"id\":\"m-g1_response\",\"timestamp\":\"2026-10-12T10:01:05.000Z\",\"type\":\"user\",\"content\":[{resp},{resp}]}}\n\
+         {{\"id\":\"m-r1\",\"timestamp\":\"2026-10-12T10:01:06.000Z\",\"type\":\"user\",\"content\":[{resp}]}}\n",
+        round_with_result("}]}"),
+        round_with_result(
+            "}],\"tokens\":{\"input\":180,\"output\":54,\"cached\":10,\"thoughts\":0,\"tool\":0,\"total\":244}}"
+        ),
+    );
+    let session = parse_one("session-resumed.jsonl", &raw);
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    assert_eq!(
+        session.metrics.user_messages, 1,
+        "only m-u1 is a prompt; m-g1_response and m-r1 are replayed response turns"
+    );
+    assert_eq!(
+        session.metrics.tool_calls_total, 1,
+        "the poisoned round bills exactly one call — mirror folded"
+    );
+    assert_eq!(session.metrics.tool_usage.get("ls"), Some(&1));
+    assert_eq!(session.metrics.tokens_input, 180);
+    assert_eq!(session.metrics.tokens_output, 54);
+    assert_eq!(session.metrics.tokens_cache_r, 10);
+    assert_eq!(
+        session.metrics.events_total, 3,
+        "one event per record: user, assistant(+call), usage — the twin turns add no events"
+    );
+}
+
 #[test]
 fn info_and_error_records_never_count_as_turns() {
     let raw = format!(

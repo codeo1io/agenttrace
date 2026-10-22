@@ -75,12 +75,6 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
-Windows CMD:
-
-```bat
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
-```
-
 The install scripts download the release binary for your platform and verify its
 SHA-256 against the published checksum before installing. They never edit your
 shell profile — they print the `PATH` addition instead (`~/.local/bin`, or

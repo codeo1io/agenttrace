@@ -1961,7 +1961,12 @@ fn render_help_overlay(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 // Deliberately exclude titles, paths, arguments and log excerpts from clipboard output.
 fn share_summary(session: &Session) -> String {
-    format!("AgentTrace\nHealth: {}\nEstimated cost: ${:.4}\nDuration: {:.1}s\nTool failures: {}\nAnomalies: {}\n", session.health, session.metrics.cost_estimated, session.metrics.duration_sec, session.metrics.tool_calls_fail, session.anomalies.len())
+    // rm-1500 honesty tail: the clipboard is a share surface — the last
+    // TUI cost fold without a finite gate. Route through the shared
+    // clamp so a poisoned session cost ships as $0.0000, never a
+    // literal NaN/inf.
+    let cost = shared::finite_cost(session.metrics.cost_estimated);
+    format!("AgentTrace\nHealth: {}\nEstimated cost: ${:.4}\nDuration: {:.1}s\nTool failures: {}\nAnomalies: {}\n", session.health, cost, session.metrics.duration_sec, session.metrics.tool_calls_fail, session.anomalies.len())
 }
 
 /// Bound on how long the TUI waits for a clipboard helper to exit after
@@ -2979,5 +2984,26 @@ mod interaction_tests {
         let summary = share_summary(app.explorer_session().unwrap());
         assert!(!summary.contains("beta"));
         assert!(!summary.contains(&app.explorer_session().unwrap().name));
+    }
+
+    #[test]
+    fn share_summary_never_carries_a_nonfinite_cost() {
+        // rm-1500 honesty tail (run eed2b388 cycle 3): share_summary is
+        // the clipboard lane — the one cost fold cycle 2's gate wave
+        // (0ff02e09) did not reach. A poisoned session cost used to
+        // ride `{:.4}` verbatim, shipping a literal NaN/inf to the
+        // clipboard; the shared clamp ships $0.0000 instead, and a
+        // finite cost stays exact.
+        let mut session = agenttrace_core::demo_sessions()
+            .expect("demo corpus")
+            .remove(0);
+        session.metrics.cost_estimated = f64::NAN;
+        let summary = share_summary(&session);
+        assert!(!summary.contains("$NaN"), "leaked: {summary}");
+        session.metrics.cost_estimated = f64::INFINITY;
+        let summary = share_summary(&session);
+        assert!(!summary.contains("$inf"), "leaked: {summary}");
+        session.metrics.cost_estimated = 1.5;
+        assert!(share_summary(&session).contains("$1.5000"));
     }
 }
