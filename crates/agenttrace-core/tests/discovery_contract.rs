@@ -2673,7 +2673,7 @@ fn rust_discovers_antigravity_conversation_sidecars_but_not_the_store() {
     .expect("write trajectory sidecar");
     fs::write(
         conversations.join("store.db"),
-        b"SQLite format 3 binary store",
+        b"SQLite format 3\0binary store",
     )
     .expect("write sqlite store");
     fs::write(conversations.join("blob.pb"), b"protobuf bytes").expect("write pb blob");

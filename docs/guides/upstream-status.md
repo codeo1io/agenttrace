@@ -46,14 +46,20 @@ the published version against the running build. If the registry probe
 fails (no `curl`, offline, bad response) the report degrades to
 `unavailable (...)` instead of failing.
 
-The same flag probes the opencode vendor watch (rm-950): the npm
-channel the watch anchored on is retired, so the probe checks the old
-registry URL for its 404 and reads the latest release tag from the
-renamed home's releases API (`github.com/anomalyco/opencode`). The
-`opencode:` line renders the tag with an explicit
-`(npm channel retired; authority: anomalyco/opencode releases)` label
-when the old channel is confirmed dead — a retired channel is a state,
-not a probe failure — and reads
+The same flag probes the opencode vendor watch (rm-950, corrected by
+the cycle-6 vendor-channel truth batch): the live npm channel publishes
+as `opencode-ai`, so the probe reads that registry entry (a status
+read, then a bounded read of the `/latest` document when the registry
+answers) and the latest release tag from the renamed home's releases
+API (`github.com/anomalyco/opencode`). The `opencode:` line renders
+the tag with the npm version alongside it when the registry answers —
+`(npm opencode-ai@<version>)`, with any skew between the two sources
+disclosed — and falls back to an explicit
+`(npm channel retired: registry 404; authority: anomalyco/opencode releases)`
+label only when the registry genuinely 404s, while any other non-2xx
+answer renders `npm registry answered <status>; channel state unknown`
+rather than guessing live or retired from an error page — a retired
+channel is a state, not a probe failure — and reads
 `unknown (offline; agenttrace --fetch upstream)` until you opt in.
 
 Every `git` subprocess this command spawns runs under a stated
