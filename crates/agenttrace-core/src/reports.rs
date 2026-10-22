@@ -526,10 +526,34 @@ pub fn report_overview_json_with_health(
     // basis vocabulary (priced/synthetic, waste.rs / diagnostics.rs)
     // and the mint itself reserved it; one key, one vocabulary.
     for row in models.iter_mut() {
-        let Some(name) = row.get("name").and_then(Value::as_str) else {
+        // rm-2032: owned name — the storedCost arm mutates the row
+        // between the two read-side uses of the name, so the borrowed
+        // &str would pin an immutable borrow across the mutation.
+        let Some(name) = row.get("name").and_then(Value::as_str).map(str::to_string)
+        else {
             continue;
         };
-        if let Some(basis) = pricing_basis_label(name) {
+        // rm-2032 (stored-cost exposure): a group whose spend the
+        // source itself recorded carries `storedCost` (vendor-billed
+        // dollars inside the row's `cost`), and — acceptance
+        // invariant — every storedCost>0 row carries the
+        // pricing-basis companion: `fallback`/`unknown` keep their
+        // disclosed-default precedence, exactly-priced rows gain
+        // `"stored"`. Zero-stored corpora render byte-identically to
+        // before (no key, no marker).
+        let stored = overview
+            .by_model
+            .get(name.as_str())
+            .map(|group| group.stored_cost)
+            .unwrap_or(0.0);
+        if stored > 0.0 {
+            if let Value::Object(obj) = row {
+                obj.insert("storedCost".to_string(), json!(round4(stored)));
+                obj.entry("pricing_basis".to_string())
+                    .or_insert_with(|| Value::String("stored".to_string()));
+            }
+        }
+        if let Some(basis) = pricing_basis_label(&name) {
             if let Value::Object(obj) = row {
                 obj.insert(
                     "pricing_basis".to_string(),

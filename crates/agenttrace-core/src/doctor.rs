@@ -1415,6 +1415,20 @@ pub fn doctor_sqlite_directories(
                 .join("opencode")
                 .join("opencode.db"),
         ),
+        // rm-1373 (goose lane): the sessions.db ingest path (the real
+        // lane resolves GOOSE_DB_FILE / GOOSE_PATH_ROOT / the platform
+        // default in sqlite_sessions::goose_db_paths; this
+        // informational row pins the default location the way the
+        // hermes/opencode rows pin theirs).
+        (
+            "goose",
+            "Goose (DB)",
+            home.join(".local")
+                .join("share")
+                .join("goose")
+                .join("sessions")
+                .join("sessions.db"),
+        ),
     ];
     let mut dirs = Vec::new();
     for (tool, name, path) in candidates {

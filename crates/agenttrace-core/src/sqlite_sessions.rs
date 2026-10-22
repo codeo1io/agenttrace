@@ -445,6 +445,33 @@ pub fn load_sqlite_backed_sessions_reported_bounded(
             eprintln!("agenttrace: doctor: sqlite opencode {} — budget reached, {} sessions kept, disclosed partial", path.display(), loaded_count);
         }
     }
+    // rm-1373 (goose lane): same lane discipline — budget-bounded,
+    // deduped by (source_tool, session_key), snapshot-cached per db.
+    for path in goose_db_paths(&home) {
+        if total_deadline.is_some_and(|bound| Instant::now() >= bound) {
+            report.partial_dbs.push(SqlitePartialDb {
+                path: path.to_string_lossy().to_string(),
+                sessions_kept: 0,
+            });
+            continue;
+        }
+        let deadline = db_ingest_deadline(budget, total_deadline);
+        if budget.is_some_and(|b| b.progress) {
+            eprintln!(
+                "agenttrace: doctor: sqlite goose {} (budget {}s)",
+                path.display(),
+                budget.map(|b| b.per_db.as_secs()).unwrap_or(0)
+            );
+        }
+        let loaded = load_goose_sqlite_sessions(&path, since, &mut report, deadline);
+        let loaded_count = loaded.len();
+        extend_deduped(&mut sessions, &mut report, &mut seen, loaded, &path);
+        if deadline.is_some_and(|bound| Instant::now() >= bound)
+            && budget.is_some_and(|b| b.progress)
+        {
+            eprintln!("agenttrace: doctor: sqlite goose {} — budget reached, {} sessions kept, disclosed partial", path.display(), loaded_count);
+        }
+    }
     (sessions, report)
 }
 
@@ -499,7 +526,78 @@ pub fn skip_sqlite_backed_file_dir(dir: &Path) -> bool {
     {
         return true;
     }
+    // rm-1373 (goose lane): the sessions.db databases are ingested by
+    // the sqlite lane below, so file discovery must not walk the
+    // sessions directory as if it held JSONL transcripts.
+    if goose_db_paths(&home)
+        .iter()
+        .any(|path| sqlite_file_exists(path))
+        && is_goose_sessions_dir(dir, &home)
+    {
+        return true;
+    }
     false
+}
+
+/// rm-1373 (goose lane): the goose sessions databases, surveyed from
+/// ccusage v20.0.40 rust/adapters/goose/src/paths.rs (the snapshot
+/// instrument for this lane; see the rm-456 evidence rider). Override
+/// order: `GOOSE_DB_FILE` points directly at the sessions db (single
+/// source of truth, returned alone), else `GOOSE_PATH_ROOT`'s
+/// `<root>/data/sessions/sessions.db`, else the platform defaults —
+/// `~/.local/share/goose/sessions/sessions.db` (Linux, XDG data dir)
+/// and `~/Library/Application Support/goose/sessions/sessions.db`
+/// (macOS) — plus the vendor's pre-rename `Block` directory, which
+/// still hosts installs upgraded in place. Candidates that do not
+/// exist are filtered at open time (sqlite_file_exists), so listing
+/// them here is free.
+pub(crate) fn goose_db_paths(home: &Path) -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os("GOOSE_DB_FILE") {
+        return vec![PathBuf::from(path)];
+    }
+    let mut paths = Vec::new();
+    if let Some(root) = std::env::var_os("GOOSE_PATH_ROOT") {
+        paths.push(
+            PathBuf::from(root)
+                .join("data")
+                .join("sessions")
+                .join("sessions.db"),
+        );
+    }
+    if let Some(data) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+        paths.push(data.join("goose").join("sessions").join("sessions.db"));
+    }
+    paths.push(
+        home.join(".local")
+            .join("share")
+            .join("goose")
+            .join("sessions")
+            .join("sessions.db"),
+    );
+    paths.push(
+        home.join("Library")
+            .join("Application Support")
+            .join("goose")
+            .join("sessions")
+            .join("sessions.db"),
+    );
+    paths.push(
+        home.join(".local")
+            .join("share")
+            .join("Block")
+            .join("goose")
+            .join("sessions")
+            .join("sessions.db"),
+    );
+    paths
+}
+
+fn is_goose_sessions_dir(dir: &Path, home: &Path) -> bool {
+    let dir = clean_path(dir);
+    goose_db_paths(home).iter().any(|path| {
+        path.parent()
+            .is_some_and(|parent| clean_path(parent) == dir)
+    })
 }
 
 fn hermes_state_db_path(home: &Path) -> PathBuf {
@@ -809,6 +907,350 @@ fn load_opencode_sqlite_sessions(
         );
     }
     filter_since(sessions, since)
+}
+
+/// rm-1373 (goose lane): load one goose sessions.db. Same snapshot
+/// discipline as the hermes/opencode lanes (warm sqlite snapshot first,
+/// clean-pass store after; see load_hermes_sqlite_sessions).
+fn load_goose_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+    report: &mut SqliteIngestReport,
+    deadline: Option<Instant>,
+) -> Vec<Session> {
+    if !sqlite_file_exists(path) {
+        return Vec::new();
+    }
+    if let Some((sessions, _fork_excluded)) =
+        crate::session_cache::load_sqlite_snapshot_with_meta(path, "goose")
+    {
+        if !sessions.is_empty() {
+            return filter_since(sessions, since);
+        }
+    }
+    let (sessions, failures) = query_goose_sqlite_sessions(path, deadline);
+    let clean = failures.is_clean();
+    let loaded = sessions.len();
+    report.absorb(path, "goose", failures, loaded);
+    if clean {
+        let _ = crate::session_cache::store_sqlite_snapshot_with_meta(
+            path,
+            "goose",
+            &sessions,
+            0,
+        );
+    }
+    filter_since(sessions, since)
+}
+
+/// Goose `created_at`/`last_updated` values appear as ISO-8601 strings
+/// (usually with a space separator, sometimes `Z`, sometimes an
+/// explicit offset) and — on cached rows — as bare unix-epoch seconds.
+/// The survey (ccusage v20.0.40 rust/adapters/goose/src/parser.rs,
+/// parse_created_at) accepts all of them; so does this reader.
+fn goose_timestamp_to_unix(value: Option<String>) -> Option<f64> {
+    let raw = value?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = raw.parse::<f64>() {
+        return Some(secs);
+    }
+    let candidate = if raw.contains(' ') && !raw.contains('T') {
+        raw.replacen(' ', "T", 1)
+    } else {
+        raw.clone()
+    };
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&candidate) {
+        return Some(ts.timestamp() as f64);
+    }
+    // `Z`-less local timestamps carry no offset; goose writes UTC, so
+    // parse as naive UTC rather than dropping the row's time truth.
+    chrono::NaiveDateTime::parse_from_str(&candidate, "%Y-%m-%dT%H:%M:%S%.f")
+        .ok()
+        .map(|naive| naive.and_utc().timestamp() as f64)
+}
+
+/// The goose `sessions.model_config_json` column names the model per
+/// session. Surveyed shapes (source-repo schema + cached rows):
+/// `{"main_model": "..."}`, `{"meta": {"name": "..."}}`, and
+/// `{"sub_session": {"main_model": "..."}}` for sub-session rows.
+/// The raw string is kept as `model_used` (the repo convention — no
+/// vendor-model normalization this cycle); `None` when the column is
+/// absent or decodes to nothing, and `model_name` (newer schemas)
+/// serves as the fallback.
+fn goose_model_from_config(config: Option<&Value>, model_name: Option<&str>) -> Option<String> {
+    if let Some(config) = config.and_then(Value::as_object) {
+        if let Some(main) = config.get("main_model").and_then(Value::as_str) {
+            if !main.is_empty() {
+                return Some(main.to_string());
+            }
+        }
+        if let Some(meta) = config.get("meta").and_then(Value::as_object) {
+            if let Some(name) = meta.get("name").and_then(Value::as_str) {
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        if let Some(sub) = config.get("sub_session").and_then(Value::as_object) {
+            if let Some(main) = sub.get("main_model").and_then(Value::as_str) {
+                if !main.is_empty() {
+                    return Some(main.to_string());
+                }
+            }
+        }
+    }
+    model_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+/// `chat_history_jsonc` — the pre-turn-tables schemas store the whole
+/// conversation on the session row (jsonc: trailing commas allowed).
+/// The history is read for COUNT truth only (events/user/assistant
+/// rows): usage never rides these entries in any surveyed schema, and
+/// ccusage v20.0.40 ignores the payload entirely. Failing to decode
+/// the blob counts a disclosure, never drops the session.
+/// One-pass jsonc leniency: drop a comma when only whitespace separates
+/// it from the next `]` or `}` (goose's writer emits trailing commas).
+fn strip_jsonc_trailing_commas(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut pending_comma = false;
+    let mut rest = source.chars().peekable();
+    while let Some(ch) = rest.next() {
+        if ch == ',' {
+            pending_comma = true;
+            continue;
+        }
+        if pending_comma {
+            if ch.is_whitespace() {
+                continue;
+            }
+            match ch {
+                ']' | '}' => {
+                    pending_comma = false;
+                }
+                _ => {
+                    out.push(',');
+                    pending_comma = false;
+                }
+            }
+        }
+        out.push(ch);
+    }
+    if pending_comma {
+        out.push(',');
+    }
+    out
+}
+
+fn goose_history_counts(raw: Option<&str>) -> (usize, usize, usize, Option<u32>) {
+    let Some(raw) = raw else {
+        return (0, 0, 0, None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (0, 0, 0, None);
+    }
+    // jsonc leniency: strip trailing commas before `]`/`}`.
+    let cleaned = strip_jsonc_trailing_commas(trimmed);
+    let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(&cleaned) else {
+        return (0, 0, 0, Some(1));
+    };
+    let mut events = 0usize;
+    let mut user_messages = 0usize;
+    let mut assistant_turns = 0usize;
+    for entry in &entries {
+        let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
+        events += 1;
+        match kind {
+            "user" => user_messages += 1,
+            "assistant" => assistant_turns += 1,
+            _ => {}
+        }
+    }
+    (events, user_messages, assistant_turns, None)
+}
+
+/// rm-1373 (goose lane): the sessions table. The pinned query shape is
+/// the ccusage v20.0.40 survey's column list (session_id,
+/// model_config_json, provider_name, created_at, the six token
+/// columns) — extended read-leniently per column (the rm-991
+/// `sqlite_has_column` precedent) with `description`, `model_name`,
+/// `model_provider`, `last_updated`, `cost_usd`, and
+/// `chat_history_jsonc`, because real databases mix schema
+/// generations (the source repo aggregates tokens in jsonb while
+/// ccusage-era installs carry the flat columns).
+///
+/// Token truth follows the survey exactly: the accumulated columns
+/// are preferred when present (they are the vendor's session totals);
+/// the flat columns are the live-updated ones. Stored cost is read
+/// leniently — `cost_usd` is a schema DEFAULT 0.0 placeholder in
+/// every surveyed generation, so 0.0 and absent both read as
+/// unmeasured (None) and the recorded tokens price from the catalog;
+/// a strictly positive recorded value rides the stored-cost lane
+/// (`usage_cost_set`, provenance cost `reported_by_agent`).
+fn query_goose_sqlite_sessions(
+    path: &Path,
+    deadline: Option<Instant>,
+) -> (Vec<Session>, SqliteFileFailures) {
+    let mut failures = SqliteFileFailures::default();
+    let Ok(conn) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        failures.unreadable = Some(format!("open failed: {}", path.display()));
+        return (Vec::new(), failures);
+    };
+    if !sqlite_has_table(&conn, "sessions") {
+        failures.unhandled_table = Some("sessions".to_string());
+        return (Vec::new(), failures);
+    }    let has = |column: &str| sqlite_has_column(&conn, "sessions", column);
+    let session_id = if has("session_id") { "session_id" } else { "id" };
+    let mut columns = vec![session_id.to_string()];
+    for column in [
+        "description",
+        "model_config_json",
+        "model_name",
+        "provider_name",
+        "created_at",
+        "last_updated",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "accumulated_total_tokens",
+        "accumulated_input_tokens",
+        "accumulated_output_tokens",
+        "cost_usd",
+        "chat_history_jsonc",
+    ] {
+        if has(column) {
+            columns.push(column.to_string());
+        }
+    }
+    // Column positions for the row reader, resolved after the
+    // lenient column list is fixed (missing columns read as None).
+    let ix = |name: &str| columns.iter().position(|c| c == name);
+    let sql = format!(
+        "SELECT {} FROM sessions",
+        columns.join(", ")
+    );
+    let mut prepared = match conn.prepare(&sql) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            failures.unreadable = Some(error.to_string());
+            return (Vec::new(), failures);
+        }
+    };
+    let mut rows = match prepared.query([]) {
+        Ok(rows) => rows,
+        Err(error) => {
+            failures.unreadable = Some(error.to_string());
+            return (Vec::new(), failures);
+        }
+    };
+    let mut out = Vec::new();
+    loop {
+        if budget_deadline_hit(deadline, &mut failures) {
+            break;
+        }
+        let row = match rows.next() {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(error) => {
+                failures.record_dropped(&error);
+                break;
+            }
+        };
+        let cell_str = |column: &str| -> Option<String> {
+            ix(column).and_then(|index| {
+                row.get::<_, Option<String>>(index).ok().flatten()
+            })
+        };
+        let cell_i64 = |column: &str| -> Option<i64> {
+            ix(column).and_then(|index| {
+                row.get::<_, Option<i64>>(index)
+                    .ok()
+                    .flatten()
+                    .filter(|value| *value >= 0)
+            })
+        };
+        let cell_f64 = |column: &str| -> Option<f64> {
+            ix(column).and_then(|index| {
+                row.get::<_, Option<f64>>(index)
+                    .ok()
+                    .flatten()
+                    .filter(|value| value.is_finite() && *value > 0.0)
+            })
+        };
+        let id = cell_str(session_id).unwrap_or_default();
+        if id.trim().is_empty() {
+            failures.dropped += 1;
+            if failures.dropped_sample.is_none() {
+                failures.dropped_sample = Some("goose session row with empty id".to_string());
+            }
+            continue;
+        }
+        let model_config = ix("model_config_json")
+            .and_then(|index| row.get::<_, Option<String>>(index).ok().flatten())
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+        let model = goose_model_from_config(
+            model_config.as_ref(),
+            cell_str("model_name").as_deref(),
+        )
+        .unwrap_or_else(|| "default".to_string());
+        let start_unix = goose_timestamp_to_unix(cell_str("created_at")).unwrap_or(0.0);
+        let end_unix = goose_timestamp_to_unix(cell_str("last_updated"))
+            .filter(|end| *end >= start_unix)
+            .unwrap_or(start_unix);
+        let accumulated_input = cell_i64("accumulated_input_tokens");
+        let accumulated_output = cell_i64("accumulated_output_tokens");
+        let (input_tokens, output_tokens) = (
+            accumulated_input.unwrap_or_else(|| cell_i64("input_tokens").unwrap_or(0)),
+            accumulated_output.unwrap_or_else(|| cell_i64("output_tokens").unwrap_or(0)),
+        );
+        let (history_events, user_messages, assistant_turns, history_dropped) =
+            goose_history_counts(
+                ix("chat_history_jsonc")
+                    .and_then(|index| row.get::<_, Option<String>>(index).ok().flatten())
+                    .as_deref(),
+            );
+        let stored_cost = cell_f64("cost_usd");
+        let agg = SqliteSessionAgg {
+            id,
+            title: cell_str("description").unwrap_or_default(),
+            model: model.clone(),
+            models: BTreeSet::from([model]),
+            start_unix,
+            end_unix,
+            events: history_events,
+            user_messages,
+            assistant_turns,
+            input_tokens,
+            output_tokens,
+            usage_cost: stored_cost.unwrap_or(0.0),
+            usage_cost_set: stored_cost.is_some(),
+            source_tool: "goose".to_string(),
+            path: path.to_string_lossy().to_string(),
+            ..SqliteSessionAgg::default()
+        };
+        let mut session = session_from_sqlite_agg(agg);
+        if history_dropped.is_some() {
+            session
+                .metrics
+                .disclosure_counters
+                .insert("goose_history_unreadable".to_string(), 1);
+        } else if history_events == 0 {
+            session
+                .metrics
+                .disclosure_counters
+                .insert("goose_history_absent".to_string(), 1);
+        }
+        out.push(session);
+    }
+    (out, failures)
 }
 
 fn query_opencode_sqlite_sessions(
@@ -1832,6 +2274,12 @@ fn sqlite_has_column(db: &Connection, table: &str, column: &str) -> bool {
                 .map(|rows| rows.filter_map(Result::ok).any(|name| name == column))
         })
         .unwrap_or(false)
+}
+
+fn sqlite_has_table(db: &Connection, table: &str) -> bool {
+    db.prepare("select 1 from sqlite_master where type = 'table' and name = ?1")
+        .and_then(|mut stmt| stmt.query_row([table], |_| Ok(())))
+        .is_ok()
 }
 
 /// rm-954: SQLite ASC orders NULL first, then numeric values by

@@ -8,7 +8,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 73;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 74;
+// Bumped 73 -> 74 (rm-2032 "stored-cost exposure", run 57f9c885 cycle 7
+// "Ecosystem parity truth I"): the cached Metrics now persist a
+// ModelAttribution shape with the new `stored_cost_usd` field
+// (serde-default, zero-skipped), so a warm v73 entry replays with the
+// field at its Default 0.0 while a fresh parse of the same file
+// folds event.recorded_cost_usd into it — a by-model `storedCost`
+// discrepancy on unchanged files (the rm-485 class). Shape-only rung:
+// pricing_snapshot.json is byte-identical and no cost semantics
+// moved; entries regenerate once on next scan.
 // Bumped 72 -> 73 (independent review of run 96287e100a56469babf0aae93fd0e9ed
 // cycle 1 "pricing-drift svg-golden red + installer unbounded", conflict
 // case b277d011cb77415eb0b83126f274404a, the rm-164 tier-case rider): the
@@ -1085,7 +1094,18 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 73;
 // + the `opencode_summary_cross_check_unreadable` counter) instead
 // of two. The numeral stays 14 (the landed-rung-keeps-numeral
 // convention); no second invalidation is owed.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 14;
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 15;
+// Bumped 14 -> 15 (run 57f9c885 cycle 7, two arms, one rung):
+// (1) the goose lane (rm-1373) is a NEW snapshot family key
+//     ("goose") — no stale entry can exist, but the ledger's
+//     schema_version IS the family-independent ceiling, so the new
+//     family ships on the fresh rung;
+// (2) rm-2032 persisted the ModelAttribution `stored_cost_usd`
+//     field through the snapshot rows (serde-default, zero-skipped) —
+//     a v14 entry replays stored-cost rows as 0.0 on unchanged
+//     (size, mtime) fingerprints while a fresh load folds the
+//     recorded costs (the rm-485 class). One regeneration per
+//     database retires the stale entries (rm-230 convention).
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep

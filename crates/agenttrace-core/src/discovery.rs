@@ -237,6 +237,16 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
             name: "WorkBuddy".to_string(),
             path: home.join(".workbuddy").join("projects"),
         },
+        // rm-1373 (grok lane): `~/.grok/sessions/<project-hash>/<session-id>/
+        // updates.jsonl` — the Grok Build CLI's session-update stream.
+        // The walker admits the files (updates.jsonl is plain JSONL);
+        // the parser claims them on the `_x.ai/session/update`
+        // envelope (parse_grok_updates_jsonl). No env override exists
+        // in any surveyed tool generation.
+        KnownSessionDir {
+            name: "Grok Build CLI".to_string(),
+            path: home.join(".grok").join("sessions"),
+        },
         KnownSessionDir {
             name: "Cursor".to_string(),
             path: home.join(".cursor").join("projects"),

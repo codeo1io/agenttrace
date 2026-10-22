@@ -838,6 +838,13 @@ pub struct ModelAttribution {
     pub cache_w: i64,
     pub cache_r: i64,
     pub cost_usd: f64,
+    /// rm-2032 (stored-cost exposure): the portion of this slice's
+    /// `cost_usd` that the source format itself recorded
+    /// (`recorded_cost_usd` blocks — vendor-billed, not priced from
+    /// the catalog). Zero-noise: the key is skipped when zero, so
+    /// corpora without recorded costs serialize byte-identically.
+    #[serde(default, skip_serializing_if = "zero_usd")]
+    pub stored_cost_usd: f64,
 }
 
 fn usize_is_zero(value: &usize) -> bool {
@@ -974,6 +981,11 @@ pub struct TaskTypeOverview {
 pub struct GroupOverview {
     pub sessions: usize,
     pub cost: f64,
+    /// rm-2032 (stored-cost exposure): vendor-recorded spend inside
+    /// this group (0.0 when nothing was recorded — group rows render
+    /// the companion key only when this is > 0, so existing corpora
+    /// stay byte-identical).
+    pub stored_cost: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2277,8 +2289,13 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             {
                 // Upstream-recorded cost already sits in the seed; credit
                 // the block's model with it so attribution sums to the
-                // session total.
+                // session total. rm-2032: the same fold feeds the slice's
+                // `stored_cost_usd` so by-model rows can disclose how
+                // much of the row the vendor itself billed.
                 entry.cost_usd = round4(entry.cost_usd + event.recorded_cost_usd.unwrap_or(0.0));
+                entry.stored_cost_usd = round4(
+                    entry.stored_cost_usd + event.recorded_cost_usd.unwrap_or(0.0),
+                );
                 continue;
             }
             let block_price = if event.model_used.is_empty() || event.model_used == "unknown" {
@@ -2937,6 +2954,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         // multi-model) keep the one-bucket full-cost behavior.
         if session.metrics.model_attribution.is_empty() && cost_finite {
             model_entry.cost += session_cost;
+            // rm-2032: unattributed sessions carry their recorded spend
+            // on the headline bucket, mirroring the cost arm.
+            model_entry.stored_cost += session.metrics.upstream_cost_usd;
         }
 
         // rm-949 (cycle 3): the per-model attribution costs are priced
@@ -3009,13 +3029,18 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
                 leftover -= 1;
                 ri += 1;
             }
-            for ((attributed_model, _), units) in attribution_items.iter().zip(&shares) {
+            for ((attributed_model, attribution), units) in attribution_items.iter().zip(&shares) {
                 let entry = overview
                     .by_model
                     .entry((*attributed_model).clone())
                     .or_default();
                 entry.sessions += 1;
                 entry.cost += *units as f64 / scale;
+                // rm-2032: recorded spend follows the model that billed
+                // it — attribution slices sum to the session's
+                // upstream total (each recorded block folds exactly
+                // once into its model's slice).
+                entry.stored_cost += attribution.stored_cost_usd;
             }
         } else {
             for attributed_model in session.metrics.model_attribution.keys() {
