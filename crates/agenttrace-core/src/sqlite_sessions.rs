@@ -134,13 +134,41 @@ pub struct SqliteIngestReport {
     /// never presented as complete ones, and the truncated pass never
     /// writes a snapshot (see `SqliteFileFailures::is_clean`).
     pub partial_dbs: Vec<SqlitePartialDb>,
-    /// rm-1927: stores carrying the v2 schema shape (no v1 `session`
-    /// table, a session-store-shaped table present) are disclosed as
-    /// a named unhandled format here — counted separately from
-    /// `unreadable` (corrupt) and from absent files (legitimately
-    /// session-less): a v2-only store used to classify as a silent
-    /// zero (zero sessions, zero disclosures).
+    /// rm-1927 (read arm rm-2290): stores carrying the v2 schema
+    /// shape are ingested — see `v2_reads`. This disclosure now
+    /// fires ONLY when a v2-shaped table was detected but could not
+    /// be READ (shape-detected-but-unreadable: the guarded SELECT
+    /// itself failed), counted separately from `unreadable` (corrupt)
+    /// and from absent files (legitimately session-less).
     pub unhandled_v2_stores: Vec<SqliteV2Store>,
+    /// rm-2290: v2-shaped tables this pass actually READ (the
+    /// `session_v2` lane beside the v1 `session` lane). Each entry
+    /// is a success disclosure, not a failure: `rows_ingested` rows
+    /// became counted sessions, `twin_rows` rows were skipped
+    /// because the v1 lane already counted the same id (upstream's
+    /// V1→V2 migration is a COPY — it inserts every v1 `session`
+    /// row into `session_v2` verbatim and leaves the v1 rows in
+    /// place, so a migrated home double-carries each legacy session;
+    /// counting once, through the richer message-enriched v1 lane,
+    /// is the honest read), and `absent_columns` names the columns
+    /// upstream drifted away (leniently read as NULL, never a hard
+    /// failure).
+    pub v2_reads: Vec<SqliteV2Read>,
+}
+
+/// rm-2290: accounting for one opencode v2-shaped session table this
+/// pass read (per-database; the primary and every sibling store get
+/// their own entry).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SqliteV2Read {
+    pub path: PathBuf,
+    /// The session-store-shaped table the rows came from (usually
+    /// `session_v2`; matched by column signature, not name).
+    pub table: String,
+    pub rows_ingested: usize,
+    pub twin_rows: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub absent_columns: Vec<String>,
 }
 
 /// rm-607: a sibling sqlite database whose sessions were fully or
@@ -162,11 +190,11 @@ pub struct SqlitePartialDb {
 
 /// rm-1927 (run 9d3b927c cycle 1): one discovered opencode store that
 /// carries the v2 schema SHAPE — a session-store column signature
-/// under a table other than the v1 `session` (the dev dist-tag's
-/// `session_v2` today) — which this reader does not ingest yet.
-/// Distinct from `SqliteUnreadableDb`: a healthy known format, not
-/// corruption; disclosing it under "unreadable" would misreport a
-/// clean upstream store as broken.
+/// under a table other than the v1 `session` (the `session_v2`
+/// today) — which this reader could not READ (see `SqliteV2Read` for
+/// the ingested arm). Distinct from `SqliteUnreadableDb`: a shape
+/// the store probe knows, not corruption; disclosing it under
+/// "unreadable" would misreport a clean upstream store as broken.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SqliteV2Store {
     pub path: PathBuf,
@@ -226,6 +254,15 @@ impl SqliteIngestReport {
                 reason,
             });
         }
+        // rm-2290: the v2 READ arm — a success disclosure, carried
+        // beside the sessions it produced so doctor and the CLI can
+        // show "counted once" twin and drift accounting even when
+        // the pass was otherwise clean (and therefore snapshot-banked
+        // on the warm path, where the entry replays from the snapshot
+        // meta — schema 15, rm-548 precedent).
+        if let Some(read) = failures.v2_read {
+            self.v2_reads.push(read);
+        }
         if failures.dropped > 0 {
             self.dropped_rows.push(SqliteDroppedRows {
                 path: path.to_path_buf(),
@@ -251,6 +288,13 @@ struct SqliteFileFailures {
     /// warm path.
     unhandled_format: Option<String>,
     unhandled_table: Option<String>,
+    /// rm-2290: set when this pass READ a v2-shaped session table —
+    /// the ingested arm of the rm-1927 disclosure. Carries the
+    /// per-table accounting (rows, twins, drifted columns) to the
+    /// report through `absorb`; does NOT affect `is_clean`, because
+    /// a successful read banks an honest snapshot (its twin/drift
+    /// notes ride the snapshot meta on the warm path).
+    v2_read: Option<SqliteV2Read>,
     dropped: usize,
     dropped_sample: Option<String>,
     /// rm-367(b): set when the pass was cut short by the scan budget
@@ -291,6 +335,9 @@ impl SqliteFileFailures {
         if self.unhandled_format.is_none() {
             self.unhandled_format = other.unhandled_format;
             self.unhandled_table = other.unhandled_table;
+        }
+        if self.v2_read.is_none() {
+            self.v2_read = other.v2_read;
         }
         self.dropped += other.dropped;
         if self.dropped_sample.is_none() {
@@ -777,7 +824,7 @@ fn load_opencode_sqlite_sessions(
     if !sqlite_file_exists(path) {
         return Vec::new();
     }
-    if let Some((sessions, fork_excluded)) =
+    if let Some((sessions, fork_excluded, v2_reads)) =
         crate::session_cache::load_sqlite_snapshot_with_meta(path, "opencode")
     {
         // rm-548: the warm snapshot (schema 9) carries the stored
@@ -786,6 +833,11 @@ fn load_opencode_sqlite_sessions(
         // rm-791 supersession); the count survives for the JSON lane's
         // benefit through the shared field.
         report.fork_excluded += fork_excluded;
+        // rm-2290: the warm snapshot (schema 15) carries the v2 read
+        // accounting beside the sessions, so the counted-once twin
+        // and column-drift disclosures survive the cached path
+        // exactly like the exclusion count above.
+        report.v2_reads.extend(v2_reads);
         // rm-753: see load_hermes_sqlite_sessions — an empty snapshot
         // is re-verified, not trusted (pre-fix corrupt databases cached
         // one; the P14 probe left exactly such a file behind); the
@@ -798,6 +850,10 @@ fn load_opencode_sqlite_sessions(
     let (sessions, failures, fork_excluded) = query_opencode_sqlite_sessions(path, None, deadline);
     let clean = failures.is_clean();
     let loaded = sessions.len();
+    // rm-2290: the v2 accounting banks with the snapshot (schema 15)
+    // so it can replay on warm loads — captured before `absorb`
+    // consumes the per-file failures.
+    let v2_meta: Vec<SqliteV2Read> = failures.v2_read.clone().into_iter().collect();
     report.absorb(path, "opencode", failures, loaded);
     report.fork_excluded += fork_excluded;
     if clean {
@@ -806,6 +862,7 @@ fn load_opencode_sqlite_sessions(
             "opencode",
             &sessions,
             fork_excluded,
+            &v2_meta,
         );
     }
     filter_since(sessions, since)
@@ -1064,24 +1121,22 @@ fn opencode_sqlite_session_rows(
                 failures.unreadable = Some(error.to_string());
                 return (HashMap::new(), failures, 0);
             }
-            // rm-1927: session-less by NAME is not session-less by
-            // SCHEMA. A store whose tables carry the opencode
-            // session-store column signature under another name (the
-            // dev dist-tag's `session_v2` DDL today) used to classify
-            // as session-less — zero sessions, zero disclosures, a
-            // silent zero that reads as "nothing happened here"
-            // instead of "format not handled". The shape probe keys
-            // on the column signature, not the table name (rm-507),
-            // and a hit is disclosed as a named unhandled format. A
+            // rm-1927 (read arm rm-2290): session-less by NAME is
+            // not session-less by SCHEMA. A store whose tables carry
+            // the opencode session-store column signature under
+            // another name (the `session_v2` DDL today) used to
+            // classify as session-less — zero sessions, zero
+            // disclosures, a silent zero that reads as "nothing
+            // happened here". The v2 arm now READS the shaped table
+            // into counted sessions; the shape probe inside it still
+            // keys on the column signature, not the table name
+            // (rm-507), and a table that matches the shape but
+            // cannot be read stays the named unhandled format. A
             // database with neither shape stays legitimately
             // session-less (a foreign sqlite file inside the glob).
-            if let Some(table) = opencode_v2_shaped_table(db) {
-                failures.unhandled_format = Some(format!(
-                    "opencode v2 store: ingest not implemented (found `{table}`; v1 `session` table absent)"
-                ));
-                failures.unhandled_table = Some(table);
-            }
-            return (HashMap::new(), failures, 0);
+            let mut aggs = HashMap::new();
+            opencode_v2_session_rows(db, path, since, &mut aggs, &mut failures);
+            return (aggs, failures, 0);
         }
     };
     let since_millis = since.map(|value| value.timestamp_millis());
@@ -1201,7 +1256,242 @@ fn opencode_sqlite_session_rows(
             Err(error) => failures.record_dropped(&error),
         }
     }
+    // rm-2290: the v2 lane rides beside the v1 lane on every pass —
+    // a MIGRATED home carries BOTH tables (upstream's V1→V2
+    // migration copies every `session` row into `session_v2` verbatim
+    // and leaves the v1 rows in place, so the common post-migration
+    // shape double-carries each legacy session), so the v2 read runs
+    // with the v1 aggregates already keyed: a v2 row whose id the v1
+    // lane counted is a TWIN — counted once (through the richer,
+    // message-enriched v1 aggregate) and disclosed — while rows that
+    // exist only in `session_v2` (sessions started after the
+    // migration) load through the v2 arm. Fresh v2 installs have no
+    // `session` table and take this same arm off the no-such-table
+    // path above with zero twins by construction.
+    opencode_v2_session_rows(db, path, since, &mut aggs, &mut failures);
     (aggs, failures, 0)
+}
+
+/// rm-2290: the columns the v2 read consumes, in SELECT order. The
+/// four-column shape signature (id, time_created, time_updated,
+/// directory) is REQUIRED — [`opencode_v2_shaped_table`] verified it
+/// before this read — and every other column is guarded and
+/// null-padded, exactly like the v1 lane's guarded SELECT, so
+/// upstream drift (a dropped or renamed column) degrades to an
+/// absent value plus a DISCLOSED column name instead of failing the
+/// pass: never a hard error, never silent.
+const OPENCODE_V2_READ_COLUMNS: [(&str, bool); 18] = [
+    ("id", true),
+    ("title", false),
+    ("time_created", true),
+    ("time_updated", true),
+    ("directory", true),
+    ("cost", false),
+    ("tokens_input", false),
+    ("tokens_output", false),
+    ("tokens_reasoning", false),
+    ("tokens_cache_read", false),
+    ("tokens_cache_write", false),
+    ("parent_id", false),
+    ("agent", false),
+    // v2 stores the model as a JSON column — the writer serializes
+    // `{"id": …, "providerID": …}` — parsed leniently in
+    // [`opencode_v2_model_id`]; never a failed row.
+    ("model", false),
+    ("summary_additions", false),
+    ("summary_deletions", false),
+    ("summary_files", false),
+    ("summary_diffs", false),
+];
+
+/// rm-2290: read the v2-shaped session table and merge its rows into
+/// `aggs` — the ingest arm of the rm-1927 disclosure. Sessions this
+/// arm contributes carry the writer-stored aggregates (cost/token
+/// columns are NOT NULL DEFAULT 0 in the v2 DDL) and the same
+/// `opencode_db` source tool as the v1 lane; per-message enrichment
+/// (`session_message`) stays deliberately out of scope — the v2 read
+/// is session-level aggregates only, the same posture as the v1
+/// lane's stored-totals fallback for stores whose `message` table is
+/// absent.
+fn opencode_v2_session_rows(
+    db: &Connection,
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+    aggs: &mut HashMap<String, SqliteSessionAgg>,
+    failures: &mut SqliteFileFailures,
+) {
+    let Some(table) = opencode_v2_shaped_table(db) else {
+        return;
+    };
+    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+    let presence = OPENCODE_V2_READ_COLUMNS
+        .iter()
+        .map(|(column, _)| sqlite_has_column(db, &quoted, column))
+        .collect::<Vec<_>>();
+    let absent_columns = OPENCODE_V2_READ_COLUMNS
+        .iter()
+        .zip(presence.iter())
+        .filter(|(_, present)| !**present)
+        .map(|((column, _), _)| (*column).to_string())
+        .collect::<Vec<_>>();
+    let select_list = presence
+        .iter()
+        .enumerate()
+        .map(|(index, present)| {
+            if *present {
+                OPENCODE_V2_READ_COLUMNS[index].0.to_string()
+            } else {
+                "null".to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "select {select_list} from {quoted} \
+         where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
+    );
+    let mut stmt = match db.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            // The one remaining unhandled class: shape-detected but
+            // UNREADABLE (the guarded SELECT itself failed). It keeps
+            // rm-1927's census bucket and `is_clean` stays false, so
+            // no session-less snapshot can mask the disclosure on
+            // the warm path.
+            failures.unhandled_format = Some(format!(
+                "opencode v2 store: shape detected but unreadable (found `{table}`; v1 `session` table absent; read failed: {error})"
+            ));
+            failures.unhandled_table = Some(table);
+            return;
+        }
+    };
+    let since_millis = since.map(|value| value.timestamp_millis());
+    let rows = match stmt.query_map([since_millis], |row| {
+        let summary_unreadable = {
+            let additions: Option<rusqlite::types::Value> = row.get(14)?;
+            let deletions: Option<rusqlite::types::Value> = row.get(15)?;
+            let mut unreadable = Vec::new();
+            for (column, present, value) in [
+                ("summary_additions", presence[14], &additions),
+                ("summary_deletions", presence[15], &deletions),
+            ] {
+                if let Some(reason) = sqlite_i64_unreadable_reason(value.as_ref(), present) {
+                    unreadable.push(SummaryColumnUnreadable {
+                        column: column.to_string(),
+                        reason: reason.to_string(),
+                    });
+                }
+            }
+            unreadable
+        };
+        // rm-1509 discipline, v2 arm: a `summary_diffs` payload that
+        // fails to decode (or carries a non-TEXT storage class) is
+        // counted, never a hard error and never re-derived.
+        let (summary_diffs, summary_diffs_dropped) = {
+            let payload: Option<rusqlite::types::Value> = row.get(17)?;
+            match payload {
+                None => (None, 0),
+                Some(rusqlite::types::Value::Text(text)) => {
+                    match serde_json::from_str::<Vec<SessionFileDiff>>(&text) {
+                        Ok(list) => (Some(list), 0),
+                        Err(_) => (None, 1),
+                    }
+                }
+                Some(_) => (None, 1),
+            }
+        };
+        let model = sqlite_value_as_text(row.get(13)?)
+            .map(|raw| opencode_v2_model_id(&raw))
+            .unwrap_or_default();
+        let id = row.get::<_, String>(0)?;
+        Ok((
+            id.clone(),
+            SqliteSessionAgg {
+                id,
+                title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                // Lenient like the v1 lane: SQLite columns are
+                // dynamically typed, so a corrupt value degrades
+                // (unknown time, stored-total fallback) instead of
+                // dropping the session row.
+                start_unix: sqlite_value_as_i64(row.get(2)?).unwrap_or(0).max(0) as f64 / 1000.0,
+                end_unix: sqlite_value_as_i64(row.get(3)?).unwrap_or(0).max(0) as f64 / 1000.0,
+                cwd: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                stored_cost: sqlite_value_as_f64(row.get(5)?),
+                stored_input: sqlite_value_as_i64(row.get(6)?),
+                stored_output: sqlite_value_as_i64(row.get(7)?),
+                stored_reasoning: sqlite_value_as_i64(row.get(8)?),
+                stored_cache_read: sqlite_value_as_i64(row.get(9)?),
+                stored_cache_write: sqlite_value_as_i64(row.get(10)?),
+                // Lenient like rm-791's v1 read — a non-text parent id
+                // degrades to "no linkage", a non-text agent name to
+                // unnamed.
+                parent_id: sqlite_value_as_text(row.get(11)?),
+                agent_name: sqlite_value_as_text(row.get(12)?).unwrap_or_default(),
+                model,
+                summary_additions: sqlite_value_as_i64(row.get(14)?),
+                summary_deletions: sqlite_value_as_i64(row.get(15)?),
+                summary_files: sqlite_value_as_i64(row.get(16)?),
+                summary_unreadable,
+                summary_diffs,
+                summary_diffs_dropped,
+                source_tool: "opencode_db".to_string(),
+                path: path.to_string_lossy().to_string(),
+                ..SqliteSessionAgg::default()
+            },
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            failures.unhandled_format = Some(format!(
+                "opencode v2 store: shape detected but unreadable (found `{table}`; v1 `session` table absent; read failed: {error})"
+            ));
+            failures.unhandled_table = Some(table);
+            return;
+        }
+    };
+    // rm-753 discipline, v2 arm: decode failures are counted and
+    // sampled, never filter_map-dropped — and twin bookkeeping runs
+    // per row so an upstream migration cannot double-count a session
+    // through its copied row.
+    let mut read = SqliteV2Read {
+        path: path.to_path_buf(),
+        table,
+        absent_columns,
+        ..SqliteV2Read::default()
+    };
+    for row in rows {
+        match row {
+            Ok((id, agg)) => {
+                if aggs.contains_key(&id) {
+                    read.twin_rows += 1;
+                } else {
+                    aggs.insert(id, agg);
+                    read.rows_ingested += 1;
+                }
+            }
+            Err(error) => failures.record_dropped(&error),
+        }
+    }
+    failures.v2_read = Some(read);
+}
+
+/// rm-2290: extract the model name from the v2 `model` column. The
+/// writer serializes a JSON object (`{"id": …, "providerID": …}`),
+/// but SQLite columns are dynamically typed and hostile or hand-edited
+/// rows carry arbitrary text: an object with a string `id` yields that
+/// id, a bare JSON string yields the string, and anything else
+/// (malformed JSON, plain text) degrades to that text trimmed — model
+/// attribution, never a failed row.
+fn opencode_v2_model_id(raw: &str) -> String {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(serde_json::Value::String(id)) = map.get("id") {
+            return id.clone();
+        }
+    }
+    if let Ok(serde_json::Value::String(text)) = serde_json::from_str::<serde_json::Value>(raw) {
+        return text;
+    }
+    raw.trim().to_string()
 }
 
 /// rm-893: message rows whose columns fail to decode (a hostile or
@@ -1905,9 +2195,23 @@ fn sqlite_i64_unreadable_reason(
 /// keeps the disclosure truthful. Reached only on the
 /// no-`session`-table path, so the pragma walk costs nothing on
 /// healthy v1 stores.
+/// rm-1927 (run 9d3b927c cycle 1; read arm rm-2290): does this
+/// database contain an opencode session-store-shaped table under a
+/// non-v1 name? Keys on the column SHAPE — `id`, `time_created`,
+/// `time_updated`, `directory`, the signature shared by the v1
+/// `session` table and the `session_v2` DDL
+/// (sst/opencode@dev packages/core/src/database/schema.gen.ts) — not
+/// on the table name (rm-507 discipline), so an upstream rename keeps
+/// the disclosure truthful. The v1 `session` table itself is EXCLUDED
+/// BY NAME from this probe — that name is the one table the v1 lane
+/// legitimately owns by name, so the v2 read arm (rm-2290, which now
+/// runs on every fresh pass, not only the no-`session`-table path)
+/// never re-reads v1 rows as v2 twins. Since the read arm landed, a
+/// probe hit is INGESTED; only a table that matches the shape but
+/// fails the guarded read stays the unhandled class.
 fn opencode_v2_shaped_table(db: &Connection) -> Option<String> {
     let names = db
-        .prepare("select name from sqlite_master where type = 'table' and name not like 'sqlite_%'")
+        .prepare("select name from sqlite_master where type = 'table' and name not like 'sqlite_%' and name != 'session'")
         .and_then(|mut stmt| {
             let names = stmt
                 .query_map([], |row| row.get::<_, String>(0))?

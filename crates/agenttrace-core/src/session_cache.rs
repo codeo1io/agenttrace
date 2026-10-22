@@ -1058,7 +1058,18 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
 // disclosure on an unchanged (size, mtime) fingerprint — one
 // regeneration per database retires the stale entry (rm-230
 // convention).
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 14;
+// Bumped 14 -> 15 (run e9021a4b cycle 7, rm-2290): the sqlite lane now
+// READS v2-shaped `session_v2` tables into counted sessions beside
+// the v1 `session` lane. A v14 snapshot banked from a MIGRATED store
+// (v1 `session` + `session_v2` carrying the copy-migrated legacy
+// rows) replays with the v2-only sessions — ones started after the
+// upstream V1→V2 migration — missing on an unchanged (size, mtime)
+// fingerprint: a silent undercount of exactly the sessions this
+// change exists to count. The entry also began carrying its v2 read
+// accounting (`v2_reads`) so the counted-once twin disclosure
+// survives the warm path. One regeneration per database retires the
+// stale entry (rm-230 convention).
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 15;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -1294,6 +1305,17 @@ struct SqliteSnapshotEntry {
     /// report sums across lanes.
     #[serde(default)]
     fork_excluded: usize,
+    /// rm-2290 (rm-548 precedent): the v2 read accounting this entry
+    /// was banked under — which session-store-shaped table was read,
+    /// how many of its rows became counted sessions, how many were
+    /// twins the v1 `session` lane had already counted (counted once,
+    /// through the richer v1 aggregate), and which columns upstream
+    /// drifted away (read as NULL, disclosed). Carried beside the
+    /// sessions so the disclosure survives a warm cache instead of
+    /// going silent; empty entries serialize nothing and older
+    /// snapshots (pre-v15) never carried the field at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    v2_reads: Vec<crate::sqlite_sessions::SqliteV2Read>,
 }
 
 /// rm-627: the SQLite snapshot is a per-source LEDGER keyed by database
@@ -1903,22 +1925,24 @@ fn remove_cache_artifacts(paths: &[PathBuf]) -> anyhow::Result<()> {
 }
 
 pub(crate) fn load_sqlite_snapshot(database: &Path, name: &str) -> Option<Vec<Session>> {
-    load_sqlite_snapshot_from(database, &sqlite_snapshot_path(name)).map(|(sessions, _)| sessions)
+    load_sqlite_snapshot_from(database, &sqlite_snapshot_path(name)).map(|(sessions, _, _)| sessions)
 }
 
 /// rm-548: opencode snapshots also carry their fork-exclusion count so
-/// the disclosure survives a warm cache.
+/// the disclosure survives a warm cache. rm-2290: they carry the v2
+/// read accounting for the same reason — the counted-once twin and
+/// column-drift disclosures replay on warm loads.
 pub(crate) fn load_sqlite_snapshot_with_meta(
     database: &Path,
     name: &str,
-) -> Option<(Vec<Session>, usize)> {
+) -> Option<(Vec<Session>, usize, Vec<crate::sqlite_sessions::SqliteV2Read>)> {
     load_sqlite_snapshot_from(database, &sqlite_snapshot_path(name))
 }
 
 fn load_sqlite_snapshot_from(
     database: &Path,
     snapshot_path: &Path,
-) -> Option<(Vec<Session>, usize)> {
+) -> Option<(Vec<Session>, usize, Vec<crate::sqlite_sessions::SqliteV2Read>)> {
     let raw = fs::read(snapshot_path).ok()?;
     let ledger = serde_json::from_slice::<SqliteSnapshotLedger>(&raw).ok()?;
     if ledger.schema_version != SQLITE_SNAPSHOT_SCHEMA_VERSION {
@@ -1939,6 +1963,18 @@ fn load_sqlite_snapshot_from(
         return None;
     }
     let fork_excluded = snapshot.fork_excluded;
+    // rm-2290: replay the banked v2 read accounting with the ledger
+    // entry key (this database's path) as the authoritative `path` —
+    // the report compares against the discovery-path key, and the
+    // stored copy must agree with it.
+    let v2_reads = snapshot
+        .v2_reads
+        .into_iter()
+        .map(|mut read| {
+            read.path = database.to_path_buf();
+            read
+        })
+        .collect();
     Some((
         snapshot
             .sessions
@@ -1946,6 +1982,7 @@ fn load_sqlite_snapshot_from(
             .map(|session| session.into_session(&database.to_string_lossy()))
             .collect(),
         fork_excluded,
+        v2_reads,
     ))
 }
 
@@ -1954,22 +1991,26 @@ pub(crate) fn store_sqlite_snapshot(
     name: &str,
     sessions: &[Session],
 ) -> anyhow::Result<()> {
-    store_sqlite_snapshot_with_meta(database, name, sessions, 0)
+    store_sqlite_snapshot_with_meta(database, name, sessions, 0, &[])
 }
 
 /// rm-548: opencode snapshots record their fork-exclusion count so the
-/// disclosure survives warm caches.
+/// disclosure survives warm caches. rm-2290: they record their v2 read
+/// accounting (counted rows, v1-lane twins, drifted columns) for the
+/// same reason — see [`SqliteSnapshotEntry::v2_reads`].
 pub(crate) fn store_sqlite_snapshot_with_meta(
     database: &Path,
     name: &str,
     sessions: &[Session],
     fork_excluded: usize,
+    v2_reads: &[crate::sqlite_sessions::SqliteV2Read],
 ) -> anyhow::Result<()> {
     store_sqlite_snapshot_at(
         database,
         &sqlite_snapshot_path(name),
         sessions,
         fork_excluded,
+        v2_reads,
     )
 }
 
@@ -1978,6 +2019,7 @@ fn store_sqlite_snapshot_at(
     path: &Path,
     sessions: &[Session],
     fork_excluded: usize,
+    v2_reads: &[crate::sqlite_sessions::SqliteV2Read],
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2009,6 +2051,7 @@ fn store_sqlite_snapshot_at(
             sessions: sessions.iter().map(GoSession::from_session).collect(),
             pricing_catalog_id: Some(crate::pricing::catalog_identity().to_string()),
             fork_excluded,
+            v2_reads: v2_reads.to_vec(),
         },
     );
     // rm-693: staged through an exclusive-create temp + rename (the
@@ -3731,7 +3774,7 @@ mod tests {
                     let database = database.clone();
                     let snapshot = snapshot.clone();
                     let session = session.clone();
-                    move || store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).map(|_| i)
+                    move || store_sqlite_snapshot_at(&database, &snapshot, &[session], 0, &[]).map(|_| i)
                 })
             })
             .collect();
@@ -3785,7 +3828,7 @@ mod tests {
             diagnostics: Diagnostics::default(),
         };
 
-        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0)
+        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0, &[])
             .expect("store snapshot");
         assert_eq!(
             load_sqlite_snapshot_from(&database, &snapshot)
@@ -3815,6 +3858,7 @@ mod tests {
                 diagnostics: Diagnostics::default(),
             }],
             0,
+            &[],
         )
         .expect("store snapshot with wal");
         fs::write(sqlite_shm_path(&database), b"shm").expect("write shm");
@@ -3854,15 +3898,15 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         };
-        store_sqlite_snapshot_at(&database_a, &snapshot, &[session_for("a", &database_a)], 0)
+        store_sqlite_snapshot_at(&database_a, &snapshot, &[session_for("a", &database_a)], 0, &[])
             .expect("store database a");
-        store_sqlite_snapshot_at(&database_b, &snapshot, &[session_for("b", &database_b)], 0)
+        store_sqlite_snapshot_at(&database_b, &snapshot, &[session_for("b", &database_b)], 0, &[])
             .expect("store database b");
         let a = load_sqlite_snapshot_from(&database_a, &snapshot)
             .expect("database a stays cached after database b stores");
         let b = load_sqlite_snapshot_from(&database_b, &snapshot).expect("database b cached");
-        let (a, _) = a;
-        let (b, _) = b;
+        let (a, _, _) = a;
+        let (b, _, _) = b;
         assert_eq!(a[0].name, "a");
         assert_eq!(b[0].name, "b");
         let _ = fs::remove_dir_all(root);
@@ -3885,7 +3929,7 @@ mod tests {
         let snapshot = root.join("opencode-sqlite.json");
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(&database, b"db").expect("write database");
-        store_sqlite_snapshot_at(&database, &snapshot, &[], 0).expect("store empty database");
+        store_sqlite_snapshot_at(&database, &snapshot, &[], 0, &[]).expect("store empty database");
         assert!(load_sqlite_snapshot_from(&database, &snapshot)
             .expect("empty database stays a cache hit")
             .0
@@ -3972,7 +4016,7 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         };
-        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0)
+        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0, &[])
             .expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
@@ -4031,7 +4075,7 @@ mod tests {
         );
         let loaded =
             load_sqlite_snapshot_from(&database, &snapshot).expect("schema fourteen cache hit");
-        let (loaded, _) = loaded;
+        let (loaded, _, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
@@ -4106,7 +4150,7 @@ mod tests {
             load_sqlite_snapshot_from(&database, &snapshot).is_none(),
             "a pre-ledger flat snapshot must be rejected"
         );
-        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0)
+        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0, &[])
             .expect("rebuild the slot after rejection");
         assert!(
             load_sqlite_snapshot_from(&database, &snapshot).is_some(),
@@ -5641,7 +5685,7 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         };
-        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0)
+        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0, &[])
             .expect("store snapshot");
         let mode = fs::metadata(&snapshot)
             .expect("snapshot exists")

@@ -103,7 +103,7 @@ pub use sqlite_sessions::{
     load_sqlite_backed_sessions, load_sqlite_backed_sessions_reported,
     load_sqlite_backed_sessions_reported_bounded, skip_sqlite_backed_file_dir, SqliteDroppedRows,
     SqliteDuplicateDb, SqliteIngestReport, SqlitePartialDb, SqliteScanBudget, SqliteUnreadableDb,
-    SqliteV2Store,
+    SqliteV2Read, SqliteV2Store,
 };
 pub use statusline::{
     correlated_prompt_ids, escape_spoofing_json, is_bidi_format_control,

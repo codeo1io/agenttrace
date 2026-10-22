@@ -2366,17 +2366,45 @@ fn disclose_sqlite_ingest(ingest: &agenttrace_core::SqliteIngestReport) {
             db.sample
         );
     }
-    // rm-1927 (run 9d3b927c cycle 1): a v2-shaped store is a healthy
-    // known format this reader does not ingest — its own census
-    // class, never "unreadable" (corrupt) and never a silent zero
-    // (which is how it used to classify: zero sessions, zero
-    // warnings, reading as "nothing happened here").
+    // rm-1927 (run 9d3b927c cycle 1; read arm rm-2290): a v2-shaped
+    // store is INGESTED now — the residual "not ingested" class is a
+    // store the shape probe matched but the guarded read could not
+    // complete. Its own census class, never "unreadable" (corrupt)
+    // and never a silent zero (which is how it used to classify:
+    // zero sessions, zero warnings, reading as "nothing happened
+    // here").
     for store in &ingest.unhandled_v2_stores {
         eprintln!(
             "agenttrace: warning: agent database found but not ingested: {} ({})",
             store.path.display(),
             store.reason
         );
+    }
+    // rm-2290: the v2 read arm's success disclosure — rows counted
+    // from a v2-shaped table, twin rows SKIPPED because the v1
+    // `session` lane already counted the same id (upstream's V1→V2
+    // migration copies every v1 row into `session_v2`, so a migrated
+    // home double-carries each legacy session; counted once, through
+    // the richer v1 aggregate), and columns upstream drifted away
+    // (read as NULL, named here). A plain successful read of a fresh
+    // v2 install has nothing to disclose and prints nothing.
+    for read in &ingest.v2_reads {
+        if read.twin_rows > 0 || !read.absent_columns.is_empty() {
+            eprintln!(
+                "agenttrace: note: opencode v2 store read: {} — {} row(s) counted, {} twin row(s) skipped as already counted through the v1 `session` lane{}",
+                read.path.display(),
+                read.rows_ingested,
+                read.twin_rows,
+                if read.absent_columns.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", columns absent upstream and read as null: {}",
+                        read.absent_columns.join(", ")
+                    )
+                }
+            );
+        }
     }
 }
 

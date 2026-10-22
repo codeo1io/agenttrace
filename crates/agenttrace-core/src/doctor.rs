@@ -1400,12 +1400,15 @@ pub fn doctor_sqlite_directories(
         // opencode*.db siblings) stay rm-607's disclosure lane.
         let unreadable = ingest.unreadable.iter().find(|db| db.path == path);
         let dropped = ingest.dropped_rows.iter().find(|db| db.path == path);
-        // rm-1927: v2-shaped stores at the primary path are a distinct
-        // census class — a healthy known format this reader does not
-        // ingest. Counted as failed files with a named sample, never
-        // folded into "unreadable" (corrupt) and never a silent
-        // zero. Sibling databases keep disclosing through the ingest
-        // report (`unhandled_v2_stores`) like the rm-607 duplicates.
+        // rm-1927 (read arm rm-2290): v2-shaped stores at the primary
+        // path are INGESTED — their rows count under `parsed` like any
+        // other session source. The residual census class is a
+        // v2-shaped store the probe detected but the guarded read
+        // could not complete (a hostile or hand-edited database):
+        // counted as failed files with a named sample, never folded
+        // into "unreadable" (corrupt) and never a silent zero.
+        // Sibling databases keep disclosing through the ingest report
+        // (`unhandled_v2_stores`) like the rm-607 duplicates.
         let unhandled: usize = ingest
             .unhandled_v2_stores
             .iter()
@@ -1432,7 +1435,7 @@ pub fn doctor_sqlite_directories(
                     .iter()
                     .find(|store| store.path == path)
                     .map(|store| store.reason.as_str())
-                    .unwrap_or("opencode v2 store: ingest not implemented")
+                    .unwrap_or("opencode v2 store: shape detected but unreadable")
             ));
         }
         dirs.push(DoctorDirReport {
