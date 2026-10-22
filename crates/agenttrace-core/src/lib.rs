@@ -1237,6 +1237,9 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         for disclosure in unrecognized_usage_keys(&value) {
             mint_disclosure(&mut line_skips, disclosure, 1);
         }
+        // rm-860: census the duplicate keys on the CONSUMED raw line,
+        // upstream of the Value collapse below.
+        parser::census_usage_duplicate_keys(line);
         // rm-616: computed before `value` is consumed by the strict
         // Event parse — the same key census the drop markers use.
         let carries_model_or_usage = value.as_object().is_some_and(|object| {
@@ -1294,6 +1297,11 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
             .entry("duplicate_spelling_normalized".to_string())
             .or_insert(0) += normalized_spellings;
     }
+    // rm-2273: the line_skips merge above landed after
+    // session_from_events sealed the anomaly vector — re-seal so the
+    // `usage_degraded` class (keyed on model_or_usage_dropped) is
+    // session-visible on the generic lane too.
+    reseal_anomalies(&mut session);
     Ok(session)
 }
 
@@ -1432,6 +1440,21 @@ pub fn session_from_events(
             .disclosure_counters
             .entry("magnitude_clamped:negative_to_zero".to_string())
             .or_default() += negative_usage_refused;
+    }
+    // rm-860: duplicate keys inside a `usage` object collapse
+    // last-wins the moment serde_json builds a Value, so by the time
+    // usage_from_value runs the evidence is gone. The parser counts
+    // them at LINE level on the census drained below (consumed lines
+    // only, upstream of the Value collapse); the drain lands on the
+    // INFORMATIONAL tier — the line is never dropped, the accounting
+    // stays last-wins, and the disclosure says so (the v2 oracle: the
+    // counter appears beside the SAME 2050 total, health untouched).
+    let usage_duplicate_keys = crate::parser::take_usage_duplicate_key_count() as usize;
+    if usage_duplicate_keys > 0 {
+        *metrics
+            .disclosure_counters
+            .entry("usage_duplicate_keys".to_string())
+            .or_default() += usage_duplicate_keys;
     }
     // rm-408 disclosure (arm a): count present-but-zero usage blocks at
     // the one choke point every format passes through, and flag them in
@@ -2433,6 +2456,52 @@ pub fn detect_anomalies(metrics: &Metrics) -> Vec<Anomaly> {
             detail: magnitude_facts.join("; "),
         });
     }
+    // rm-2273: parse loss that carried ACCOUNTING identity is a
+    // first-class degradation of the session's usage truth, not a
+    // doctor-only footnote. Probes v10/v13 (assess 8c1c0cea): a
+    // negative usage block gets zeroed AND flags implausible_magnitude
+    // (HIGH, health 70), while the same journal with the usage line
+    // merely unparseable (cost_usd 1e999) drops the line, falls back
+    // to word-count estimation seeded with MODEL 'default', and
+    // renders HEALTH 100 with zero anomalies — the only trace a
+    // `--doctor` counter the session view never shows. Parity: the
+    // rm-616 `model_or_usage_dropped` line_skips census (generic lane,
+    // native jsonl lanes, codex) now mints the session-visible
+    // `usage_degraded` anomaly — HIGH when the loss engaged the
+    // word-count fallback (per-session attribution names the model
+    // label the fallback produced), MEDIUM when surviving usage
+    // blocks still report but the dropped line(s) leave the totals
+    // undercounted.
+    let dropped_accounting_lines = metrics
+        .line_skips
+        .get("model_or_usage_dropped")
+        .copied()
+        .unwrap_or(0);
+    if dropped_accounting_lines > 0 {
+        let fallback_engaged = metrics.provenance.tokens.starts_with("estimated_from_text");
+        let (severity, basis) = if fallback_engaged {
+            (
+                "high",
+                format!(
+                    "token/cost truth fell back to word-count estimation (model '{}'): the journal's own usage line(s) never parsed",
+                    metrics.model_used
+                ),
+            )
+        } else {
+            (
+                "medium",
+                "surviving usage blocks still report, but the dropped line(s) leave the totals undercounted"
+                    .to_string(),
+            )
+        };
+        anomalies.push(Anomaly {
+            kind: "usage_degraded".to_string(),
+            severity: severity.to_string(),
+            detail: format!(
+                "{dropped_accounting_lines} journal line(s) carrying model/usage identity were dropped as unparseable; {basis}; --doctor 'Dropped lines (parse loss)' names the counters"
+            ),
+        });
+    }
     // rm-1534: far-future timestamps are a first-class anomaly class.
     // A single corrupted clock (the year-9999 PoC) used to sail
     // through as HEALTH 100 with zero anomalies AND pollute every
@@ -2572,6 +2641,19 @@ pub fn health_score(anomalies: &[Anomaly]) -> i32 {
         }
     }
     score.clamp(0, 100)
+}
+
+/// rm-2273: lanes fold parse-loss counters into `metrics.line_skips`
+/// AFTER `session_from_events` sealed the anomaly vector (the codex
+/// parse_counters fold and the rm-526 finish closure both land
+/// post-construction), so anomaly classes keyed on those counters
+/// (`model_or_usage_dropped` → `usage_degraded`) would stay sealed
+/// out. Re-seal after every such fold: `detect_anomalies` is a pure
+/// function of `metrics` and `health_score` of the anomaly vector, so
+/// recomputing both is idempotent.
+pub(crate) fn reseal_anomalies(session: &mut Session) {
+    session.anomalies = detect_anomalies(&session.metrics);
+    session.health = health_score(&session.anomalies);
 }
 
 fn validate_tool_warnings(events: &[Event]) -> Vec<ToolWarning> {
@@ -5182,6 +5264,74 @@ fn detect_anomalies_flags_implausible_magnitudes_from_the_disclosure_channel() {
             .iter()
             .any(|anomaly| anomaly.kind == "implausible_magnitude"),
         "clean metrics must stay clean"
+    );
+}
+
+#[test]
+fn detect_anomalies_mints_usage_degraded_at_parity_with_the_negative_arm() {
+    // rm-2273: the v13 PoC — the journal's usage line is unparseable
+    // (cost_usd 1e999), the line is dropped, and the session degrades
+    // to word-count estimation seeded with MODEL 'default'. The
+    // degradation must be session-visible at the SAME severity the
+    // negative-usage arm (v10) gets: one HIGH anomaly, health 70.
+    let mut metrics = Metrics::default();
+    metrics.model_used = "default".to_string();
+    metrics.provenance.tokens = "estimated_from_text".to_string();
+    metrics
+        .line_skips
+        .insert("unparseable_line".to_string(), 1);
+    metrics
+        .line_skips
+        .insert("model_or_usage_dropped".to_string(), 1);
+    let anomaly = detect_anomalies(&metrics)
+        .into_iter()
+        .find(|anomaly| anomaly.kind == "usage_degraded")
+        .expect("lost accounting must mint the degradation anomaly");
+    assert_eq!(anomaly.severity, "high", "parity with v10's HIGH arm");
+    assert_eq!(
+        health_score(&[anomaly.clone()]),
+        70,
+        "the degraded session must score the same 70 the negative arm does"
+    );
+    assert!(
+        anomaly.detail.contains("word-count estimation (model 'default')"),
+        "per-session fallback attribution must name the model label: {}",
+        anomaly.detail
+    );
+    assert!(
+        anomaly.detail.contains("1 journal line(s)"),
+        "the attribution must count the dropped accounting line(s): {}",
+        anomaly.detail
+    );
+
+    // The surviving-usage tier: parse loss dropped an accounting line
+    // but other usage blocks still report — disclosed at medium, so a
+    // degraded-but-measured session never reads as fully healthy
+    // while also never claiming the fallback engaged.
+    let mut survived = metrics.clone();
+    survived.provenance.tokens = "reported".to_string();
+    let anomaly = detect_anomalies(&survived)
+        .into_iter()
+        .find(|anomaly| anomaly.kind == "usage_degraded")
+        .expect("survived tier must still mint the anomaly");
+    assert_eq!(anomaly.severity, "medium");
+    assert!(
+        anomaly.detail.contains("undercounted"),
+        "{}",
+        anomaly.detail
+    );
+
+    // Clean metrics stay clean — a generic session with NO parse loss
+    // (word-count estimation alone is legitimate when nothing was
+    // dropped) must not mint the class.
+    let mut legit_generic = Metrics::default();
+    legit_generic.model_used = "default".to_string();
+    legit_generic.provenance.tokens = "estimated_from_text".to_string();
+    assert!(
+        !detect_anomalies(&legit_generic)
+            .iter()
+            .any(|anomaly| anomaly.kind == "usage_degraded"),
+        "estimation without parse loss is the honest generic lane, not a degradation"
     );
 }
 

@@ -8,7 +8,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 73;
+// Bumped 72 -> 73 (run cd20b59d4d0a cycle 2 'usage-truth session
+// disclosure', rm-2273 LEAD + rm-860 rider): the batch changed what
+// UNCHANGED source files REPORT — every session whose parse lost an
+// accounting-bearing line (the rm-616 `model_or_usage_dropped`
+// line_skips census, now also minted by the native jsonl lanes and the
+// codex lane instead of the generic fallback alone) now carries a
+// session-visible `usage_degraded` anomaly (HIGH when the loss engaged
+// the word-count fallback — the v13 PoC: cost_usd 1e999 dropped the
+// line, MODEL 'default' estimate, health 100/anomalies 0 — MEDIUM when
+// surviving usage blocks still report) and a recomputed health score,
+// and consumed lines with duplicate keys inside `usage` objects now
+// disclose `usage_duplicate_keys` on the informational tier. A warm
+// v72 entry keeps serving health 100 with zero anomalies for exactly
+// those journals verbatim under matching size/mtime fingerprints: no
+// re-parse, no self-heal. rm-230 convention: cached sessions must
+// regenerate under corrected accounting. No sibling rung observed
+// above the landed 72 at dispatch (this tree's ceiling), so the rung
+// lands as 73. No SQLite snapshot rung rode the batch; the landed 13
+// remains the snapshot ceiling. Entries regenerate once on next scan.
 // Bumped 71 -> 72 (integration of run 4eeea89188b245068a569ba76f8caa71
 // cycle 2 "truth of the default surfaces", rm-1553: the claude identity
 // capture (orgIdentifier/loginEmail) is now capped at capture

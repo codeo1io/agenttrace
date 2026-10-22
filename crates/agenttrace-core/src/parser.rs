@@ -634,6 +634,11 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
                     *session.metrics.line_skips.entry(key).or_insert(0) += count;
                 }
             }
+            // rm-2273: the skip fold above landed AFTER
+            // session_from_events sealed the anomaly vector, so a
+            // codex session whose parse lost accounting-bearing lines
+            // would keep its pre-fold health/anomalies — re-seal.
+            crate::reseal_anomalies(&mut session);
             return Ok(session);
         }
     }
@@ -658,6 +663,13 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
                 .entry(reason.clone())
                 .or_insert(0) += *count;
         }
+        // rm-2273: the line-skips fold (rm-526) landed after
+        // session_from_events sealed the anomaly vector — re-seal so
+        // parse-loss classes keyed on those counters
+        // (`model_or_usage_dropped` → the usage_degraded anomaly) are
+        // session-visible on every native probe lane, not just the
+        // generic fallback.
+        crate::reseal_anomalies(&mut session);
         Ok(session)
     };
     if parsed_value.is_none() {
@@ -4434,9 +4446,25 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                 *counters
                     .entry("codex_unparseable_line".to_string())
                     .or_insert(0) += 1;
+                // rm-2273: the same lost-ACCOUNTING subclass the
+                // generic lane has minted since rm-616 — a torn codex
+                // line carrying usage (payload "usage") or model
+                // identity is a usage-truth degradation, not mere
+                // junk; the counter feeds the session-visible
+                // usage_degraded anomaly via the parse_counters fold.
+                if line_carries_usage_or_model(line.trim()) {
+                    *counters
+                        .entry("model_or_usage_dropped".to_string())
+                        .or_insert(0) += 1;
+                }
                 continue;
             }
         };
+        // rm-860: the duplicate-key census rides the CONSUMED line,
+        // upstream of the Value collapse (the codex usage block nests
+        // under payload.usage, which the walker's usage-subtree rule
+        // covers).
+        census_usage_duplicate_keys(line.trim());
         let typ = string(obj.get("type")).unwrap_or("");
         let ts = string(obj.get("timestamp")).unwrap_or("").to_string();
         match typ {
@@ -8809,6 +8837,203 @@ pub(crate) fn take_negative_usage_refusal_count() -> u64 {
     NEGATIVE_USAGE_REFUSALS.with(|census| census.replace(0))
 }
 
+thread_local! {
+    // rm-860: duplicate keys inside a `usage` object collapse
+    // last-wins the moment serde_json builds a `Value` (probe v2:
+    // {"input_tokens":100, "output_tokens":50, "input_tokens":2000}
+    // counts a clean 2050 with health 100), so by the time
+    // `usage_from_value` runs the evidence is gone. Count every
+    // duplicate on this thread-local census at LINE level — upstream
+    // of Value construction, on lines the session actually consumes —
+    // and `session_from_events` drains it onto the informational
+    // `disclosure_counters` tier (`usage_duplicate_keys`). The line is
+    // NEVER dropped (contrast rm-616's whole-line-drop census): the
+    // accounting stays last-wins, the disclosure says so.
+    static USAGE_DUPLICATE_KEYS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_usage_duplicate_keys(count: u64) {
+    USAGE_DUPLICATE_KEYS.with(|census| {
+        census.set(census.get().saturating_add(count))
+    });
+}
+
+/// rm-860: take (and reset) the current thread's parse-scope count of
+/// duplicate keys observed inside `usage` objects on consumed journal
+/// lines.
+pub(crate) fn take_usage_duplicate_key_count() -> u64 {
+    USAGE_DUPLICATE_KEYS.with(|census| census.replace(0))
+}
+
+/// rm-860: count duplicate keys inside `usage` (or `Usage`) objects on
+/// a RAW journal line, walking serde_json's own tokenizer so string
+/// escapes and nesting are handled exactly as the accounting lane sees
+/// them — upstream of the `Value` collapse that makes duplicates
+/// invisible. Counts:
+/// - any duplicated key inside an object whose path passes through a
+///   `usage`/`Usage` key (the codex lane's `payload.usage` and the
+///   generic lane's top-level `usage` both qualify), and
+/// - a duplicated `usage`/`Usage` key itself anywhere (the whole usage
+///   block is last-wins there).
+/// Malformed lines return 0 — the normal parse path already counts
+/// them as `unparseable_line`; callers gate on the cheap byte-guard
+/// `line.contains("usage") || line.contains("Usage")` so clean
+/// journals never pay the walk.
+fn count_usage_duplicate_keys(line: &str) -> usize {
+    use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+
+    /// Seed that collects a map key as a `String` (keys only — the
+    /// value side recurses with [`UsageDupSeed`]).
+    struct KeySeed;
+
+    impl<'de> DeserializeSeed<'de> for KeySeed {
+        type Value = String;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_str(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for KeySeed {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object key")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(value.to_string())
+        }
+
+        fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+    }
+
+    /// Walks one JSON node, carrying whether this node sits inside a
+    /// `usage` subtree; returns the duplicate-key count of the subtree.
+    struct UsageDupSeed {
+        in_usage: bool,
+    }
+
+    impl<'de> DeserializeSeed<'de> for UsageDupSeed {
+        type Value = usize;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for UsageDupSeed {
+        type Value = usize;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("any JSON node")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut seen = std::collections::HashSet::new();
+            let mut duplicates = 0usize;
+            while let Some(key) = access.next_key_seed(KeySeed)? {
+                let is_usage_key = key == "usage" || key == "Usage";
+                let fresh = seen.insert(key.clone());
+                if !fresh && (self.in_usage || is_usage_key) {
+                    duplicates += 1;
+                }
+                duplicates += access.next_value_seed(UsageDupSeed {
+                    in_usage: self.in_usage || is_usage_key,
+                })?;
+            }
+            Ok(duplicates)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut duplicates = 0usize;
+            while let Some(count) = access.next_element_seed(UsageDupSeed {
+                in_usage: self.in_usage,
+            })? {
+                duplicates += count;
+            }
+            Ok(duplicates)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(0)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(0)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            self.deserialize(deserializer)
+        }
+
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(0)
+        }
+
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(0)
+        }
+
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(0)
+        }
+
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(0)
+        }
+
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(0)
+        }
+
+        fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
+            Ok(0)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(line);
+    UsageDupSeed { in_usage: false }
+        .deserialize(&mut deserializer)
+        .unwrap_or(0)
+}
+
+/// rm-860/rm-2273 line guard shared by every counted lane: the cheap
+/// byte-test that decides whether a consumed journal line is
+/// accounting-bearing (usage block or model identity) and therefore
+/// worth the duplicate-key walk — the same conservative marker set the
+/// rm-616 drop census uses, so the two disclosures never disagree
+/// about which lines carry accounting.
+fn line_carries_usage_or_model(line: &str) -> bool {
+    line.contains("model_used")
+        || line.contains("ModelUsed")
+        || line.contains("\"usage\"")
+        || line.contains("\"Usage\"")
+}
+
+/// rm-860: count (and note on the thread-local census) the duplicate
+/// keys inside `usage` objects of an accounting-bearing line that the
+/// lane is about to consume. Only called on lines that PARSED, so the
+/// walk cannot misclassify a torn line the census already owns.
+pub(crate) fn census_usage_duplicate_keys(line: &str) {
+    if line_carries_usage_or_model(line) {
+        let c = count_usage_duplicate_keys(line);
+        if c > 0 { eprintln!("DBG-CENSUS count={c} line={}", &line[..line.len().min(60)]); }
+        note_usage_duplicate_keys(c as u64);
+    }
+}
+
 /// rm-726: take (and reset) the current thread's parse-scope count of
 /// magnitude clamps performed by `number_as_i64`.
 pub(crate) fn take_magnitude_clamp_count() -> u64 {
@@ -9062,9 +9287,28 @@ fn jsonl_objects_counted(raw: &str) -> (Vec<Map<String, Value>>, BTreeMap<String
             continue;
         }
         match parse_jsonl_value_lenient(line) {
-            Some(Value::Object(obj)) => objs.push(obj),
+            Some(Value::Object(obj)) => {
+                // rm-860: the duplicate-key census rides the CONSUMED
+                // line, upstream of the Value collapse.
+                census_usage_duplicate_keys(line);
+                objs.push(obj);
+            }
             Some(_) => *skips.entry("non_object_line".to_string()).or_insert(0) += 1,
-            None => *skips.entry("unparseable_line".to_string()).or_insert(0) += 1,
+            None => {
+                *skips.entry("unparseable_line".to_string()).or_insert(0) += 1;
+                // rm-2273: subclassify parse loss the way the generic
+                // fallback has since rm-616 — a torn line that itself
+                // carried model/usage identity is LOST ACCOUNTING, not
+                // mere junk: without the marker the session degrades
+                // to word-count estimation (MODEL 'default') with
+                // health 100 and the only disclosure is a doctor
+                // counter. The subclass feeds the session-visible
+                // `usage_degraded` anomaly (lib.rs detect_anomalies)
+                // via the finish-closure line_skips fold.
+                if line_carries_usage_or_model(line) {
+                    *skips.entry("model_or_usage_dropped".to_string()).or_insert(0) += 1;
+                }
+            }
         }
     }
     (objs, skips)
@@ -9789,6 +10033,39 @@ fn session_name(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn count_usage_duplicate_keys_walks_the_usage_subtree_only() {
+        // rm-860: duplicate keys inside a `usage` object are invisible
+        // after the Value collapse — the walker must see them on the RAW
+        // line: any duplicate inside a usage subtree, a duplicated
+        // usage/Usage key itself, and NOTHING outside those scopes.
+        let dup = "{\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"input_tokens\":2000}}";
+        assert_eq!(count_usage_duplicate_keys(dup), 1);
+        // Nested inside the subtree still counts (codex payload.usage).
+        let nested =
+            "{\"payload\":{\"usage\":{\"input_tokens\":{\"n\":1,\"n\":2}}}}";
+        assert_eq!(count_usage_duplicate_keys(nested), 1);
+        // A duplicated usage BLOCK key counts (whole block last-wins).
+        let block = "{\"usage\":{\"input_tokens\":1},\"usage\":{\"output_tokens\":2}}";
+        assert_eq!(count_usage_duplicate_keys(block), 1);
+        // Duplicates OUTSIDE any usage scope stay invisible to this
+        // census — they belong to other lanes' disclosures, and
+        // inflating this counter would misattribute accounting risk.
+        let outside = "{\"messages\":[{\"m\":1,\"m\":2}],\"session_id\":{\"a\":1,\"a\":2}}";
+        assert_eq!(count_usage_duplicate_keys(outside), 0);
+        // Case-variant Usage block key counts as the usage scope.
+        let cased = "{\"Usage\":{\"input_tokens\":1,\"input_tokens\":2}}";
+        assert_eq!(count_usage_duplicate_keys(cased), 1);
+        // Escaped keys do not fool the tokenizer (serde_json handles
+        // the escapes; a hand-rolled byte scan would not).
+        let escaped =
+            "{\"usage\":{\"in\\\"put\":1,\"in\\\"put\":2,\"input_tokens\":3}}";
+        assert_eq!(count_usage_duplicate_keys(escaped), 1);
+        // Malformed input returns 0 — the unparseable-line census owns it.
+        assert_eq!(count_usage_duplicate_keys("{\"usage\":{"), 0);
+        assert_eq!(count_usage_duplicate_keys("1e999"), 0);
+    }
 
     #[test]
     fn codex_total_usage_rewind_after_compaction_counts_forward() {

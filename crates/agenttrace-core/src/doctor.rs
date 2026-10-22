@@ -138,6 +138,19 @@ pub struct DoctorReport {
     /// the pre-rm-1534 report.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub future_timestamp_sessions: usize,
+    /// rm-2273: sessions whose usage truth degraded to the word-count
+    /// fallback because parse loss dropped their accounting-bearing
+    /// line(s) (the `usage_degraded` anomaly class, minted off the
+    /// rm-616 `model_or_usage_dropped` line_skips census). This is the
+    /// doctor's NAMED degradation class — distinct from the raw
+    /// [`Self::dropped_lines`] census (which cannot tell a lost
+    /// message from lost accounting) and from the rm-406 unknown-event
+    /// vocabulary: the count names sessions whose COST/TOKEN numbers
+    /// on every surface are estimates, not measurements, so a reader
+    /// auditing spend knows which rows never saw the journal's own
+    /// usage. 0-count-clean: healthy corpora render identically.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub usage_degraded_sessions: usize,
     /// Parse-time journal disclosures aggregated over scanned sessions
     /// (rm-436/rm-437, pi-family journals): `pi_usage_entry:<kind>`,
     /// `pi_branches`, `pi_entry_skipped:<type>`,
@@ -498,6 +511,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         mut project_decode,
         zero_usage,
         future_timestamp_sessions,
+        usage_degraded_sessions,
         disclosure_fold,
         // scanned_sessions is consumed inside doctor_directories by the
         // rm-904 linkage pass — nothing here needs the corpus again.
@@ -612,6 +626,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         project_decode,
         zero_usage,
         future_timestamp_sessions,
+        usage_degraded_sessions,
         disclosures,
         dropped_lines,
         directories,
@@ -1031,6 +1046,11 @@ struct DoctorScanState {
     /// corpus — counted once here so the doctor row and the
     /// disclosure fold agree.
     future_timestamp_sessions: usize,
+    /// rm-2273: census of sessions carrying the `usage_degraded`
+    /// anomaly (parse loss dropped their accounting-bearing line(s)
+    /// and the usage truth fell back or undercounts) — both lanes,
+    /// same single-count discipline as `future_timestamp_sessions`.
+    usage_degraded_sessions: usize,
     // rm-367/rm-904 accumulator (folded into the rm-862 scan state at
     // the integration of run 5eb82325, after both landed on this wall
     // post-base): every session a directory report parses or a cache
@@ -1103,6 +1123,7 @@ fn doctor_directories(
             project_decode,
             zero_usage,
             future_timestamp_sessions: _,
+            usage_degraded_sessions: _,
             disclosure_fold,
             scanned_sessions,
         } = scan;
@@ -1208,6 +1229,27 @@ fn doctor_directories(
         scan.disclosure_fold.disclosures.insert(
             "future_timestamp_sessions".to_string(),
             scan.future_timestamp_sessions,
+        );
+    }
+    // rm-2273: same census discipline — the count rides the parsed
+    // session's own `usage_degraded` anomaly (minted off the
+    // model_or_usage_dropped line_skips class in detect_anomalies),
+    // so the doctor row, the session views, and the JSON lane name
+    // the same sessions. 0-count-clean.
+    scan.usage_degraded_sessions = scan
+        .scanned_sessions
+        .iter()
+        .filter(|session| {
+            session
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.kind == "usage_degraded")
+        })
+        .count();
+    if scan.usage_degraded_sessions > 0 {
+        scan.disclosure_fold.disclosures.insert(
+            "usage_degraded_sessions".to_string(),
+            scan.usage_degraded_sessions,
         );
     }
     dirs
@@ -1502,6 +1544,15 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
             crate::insights::FUTURE_ADMISSION_GRACE_SECS / 3600
         ));
     }
+    // rm-2273: usage-truth degradation is spend-audit material — the
+    // operator must learn WHY some totals are estimates, at the same
+    // prominence the clock class gets.
+    if report.usage_degraded_sessions > 0 {
+        recommendations.push(format!(
+            "{} session(s) report word-count ESTIMATES instead of the journal's own usage (usage_degraded): parse loss dropped their accounting-bearing line(s) — repair or re-export the source journals; until then, cost/token totals for those sessions are estimates, not measurements.",
+            report.usage_degraded_sessions
+        ));
+    }
     // rm-607: sibling sqlite databases suppressed as duplicates are
     // disclosed, not silently skipped — the numbers are honest but the
     // user should learn their backups are inside the discovery glob.
@@ -1658,6 +1709,16 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
         out.push_str(&format!(
             "Future timestamps: {} session(s) with activity beyond now+{}h (rm-1534) — excluded from ranged views, disclosed here and as `future_timestamp` anomalies\n",
             report.future_timestamp_sessions, crate::insights::FUTURE_ADMISSION_GRACE_SECS / 3600
+        ));
+    }
+    // rm-2273: the NAMED degradation class — a visible count beside
+    // the raw dropped-lines census, so a reader can tell "lost
+    // accounting" (estimates on every surface) from a lost message.
+    // 0-count-clean: healthy corpora render identically.
+    if report.usage_degraded_sessions > 0 {
+        out.push_str(&format!(
+            "Usage degraded: {} session(s) whose usage line(s) never parsed (rm-2273) — cost/token figures are word-count estimates; disclosed on the sessions as `usage_degraded` anomalies\n",
+            report.usage_degraded_sessions
         ));
     }
     for sample in &report.zero_usage.samples {
