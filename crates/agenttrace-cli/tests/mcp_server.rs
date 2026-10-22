@@ -204,7 +204,20 @@ fn handshake_tools_and_report_rendering() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect();
-    assert_eq!(names, vec!["usage_overview", "by_model_breakdown"]);
+    // rm-455 arm 1 (run e9eb92e2 cycle 6): the catalog grew to five —
+    // session_list, session_detail, and doctor_verdict close the row's
+    // open acceptance (the docs always promised session list/detail and
+    // a doctor verdict). Order pins the docs' Tools section order.
+    assert_eq!(
+        names,
+        vec![
+            "usage_overview",
+            "by_model_breakdown",
+            "session_list",
+            "session_detail",
+            "doctor_verdict"
+        ]
+    );
     let range_enum = &tools[0]["inputSchema"]["properties"]["range"]["enum"];
     assert_eq!(
         serde_json::json!([
@@ -1583,6 +1596,299 @@ fn tools_list_carries_2026_07_28_cache_hints() {
             && responses[1]["result"]["cacheScope"].as_str() == Some("public"),
         "the emission is unconditional and additive — documented, not \
          version-gated (the server keeps no per-connection state)"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn tools_catalog_pins_the_three_new_tool_schemas() {
+    // rm-455 arm 1 (run e9eb92e2 cycle 6): the schemas must not
+    // under-declare what the dispatch enforces (rm-782 lesson) —
+    // session_list's `limit` mirrors --limit (integer, minimum 1,
+    // default 20), session_detail's `rank` is required (integer,
+    // minimum 1, the row's 1-based position in session_list's
+    // order), and doctor_verdict takes no arguments.
+    let (home, cache) = seed_home("new-schemas", true);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    let tools = &responses[0]["result"]["tools"];
+    let tool = |name: &str| {
+        tools
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("tool {name} missing"))
+            .clone()
+    };
+
+    let session_list = tool("session_list");
+    let limit = &session_list["inputSchema"]["properties"]["limit"];
+    assert_eq!(Some("integer"), limit["type"].as_str());
+    assert_eq!(1, limit["minimum"].as_i64().expect("minimum 1"));
+    assert_eq!(20, limit["default"].as_i64().expect("default mirrors --limit"));
+    assert_eq!(
+        serde_json::json!(["today", "day", "1d", "7d", "week", "weekly", "30d", "month", "monthly", "all", ""]),
+        session_list["inputSchema"]["properties"]["range"]["enum"],
+        "session_list publishes the same range labels as the other tools"
+    );
+
+    let session_detail = tool("session_detail");
+    let rank = &session_detail["inputSchema"]["properties"]["rank"];
+    assert_eq!(Some("integer"), rank["type"].as_str());
+    assert_eq!(1, rank["minimum"].as_i64().expect("minimum 1"));
+    assert_eq!(
+        serde_json::json!(["rank"]),
+        session_detail["inputSchema"]["required"],
+        "rank is required — the server answers -32602 without it"
+    );
+
+    let doctor_verdict = tool("doctor_verdict");
+    assert!(
+        doctor_verdict["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties object")
+            .is_empty(),
+        "doctor_verdict takes no arguments"
+    );
+    assert_eq!(
+        Some(false),
+        doctor_verdict["inputSchema"]["additionalProperties"].as_bool()
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn session_tools_render_the_cli_documents() {
+    // rm-455 arm 1 (run e9eb92e2 cycle 6): the three new tools render
+    // through the CLI's own renderers — one truth, pinned by byte
+    // parity with the CLI lanes on the same seeded home:
+    // session_list is the `--sessions -f json` document, session_detail
+    // is the `--inspect <rank> -f json` document for the row the
+    // listing renders at that rank, and doctor_verdict is the
+    // `doctor -f json` document.
+    let (home, cache) = seed_home("session-tools", true);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"session_list","arguments":{"range":"all"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session_detail","arguments":{"rank":1,"range":"all"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"doctor_verdict","arguments":{}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(3, responses.len());
+    for response in &responses {
+        assert_eq!(
+            false,
+            response["result"]["isError"].as_bool().unwrap_or(true),
+            "every new tool reports on the seeded fixture: {response}"
+        );
+    }
+
+    // session_list: the CLI's --sessions -f json envelope.
+    let listing = text_payload(&responses[0]);
+    assert_eq!(
+        1, listing["matched_sessions"],
+        "the seeded fixture holds one session"
+    );
+    assert_eq!(1, listing["returned_sessions"]);
+    assert_eq!(
+        false,
+        listing["truncated"].as_bool().expect("truncated is a bool")
+    );
+    assert_eq!(
+        20,
+        listing["limit"],
+        "the limit default mirrors the CLI --limit default"
+    );
+    let listed_name = listing["sessions"][0]["name"]
+        .as_str()
+        .expect("session rows carry their name")
+        .to_string();
+
+    // session_detail: the CLI's --inspect 1 -f json document, naming
+    // the SAME row the listing rendered at rank 1.
+    let detail = text_payload(&responses[1]);
+    assert_eq!(
+        listed_name,
+        detail["session"]["name"]
+            .as_str()
+            .expect("detail names the rank-1 session"),
+        "rank 1 names the first session_list row — one listing order"
+    );
+    assert!(
+        detail.get("cost_alert").is_some(),
+        "the inspect document carries the diagnostics arms"
+    );
+
+    // doctor_verdict: the CLI's doctor -f json document.
+    let verdict = text_payload(&responses[2]);
+    assert!(verdict["version"].is_string());
+    assert!(verdict["mode"].is_string());
+
+    // Byte parity with the CLI lanes — the one-renderer contract.
+    let payload = |index: usize| {
+        responses[index]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool text")
+            .to_string()
+    };
+    let (_, sessions_json, _) = cli_run(&home, &cache, &["--sessions", "-f", "json"]);
+    assert_eq!(
+        sessions_json.trim(),
+        payload(0),
+        "session_list payload is byte-identical to `agenttrace --sessions -f json`"
+    );
+    let (_, inspect_json, _) = cli_run(&home, &cache, &["--inspect", "1", "-f", "json"]);
+    assert_eq!(
+        inspect_json.trim(),
+        payload(1),
+        "session_detail payload is byte-identical to `agenttrace --inspect 1 -f json`"
+    );
+    let (_, doctor_json, _) = cli_run(&home, &cache, &["doctor", "-f", "json"]);
+    assert_eq!(
+        doctor_json.trim(),
+        payload(2),
+        "doctor_verdict payload is byte-identical to `agenttrace doctor -f json`"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn session_tool_argument_discipline_answers_32602() {
+    // rm-455 arm 1: structural argument errors are -32602 with the
+    // rm-840 wording (name the tool, the argument, and the JSON type
+    // the host sent); a rank beyond the listing is a corpus-level
+    // isError result (the twin of the CLI's rc1 bail), naming the
+    // valid rank range the same way --inspect does.
+    let (home, cache) = seed_home("session-args", true);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"session_detail","arguments":{"rank":0,"range":"all"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session_detail","arguments":{"range":"all"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"session_detail","arguments":{"rank":"1","range":"all"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"session_list","arguments":{"limit":0,"range":"all"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"session_list","arguments":{"limit":"5","range":"all"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"session_detail","arguments":{"rank":3,"range":"all"}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(6, responses.len());
+
+    let error_of = |index: usize| {
+        (
+            responses[index]["error"]["code"].as_i64(),
+            responses[index]["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+    let (code0, msg0) = error_of(0);
+    assert_eq!(Some(-32602), code0, "rank 0 is a usage error: {msg0}");
+    assert!(
+        msg0.contains("rank") && msg0.contains("1"),
+        "the message names the argument and its floor: {msg0}"
+    );
+    let (code1, msg1) = error_of(1);
+    assert_eq!(Some(-32602), code1, "absent rank is a usage error: {msg1}");
+    assert!(
+        msg1.contains("rank") && msg1.contains("required"),
+        "the message says rank is required: {msg1}"
+    );
+    let (code2, msg2) = error_of(2);
+    assert_eq!(Some(-32602), code2, "a string rank is a usage error: {msg2}");
+    assert!(
+        msg2.contains("a string"),
+        "the message names the JSON type sent: {msg2}"
+    );
+    let (code3, msg3) = error_of(3);
+    assert_eq!(Some(-32602), code3, "limit 0 is a usage error: {msg3}");
+    assert!(
+        msg3.contains("limit") && msg3.contains("1"),
+        "the message names the argument and its floor: {msg3}"
+    );
+    let (code4, msg4) = error_of(4);
+    assert_eq!(Some(-32602), code4, "a string limit is a usage error: {msg4}");
+    assert!(
+        msg4.contains("a string"),
+        "the message names the JSON type sent: {msg4}"
+    );
+    // rank 3 on a one-session corpus: isError, not a protocol error —
+    // the twin of the CLI's rc1 `--inspect` bail, naming valid ranks.
+    assert!(
+        responses[5]["result"]["isError"].as_bool() == Some(true),
+        "an out-of-range rank is a tool error, not a protocol one"
+    );
+    let text = responses[5]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        text.contains("exceeds") && text.contains("1..=1"),
+        "the error names the valid rank range: {text}"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn legacy_protocol_versions_negotiate_to_themselves() {
+    // rm-455 arm 2 (run e9eb92e2 cycle 6): the revision ladder grows
+    // two older published revisions — 2025-03-26 and 2024-11-05 — so
+    // legacy hosts (the ones the rm-780 absent-version fallback
+    // serves) can negotiate their own dialect instead of being
+    // answered in the newest one and served the older wire. Newest
+    // first is the list's pinned order; unknown versions keep the
+    // typed -32022 with the FULL ladder in `data.supported`.
+    let (home, cache) = seed_home("legacy-versions", true);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2024-11-05"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"1999-99-99","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(4, responses.len());
+    assert_eq!(
+        Some("2025-03-26"),
+        responses[0]["result"]["protocolVersion"].as_str(),
+        "a legacy revision is negotiated to itself — never upgraded silently"
+    );
+    assert_eq!(
+        Some("2024-11-05"),
+        responses[1]["result"]["protocolVersion"].as_str(),
+        "the oldest published revision is served, not echoed-from-error"
+    );
+    assert!(
+        responses[2]["result"]["tools"].is_array(),
+        "the reserved _meta key negotiates the legacy revision on any method"
+    );
+    assert_eq!(
+        Some(-32022),
+        responses[3]["error"]["code"].as_i64(),
+        "unknown versions keep the typed error"
+    );
+    assert_eq!(
+        serde_json::json!([
+            "2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"
+        ]),
+        responses[3]["error"]["data"]["supported"],
+        "the recovery list is the full newest-first ladder"
     );
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));
 }

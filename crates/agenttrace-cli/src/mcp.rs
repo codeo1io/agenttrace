@@ -121,12 +121,24 @@ const META_SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 /// MCP protocol revisions this server speaks, NEWEST FIRST — the
 /// order is the negotiation preference (rm-780). `initialize` answers
 /// the first entry the client also declared, or falls back to `[0]`
-/// for unknown/absent client versions. The set mirrors the official
-/// revision ladder (modelcontextprotocol repository tags, fetched
-/// live 2026-10-08: 2026-07-28 > 2025-11-25 > 2025-06-18); adding a
-/// revision here is a deliberate, tested act — the cost the rm-455
-/// rmcp-adoption rider tracks.
-const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "2025-06-18"];
+/// for unknown/absent client versions. The ladder mirrored the
+/// official revision list (modelcontextprotocol repository tags,
+/// fetched live 2026-10-08) down to `2025-06-18`; rm-455 arm 2 (run
+/// e9eb92e2 cycle 6) deliberately FLOORS the ladder at the two
+/// legacy revisions older hosts actually declare (`2025-03-26`, the
+/// spec revision that introduced `_meta` and jsonrpc 2.0 framing, and
+/// `2024-11-05`, the original revision) — a legacy host that
+/// negotiated down to "unsupported version" while the server could
+/// have served its wire verbatim was the acceptance's own bug class.
+/// Adding or removing a revision here is a deliberate, tested act —
+/// the cost the rm-455 rmcp-adoption rider tracks.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 5] = [
+    "2026-07-28",
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
 
 /// `tools/list` cache hint (rm-455, run e4209f0c cycle 5): the
 /// 2026-07-28 revision's CacheableResult rule (SEP-2549) makes
@@ -180,6 +192,14 @@ const RANGE_ALIASES: [&str; 11] = [
 /// and `RECENT_SESSIONS_MAX` in `agenttrace-core` (nothing here may
 /// grow past that cap).
 const RECENT_SESSIONS_LIMIT: usize = 10;
+
+/// `session_list`'s display limit when the host sends none — the
+/// CLI's `--sessions` `--limit` default (rm-455 arm 1, run e9eb92e2
+/// cycle 6). Mirrored, not shared: the CLI default lives in the
+/// clap attributes on `Args::limit`; the pin
+/// `session_tools_render_the_cli_documents` and the published
+/// `inputSchema` `default` keep the two honest against each other.
+const SESSIONS_LIMIT_DEFAULT: usize = 20;
 
 /// Entry point for the `agenttrace mcp` host command.
 ///
@@ -578,7 +598,10 @@ fn initialize_result(params: Value) -> Result<Value, (i64, String)> {
         },
         "instructions": "Read-only usage reporting over locally discovered \
     agent sessions. Tools: usage_overview (the CLI --overview JSON), \
-    by_model_breakdown (cost and sessions per model). The server is offline \
+    by_model_breakdown (cost and sessions per model), session_list (the \
+    CLI --sessions listing), session_detail (one session, the CLI \
+    --inspect JSON), doctor_verdict (the corpus doctor's verdict, the \
+    CLI doctor JSON). The server is offline \
     and stdio-only; it writes nothing outside the agenttrace session cache."
     }))
 }
@@ -673,19 +696,26 @@ fn discover_result() -> Value {
 /// `resultType` is added centrally by [`with_result_type`] (it is
 /// required on all results, not just this one).
 fn tools_list_result() -> Value {
-    let range_schema = || {
+    // rm-455 arm 1 (run e9eb92e2 cycle 6): the shared `range` property
+    // is factored out so the three new tools publish the EXACT enum +
+    // description the two report tools do — schema drift between
+    // tools was rm-782's original bug class.
+    let range_property = || {
         json!({
-            "type": "object",
-            "properties": {
-                "range": {
-                    "type": "string",
-                    "enum": RANGE_ALIASES,
-                    "description": "Report window, matched case-insensitively \
+            "type": "string",
+            "enum": RANGE_ALIASES,
+            "description": "Report window, matched case-insensitively \
         exactly like the CLI's --range: `today`/`day`/`1d` is your local \
         calendar day; `7d`/`week`/`weekly` and `30d`/`month`/`monthly` are \
         rolling windows; `all` (or an empty string) is everything \
         discovered. Defaults to `all`."
-                }
+        })
+    };
+    let range_schema = || {
+        json!({
+            "type": "object",
+            "properties": {
+                "range": range_property()
             },
             "additionalProperties": false
         })
@@ -711,6 +741,75 @@ fn tools_list_result() -> Value {
     window — the `by_model` rollup of the same locally discovered sessions. \
     Read-only; no network.",
                 "inputSchema": range_schema()
+            },
+            // rm-455 arm 1 (run e9eb92e2 cycle 6): the tool-scope
+            // acceptance — the docs had promised session list/detail and
+            // a doctor verdict since the guide's first cut; the server
+            // shipped two report tools and grep'd zero of the three.
+            // Order here is the docs guide's Tools-section order, pinned
+            // by `handshake_tools_and_report_rendering` and
+            // scripts/ci/check-docs-commands.sh.
+            {
+                "name": "session_list",
+                "description": "The session listing — the same JSON the \
+    `agenttrace --sessions -f json` CLI action renders over the same \
+    discovered corpus (matched/returned counts, truncation disclosure, one \
+    row per session in the CLI's default `--sort recent --order desc` \
+    order). Read-only; no network.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "range": range_property(),
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": SESSIONS_LIMIT_DEFAULT,
+                            "description": "Maximum sessions returned — \
+            the `--limit` default of `agenttrace --sessions`; the document \
+            discloses `truncated` and `matched_sessions` so a capped \
+            listing cannot be mistaken for the whole corpus."
+                        }
+                    },
+                    "required": [],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "session_detail",
+                "description": "One session's full diagnostics — the same \
+    JSON `agenttrace --inspect <rank> -f json` renders for that rank \
+    (1-based position in session_list's order): the session object, \
+    pricing basis, cost anomaly alert, and fix suggestions. Read-only; \
+    no network.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "rank": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "1-based position in the \
+            session_list order (the CLI --sessions order); 1 is the \
+            most recent session."
+                        },
+                        "range": range_property()
+                    },
+                    "required": ["rank"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "doctor_verdict",
+                "description": "The corpus doctor's verdict — the same JSON \
+    the `agenttrace doctor -f json` CLI action renders (agent version, \
+    mode, session cache census, finding categories). Takes no arguments; \
+    it scans the same auto-discovered homes `doctor` does. Read-only; \
+    no network.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -784,9 +883,64 @@ fn call_tool(params: Value, root: Option<&Path>) -> Result<Value, (i64, String)>
     match name {
         "usage_overview" => usage_overview(root, range),
         "by_model_breakdown" => by_model_breakdown(root, range),
+        // rm-455 arm 1 (run e9eb92e2 cycle 6): the three tools the
+        // guide always promised. Each renders through the CLI's own
+        // lane (crate::sessions_listing_json / session_detail_json /
+        // doctor_report_json) so the MCP answer and the CLI document
+        // are one truth — the same posture usage_overview set.
+        "session_list" => {
+            let limit = match parse_limit_argument(&arguments) {
+                Ok(limit) => limit,
+                Err(message) => return Err(invalid(message)),
+            };
+            let report = load_for_range(root, range);
+            if report.sessions.is_empty() {
+                return empty_corpus_result(root, range, &report);
+            }
+            match crate::sessions_listing_json(report.sessions.clone(), limit) {
+                Ok(text) => Ok(tool_text_result(text)),
+                Err(error) => tool_execution_error(error.to_string()),
+            }
+        }
+        "session_detail" => {
+            let rank = match parse_rank_argument(&arguments) {
+                Ok(rank) => rank,
+                Err(message) => return Err(invalid(message)),
+            };
+            let report = load_for_range(root, range);
+            if report.sessions.is_empty() {
+                return empty_corpus_result(root, range, &report);
+            }
+            match crate::session_detail_json(report.sessions.clone(), rank) {
+                Ok(text) => Ok(tool_text_result(text)),
+                Err(error) => tool_execution_error(error.to_string()),
+            }
+        }
+        "doctor_verdict" => {
+            // The schema publishes zero properties and
+            // `additionalProperties: false` — so does the dispatch:
+            // any argument is a -32602, not a silently ignored extra
+            // (the same discipline `parse_range_argument` applies to
+            // its lane).
+            if let Some(fields) = arguments.as_object() {
+                if !fields.is_empty() {
+                    let unexpected = fields.keys().cloned().collect::<Vec<_>>().join(", ");
+                    return Err(invalid(format!(
+                        "Invalid params: `doctor_verdict` takes no arguments \
+                         (unexpected: {unexpected}) — remove every argument; the \
+                         tool scans the same auto-discovered corpus \
+                         `agenttrace doctor` does"
+                    )));
+                }
+            }
+            match crate::doctor_report_json(root) {
+                Ok(text) => Ok(tool_text_result(text)),
+                Err(error) => tool_execution_error(error.to_string()),
+            }
+        }
         other => Err(invalid(format!(
             "Invalid params: unknown tool `{other}` (available: usage_overview, \
-by_model_breakdown)"
+by_model_breakdown, session_list, session_detail, doctor_verdict)"
         ))),
     }
 }
@@ -811,6 +965,63 @@ weekly, 30d, month, monthly, all, or \"\" for all, matched case-insensitively \
 weekly, 30d, month, monthly, all)"
                 .to_string(),
         ),
+    }
+}
+
+/// Parse `session_list`'s `limit` argument (rm-455 arm 1, run e9eb92e2
+/// cycle 6). Absent means the CLI's `--sessions` default
+/// ([`SESSIONS_LIMIT_DEFAULT`]); a non-integer or a value below 1 is
+/// `-32602` in the landed rm-840 wording (name the field, name what
+/// the host sent) — the CLI's rc2 usage-error twin, not an execution
+/// failure.
+fn parse_limit_argument(arguments: &Value) -> Result<usize, String> {
+    match arguments.get("limit") {
+        None | Some(Value::Null) => Ok(SESSIONS_LIMIT_DEFAULT),
+        Some(Value::Number(number)) => match number.as_i64() {
+            Some(limit) if limit >= 1 => Ok(limit as usize),
+            Some(limit) => Err(format!(
+                "Invalid params: `limit` must be at least 1 (got {limit})"
+            )),
+            None => Err(format!(
+                "Invalid params: `limit` must be an integer (got {number})"
+            )),
+        },
+        Some(other) => Err(format!(
+            "Invalid params: `limit` for tool `session_list` must be an \
+             integer when present, got {}",
+            json_type_name(other)
+        )),
+    }
+}
+
+/// Parse `session_detail`'s required `rank` argument (rm-455 arm 1,
+/// run e9eb92e2 cycle 6). `rank` is REQUIRED — a rank-less detail
+/// call has no session to render — and must be an integer ≥ 1 (1 =
+/// the most recent session in the `--sessions` order). Out-of-window
+/// ranks are NOT a params error: a rank past the listing's end is an
+/// execution outcome and answers an `isError` result, exactly like
+/// the CLI's `--inspect` bail.
+fn parse_rank_argument(arguments: &Value) -> Result<usize, String> {
+    match arguments.get("rank") {
+        None | Some(Value::Null) => Err(
+            "Invalid params: `rank` for tool `session_detail` is required \
+             (1-based position in the session_list order)"
+                .to_string(),
+        ),
+        Some(Value::Number(number)) => match number.as_i64() {
+            Some(rank) if rank >= 1 => Ok(rank as usize),
+            Some(rank) => {
+                Err(format!("Invalid params: `rank` must be at least 1 (got {rank})"))
+            }
+            None => Err(format!(
+                "Invalid params: `rank` must be an integer (got {number})"
+            )),
+        },
+        Some(other) => Err(format!(
+            "Invalid params: `rank` for tool `session_detail` must be an \
+             integer when present, got {}",
+            json_type_name(other)
+        )),
     }
 }
 

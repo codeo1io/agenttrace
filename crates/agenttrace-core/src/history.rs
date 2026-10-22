@@ -143,21 +143,62 @@ fn records_from_bytes(path: &Path, raw: &[u8]) -> BTreeMap<String, DerivedSessio
             // `<name>.json.corrupt`, `.corrupt.1`, `.corrupt.2`, ...;
             // the bound only guards a pathological directory (the
             // last slot is reused rather than looping forever).
+            // rm-455 arm 3 (run e9eb92e2 cycle 6): the stack only
+            // advances over names a rename could actually clobber —
+            // an existing FILE. A directory (or any other blocker) at
+            // a candidate name can never be renamed onto (EISDIR),
+            // and bumping past it used to turn an honest rename
+            // failure into a silent success at `.corrupt.N` while
+            // the operator was told the FIRST name had it.
             let mut quarantine = path.with_extension("json.corrupt");
             let mut generation = 0u32;
-            while quarantine.exists() && generation < 10_000 {
+            while quarantine.is_file() && generation < 10_000 {
                 generation += 1;
                 quarantine = path.with_extension(format!("json.corrupt.{generation}"));
             }
-            let _ = std::fs::rename(path, &quarantine);
-            eprintln!(
-                "agenttrace: history file {} was unreadable; quarantined as {} (new history starts empty)",
-                path.display(),
-                quarantine.display()
-            );
+            // rm-455 arm 3 (run e9eb92e2 cycle 6): the pre-fix code
+            // printed "quarantined as <name>" UNCONDITIONALLY — a
+            // failed rename (a directory planted at the quarantine
+            // name, a read-only parent, EBUSY) told the operator a
+            // forensic copy existed while the next history write
+            // would silently replace the only original. The
+            // disclosure now states the true outcome of the rename.
+            match std::fs::rename(path, &quarantine) {
+                Ok(()) => eprintln!("{}", quarantine_success_message(path, &quarantine)),
+                Err(error) => {
+                    eprintln!("{}", quarantine_failure_message(path, &quarantine, &error))
+                }
+            }
             BTreeMap::new()
         }
     }
+}
+
+/// The honest quarantine disclosure for a rename that SUCCEEDED: names
+/// the forensic copy the corrupt bytes now live in (the landed rm-703
+/// wording, unchanged).
+fn quarantine_success_message(path: &Path, quarantine: &Path) -> String {
+    format!(
+        "agenttrace: history file {} was unreadable; quarantined as {} (new history starts empty)",
+        path.display(),
+        quarantine.display()
+    )
+}
+
+/// The honest quarantine disclosure for a rename that FAILED (rm-455
+/// arm 3, run e9eb92e2 cycle 6): the io error rides verbatim, the
+/// blocked quarantine name is stated, and the operator is told what
+/// happens next — the corrupt original stays in place and the next
+/// history write will replace it, so the bytes must be copied NOW if
+/// they matter. Pure so the pin can assert both outcomes without
+/// capturing stderr.
+fn quarantine_failure_message(path: &Path, quarantine: &Path, error: &std::io::Error) -> String {
+    format!(
+        "agenttrace: history file {} was unreadable and could NOT be quarantined as {} ({}); the corrupt original stays in place and the next history write will replace it — copy the bytes now if they matter",
+        path.display(),
+        quarantine.display(),
+        error
+    )
 }
 
 fn decode_records(raw: &[u8]) -> BTreeMap<String, DerivedSession> {
@@ -818,6 +859,90 @@ mod tests {
         assert_eq!(restored.metrics.subagent_cost, 0.0);
         assert_eq!(restored.metrics.subagent_tokens, 0);
         assert!(restored.metrics.parent_session.is_empty());
+    }
+
+    #[test]
+    fn quarantine_rename_failure_is_disclosed_not_lied_about() {
+        // rm-455 arm 3 (run e9eb92e2 cycle 6): the pre-fix code printed
+        // "quarantined as <name>" UNCONDITIONALLY — when the rename
+        // failed (a directory planted at the quarantine name, a
+        // read-only parent, EBUSY), the operator was told a forensic
+        // copy existed while the next history write silently replaced
+        // the only original. The disclosure must state the true
+        // outcome: success names the quarantine path; failure names
+        // the io error verbatim and says the original stays in place
+        // and will be replaced — the bytes must be copied now if they
+        // matter.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-quarantine-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let history = root.join("history.json");
+        let corrupt = b"{not json";
+        std::fs::write(&history, corrupt).expect("plant corrupt history");
+        // A directory at the first quarantine name makes the rename
+        // fail deterministically (rename(2): file onto a directory is
+        // EISDIR) — the red-first stand-in for every io failure.
+        std::fs::create_dir_all(root.join("history.json.corrupt"))
+            .expect("plant quarantine blocker");
+
+        let records = records_from_bytes(&history, corrupt);
+        assert!(
+            records.is_empty(),
+            "an unreadable history still yields an empty map — the tool keeps working"
+        );
+        assert!(
+            history.exists(),
+            "the corrupt original must still be in place when the rename failed"
+        );
+        assert_eq!(
+            corrupt.as_slice(),
+            std::fs::read(&history).expect("original bytes").as_slice(),
+            "nothing moved — keep-every-generation forensics preserved for the operator"
+        );
+
+        let blocked = root.join("history.json.corrupt");
+        let failure = quarantine_failure_message(
+            &history,
+            &blocked,
+            &std::io::Error::other("planted directory at the quarantine name"),
+        );
+        assert!(
+            failure.contains("could NOT be quarantined"),
+            "the failure line must deny the quarantine, not claim it: {failure}"
+        );
+        assert!(
+            failure.contains("planted directory at the quarantine name"),
+            "the io error rides verbatim: {failure}"
+        );
+        assert!(
+            failure.contains("history.json.corrupt"),
+            "the blocked quarantine path is named: {failure}"
+        );
+        assert!(
+            failure.contains("replace"),
+            "the line must disclose what happens next to the original: {failure}"
+        );
+        let success = quarantine_success_message(&history, &root.join("history.json.corrupt-1"));
+        assert!(
+            success.contains("quarantined as"),
+            "the success line keeps the landed contract: {success}"
+        );
+
+        // And the honest paths stay honest: with the blocker removed,
+        // the rename succeeds and the corrupt file moves away.
+        std::fs::remove_dir_all(root.join("history.json.corrupt"))
+            .expect("unblock quarantine");
+        let records = records_from_bytes(&history, corrupt);
+        assert!(records.is_empty());
+        assert!(
+            !history.exists(),
+            "the quarantine rename moved the corrupt original away"
+        );
+        assert!(root.join("history.json.corrupt").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
