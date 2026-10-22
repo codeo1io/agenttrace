@@ -2679,16 +2679,35 @@ fn error_stderr_carries_the_anyhow_cause_chain() {
 
     let enospc_err = String::from_utf8_lossy(&enospc.stderr);
     let eisdir_err = String::from_utf8_lossy(&eisdir.stderr);
-    for (label, code, stderr) in [
-        ("enospc", enospc.status.code(), &enospc_err),
-        ("eisdir", eisdir.status.code(), &eisdir_err),
-    ] {
-        assert_eq!(code, Some(1), "{label}: exit code unchanged: {stderr}");
-        assert!(
-            stderr.contains("Error: writing report output file"),
-            "{label}: context site still leads the chain: {stderr}"
-        );
-    }
+    assert_eq!(
+        enospc.status.code(),
+        Some(1),
+        "enospc: exit code unchanged: {enospc_err}"
+    );
+    assert!(
+        enospc_err.contains("Error: writing report output file"),
+        "enospc: context site still leads the chain: {enospc_err}"
+    );
+    // rm-784 rider (run 7eb6138c cycle 3) rebased this arm: an
+    // existing DIRECTORY as the -o target no longer falls through to
+    // the atomic stage-and-rename (whose rename(2) onto a directory
+    // fails with a bare, path-less EISDIR under the write context) —
+    // it is refused UP FRONT with the requested path and the reason,
+    // mirroring the fifo/socket/block-device refusal. rm-610's honesty
+    // goal (the underlying cause kind must be distinguishable in
+    // stderr, exit stays 1) moves to the refusal wording; the ENOSPC
+    // arm above still pins the raw cause-chain-through-context
+    // contract for genuine write failures.
+    assert_eq!(
+        eisdir.status.code(),
+        Some(1),
+        "eisdir: exit code unchanged: {eisdir_err}"
+    );
+    assert!(
+        eisdir_err.contains("refusing to write -o")
+            && eisdir_err.contains("it is an existing directory"),
+        "eisdir: the refusal names the target and the reason: {eisdir_err}"
+    );
     assert!(
         enospc_err.contains("No space left on device")
             || enospc_err.contains("Permission denied")
@@ -2698,8 +2717,8 @@ fn error_stderr_carries_the_anyhow_cause_chain() {
          next to /dev/full, the honest cause is EACCES): {enospc_err}"
     );
     assert!(
-        eisdir_err.contains("Is a directory"),
-        "EISDIR cause must be visible through the context site: {eisdir_err}"
+        eisdir_err.contains("Is a directory") || eisdir_err.contains("existing directory"),
+        "EISDIR cause must be visible: {eisdir_err}"
     );
     assert_ne!(
         enospc_err, eisdir_err,

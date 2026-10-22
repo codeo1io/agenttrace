@@ -213,3 +213,75 @@ authority. Numbered 11 at mint: sibling run 5c144613's unlanded band
 every `.git` ancestor; pristine-base triage) — theirs keep 9–10 at any
 fold where both land, this stays 11 (the Rule 7→8 renumber precedent).
 
+
+## Rule 12 — No golden may pin a wall-clock-derived count (2026-10-21)
+
+If a test asserts byte-equality against a golden artifact (svg card, snapshot,
+fixture) and any part of that artifact is derived from `Utc::now()` (or any
+wall-clock read), the golden is a TIME BOMB: it passes until the wall clock
+crosses the next boundary, then reds forever with a one-field diff that looks
+like an unrelated regression.
+
+1. Anchor the derived computation to the artifact's own source date (the
+   pricing snapshot's date, the fixture's recorded date), never to `now()`.
+2. Regenerate the golden once after anchoring, and record the regen in the
+   same change (do not hand-edit the golden to match the new output).
+3. Pin a red-first future-date fixture: set the source date forward past the
+   next boundary and assert the output (and the golden) are stable.
+
+   Incident — 2026-10-21 cycle-3 full validation (run 7eb6138c, full 916316b4):
+   `golden_bytes_are_pinned_for_the_demo_corpus` (svg_card_contract) passed in
+   the battery run stamped 2026-10-20T23:07Z and failed the contiguous matrix
+   run on 2026-10-21 with exactly `215 of 4441` vs golden `215 of 4443`
+   (demo-auto.svg:1467) on the same target dir and binary.
+   `build_pricing_census` (reports.rs:1674-1712) counts
+   `deprecation_date <= Utc::now().date_naive()`, so the svg footer's
+   "priced models past vendor deprecation" count is date-relative while the
+   golden pins bytes; the census ticked 4443 -> 4441 across UTC midnight as
+   dated-retirement keys fell out of the priced base. NOT fixed in that cycle
+   (a reports.rs edit would have falsified the cycle's verbatim digest
+   declaration); cure registered as the next-cycle lead on rm-176.
+
+   RECORDED-CASE CORRECTION (2026-10-21, independent review 4ddc66b7 / review
+   fix 5754f998): the incident was FALSIFIED as a date bomb — every mechanic
+   above was checked live and did not hold: `build_pricing_census` does not
+   exist in the tree, reports.rs:1674-1712 is the text report's anomalies
+   section, the deprecation census is snapshot-anchored never wall-clock
+   (`bundled_snapshot_deprecated` pricing.rs:587-607 keys
+   PRICING_SNAPSHOT_DATE; `catalog_source` pricing.rs:795-809 filters
+   `past_deprecated(price, catalog.reference_date)`, the rm-419 "never the
+   wall clock" anchor), demo-auto.svg is a 50-line file with no :1467, the
+   checked-in goldens pin `215 of 4441` (so the `4443` was the STALE side,
+   not the golden), and the golden test PASSED 2026-10-21 on fresh
+   private-target binaries. The observed red was the Rule 13 stale-binary
+   class (an older bundled snapshot regenerating 4443 against the checked-in
+   4441 goldens on a shared CARGO_TARGET_DIR). The rule STANDS as a
+   prevention principle for any genuinely wall-clock-derived count (and is
+   already satisfied by rm-419); the registered next-cycle cure lead is
+   retired. Recorded here so the rule's own case history stays honest —
+   which is itself the point of this document.
+
+## Rule 13 — Distrust quick greens from a fleet-shared CARGO_TARGET_DIR (2026-10-21)
+
+A shared `CARGO_TARGET_DIR` (conductor scratch, `~/.cache/...`) accumulates
+binaries and fingerprints from every sibling worktree on the host. Cargo's
+mtime-fingerprint cache can then serve you a STALE artifact in three ways:
+a clippy run "finishing" in <1s on freshly-edited sources, a filtered test
+run reporting a test count from a sibling's larger test binary, and a
+first-run-green that is really last-run-green.
+
+1. Before trusting any quick green on a shared target dir, `touch` the changed
+   `.rs` files (mtime-fingerprint bust) and re-run; a sudden drop in runtime
+   (0.47s vs 27.92s clippy) is the tell.
+2. Cross-check reported test counts against the tree you are actually testing
+   (`461` lib tests in-tree vs `483 filtered` from a 484-test sibling binary).
+3. Prefer a per-attempt target dir for evidence-grade runs; a shared dir is
+   acceptable only for warm compile caches, never for the deciding run.
+
+   Incident — 2026-10-21 cycle-3 targeted validation (run 7eb6138c, targeted
+   0f78932d): the first clippy run reported rc0 in 0.47s (stale cache) and an
+   overview_summary run reported `1 passed / 483 filtered` from a sibling's
+   484-test binary while the tree under test has 461 lib tests; after the
+   fingerprint bust, clippy took 27.92s fresh and every lane was re-run green
+   from the current binary. Companion to the rm-241 shared-target-dir family
+   (wrong-binary selection); this rule covers the mtime-fingerprint class.

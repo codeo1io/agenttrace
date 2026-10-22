@@ -1483,7 +1483,15 @@ pub fn is_session_file_name(name: &str) -> bool {
     if name.ends_with(".lock") {
         return false;
     }
-    name.ends_with(".jsonl") || name.ends_with(".json")
+    // rm-992 (run e4209f0c, cycle-3 research RC1 landing): codex
+    // compresses completed rollouts with zstd while leaving the
+    // `.jsonl.zst` extension intact (verified live: upstream codex
+    // rust-v0.164.0 rollout writes), so a name-only gate must admit
+    // the extension or every completed codex session silently
+    // disappears from `--dir` walks (the parser already sniffs the
+    // zstd magic bytes and decodes via decode_zstd_rollout_bounded —
+    // admission is the only missing half).
+    name.ends_with(".jsonl") || name.ends_with(".jsonl.zst") || name.ends_with(".json")
 }
 
 fn max_session_dir_depth(dir: &Path) -> usize {

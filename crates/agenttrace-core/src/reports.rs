@@ -2571,7 +2571,18 @@ fn overview_summary(overview: &Overview, sessions: &[Session]) -> Value {
         .map(|s| s.metrics.tool_calls_ok + s.metrics.tool_calls_fail)
         .sum();
     let failed_tools: usize = sessions.iter().map(|s| s.metrics.tool_calls_fail).sum();
-    let total_duration: f64 = sessions.iter().map(|s| s.metrics.duration_sec).sum();
+    // rm-1500 rider (run 7eb6138c cycle 3): a non-finite per-session
+    // duration (hostile/absurd timestamp spans) used to poison this
+    // fold — round4(NaN/inf) serialized as JSON null while the html
+    // and markdown twins printed the raw literals. Mirroring the nine
+    // gated cost-fold sites, the total gates on is_finite: the sum
+    // stays a number, and the offending rows remain visible as
+    // per-session values instead of silently zeroing the report total.
+    let total_duration: f64 = sessions
+        .iter()
+        .map(|s| s.metrics.duration_sec)
+        .filter(|duration| duration.is_finite())
+        .sum();
     let anomalies_total = overview.anomalies_top.len();
     let authority_counts = authority_counts(sessions);
     let highest = highest_authority(sessions);
@@ -4018,6 +4029,52 @@ mod tests {
         let sessions = vec![session.clone(), session];
         let summary = overview_summary(&crate::Overview::default(), &sessions);
         assert_eq!(summary["total_tokens"].as_i64(), Some(i64::MAX));
+    }
+
+    #[test]
+    fn overview_summary_excludes_non_finite_durations_from_the_total() {
+        // rm-1500 rider (run 7eb6138c cycle 3): a NaN/±inf per-session
+        // duration (hostile timestamp spans) used to poison the fold —
+        // the JSON lane serialized it as a bare `null`-literals problem
+        // while the markdown/html twins printed `NaN`/`inf` verbatim,
+        // so the three format twins disagreed about the same corpus.
+        // Mirroring the nine gated cost-fold sites, non-finite
+        // durations are EXCLUDED from the total (the finite remainder
+        // stays a number); the offending rows keep their own values so
+        // the poison remains visible per-session instead of zeroing
+        // the report total.
+        let mut poisoned = Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "adversarial-duration".to_string(),
+            path: "/tmp/adversarial-duration.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                duration_sec: f64::INFINITY,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let mut finite = poisoned.clone();
+        finite.metrics.duration_sec = 12.5;
+        let summary = overview_summary(&crate::Overview::default(), &[poisoned.clone(), finite]);
+        assert_eq!(
+            summary["total_duration_seconds"].as_f64(),
+            Some(12.5),
+            "the fold must keep the finite remainder, not the poison: {summary}"
+        );
+        // The NaN twin poisons the same way — excluded, never propagated.
+        poisoned.metrics.duration_sec = f64::NAN;
+        let summary = overview_summary(&crate::Overview::default(), &[poisoned]);
+        assert_eq!(
+            summary["total_duration_seconds"].as_f64(),
+            Some(0.0),
+            "an all-non-finite corpus must total 0, not NaN: {summary}"
+        );
     }
 
     #[test]
