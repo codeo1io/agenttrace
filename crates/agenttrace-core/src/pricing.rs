@@ -18,7 +18,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-22";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();

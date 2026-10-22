@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read as _;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BaselineThresholds {
@@ -1391,16 +1392,52 @@ fn render_recommendations_markdown(out: &mut String, items: &[crate::Recommendat
 /// numeric fields (`total_duration_seconds`, `total_cost`, `total_tokens`) are
 /// required up front, so an empty or partial summary cannot zero-fill its way
 /// into a fabricated +100% regression.
+/// rm-2345 (rm-569 extension, run d5e143bce25e cycle 7): read the
+/// `--baseline` file bounded by the crate-wide read cap — the same
+/// metadata-fast-path + `take(cap + 1)` discipline as
+/// `parser::read_session_file_bounded`. The baseline is
+/// operator-supplied untrusted input on the compare gate; an
+/// unbounded `fs::read_to_string` loaded a huge (or TOCTOU-growing)
+/// file into memory whole before the first parse. The refusal is
+/// attributed to `--baseline` and discloses the actual size and the
+/// cap (raise/lower via `AGENTTRACE_FILE_CAP_BYTES`, the same knob
+/// `parser::file_read_cap_bytes` honors).
+fn read_baseline_text_capped(baseline_path: &str) -> anyhow::Result<String> {
+    let cap = crate::parser::file_read_cap_bytes();
+    let path = std::path::Path::new(baseline_path);
+    let metadata_len = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if metadata_len > cap {
+        anyhow::bail!(
+            "--baseline: {baseline_path} is {metadata_len} bytes and exceeds the {cap}-byte \
+             read cap (AGENTTRACE_FILE_CAP_BYTES); refusing the read — regenerate a smaller \
+             baseline or raise the cap"
+        );
+    }
+    let mut bytes = Vec::new();
+    let read = std::io::Read::take(
+        fs::File::open(path).map_err(|err| {
+            anyhow::anyhow!("--baseline: failed to read baseline file {baseline_path}: {err}")
+        })?,
+        cap.saturating_add(1),
+    )
+    .read_to_end(&mut bytes)
+    .map_err(|err| {
+        anyhow::anyhow!("--baseline: failed to read baseline file {baseline_path}: {err}")
+    })?;
+    if read as u64 > cap {
+        anyhow::bail!(
+            "--baseline: {baseline_path} grew past the {cap}-byte read cap while reading \
+             ({read} bytes); refusing the read — regenerate a smaller baseline or raise the cap"
+        );
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| anyhow::anyhow!("--baseline: {baseline_path} is not valid UTF-8: {err}"))
+}
+
 fn load_baseline_report(baseline_path: &str) -> anyhow::Result<Value> {
-    let baseline_text = match fs::read_to_string(baseline_path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
-            anyhow::bail!("--baseline: {baseline_path} is not valid UTF-8: {err}");
-        }
-        Err(err) => {
-            anyhow::bail!("--baseline: failed to read baseline file {baseline_path}: {err}");
-        }
-    };
+    let baseline_text = read_baseline_text_capped(baseline_path)?;
     let baseline: Value = serde_json::from_str(&baseline_text)
         .map_err(|err| anyhow::anyhow!("--baseline: {baseline_path} is not valid JSON: {err}"))?;
     let Some(summary) = baseline.get("summary").and_then(Value::as_object) else {
@@ -4628,5 +4665,34 @@ mod tests {
         // HTML lane carries the same marker.
         let html = report_overview_html(&overview, &sessions);
         assert!(html.contains("(fallback pricing)"));
+    }
+
+    #[test]
+    fn baseline_read_refuses_files_past_the_read_cap() {
+        // rm-2345 (rm-569 extension, run d5e143bce25e cycle 7): the
+        // --baseline file is operator-supplied untrusted input, and
+        // load_baseline_report read it with fs::read_to_string
+        // unbounded — a huge (or TOCTOU-growing) baseline loaded into
+        // memory whole before the first parse. The read must refuse
+        // past the crate-wide read cap (FILE_READ_CAP_BYTES, the
+        // parser::read_session_file_bounded idiom) with an attributed
+        // error disclosing the cap and the actual size, not a
+        // confusing late JSON error.
+        let dir = std::env::temp_dir().join(format!("at-baseline-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oversized-baseline.json");
+        // Sparse file: the length crosses the cap without any disk use.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(crate::FILE_READ_CAP_BYTES + 1)
+            .unwrap();
+        let err = load_baseline_report(path.to_str().unwrap()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exceeds the") && msg.contains("read cap"),
+            "refusal must disclose the cap and the size, got: {msg}"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 }

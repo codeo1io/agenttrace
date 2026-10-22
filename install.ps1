@@ -30,10 +30,35 @@ $REPO = "luoyuctl/agenttrace"
 $BIN = "agenttrace.exe"
 
 # Detect architecture
-$ARCH = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
+# rm-550 (run d5e143bce25e cycle 7, ported from upstream #314): a
+# 32-bit PowerShell process on a 64-bit Windows host reports "X86" for
+# ProcessArchitecture — WOW64. On such a host the real machine
+# architecture is named by PROCESSOR_ARCHITEW6432, so consult it
+# before giving up (ARM64 hosts running x86 emulation report "ARM64"
+# there). PSReadLine 2.0 in interactive 5.1 sessions can also shadow
+# RuntimeInformation entirely (upstream #314), so treat a type-resolution
+# failure as "unknown" and use the environment as the fallback source.
+$ProcArch = try {
+    "$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)"
+} catch {
+    ""
+}
+if (-not $ProcArch -or $ProcArch -eq "X86") {
+    $EnvArch = if ($env:PROCESSOR_ARCHITEW6432) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+    $ProcArch = switch ("$EnvArch") {
+        "AMD64" { "X64" }
+        "ARM64" { "Arm64" }
+        default  { $ProcArch }
+    }
+}
+$ARCH = switch ($ProcArch) {
     "X64"   { "amd64" }
     "Arm64" { "arm64" }
-    default { throw "Unsupported architecture: $_" }
+    default { throw "Unsupported architecture: '$ProcArch'" }
 }
 
 $Pinned = $Version -ne "latest"

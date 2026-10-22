@@ -94,3 +94,59 @@ fn cache_rate_census_body() {
         census.models
     );
 }
+
+#[test]
+fn vendored_bundle_prices_gemini_4_argon_exactly() {
+    support::with_isolated_pricing_env(gemini_4_argon_price_body);
+}
+
+fn gemini_4_argon_price_body() {
+    // rm-176 (run d5e143bce25e cycle 7): the 2026-10-08 bundle carried
+    // ZERO gemini-4* rows while the live source had priced the argon
+    // family since 2026-10-19, so every gemini-4 session fell back to
+    // the $3/$15 default — a 1.5x overstatement on both axes for the
+    // 2e-6/1e-5 rows. Red-first pin for the 2026-10-22 union refresh
+    // (scripts/pricing/update-snapshot.sh): hold the exact refreshed
+    // rates so a future refresh that loses or corrupts the family goes
+    // red here instead of silently re-enabling the fallback.
+    // Per-million units (Price is $/Mtok). Isolated like the census
+    // arm (rm-1954) — the public lookup lane prefers a machine cache
+    // over the bundle.
+    assert!(
+        agenttrace_core::has_specific_price("gemini/gemini-4-argon"),
+        "the gemini first-party argon row must be priced, not defaulted"
+    );
+    let price = agenttrace_core::lookup_price("gemini/gemini-4-argon");
+    // Live rates 2026-10-22: 2e-6 in / 1e-5 out / 1e-7 cache-read per
+    // token; no published cache-write rate (the disclosed rm-1508
+    // fallback bills it at input x 1.25).
+    let eps = 1e-12;
+    assert!((price.input - 2.0).abs() < eps, "input {}", price.input);
+    assert!((price.output - 10.0).abs() < eps, "output {}", price.output);
+    assert!((price.cr.unwrap() - 0.1).abs() < eps, "cr {:?}", price.cr);
+    assert!(
+        price.cw.is_none(),
+        "cw stays unpublished (None), never zero-filled: {:?}",
+        price.cw
+    );
+    let (billed_cw, fallback) = price.cache_write_billed();
+    assert!(
+        fallback,
+        "absent cache-write must bill at the disclosed fallback"
+    );
+    assert!((billed_cw - 2.5).abs() < eps, "fallback is input x 1.25: {billed_cw}");
+    // The reseller-qualified argon rows land with the same refresh:
+    // vertex_ai x2 (cyber-permissive at 4e-6/2e-5) and github_copilot
+    // (200k context). Same exact-rate discipline on each qualified key.
+    for (key, input, output) in [
+        ("vertex_ai/gemini-4-argon", 2.0, 10.0),
+        ("vertex_ai/gemini-4-argon-cyber-permissive", 4.0, 20.0),
+        ("github_copilot/gemini-4-argon", 2.0, 10.0),
+    ] {
+        let p = agenttrace_core::lookup_price(key);
+        assert!((p.input - input).abs() < eps, "{key} input {}", p.input);
+        assert!((p.output - output).abs() < eps, "{key} output {}", p.output);
+    }
+    // The fallback this replaces is default_price() $3/$15 per M —
+    // 1.5x the true rates on both axes (pricing.rs default_price).
+}
