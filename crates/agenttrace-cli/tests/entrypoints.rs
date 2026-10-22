@@ -870,6 +870,8 @@ fn statusline_host_mode_never_fails_the_host() {
     let _ = std::fs::remove_dir_all(cache);
 }
 
+#[cfg(target_os = "linux")] // /dev/full is a Linux special file; macOS and
+// Windows have no ENOSPC-on-write device node.
 #[test]
 fn statusline_host_mode_survives_stdout_write_failure() {
     // Review F2 (cycle 7): the host contract is exit 0 for any input —
@@ -2656,6 +2658,10 @@ fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(target_os = "linux")]
+// the ENOSPC leg needs /dev/full; the EISDIR
+// leg it shares this test with is pinned by
+// sibling directory-target tests on other OSes.
 #[test]
 fn error_stderr_carries_the_anyhow_cause_chain() {
     // rm-610: the top-level handler printed `Error: {err}`, and
@@ -3513,6 +3519,30 @@ fn count_honesty_disclosures_in_cli_lanes() {
     );
     // A negative recorded cost (-5.0): rejected, never folded.
     write("gamma/neg.jsonl", &pi_journal("-5.0"));
+    // Deterministic survivor: the aggregation walk orders candidates
+    // newest-mtime-first and the rm-1886 content dedup keeps the
+    // first-seen path, so alpha (written first) and beta (written
+    // microseconds later) race for survival whenever the two writes
+    // share a filesystem mtime tick — the disclosure pair then flips
+    // between runs (the macOS lane flake in this suite). Pin alpha
+    // strictly NEWER so it survives on the mtime-ordered base; alpha
+    // also sorts before beta canonically, so a path-ordered dedup base
+    // names the same survivor.
+    let pin_mtime = |rel: &str, age: std::time::Duration| {
+        let stamped = std::time::SystemTime::now() - age;
+        std::fs::File::options()
+            .write(true)
+            .open(sessions.join(rel))
+            .expect("open fixture for mtime pin")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(stamped)
+                    .set_modified(stamped),
+            )
+            .expect("pin fixture mtime");
+    };
+    pin_mtime("alpha/a.jsonl", std::time::Duration::from_secs(4));
+    pin_mtime("beta/b.jsonl", std::time::Duration::from_secs(11));
 
     let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .args(["--audit", "-f", "json", "--range", "all"])

@@ -17,7 +17,10 @@ jobs:
     name: Verify release sources
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    # ubuntu-22.04 keeps every release-side build on the glibc 2.35
+    # floor the smoke lane guards; ubuntu-latest (24.04) would stamp
+    # the shipped binaries with its newer glibc.
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -55,11 +58,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux targets cross-compile the arm64 build on ubuntu
-          - os: ubuntu-latest
+          # Linux targets cross-compile the arm64 build on ubuntu;
+          # ubuntu-22.04 holds the shipped glibc floor at 2.35.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset: agenttrace-linux-amd64
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             asset: agenttrace-linux-arm64
           # Darwin targets need the Apple SDK — build natively on macOS runners
@@ -131,7 +135,8 @@ jobs:
   release:
     name: Publish GitHub release
     needs: [build, verify]
-    runs-on: ubuntu-latest
+    # Same glibc-floor rationale as the build/verify jobs.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
       attestations: write

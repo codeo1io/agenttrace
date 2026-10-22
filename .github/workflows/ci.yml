@@ -113,7 +113,9 @@ jobs:
       fail-fast: false
       matrix:
         # Linux tests run under the coverage job.
-        os: [macos-14, windows-latest]
+        # macos-14 brownout opens 2026-10-23 and the image retires
+        # 2026-11-02; macos-15 is the current stable Intel runner.
+        os: [macos-15, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -222,7 +224,10 @@ jobs:
 
   smoke:
     name: Release binary smoke
-    runs-on: ubuntu-latest
+    # ubuntu-22.04 keeps the release-binary build on the glibc 2.35
+    # floor the install-time guard enforces (ubuntu-latest is 24.04,
+    # whose glibc 2.39 toolchain leaks into the shipped binary).
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
       AGENTTRACE_BIN: target/release/agenttrace
