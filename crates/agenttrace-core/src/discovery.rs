@@ -76,7 +76,7 @@ pub struct LoadReport {
     /// they exceed `OPENCODE_INFO_DOC_READ_CAP_BYTES` (rm-212 admits them
     /// by file-kind). The skip is disclosed here, never silent, and the
     /// transcript stays aggregated — no fork verdict is derivable without
-    /// the doc. Rides separately from [`SuppressedSessions`]: an over-cap
+    /// the doc. Rides separately from `SuppressedSessions`: an over-cap
     /// doc is NOT an aggregation suppression (the session stays admitted),
     /// only its probe read was refused.
     pub opencode_info_docs_skipped_over_cap: usize,

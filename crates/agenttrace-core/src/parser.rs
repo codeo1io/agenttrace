@@ -6878,6 +6878,9 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 index.clear();
                 for record in replacement.iter().filter_map(Value::as_object) {
                     if let Some(id) = gemini_chats_message_id(record) {
+                        if gemini_chats_is_resume_twin(&id, &index) {
+                            continue;
+                        }
                         gemini_chats_upsert(&mut messages, &mut index, id, record.clone());
                     }
                 }
@@ -6900,6 +6903,24 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             continue;
         }
         if let Some(id) = gemini_chats_message_id(obj) {
+            // #29618 resume twin (rm-715): a `X_response` record whose
+            // base `X` is already in the journal is the v0.64.0
+            // resume-path duplicate — the writer's history
+            // reconstruction (utils/sessionUtils.ts
+            // `convertSessionToClientHistory`, v0.64.0) synthesized a
+            // `${msg.id}_response` user turn for every tool call
+            // carrying a result even when a live user turn already
+            // covered it, and `updateMessagesFromHistory` persisted
+            // the synthesis into the journal. Its content duplicates
+            // what the base record's `toolCalls[].result` (and/or the
+            // live response turn) already carries, so it bills
+            // nowhere — skip it exactly where the v0.65.0 reader
+            // recovers "previously inflated recordings". Base-gated:
+            // when the base was evicted by the writer's history
+            // window, the twin is the only carrier and still bills.
+            if gemini_chats_is_resume_twin(&id, &index) {
+                continue;
+            }
             gemini_chats_upsert(&mut messages, &mut index, id, obj.clone());
         }
     }
@@ -6913,18 +6934,49 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
 /// O(1) id upsert for [`parse_gemini_chats_jsonl`] — replace in
 /// place when the reader would (pushMessage re-appends the full record
 /// with tokens/toolCalls attached), append at the tail otherwise.
+/// Replace carries `model`/`toolCalls`/`tokens` forward from the
+/// existing record when the re-append omits them (rm-715, #29618): a
+/// v0.64.0 resume replayed the whole history as content-only records
+/// (initialize() reset `messages: []` and updateMessagesFromHistory
+/// re-appended every turn), so a bare replace-in-place silently
+/// zeroed the recorded token summary of every replayed turn; the
+/// tokens-attach re-append always carries the fields itself and is
+/// unaffected by the merge.
 fn gemini_chats_upsert(
     messages: &mut Vec<(String, JsonObject)>,
     index: &mut HashMap<String, usize>,
     id: String,
-    record: JsonObject,
+    mut record: JsonObject,
 ) {
     match index.get(&id) {
-        Some(slot) => messages[*slot].1 = record,
+        Some(slot) => {
+            {
+                let existing = &messages[*slot].1;
+                for field in ["model", "toolCalls", "tokens"] {
+                    if !record.contains_key(field) {
+                        if let Some(value) = existing.get(field) {
+                            record.insert(field.to_string(), value.clone());
+                        }
+                    }
+                }
+            }
+            messages[*slot].1 = record;
+        }
         None => {
             index.insert(id.clone(), messages.len());
             messages.push((id, record));
         }
+    }
+}
+
+/// True when `id` is the writer's resume-path duplicate marker for a
+/// base record already present in the journal: `<base>_response` (see
+/// the #29618 note at the upsert call site). Empty bases never fold —
+/// a bare `_response` id is not the marker.
+fn gemini_chats_is_resume_twin(id: &str, index: &HashMap<String, usize>) -> bool {
+    match id.strip_suffix("_response") {
+        Some(base) if !base.is_empty() => index.contains_key(base),
+        _ => false,
     }
 }
 

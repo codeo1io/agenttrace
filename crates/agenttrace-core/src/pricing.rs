@@ -60,7 +60,7 @@ pub struct Price {
     /// `cache_creation_input_token_cost`). `None` = the vendor row
     /// publishes no cache rate (rm-1508) — distinct from `Some(0.0)`,
     /// which is a published $0. Absent rates bill at the disclosed
-    /// fallback (input × [`CACHE_WRITE_FALLBACK_MULTIPLE`]), never a
+    /// fallback (input × `CACHE_WRITE_FALLBACK_MULTIPLE`), never a
     /// silent $0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cw: Option<f64>,
@@ -138,7 +138,7 @@ impl Price {
 
     /// The cache-write rate a session bills at, and whether it is the
     /// rm-1508 absent-rate fallback (input ×
-    /// [`CACHE_WRITE_FALLBACK_MULTIPLE`]).
+    /// `CACHE_WRITE_FALLBACK_MULTIPLE`).
     pub fn cache_write_billed(&self) -> (f64, bool) {
         match self.cw {
             Some(rate) => (rate, false),

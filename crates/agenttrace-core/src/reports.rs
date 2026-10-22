@@ -3499,7 +3499,7 @@ fn build_incident_timeline(session: &Session) -> IncidentTimelineSummary {
 /// rm-895: the ONE truncation policy for the overview by_* spend
 /// families (agent / model / provider / branch). Human-facing
 /// surfaces (text, html, markdown) render at most `GROUP_TAKE` groups
-/// per family — sorted with [`sorted_group_overview`] — and disclose
+/// per family — sorted with `sorted_group_overview` — and disclose
 /// the cut with a `+N more not shown` marker. Machine surfaces
 /// (json, csv) never truncate and carry no marker: full data is their
 /// contract. A policy change is a one-line edit here, and the golden

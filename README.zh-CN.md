@@ -190,6 +190,81 @@ stdin 关闭即退出；对非 UTF-8 的行回 `-32700`、对超过 1 MiB 传输
 [docs/guides/mcp-server.md](docs/guides/mcp-server.md)（英文）。该关键字
 与 `--mcp-governance` 报告过滤标志无关。
 
+### 可分享的用量卡片（SVG）
+
+`--overview -f svg` 渲染单个静态 SVG 文件——总成本、会话数、工具调用、
+Token、按成本排序的模型/项目 Top 榜，以及 14 天日花费迷你图，并带有与
+其它 overview 格式相同的诚实性页脚（窗口、定价来源、数据置信度）。卡片
+对固定的语料 + 范围 + 主题是字节确定的（byte-deterministic），不含任何
+脚本、不做任何网络调用，并对会话来源字符串做转义——恶意的模型名或
+项目名只会被渲染成文本。`--card-theme auto|dark|light` 选择配色（`auto`
+通过 `prefers-color-scheme` 适配查看端，无法适配时优雅回退到浅色）。
+
+```shell
+agenttrace --overview --range 7d -f svg -o usage-week.svg
+agenttrace --overview -f svg --card-theme dark > usage.svg
+```
+
+细节与确定性契约见
+[docs/guides/usage-card.md](docs/guides/usage-card.md)（英文）。
+
+### 定价
+
+每个会话都按二进制内置（vendored）的定价目录快照计价——快照模型意味着
+报告离线可复现，快照的更新入口是 `--update-pricing`（它从上游源刷新，
+然后报告漂移）。按模型的费率覆盖通过 `pricing-overrides.json` 生效（见
+上方英文 README 的示例），优先级链为 `--pricing-file` > 配置文件 >
+`AGENTTRACE_PRICING_FILE`；所有提到定价的指南都链接到这里。
+
+### 从 stdin 读取会话
+
+`agenttrace -`（报告标志写在它之前，例如 `agenttrace --overview -`）
+通过与命名文件相同的解析器从 stdin 读取一条会话流——stdin 会话是临时
+的，从不进入会话缓存。读取默认有 256 MiB 上限（rm-503）：超过上限的流
+会以指名 `stdin session exceeds the read cap` 的错误失败，而不是让进程
+一直增长到分配器死亡；`AGENTTRACE_STDIN_CAP_BYTES` 可提高或降低上限
+（无法解析或非正值会回退到默认值，而不会因为一个写错的旋钮让整次
+运行失败）。
+
+### 命名会话文件同样有上限
+
+命名文件通道（位置参数路径或显式 `--dir` 扫描）通过同一解析器读取，
+准入姿态相同（rm-451）：每个文件默认上限 256 MiB，
+`AGENTTRACE_FILE_CAP_BYTES` 提高或降低该上限（与 stdin 旋钮一样是尽力
+而为的契约），超上限的文件在读发生之前就被以指名 `session file …
+exceeds the …-byte read cap` 的错误拒绝——进程不会为了发现文件无法
+解析而先长到文件那么大。被拒绝的文件会被跳过、从不致命：`--doctor`
+按目录把它们报告为 `read-cap refused`（其 JSON 中为 `read_cap_refused`
+字段），目录扫描的 stderr 提示会指明数量。该上限是准入旋钮而非格式
+契约：拆分文件或通过 stdin 管道输入即可分析超大的转写。
+
+### `--baseline` 与 `--compare`
+
+`--baseline <file>` 让一次 `--overview -f json` 运行与先前保存的
+overview 文档对表：阈值用 `--baseline-max-duration-delta-pct` 及
+token/成本的等价项设置，`--no-baseline-gate` 保留对比但跳过退出码门。
+`--baseline` 需要 `--overview -f json`。
+
+`--compare` 在所选会话上构建双视图对比报告，从不读取 baseline 文档，
+因此把 `--baseline` 与 `--compare` 组合会以退出码 1 失败，错误同时指名
+两个标志，而不是落到一个有误导性的动作错误上。
+
+### 未翻译章节
+
+以下章节以英文 README 为准（标题即锚点，直接搜索即可跳转）。
+
+- `Configuration file`（配置文件分层与逐行注释的 TOML 示例）
+- `CSV statement export (rm-409)`（CSV 账单导出）
+- `Governance reports`（治理报告：8 个子报告的命令示例与说明）
+- `Compressed (zstd) Codex rollouts`（zstd 压缩的 Codex rollout 解析）
+- `--demo` never silently replaces an explicit session source
+- `Quota view`（订阅配额视图）
+- `Statusline capture`（状态行捕获）
+- `CLI flag reference`（完整命令行标志参考表）
+
+（本清单由 `scripts/ci/check-readme-zh-parity.sh` 门禁钉住：英文 README
+新增章节必须要么在此翻译，要么在此按标题让渡，否则 CI 失败。）
+
 ## 自动发现的会话根目录
 
 不传 `-d/--dir` 时，agenttrace 会扫描下列所有自动发现的 Agent 主目录

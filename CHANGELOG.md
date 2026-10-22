@@ -1026,6 +1026,39 @@
 
 ### Fixed
 
+- Gemini CLI chats replays no longer duplicate tool-response turns or
+  zero the recorded usage of replayed records (rm-715 remaining scope,
+  run 940e1aab cycle 4, batch "Gemini 0.65.0 resume-dedup truth
+  (trigger-fired) + doc-truth gates"): the refined trigger fired
+  2026-10-20 when gemini-cli v0.65.0 shipped #29618 ("avoid duplicate
+  tool response turns when resuming sessions"), and agenttrace's
+  chats lane (`parse_gemini_chats_jsonl`) still carried both halves of
+  the v0.64.0 disease. (1) The v0.64.0 resume path synthesized a
+  `${id}_response` user record for every tool call carrying a result —
+  even when a live user turn already covered it — and persisted that
+  synthesis into the journal (`utils/sessionUtils.ts`
+  `convertSessionToClientHistory`), so re-opening a session counted
+  the covering user turn twice; the parser now folds a `<base>_response`
+  twin wherever its base record is already in the journal, exactly
+  where the v0.65.0 reader recovers "previously inflated recordings",
+  and the fold is base-gated (a twin whose base was evicted by the
+  writer's history window is still the only carrier and still bills).
+  (2) The v0.64.0 `initialize()` reset (`messages: []` rebuild, the
+  subagent file-collision path) replayed the whole history as
+  content-only records, and the lane's replace-in-place upsert silently
+  dropped the recorded `model`/`toolCalls`/`tokens` of every replayed
+  turn — a resumed session billed zero for its entire history; the
+  replace path now carries those fields forward when the re-append
+  omits them (the tokens-attach re-append always carried them itself
+  and is unchanged). Pinned red-first in
+  `crates/agenttrace-core/tests/gemini_chats_contract.rs`
+  (`gemini_chats_resume_twin_does_not_duplicate_tool_response`,
+  `gemini_chats_resume_replay_keeps_recorded_tokens`,
+  `gemini_chats_resume_fold_is_base_gated`; pre-fix red: user turn
+  counted 2 vs 1, tokens 400 vs 1400) against synthetic journals
+  shaped from the pinned v0.64.0/v0.65.0 sources
+  (chatRecordingService.ts + sessionUtils.ts).
+
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch
@@ -2146,6 +2179,35 @@
 - The minimum supported Rust version is now 1.89 (1.80 → 1.88 in cycle 1, rm-386; 1.88 → 1.89 in cycle 3, rm-166, for the stabilized `std::fs::File::lock`): `rust-version` matches the dependency-greatest floor, a gated CI lane (schedule/workflow_dispatch) proves the declared floor with `cargo +<floor> check --locked`, and the manifest-alignment gate's expectation moved with it.
 
 ### Build and CI
+
+- The API-doc surface is gated under `-D warnings` (rm-2292, run
+  940e1aab cycle 4): `cargo doc` ran in NO CI lane and no gate script,
+  and the workspace docs carried 11 errors — 10
+  `rustdoc::private_intra_doc_links` (public doc comments linking
+  private items across discovery.rs, otel.rs, pricing.rs, reports.rs,
+  statusline.rs, lib.rs) and one unclosed HTML tag (`<reason>` in
+  lib.rs). The ten broken links are cured to plain code spans (the
+  identifiers stay documented; the public→private link goes), the
+  placeholder is code-spanned, and `scripts/ci/check-docs-rustdoc.sh`
+  pins it red-first (pre-cure tree: rc1 naming all 11; cured tree:
+  rc0) as a `ci.yml` step beside the existing docs gates.
+
+- README.zh-CN.md section parity is pinned, not aspirational
+  (rm-2283, run 940e1aab cycle 4): the fenced-code-aware heading
+  census stood at EN 25 vs zh 12 with no gate — a naive grep census
+  miscounts because both READMEs carry `#` comment lines inside fenced
+  code blocks. Five small EN sections are now ported (定价， 从 stdin
+  读取会话， 命名会话文件同样有上限， `--baseline` 与 `--compare`,
+  可分享的用量卡片（SVG）), the eight large ones (Configuration
+  file, CSV statement export, Governance reports, Compressed (zstd)
+  Codex rollouts, the `--demo` admission section, Quota view,
+  Statusline capture, CLI flag reference) are explicitly ceded to the
+  English README in a named 未翻译章节 block, and
+  `scripts/ci/check-readme-zh-parity.sh` enforces the ledger
+  fenced-aware and in both directions (an EN section must be ported or
+  ceded; a cession must still be named verbatim in the zh file; a zh
+  heading must map back or be allowlisted) — red-first on the pre-port
+  tree (13 uncovered), green after, wired into `ci.yml`.
 
 - Unix-only tests are statically paired with `#[cfg(unix)]` (run 79fe78c0 cycle 3, batch "canonical CI truth"; wall reconciliation rm-993/rm-501, method #18188): thirteen test legs that exercise unix-only syscalls compiled as bare `#[test]`s — the eight symlink-family legs in discovery_contract.rs, the stale-schema masking pins in zero_usage_contract.rs and both copilot_checkpoint_reconciliation.rs legs, the CLI alias-path end-to-end in agenttrace-cli's entrypoints.rs, and the chmod-000 disclosure leg in sqlite_sessions.rs — an E0433 (unresolved `std::os::unix` module) hard error on windows-latest the moment that lane exists. Each now carries `#[cfg(unix)]` above `#[test]`, matching the in-tree gated precedent; no assertion or body changed.
 

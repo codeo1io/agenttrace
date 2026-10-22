@@ -997,7 +997,7 @@ pub struct SearchResult {
     pub tokens: i64,
     pub matches: Vec<String>,
     /// rm-1415: disclosure for this row's bounded transcript re-read lane
-    /// ("scanned (N bytes)" or "skipped: <reason>"); the hand-rolled JSON
+    /// ("scanned (N bytes)" or "skipped: `<reason>`"); the hand-rolled JSON
     /// writers carry it per row.
     pub transcript_scan: String,
 }
@@ -3295,7 +3295,7 @@ fn quota_window_json(window: &QuotaWindow, span: chrono::Duration) -> serde_json
 /// 7am-UTC Monday reset) are not knowable without credentials, which
 /// agenttrace never reads; the JSON says so in `corpus.window_anchor`
 /// instead of inventing them. Spend is TTL-correct per session (see
-/// [`quota_cost_share`]), limits are disclosed-unknown (`limits` is
+/// `quota_cost_share`), limits are disclosed-unknown (`limits` is
 /// null with its basis — a config-provided limit is a later extension
 /// arm), and the cutoff itself is disclosed so a stale corpus cannot
 /// masquerade as a live quota. Schema `agenttrace.quota/1` is stable:

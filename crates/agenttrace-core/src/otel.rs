@@ -410,7 +410,7 @@ pub fn report_otel_export(sessions: &[Session]) -> String {
 }
 
 /// True when the given path would be attributed to the given gen_ai
-/// system by [`infer_gen_ai_system`] — exposed for tests.
+/// system by `infer_gen_ai_system` — exposed for tests.
 pub fn gen_ai_system_for_path(path: &Path) -> &'static str {
     infer_gen_ai_system(&path.to_string_lossy())
 }

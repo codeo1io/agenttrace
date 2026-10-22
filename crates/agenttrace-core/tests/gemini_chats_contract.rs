@@ -322,3 +322,154 @@ fn hostile_append_journal_parses_within_the_linear_bound() {
          ~100x ratio; the 60x floor rides 3x of load headroom, see rm-1519)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// rm-715 remaining scope — gemini-cli 0.65.0 resume-dedup truth. The
+// trigger fired 2026-10-20: v0.65.0 STABLE ships #29618 "avoid duplicate
+// tool response turns when resuming sessions". Source-pinned writer truth
+// (raw.githubusercontent.com/google-gemini/gemini-cli at v0.64.0/v0.65.0):
+//
+// - utils/sessionUtils.ts `convertSessionToClientHistory` synthesizes a
+//   `${msg.id}_response` user turn for every gemini tool call carrying a
+//   result when rebuilding client history from a recorded journal.
+//   v0.64.0 synthesized it UNCONDITIONALLY — even when a subsequent live
+//   user turn already covered the call. For an Array-of-Part result the
+//   synthesized twin's content IS the spread parts, so it carries text.
+// - services/chatRecordingService.ts `updateMessagesFromHistory` persists
+//   every history turn whose id is missing from `messageMetaMap`, so a
+//   v0.64.0 resume WROTE the twin into the journal (the "previously
+//   inflated recordings" the v0.65.0 docstring requires to recover
+//   cleanly).
+// - The same v0.64.0 `initialize()` new-session path for subagents
+//   (filename = `<sessionId>.jsonl`, no collision check) appended a
+//   second metadata record, reset `messages: []`, and replayed the
+//   whole history as content-only records (no model/tokens/toolCalls).
+// - v0.65.0 cures both: synthesis stops when a subsequent user turn
+//   covers the call (fallback only for legacy recordings lacking a
+//   recorded response turn), and initialize() reuses the loaded record
+//   instead of resetting to empty.
+//
+// The three tests below pin that the pre-0.65 inflated shapes account
+// IDENTICALLY to the clean v0.65.0 shape.
+
+#[test]
+fn gemini_chats_resume_twin_does_not_duplicate_tool_response() {
+    // v0.65.0-clean resume journal: user prompt; gemini turn with a
+    // tool call whose result is a Part array; the live user response
+    // turn (functionResponse parts carry no text — inert in this
+    // lane); the finalized re-append carrying the token summary.
+    let clean = r#"{"sessionId":"8f2c9f1c2b7d4e6a","projectHash":"5c0f7e9a","kind":"main"}
+{"id":"turn-1","type":"user","timestamp":"2026-10-20T10:00:00.000Z","content":"Read the config"}
+{"id":"turn-2","type":"gemini","timestamp":"2026-10-20T10:00:05.000Z","model":"gemini-2.5-pro","content":[{"text":"Reading it now."}],"toolCalls":[{"id":"call-1","name":"read_file","args":{"path":"config.toml"},"result":[{"text":"key = \"value\"\n"}]}]}
+{"id":"turn-3","type":"user","timestamp":"2026-10-20T10:00:06.000Z","content":[{"functionResponse":{"id":"call-1","name":"read_file","response":{"output":"key = \"value\""}}}]}
+{"id":"turn-2","type":"gemini","timestamp":"2026-10-20T10:00:05.000Z","model":"gemini-2.5-pro","content":[{"text":"Reading it now."}],"toolCalls":[{"id":"call-1","name":"read_file","args":{"path":"config.toml"},"result":[{"text":"key = \"value\"\n"}]}],"tokens":{"input":1000,"output":200,"cached":300,"thoughts":50}}
+"#;
+    // The SAME journal as a v0.64.0-stable resume left it: the
+    // synthesized `turn-2_response` twin appended at the tail (its
+    // content is the spread Array-of-Part result, so it carries the
+    // tool output text a second time). The dedup contract: it must
+    // account identically to the clean journal — one tool response
+    // exchange happened, one is billed.
+    let inflated = r#"{"sessionId":"8f2c9f1c2b7d4e6a","projectHash":"5c0f7e9a","kind":"main"}
+{"id":"turn-1","type":"user","timestamp":"2026-10-20T10:00:00.000Z","content":"Read the config"}
+{"id":"turn-2","type":"gemini","timestamp":"2026-10-20T10:00:05.000Z","model":"gemini-2.5-pro","content":[{"text":"Reading it now."}],"toolCalls":[{"id":"call-1","name":"read_file","args":{"path":"config.toml"},"result":[{"text":"key = \"value\"\n"}]}]}
+{"id":"turn-3","type":"user","timestamp":"2026-10-20T10:00:06.000Z","content":[{"functionResponse":{"id":"call-1","name":"read_file","response":{"output":"key = \"value\""}}}]}
+{"id":"turn-2","type":"gemini","timestamp":"2026-10-20T10:00:05.000Z","model":"gemini-2.5-pro","content":[{"text":"Reading it now."}],"toolCalls":[{"id":"call-1","name":"read_file","args":{"path":"config.toml"},"result":[{"text":"key = \"value\"\n"}]}],"tokens":{"input":1000,"output":200,"cached":300,"thoughts":50}}
+{"id":"turn-2_response","type":"user","timestamp":"2026-10-20T10:00:07.000Z","content":[{"text":"key = \"value\"\n"}]}
+"#;
+    let clean_session = parse_one("resume-clean.jsonl", clean);
+    let inflated_session = parse_one("resume-inflated.jsonl", inflated);
+    assert_eq!(clean_session.metrics.source_tool, "gemini_cli");
+    // Clean baseline pinned on its own: exactly one user message (the
+    // prompt — turn-3's functionResponse parts are inert), one
+    // assistant event, one tool call, tokens billed once. events_total
+    // = turn-1's user event + turn-2's assistant event (text and the
+    // tool call ride ONE event) + turn-2's `tokens` meta usage event.
+    assert_eq!(clean_session.metrics.user_messages, 1);
+    assert_eq!(clean_session.metrics.events_total, 3);
+    assert_eq!(clean_session.metrics.tool_calls_total, 1);
+    assert_eq!(clean_session.metrics.tokens_input, 1000);
+    assert_eq!(clean_session.metrics.tokens_output, 250);
+    // The rm-715 resume-dedup contract: the v0.64.0-inflated journal
+    // accounts identically to the v0.65.0-clean one.
+    assert_eq!(
+        inflated_session.metrics.user_messages, clean_session.metrics.user_messages,
+        "v0.64.0 resume twin inflated the user-turn count (#29618)"
+    );
+    assert_eq!(
+        inflated_session.metrics.events_total, clean_session.metrics.events_total,
+        "v0.64.0 resume twin inflated the event count (#29618)"
+    );
+    assert_eq!(
+        inflated_session.metrics.tokens_input, clean_session.metrics.tokens_input,
+        "v0.64.0 resume twin changed input tokens (#29618)"
+    );
+    assert_eq!(
+        inflated_session.metrics.tokens_output, clean_session.metrics.tokens_output,
+        "v0.64.0 resume twin changed output tokens (#29618)"
+    );
+    assert_eq!(
+        inflated_session.metrics.tool_calls_total, clean_session.metrics.tool_calls_total,
+        "v0.64.0 resume twin changed the tool-call count (#29618)"
+    );
+}
+
+#[test]
+fn gemini_chats_resume_replay_keeps_recorded_tokens() {
+    // v0.64.0-stable subagent resume: the re-initialize() path for
+    // kind=subagent (filename = `<sessionId>.jsonl`, no collision
+    // check) appended a SECOND metadata record, reset the cached
+    // messages to empty, and `updateMessagesFromHistory` replayed the
+    // whole history as content-only records — no model, no toolCalls,
+    // no tokens. Replace-in-place without a carry-forward merge
+    // silently zeroes the session's recorded billing for every
+    // replayed turn (v0.65.0 cures this at the writer by reusing the
+    // loaded record; the reader-side cure must survive the journals
+    // already in the wild).
+    let replayed = r#"{"sessionId":"c3d1a4b2","projectHash":"5c0f7e9a","kind":"subagent"}
+{"id":"turn-1","type":"user","timestamp":"2026-10-19T09:00:00.000Z","content":"Summarize the log"}
+{"id":"turn-2","type":"gemini","timestamp":"2026-10-19T09:00:04.000Z","model":"gemini-2.5-flash","content":[{"text":"Scanning."}],"toolCalls":[{"id":"call-1","name":"run_command","args":{"cmd":"tail -n 5 app.log"}}]}
+{"id":"turn-2","type":"gemini","timestamp":"2026-10-19T09:00:04.000Z","model":"gemini-2.5-flash","content":[{"text":"Scanning."}],"toolCalls":[{"id":"call-1","name":"run_command","args":{"cmd":"tail -n 5 app.log"}}],"tokens":{"input":1000,"output":200,"cached":300,"thoughts":0}}
+{"sessionId":"c3d1a4b2","projectHash":"5c0f7e9a","kind":"subagent"}
+{"id":"turn-1","type":"user","timestamp":"2026-10-19T09:00:00.000Z","content":"Summarize the log"}
+{"id":"turn-2","type":"gemini","timestamp":"2026-10-19T09:00:04.000Z","content":[{"text":"Scanning."}]}
+{"id":"turn-3","type":"gemini","timestamp":"2026-10-19T09:05:00.000Z","model":"gemini-2.5-flash","content":[{"text":"Done."}],"tokens":{"input":400,"output":100,"cached":0,"thoughts":0}}
+"#;
+    let session = parse_one("resume-replayed.jsonl", replayed);
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    // turn-2's recorded token summary must survive the content-only
+    // replay (1000 + turn-3's 400), its tool call must survive, and
+    // the user prompt must be billed exactly once.
+    assert_eq!(
+        session.metrics.tokens_input, 1400,
+        "resume replay clobbered the recorded token summary (#29618 writer reset)"
+    );
+    assert_eq!(session.metrics.tokens_output, 300);
+    assert_eq!(session.metrics.tokens_cache_r, 300);
+    assert_eq!(
+        session.metrics.tool_calls_total, 1,
+        "resume replay clobbered the recorded tool call"
+    );
+    assert_eq!(session.metrics.user_messages, 1);
+    // turn-1 user event + turn-2 assistant event + turn-2 tokens meta
+    // event + turn-3 assistant event + turn-3 tokens meta event.
+    assert_eq!(session.metrics.events_total, 5);
+}
+
+#[test]
+fn gemini_chats_resume_fold_is_base_gated() {
+    // The `_response` fold is gated on the base record being present
+    // in the journal: when the writer's history window evicted the
+    // base gemini turn (MAX_HISTORY_MESSAGES), a surviving `_response`
+    // record is the only carrier of that tool exchange's text and MUST
+    // still be billed — exactly as a v0.65.0 reader recovers it via
+    // the legacy fallback synthesis.
+    let orphan_twin = r#"{"sessionId":"ab12cd34","projectHash":"5c0f7e9a","kind":"main"}
+{"id":"turn-9","type":"user","timestamp":"2026-10-20T11:00:00.000Z","content":"Check the build"}
+{"id":"evicted-1_response","type":"user","timestamp":"2026-10-20T11:00:02.000Z","content":[{"text":"build ok"}]}
+"#;
+    let session = parse_one("resume-orphan-twin.jsonl", orphan_twin);
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    assert_eq!(session.metrics.user_messages, 2);
+    assert_eq!(session.metrics.events_total, 2);
+}

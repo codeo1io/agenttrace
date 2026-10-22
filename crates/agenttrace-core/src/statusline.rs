@@ -395,7 +395,7 @@ pub fn is_bidi_format_control(c: char) -> bool {
 /// and the zero-width JOINER pair U+200C ZWNJ / U+200D ZWJ, functional
 /// orthography in real scripts (emoji sequences ride ZWJ) that no
 /// display sanitizer may eat: that pair is substituted ONLY by the
-/// 2026-10-16 widening arm ([`is_joiner_format_control`]) in the
+/// 2026-10-16 widening arm (`is_joiner_format_control`) in the
 /// shared line-segment and document sanitizers, leaving this union,
 /// the JSON escape lane, and the TUI display filter unwidened.
 pub fn is_invisible_spoofing_control(c: char) -> bool {
@@ -461,7 +461,7 @@ pub fn sanitize_line_segment(segment: &str) -> String {
 /// spoofing union ([`is_spoofing_format_control`]) so the invisible
 /// zero-width family dies here too, and the rm-933 widening arm
 /// (2026-10-16) composes the joiner pair
-/// ([`is_joiner_format_control`]) into the same substitution class at
+/// (`is_joiner_format_control`) into the same substitution class at
 /// this boundary, so markdown/HTML cells — which carry no line-segment
 /// pass — cannot ride a raw ZWJ/ZWNJ either. Idempotent by
 /// construction: U+FFFD is
@@ -1304,8 +1304,8 @@ pub struct StatuslineJournalStats {
     /// journal fits half of this once it crosses it.
     pub retained_max_bytes: u64,
     /// rm-898: bytes cut from the head of the journal by
-    /// [`read_statusline_capture_bounded`] when it exceeds
-    /// [`STATUSLINE_READ_CAP_BYTES`] (`0` = the read was complete). The
+    /// `read_statusline_capture_bounded` when it exceeds
+    /// `STATUSLINE_READ_CAP_BYTES` (`0` = the read was complete). The
     /// statusline-report JSON surfaces this so a bounded read is disclosed
     /// rather than silently undercounting a huge journal.
     pub capped_away_bytes: u64,
