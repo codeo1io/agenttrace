@@ -870,6 +870,8 @@ fn statusline_host_mode_never_fails_the_host() {
     let _ = std::fs::remove_dir_all(cache);
 }
 
+#[cfg(target_os = "linux")] // /dev/full is a Linux special file; macOS and
+// Windows have no ENOSPC-on-write device node.
 #[test]
 fn statusline_host_mode_survives_stdout_write_failure() {
     // Review F2 (cycle 7): the host contract is exit 0 for any input —
@@ -2656,6 +2658,10 @@ fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(target_os = "linux")]
+// the ENOSPC leg needs /dev/full; the EISDIR
+// leg it shares this test with is pinned by
+// sibling directory-target tests on other OSes.
 #[test]
 fn error_stderr_carries_the_anyhow_cause_chain() {
     // rm-610: the top-level handler printed `Error: {err}`, and
@@ -2977,8 +2983,12 @@ fn output_flag_refusal_names_the_directory_and_target() {
         stderr.contains(target.to_str().expect("path is UTF-8")),
         "error must name the requested -o target: {stderr}"
     );
+    // The OS cause stays disclosed (rm-610) — spelled differently per
+    // platform: Linux mkdir(2) under a file parent reports EEXIST ("File
+    // exists"); Windows CreateDirectoryW reports ERROR_ALREADY_EXISTS
+    // ("Cannot create a file when that file already exists").
     assert!(
-        stderr.contains("File exists"),
+        stderr.contains("File exists") || (cfg!(windows) && stderr.contains("file already exists")),
         "the OS cause stays disclosed (rm-610): {stderr}"
     );
 
@@ -3505,6 +3515,23 @@ fn count_honesty_disclosures_in_cli_lanes() {
     let journal = pi_journal("0.0038");
     write("alpha/a.jsonl", &journal);
     let beta = write("beta/b.jsonl", &journal);
+    // rm-2136 test-side pinning: the duplicate-collapse survivor is the
+    // NEWEST twin by mtime, so "alpha survives" is only true by accident
+    // of write order — on APFS the two writes land in distinct
+    // nanoseconds (beta newer, beta survives, the pair flips to
+    // `beta <- alpha` and the ends_with pin below panics — the live
+    // macOS lane red), while on tie-granularity filesystems it falls to
+    // walk name order. Pin both mtimes explicitly: alpha strictly
+    // newest by an hour on every filesystem, so the survivor — and the
+    // asserted `survivor <- suppressed` pair shape — is deterministic.
+    let pin_mtime = |rel: &str, older_by: std::time::Duration| {
+        std::fs::File::open(sessions.join(rel))
+            .expect("open journal to pin mtime")
+            .set_modified(std::time::SystemTime::now() - older_by)
+            .expect("pin journal mtime");
+    };
+    pin_mtime("alpha/a.jsonl", std::time::Duration::ZERO);
+    pin_mtime("beta/b.jsonl", std::time::Duration::from_secs(3600));
     // A pi-subagents artifact mirror under the path segment — child
     // spend the parent owns; skipped, never banked.
     write(

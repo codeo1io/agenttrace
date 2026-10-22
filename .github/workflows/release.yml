@@ -55,11 +55,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux targets cross-compile the arm64 build on ubuntu
-          - os: ubuntu-latest
+          # Linux targets cross-compile the arm64 build on ubuntu.
+          # Both linux lanes build on the Ubuntu 22.04 glibc-2.35
+          # floor: the shipped assets must keep running on 22.04
+          # hosts, and scripts/ci/check-install-runtime.sh holds the
+          # smoke lane to the same floor — building them on
+          # ubuntu-latest (glibc 2.39) would silently raise the
+          # assets' baseline past the advertised compatibility floor
+          # (the exact failure mode that script's header records).
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset: agenttrace-linux-amd64
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             asset: agenttrace-linux-arm64
           # Darwin targets need the Apple SDK — build natively on macOS runners
