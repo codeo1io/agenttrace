@@ -410,6 +410,10 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     // that reach the operator.
     let mut twin_ledger = SuppressedSessions::default();
     all = suppress_zst_stem_twins(all, &mut twin_ledger);
+    // ci-audit 2026-10-22: mirror the cached lane — sort before the
+    // content-signature dedup so cold/warm/ad-hoc runs pick the same
+    // survivor (lexicographically-first path), not readdir luck.
+    all.sort();
     let mut signatures: HashSet<(i64, u64)> = HashSet::new();
     all.retain(|path| {
         // Unreadable: keep (the parse lane owns and discloses those).
@@ -1184,6 +1188,16 @@ pub(crate) fn find_session_files_cached(
     // signature, so this pass is the only one that can collapse the
     // pair. Deterministic by NAME, so cold and warm runs agree.
     all = suppress_zst_stem_twins(all, &mut suppressed);
+    // ci-audit 2026-10-22: the first-seen survivor is only deterministic
+    // if `all` itself is. The walk sorts per-directory, but the root
+    // merge order rides `discover_session_dirs()` (registration order)
+    // and the cline/zst passes reorder nothing — on CI the beta copy
+    // repeatedly became the survivor over alpha (master reds
+    // 39749246398/39635038200), breaking the pair's contract. Sort the
+    // candidate list before the dedup so the lexicographically-first
+    // path always survives; final output order is still set by
+    // `sort_paths_by_cache` below, and the uncached lane mirrors this.
+    all.sort();
     // rm-1886: content dedup at admission — a byte-identical journal
     // at a second path re-emits the same events and double-banks every
     // aggregate it feeds. First-seen survivor wins (deterministic: the
