@@ -244,6 +244,86 @@ fn old_usage_metadata_shape_still_counts() {
     assert_eq!(session.metrics.tokens_cache_r, 300);
 }
 
+/// rm-715 resume rider (run 212f7e87 cycle 1, batch "gemini-cli v0.65
+/// resume-dedupe truth"): a 0.64 host that resumed a session wrote
+/// the whole reconstruction back into the journal under
+/// `_response`-suffixed ids — upstream `convertSessionToClientHistory`
+/// synthesized `${msg.id}_response` turns from `toolCalls[].result`
+/// while the recorded turns also replayed (upstream #29618, fixed in
+/// v0.65.0 released 2026-10-20). The suffixed twins escape the
+/// id-upsert dedupe (different ids), so every replayed turn
+/// double-billed. The reader collapses a `_response`-suffixed record
+/// whose base id is present in the same journal (base kept, twin
+/// dropped) and discloses the collapse count on the non-loss channel.
+#[test]
+fn resumed_journal_response_twins_collapse() {
+    let raw = format!(
+        "{METADATA_LINE}\n{}\n{}\n{}\n{}\n",
+        // The original turn pair, tokens attached (arm_a's shape).
+        r#"{"id":"m-user-1","timestamp":"2026-10-13T08:00:01.000Z","type":"user","content":"hello gemini"}"#,
+        r#"{"id":"m-gen-1","timestamp":"2026-10-13T08:00:05.000Z","type":"gemini","content":"hi there","model":"gemini-2.5-pro","tokens":{"input":1000,"output":200,"cached":300,"thoughts":0,"tool":0,"total":1500}}"#,
+        // The 0.64 resume replay: the same records back under
+        // `_response`-suffixed ids. Same ids they are NOT — the
+        // id-upsert cannot see them as re-appends.
+        r#"{"id":"m-user-1_response","timestamp":"2026-10-13T08:00:01.000Z","type":"user","content":"hello gemini"}"#,
+        r#"{"id":"m-gen-1_response","timestamp":"2026-10-13T08:00:05.000Z","type":"gemini","content":"hi there","model":"gemini-2.5-pro","tokens":{"input":1000,"output":200,"cached":300,"thoughts":0,"tool":0,"total":1500}}"#
+    );
+    let session = parse_one("session-resume.jsonl", &raw);
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    // Exactly one copy of the turn bills: the twins collapsed onto
+    // their bases. A missed collapse doubles every bucket (the
+    // pre-rider PoC: 10 sessions / 5 turns reported 20 / 10).
+    assert_eq!(
+        session.metrics.tokens_input, 1000,
+        "the replayed twin must not re-bill input tokens (got {})",
+        session.metrics.tokens_input
+    );
+    assert_eq!(session.metrics.tokens_output, 200);
+    assert_eq!(session.metrics.tokens_cache_r, 300);
+    assert_eq!(session.metrics.user_messages, 1);
+    // The collapse is disclosed, never silent: one counter per
+    // collapsed record, on the non-loss channel.
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("gemini_resume_dedupe_collapsed"),
+        Some(&2),
+        "both collapsed twins must be disclosed"
+    );
+}
+
+/// The no-double-suppress guard (upstream's own first test case): a
+/// `_response`-suffixed record whose base id is NOT in the journal is
+/// legitimate synthesized-only history — a tool-response turn that
+/// exists nowhere else — and must still count. An over-eager fold
+/// (drop every suffixed record) would silently zero it.
+#[test]
+fn response_twin_without_base_still_counts() {
+    let raw = format!(
+        "{METADATA_LINE}\n{}\n{}\n",
+        r#"{"id":"m-u1","timestamp":"2026-10-14T08:00:01.000Z","type":"user","content":"run the tool"}"#,
+        // Synthesized-only: no `m-g1` MessageRecord exists anywhere in
+        // the stream (its model turn predates this journal — the
+        // recorded tool result is the only carrier).
+        r#"{"id":"m-g1_response","timestamp":"2026-10-14T08:00:06.000Z","type":"user","content":"tool result: ok"}"#
+    );
+    let session = parse_one("session-synth.jsonl", &raw);
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    assert_eq!(
+        session.metrics.user_messages, 2,
+        "a _response record with no base in the journal is real history and must count"
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("gemini_resume_dedupe_collapsed"),
+        None,
+        "nothing collapsed — no base present — so no disclosure"
+    );
+}
+
 /// rm-715 perf rider (run 80e8beb6 cycle 1, batch "bounded inputs,
 /// honest docs"; hardened by review-fix F1, attempt 994f9491): a
 /// hostile append-only journal must parse in linear time. The original

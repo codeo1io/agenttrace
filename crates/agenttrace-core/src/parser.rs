@@ -687,23 +687,42 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             }
             return Ok(session);
         }
-        let probes: [JsonlProbe; 5] = [
+        let probes: [JsonlProbe; 4] = [
             parse_antigravity_jsonl,
             parse_cursor_transcript_jsonl,
             parse_claude_transcript_jsonl,
             parse_copilot_session_jsonl,
-            // rm-715 (silent-zero closeout LEAD): last, with the
-            // strictest claim rule in the array — the gemini-cli >= 0.63
-            // chats record stream (metadata line carrying sessionId +
-            // projectHash, MessageRecords keyed by id). Every earlier
-            // probe keeps its claim precedence; this lane only picks up
-            // the shape nothing else recognizes, so the generic-lane
-            // fallback below stays byte-identical for every corpus it
-            // served before this run.
-            parse_gemini_chats_jsonl,
         ];
         if let Some(events) = probes.iter().find_map(|probe| probe(&objs)) {
             return finish(events);
+        }
+        // rm-715 resume rider (run 212f7e87 cycle 1, batch "gemini-cli
+        // v0.65 resume-dedupe truth"): the gemini-cli >= 0.63 chats
+        // record stream keeps the strictest claim rule in the chain —
+        // the metadata line carrying sessionId + projectHash, which no
+        // other probe recognizes — but it now parses OUTSIDE the probe
+        // array, in the exact precedence slot it held as the array's
+        // last entry (after every array probe, before kimi_cli),
+        // because it carries its own disclosure channel: a 0.64 host
+        // that resumed a session wrote the whole reconstruction back
+        // under `_response`-suffixed ids (upstream #29618 —
+        // `convertSessionToClientHistory` synthesized `${msg.id}`
+        // `_response` turns from `toolCalls[].result`; fixed in
+        // v0.65.0, released 2026-10-20). The suffixed twins escape the
+        // id-upsert dedupe and double-bill; the lane collapses them
+        // onto their base records and reports the count through the
+        // non-loss disclosure channel — the kimi/workbuddy tuple
+        // pattern, so every probe before it is byte-identical.
+        if let Some((events, resume_twins_collapsed)) = parse_gemini_chats_jsonl(&objs) {
+            let mut session = finish(events)?;
+            if resume_twins_collapsed > 0 {
+                crate::mint_disclosure(
+                    &mut session.metrics.disclosure_counters,
+                    "gemini_resume_dedupe_collapsed".to_string(),
+                    resume_twins_collapsed as usize,
+                );
+            }
+            return Ok(session);
         }
         // kimi_cli parses outside the probe array — last, exactly where it
         // used to sit — because it carries its own disclosure channel for
@@ -6855,7 +6874,7 @@ fn parse_gemini_content_object(
 //   when the id is gone);
 // - `{$patch: {...}}` rewrites content/toolCalls in place, removes ids,
 //   and reorders — best-effort per the main reader.
-fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
+fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, u64)> {
     if !is_gemini_chats_jsonl(objs) {
         return None;
     }
@@ -6903,11 +6922,64 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             gemini_chats_upsert(&mut messages, &mut index, id, obj.clone());
         }
     }
+    // rm-715 resume rider: collapse `_response`-suffixed twins onto
+    // their base records. Evaluated on the FINAL message state (after
+    // every $set/$rewindTo/$patch rewrote it) so it is
+    // order-independent — the collapse never depends on where in the
+    // stream the twin appeared. Only a twin whose base id is PRESENT
+    // collapses; a `_response` id with no base is synthesized-only
+    // history (upstream #29618's own kept case) and must count.
+    let resume_twins_collapsed = gemini_chats_collapse_resume_twins(&mut messages);
     let mut events = Vec::new();
     for (_, record) in &messages {
         gemini_chats_message_events(record, &mut events);
     }
-    non_empty(events)
+    non_empty(events).map(|events| (events, resume_twins_collapsed))
+}
+
+/// rm-715 resume rider (run 212f7e87 cycle 1): a 0.64-stable host
+/// that resumed a session wrote the whole reconstruction back into
+/// the journal under `_response`-suffixed ids — upstream
+/// `convertSessionToClientHistory` synthesized `${msg.id}_response`
+/// turns from `toolCalls[].result` (PR #29618, merged into v0.65.0,
+/// released 2026-10-20), and the full-history replay re-persisted the
+/// recorded turns with the same suffix family. Those twins escape the
+/// id-upsert dedupe (different ids) and double-bill every replayed
+/// turn. A `_response`-suffixed record whose base id is present in
+/// the same journal is a duplicate carrier: drop the twin, keep the
+/// authoritative unsuffixed base, and return how many collapsed so
+/// the caller can disclose the count (never silent). One suffix is
+/// stripped — `foo_response` folds onto `foo`, never onto a bare
+/// `foo`-less stream — and an empty base (`"_response"` alone)
+/// collapses onto nothing and stays.
+fn gemini_chats_collapse_resume_twins(messages: &mut Vec<(String, JsonObject)>) -> u64 {
+    if !messages
+        .iter()
+        .any(|(id, _)| gemini_chats_resume_twin_base(id).is_some())
+    {
+        return 0;
+    }
+    let base_ids: HashSet<String> = messages.iter().map(|(id, _)| id.clone()).collect();
+    let mut kept = Vec::with_capacity(messages.len());
+    let mut collapsed = 0u64;
+    for (id, record) in messages.drain(..) {
+        match gemini_chats_resume_twin_base(&id) {
+            Some(base) if base_ids.contains(base) => collapsed += 1,
+            _ => kept.push((id, record)),
+        }
+    }
+    *messages = kept;
+    collapsed
+}
+
+/// The base id a `_response`-suffixed record folds onto, when the id
+/// carries the suffix at all. Only ONE suffix is stripped: the writer
+/// synthesizes a single `_response` per base (and a replay of a
+/// synthesized turn yields `foo_response_response`, whose base is
+/// `foo_response` — itself collapsible when that twin survived).
+fn gemini_chats_resume_twin_base(id: &str) -> Option<&str> {
+    let base = id.strip_suffix("_response")?;
+    (!base.is_empty()).then_some(base)
 }
 
 /// O(1) id upsert for [`parse_gemini_chats_jsonl`] — replace in
@@ -13864,8 +13936,9 @@ fn gemini_chats_lane_claims_the_record_stream_and_replaces_reappends() {
             "\n",
         )
     );
-    let events =
-        parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("chats record stream claimed");
+    let events = parse_gemini_chats_jsonl(&chats_objs(raw.as_str()))
+        .expect("chats record stream claimed")
+        .0;
     // Full-record re-append (tokens attach to the turn's own id)
     // replaces in place: one user event, one assistant event, one
     // usage event -- never a duplicate of the generation.
@@ -13916,7 +13989,9 @@ fn gemini_chats_patch_rewrites_content_and_merges_tool_calls() {
             "\n",
         )
     );
-    let events = parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("claimed");
+    let events = parse_gemini_chats_jsonl(&chats_objs(raw.as_str()))
+        .expect("claimed")
+        .0;
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].content, "patched reply",
@@ -13949,7 +14024,9 @@ fn gemini_chats_order_ids_reorder_and_remove_ids_drop() {
             "\n",
         )
     );
-    let events = parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("claimed");
+    let events = parse_gemini_chats_jsonl(&chats_objs(raw.as_str()))
+        .expect("claimed")
+        .0;
     let content: Vec<&str> = events.iter().map(|e| e.content.as_str()).collect();
     assert_eq!(
         content,
@@ -13967,7 +14044,9 @@ fn gemini_chats_part_content_walks_text_thought_and_function_calls() {
             "\n",
         )
     );
-    let events = parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("claimed");
+    let events = parse_gemini_chats_jsonl(&chats_objs(raw.as_str()))
+        .expect("claimed")
+        .0;
     let assistant = events
         .iter()
         .find(|e| e.role == "assistant")

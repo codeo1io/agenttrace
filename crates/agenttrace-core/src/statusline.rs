@@ -682,24 +682,15 @@ fn journal_descriptor_is_live(path: &Path, journal: &fs::File) -> bool {
     }
 }
 
-/// Retention: drop oldest whole lines until the journal fits under
-/// `keep_under` bytes. Rewritten through a temp file + rename so a crash
-/// mid-compaction cannot truncate the journal to zero.
-///
 /// rm-166: the read→rewrite→rename critical section races concurrent
-/// appends unless it runs under the journal lock, so this entry takes the
-/// lock itself. The append path (which already holds the lock — the
-/// open-file-description lock is not reentrant across handles) calls the
-/// locked core directly; no production caller needs the standalone entry
-/// yet, so it is exercised by the journal race fixtures.
-#[allow(dead_code)]
-fn compact_statusline_capture_under(path: &Path, keep_under: u64) -> io::Result<()> {
-    let journal = open_locked_journal(path)?;
-    let compacted = compact_statusline_capture_locked(path, keep_under);
-    let unlocked = journal.unlock();
-    compacted.and(unlocked)
-}
-
+/// appends unless it runs under the journal lock, so compaction takes
+/// the lock. The append path (which already holds the lock — the
+/// open-file-description lock is not reentrant across handles) calls
+/// the locked core directly; rm-014 (run 212f7e87 cycle 1) deleted the
+/// production-dead standalone entry — the journal race fixtures now
+/// compose the lock discipline directly (see `compact_under` in the
+/// tests module below).
+///
 /// rm-898: bound on how much of a statusline journal this module will
 /// materialize at once. Mirrors the retention bound below — the compaction
 /// REWRITE always kept to it, but the READ side (three sites) loaded the
@@ -2295,6 +2286,19 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
+    /// rm-166 lock discipline, composed the way the deleted standalone
+    /// entry did (rm-014, run 212f7e87 cycle 1: that entry was
+    /// production-dead — its only callers were these fixtures). The
+    /// journal races this file pins live on exactly this sequence:
+    /// take the lock, run the locked compaction core, release.
+    #[cfg(unix)]
+    fn compact_under(path: &std::path::Path, keep_under: u64) -> std::io::Result<()> {
+        let journal = super::open_locked_journal(path)?;
+        let compacted = super::compact_statusline_capture_locked(path, keep_under);
+        let unlocked = journal.unlock();
+        compacted.and(unlocked)
+    }
+
     #[test]
     fn rm936_is_bidi_format_control_bounds() {
         // The directional/format set (Cf) the lane sanitizers must kill.
@@ -4040,7 +4044,7 @@ mod tests {
             raw.push('\n');
         }
         fs::write(&journal, &raw).expect("write journal");
-        compact_statusline_capture_under(&journal, 1024).expect("compact");
+        compact_under(&journal, 1024).expect("compact");
         let kept = fs::read_to_string(&journal).expect("read journal");
         let count = kept.lines().count();
         assert!(count < 40, "old lines must drop, kept {count}");
@@ -4424,8 +4428,7 @@ mod tests {
         assert!(!stats.read_truncated, "a small journal is not truncated");
         assert_eq!(stats.lines, 3, "the stats lane still counts every line");
         // Retention repairs instead of failing forever.
-        compact_statusline_capture_under(&journal, 1024)
-            .expect("compaction survives invalid UTF-8");
+        compact_under(&journal, 1024).expect("compaction survives invalid UTF-8");
         let rewritten = fs::read(&journal).expect("journal rewritten");
         String::from_utf8(rewritten).expect("the rewritten journal is clean UTF-8");
         let repaired = read_statusline_captures(&journal);
@@ -4794,7 +4797,7 @@ mod tests {
                     let barrier = Arc::clone(&barrier);
                     std::thread::spawn(move || {
                         barrier.wait();
-                        compact_statusline_capture_under(&journal, keep)
+                        compact_under(&journal, keep)
                     })
                 })
                 .into_iter()
@@ -4869,7 +4872,7 @@ mod tests {
             "journal must be owner-only, got {:o}",
             mode & 0o777
         );
-        compact_statusline_capture_under(&journal, 1).expect("compact");
+        compact_under(&journal, 1).expect("compact");
         let mode = fs::metadata(&journal)
             .expect("journal survives compaction")
             .permissions()
@@ -5086,7 +5089,7 @@ mod tests {
         // handle.
         let mut stale =
             crate::session_cache::open_private_append(&journal).expect("open stale append handle");
-        compact_statusline_capture_under(&journal, u64::MAX).expect("compaction swaps inode");
+        compact_under(&journal, u64::MAX).expect("compaction swaps inode");
         writeln!(stale, "{{\"lost\": true}}").expect("write through stale handle");
         let after_swap = fs::read_to_string(&journal).expect("journal readable");
         assert!(
@@ -5144,7 +5147,7 @@ mod tests {
             // Phase 1: tight loop — the rename window stays continuously
             // open while the writers hammer.
             while !(0..WRITERS).all(|writer| hammer_done(writer).exists()) {
-                if compact_statusline_capture_under(&journal, keep_under).is_ok() {
+                if compact_under(&journal, keep_under).is_ok() {
                     swaps += 1;
                 }
             }
@@ -5156,13 +5159,13 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while !(0..WRITERS).all(|writer| root.join(format!("sentinel-done-{writer}")).exists())
             {
-                let _ = compact_statusline_capture_under(&journal, keep_under);
+                let _ = compact_under(&journal, keep_under);
                 assert!(
                     std::time::Instant::now() < deadline,
                     "compactor timed out waiting for sentinels"
                 );
             }
-            compact_statusline_capture_under(&journal, keep_under).expect("final compaction");
+            compact_under(&journal, keep_under).expect("final compaction");
         } else {
             panic!("unknown journal race role {role}");
         }
