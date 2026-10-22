@@ -18,7 +18,11 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+/// Date the bundled snapshot was regenerated (refreshed 2026-10-22 from live
+/// LiteLLM via update-snapshot.sh: +140 keys, 2,249 rate mutations, 466 keys
+/// retained by the rm-588 union; must equal `_snapshot.date` in the JSON —
+/// drift-check.sh hard-fails a desync).
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-22";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -3990,10 +3994,14 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // The named wide-window class (rm-231's motivating case).
+        // 2026-10-22 rm-176 refresh: upstream corrected the claude-sonnet-4-5
+        // window vendor-wide from 1M to 200K (one of the refresh's window-only
+        // mutations — every provider spelling now carries 200_000); the pin
+        // follows the vendor truth.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 

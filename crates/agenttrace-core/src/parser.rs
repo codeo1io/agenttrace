@@ -1569,6 +1569,18 @@ struct AntigravityModelId {
 /// unknown-model path rather than this table inventing a price.
 const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
     (1417, "gemini-4-argon"),
+    // rm-1533 refresh rider (run 4fd837bd cycle 1, implement
+    // a944143e, 2026-10-22): upstream's numeric map also carries
+    // 1418 and 1419 → gemini-4-argon (numerical spellings of the
+    // same argon deployment the repo previously dropped unmapped).
+    // The arms landed only with the 2026-10-22 rm-176 pricing
+    // refresh — the 2026-10-08 bundle carried zero argon rows, so
+    // mapping them earlier would have WARN-and-dropped with nothing
+    // to price; the refreshed bundle prices gemini-4-argon
+    // ($2/$10 per-M with a 1e-7 cache-read rate), so these stay
+    // identity-only mappings like their siblings.
+    (1418, "gemini-4-argon"),
+    (1419, "gemini-4-argon"),
     // rm-1533 (run 18f9b98a cycle 2, research 0418480c): ccusage
     // v20.0.36 (2026-10-18, #1902) maps antigravity id 1050 to
     // gemini-3.1-flash-lite — the bare key is already priced in the
@@ -11237,6 +11249,63 @@ mod tests {
             session.metrics.cost_estimated > 0.0,
             "the bare gemini-3.1-flash-lite key is priced in the bundled snapshot"
         );
+    }
+
+    #[test]
+    fn antigravity_numeric_1418_1419_map_to_argon_and_price_after_refresh() {
+        // rm-1533 refresh rider (run 4fd837bd cycle 1, implement
+        // a944143e, 2026-10-22): red-first against the 2026-10-08
+        // bundle — before the 2026-10-22 rm-176 pricing refresh these
+        // ids stringified ("1418"/"1419" banked unmapped at $0 because
+        // the bundle carried zero argon rows), so both arms of this
+        // test failed: identity through ANTIGRAVITY_NUMERIC_MODEL_MAP
+        // and the priced-spend assertion that only the refreshed
+        // bundle (gemini/gemini-4-argon → $2/$10 per-M) can satisfy.
+        for numeric_id in [1418, 1419] {
+            let raw = serde_json::json!({
+                "trajectoryId": "44444444-5555-6666-7777-888888888888",
+                "steps": [
+                    {
+                        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                        "status": "COMPLETED",
+                        "metadata": { "createdAt": "2026-10-22T10:00:05Z" },
+                        "plannerResponse": {
+                            "response": "Argon generation.",
+                            "usageStats": {
+                                "inputTokens": 1000,
+                                "outputTokens": 500
+                            },
+                            "modelConfigId": numeric_id
+                        }
+                    }
+                ]
+            })
+            .to_string();
+            let session = parse_raw_session(
+                "numeric-argon",
+                "conversation.trajectory.json",
+                &raw,
+            )
+            .unwrap();
+            assert_eq!(
+                session.metrics.model_used, "gemini-4-argon",
+                "{numeric_id} maps through ANTIGRAVITY_NUMERIC_MODEL_MAP instead of stringifying"
+            );
+            assert_eq!(
+                session
+                    .metrics
+                    .disclosure_counters
+                    .get("antigravity_model:numeric_id"),
+                Some(&1),
+                "the mapped sighting still discloses its numeric origin ({numeric_id})"
+            );
+            assert!(
+                session.metrics.cost_estimated > 0.0,
+                "{numeric_id} → gemini-4-argon must price: the 2026-10-22 rm-176 refresh \
+                 landed the argon rows (gemini/gemini-4-argon $2/$10 per-M) — if this \
+                 arm went red, a later refresh dropped them again"
+            );
+        }
     }
 
     #[test]
