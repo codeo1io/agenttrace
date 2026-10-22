@@ -35,6 +35,7 @@ use agenttrace_core::{
 };
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)] // rm-1543: PermissionsExt is unix-only
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -371,6 +372,70 @@ fn explicit_dir_lane_keeps_subagent_artifacts() {
 // ------------------------------------------------------------------
 
 #[test]
+fn duplicate_survivor_is_deterministic_under_mtime_straddle() {
+    // rm-2232: survivor selection must not follow mtimes. The dedup
+    // walks used to see newest-first, so two byte-identical journals
+    // picked whichever copy the filesystem stamped later (assess F1:
+    // 10 byte-identical corpora flipped 9/10 alpha vs 1/10 beta; a
+    // forced 50ms straddle flipped the survivor 5/5). The survivor is
+    // now the lexicographically smallest path on both discovery lanes:
+    // pin the mtimes HARD in both directions and require alpha to win
+    // either way — order-independence, not a lucky stamp.
+    use std::time::{Duration, SystemTime};
+
+    fn stamp(path: &Path, back_secs: u64) {
+        let file = fs::File::open(path).expect("open fixture for mtime stamp");
+        let modified = SystemTime::now()
+            .checked_sub(Duration::from_secs(back_secs))
+            .expect("clock sane");
+        file.set_times(fs::FileTimes::new().set_modified(modified))
+            .expect("pin fixture mtime");
+    }
+
+    for straddle in ["future-beta", "future-alpha"] {
+        let home = temp_home(&format!("straddle-{straddle}"));
+        let journal = pi_journal_with_cost("0.0038");
+        let alpha = write(&home.join(".pi/agent/sessions/alpha/a.jsonl"), &journal);
+        let beta = write(&home.join(".pi/agent/sessions/beta/b.jsonl"), &journal);
+        if straddle == "future-beta" {
+            // beta a full hour newer: the exact shape that used to flip
+            stamp(&alpha, 3600);
+        } else {
+            // alpha an hour newer: the mtime sort would keep alpha for
+            // the wrong reason — the path rule must be the reason.
+            stamp(&beta, 3600);
+        }
+        with_pinned_home(&home, || {
+            let admitted = find_session_files(None);
+            assert_eq!(
+                admitted.len(),
+                1,
+                "{straddle}: exactly one survivor on the uncached lane: {admitted:?}"
+            );
+            assert!(
+                admitted[0].ends_with("a.jsonl"),
+                "{straddle}: uncached survivor is the lexicographic alpha: {:?}",
+                admitted[0]
+            );
+            let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+            assert_eq!(report.sessions.len(), 1, "{straddle}: one session");
+            assert_eq!(report.duplicate_session_files, 1, "{straddle}");
+            let (survivor, suppressed) = &report.duplicate_session_file_pairs[0];
+            assert!(
+                survivor.ends_with("a.jsonl") && suppressed.ends_with("b.jsonl"),
+                "{straddle}: pair names survivor <- suppressed: {survivor:?} <- {suppressed:?}"
+            );
+            assert_eq!(
+                Path::new(&report.sessions[0].path),
+                survivor.as_path(),
+                "{straddle}: the admitted session is the named survivor"
+            );
+        });
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
+#[test]
 fn byte_identical_copy_is_suppressed_with_disclosure() {
     // Red-first flip of assess F1: two byte-identical copies of one
     // journal used to count as 2 sessions / $0.0076 (double-banked).
@@ -475,6 +540,7 @@ fn explicit_dir_lane_keeps_duplicate_copies() {
     let _ = fs::remove_dir_all(&home);
 }
 
+#[cfg(unix)] // rm-1543: the seal premise (mode 0o000) is unix-only
 #[test]
 fn unreadable_journal_is_kept_and_never_a_duplicate() {
     // A journal whose bytes cannot be read (permissions) has no

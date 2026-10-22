@@ -881,10 +881,17 @@ fn statusline_host_mode_survives_stdout_write_failure() {
         "agenttrace-statusline-devfull-{}",
         std::process::id()
     ));
-    let devfull = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/full")
-        .expect("open /dev/full");
+    // rm-1543: /dev/full is a Linux-only device — macOS and Windows
+    // hosts have none, and the ENOSPC contract is only provable where
+    // the device exists (the write-failure lane keeps its Linux teeth).
+    let devfull = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping: no /dev/full on this host");
+            return;
+        }
+        Err(error) => panic!("open /dev/full: {error}"),
+    };
     let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .arg("statusline")
         .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
@@ -2689,13 +2696,23 @@ fn error_stderr_carries_the_anyhow_cause_chain() {
             "{label}: context site still leads the chain: {stderr}"
         );
     }
-    assert!(
+    // rm-1543: /dev/full is Linux-only. Where the device is absent
+    // the child still proves the cause chain — the open failure
+    // surfaces its own cause through the same context site.
+    let dev_full_available = std::path::Path::new("/dev/full").exists();
+    let write_cause_surfaces = if dev_full_available {
         enospc_err.contains("No space left on device")
             || enospc_err.contains("Permission denied")
-            || enospc_err.contains("ENOSPC"),
+            || enospc_err.contains("ENOSPC")
+    } else {
+        enospc_err.contains("No such file or directory")
+    };
+    assert!(
+        write_cause_surfaces,
         "the underlying write cause must surface through the context site \
          (on hosts where the atomic writer's temp sibling cannot be created \
-         next to /dev/full, the honest cause is EACCES): {enospc_err}"
+         next to /dev/full, the honest cause is EACCES; on hosts without \
+         /dev/full the open failure is the cause): {enospc_err}"
     );
     assert!(
         eisdir_err.contains("Is a directory"),
@@ -3544,8 +3561,13 @@ fn count_honesty_disclosures_in_cli_lanes() {
         .expect("named pairs ride the duplicate disclosure");
     assert_eq!(pairs.len(), 1, "one pair, capped shape");
     let pair = pairs[0].as_str().expect("pair renders as a string");
+    // rm-2232: the survivor is the lexicographically smallest path
+    // (alpha/a.jsonl < beta/b.jsonl) regardless of which copy the
+    // filesystem stamped newer — this assert used to flip on a 4ms
+    // mtime straddle (assess F1 made this exact gate red run to run).
     assert!(
-        pair.contains("a.jsonl")
+        pair.contains("alpha")
+            && pair.contains("a.jsonl")
             && pair.contains("beta")
             && pair.contains("<-")
             && pair.ends_with(beta.file_name().expect("name").to_string_lossy().as_ref()),

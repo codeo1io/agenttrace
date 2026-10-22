@@ -388,10 +388,19 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     all.retain(|path| !is_subagent_artifact_path(path));
     // rm-1881: the same session id in both the canonical CLI store and
     // the legacy VS Code tasks root renders one session (canonical wins).
-    // Integration note (conflict case 169c75c7): runs before the rm-1886
+    // integration note (conflict case 169c75c7): runs before the rm-1886
     // content dedup so an id-level duplicate resolves by the canonical
     // store rather than first-seen path order, matching the cached walk.
     retain_single_cline_session_per_id(&mut all);
+    // rm-2232: survivor selection must not follow mtimes. The walk
+    // yields newest-first per directory, so first-seen dedup picked
+    // whichever byte-identical copy the filesystem happened to stamp
+    // later — a race that flipped the wall gate 9/10 vs 1/10 on
+    // byte-identical corpora (assess F1). Sorting by path first makes
+    // the survivor the lexicographically smallest path — stable across
+    // runs and walk orders on a given platform; recency ordering for
+    // the returned list is restored by the sort below.
+    all.sort();
     let mut signatures: HashSet<(i64, u64)> = HashSet::new();
     all.retain(|path| {
         // Unreadable: keep (the parse lane owns and discloses those).
@@ -1088,13 +1097,17 @@ pub(crate) fn find_session_files_cached(
     retain_single_cline_session_per_id(&mut all);
     // rm-1886: content dedup at admission — a byte-identical journal
     // at a second path re-emits the same events and double-banks every
-    // aggregate it feeds. First-seen survivor wins (deterministic: the
-    // walk yields sorted per-directory files, roots in registration
-    // order); a file whose bytes cannot be read is KEPT — the parse
-    // lane owns unreadable files and discloses them, dedup must not
-    // silently drop what it cannot verify. Unreadable-file stance
-    // keeps this pass observable: suppressed copies are counted and
-    // the first pairs named.
+    // aggregate it feeds. rm-2232: the survivor is the lexicographically
+    // smallest path per signature — first-seen order over this
+    // path-sorted list, so selection is independent of walk order and
+    // of mtime races (the pre-rm-2232 walk fed newest-first and flipped
+    // survivors run to run). A file whose bytes cannot be read is KEPT
+    // — the parse lane owns unreadable files and discloses them, dedup
+    // must not silently drop what it cannot verify. Unreadable-file
+    // stance keeps this pass observable: suppressed copies are counted
+    // and the first pairs named. Recency ordering for the returned list
+    // is restored by the sort after the loop.
+    all.sort();
     let mut deduped: Vec<PathBuf> = Vec::with_capacity(all.len());
     let mut signatures: HashMap<(i64, u64), PathBuf> = HashMap::new();
     for path in all {

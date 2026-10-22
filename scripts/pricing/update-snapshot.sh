@@ -81,7 +81,10 @@ if [[ -n "$src" ]]; then
     cp -- "$src" "$tmp"
     echo "refresh source: captured file $src (offline refresh)"
 else
-    curl -fsSL "$url" -o "$tmp"
+    # rm-176 (run 10d7fba2 cycle 3): --max-time 60 parity with
+    # drift-check.sh:209 — the refresh fetch must never hang a
+    # scheduled workflow lane on a stalled CDN connection.
+    curl -fsSL --max-time 60 "$url" -o "$tmp"
     echo "refresh source: $url (live fetch)"
 fi
 
