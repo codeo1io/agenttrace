@@ -322,3 +322,68 @@ fn hostile_append_journal_parses_within_the_linear_bound() {
          ~100x ratio; the 60x floor rides 3x of load headroom, see rm-1519)"
     );
 }
+
+/// Arm — pre-0.65.0 resume twins (rm-715, upstream #29618).
+///
+/// Source-pinned shapes, captured from gemini-cli v0.64.0:
+/// `sessionUtils.ts` `convertGeminiMessageToHistory` synthesized a
+/// `{ id: `${msg.id}_response`, role: "user", parts: ... }` turn for
+/// EVERY tool-carrying gemini message (no `recordedResponseIds` check —
+/// that guard is the 0.65.0 fix), and when the result was an ARRAY the
+/// parts landed raw (`ensurePartArray(toolCall.result)`), so tool output
+/// text rode the twin as a user text part. `chatRecordingService.ts`
+/// `initialize()`'s fallback rewrite could persist that converted
+/// conversation back into the journal, so a resumed journal holds the
+/// same tool exchange twice: the real records (tool call + recorded
+/// response) AND a `<base>_response` twin re-carrying the output.
+/// The exact-id upsert cannot fold a suffixed twin, so the twin bills
+/// as a phantom user turn (PoC: 10 sessions / 5 turns → 20 / 10).
+#[test]
+fn arm_e_response_suffix_twins_fold_into_their_base_slot() {
+    let raw = format!(
+        "{METADATA_LINE}\n\
+         {{\"id\":\"m1\",\"type\":\"user\",\"content\":\"list files\"}}\n\
+         {{\"id\":\"m2\",\"type\":\"gemini\",\"content\":[{{\"text\":\"calling ls\"}}],\
+         \"toolCalls\":[{{\"id\":\"c1\",\"name\":\"ls\",\"args\":{{\"path\":\".\"}},\
+         \"result\":[{{\"text\":\"a b\"}}]}}],\
+         \"tokens\":{{\"input\":1000,\"output\":200,\"cached\":300}}}}\n\
+         {{\"id\":\"m2r\",\"type\":\"user\",\"content\":\"a b\"}}\n\
+         {{\"id\":\"m2_response\",\"type\":\"user\",\
+         \"content\":[{{\"text\":\"a b\"}}],\
+         \"tokens\":{{\"input\":1000,\"output\":200,\"cached\":300}}}}\n\
+         {{\"id\":\"m3\",\"type\":\"user\",\"content\":\"thanks\"}}\n"
+    );
+    let session = parse_one("twin.jsonl", &raw);
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    // The twin is the synthesized re-view of m2's tool exchange: its
+    // phantom user turn must fold away (user turns stay m1 + m2r).
+    assert_eq!(session.metrics.user_messages, 2);
+    // m2 stays the assistant turn — the fold merges the twin INTO its
+    // base slot; it must not replace or drop the base record.
+    assert_eq!(session.metrics.assistant_turns, 1);
+    // Identical tokens carriers on base and twin bill exactly once
+    // (merge-by-max, never a sum).
+    assert_eq!(session.metrics.tokens_input, 1000);
+    assert_eq!(session.metrics.tokens_output, 200);
+    assert_eq!(session.metrics.tokens_cache_r, 300);
+}
+
+/// Arm — the fold must be structural, not blind: a `_response`-suffixed
+/// record whose base id is absent from the journal (0.65-fixed journals
+/// can still carry one — e.g. after a `$rewindTo` dropped the base) is
+/// the only copy of that content and survives the fold untouched.
+#[test]
+fn arm_e_response_suffix_record_without_a_base_survives() {
+    let raw = format!(
+        "{METADATA_LINE}\n\
+         {{\"id\":\"m1\",\"type\":\"user\",\"content\":\"list files\"}}\n\
+         {{\"id\":\"m9_response\",\"type\":\"user\",\"content\":\"late output\",\
+         \"tokens\":{{\"input\":10,\"output\":2}}}}\n\
+         {{\"id\":\"m3\",\"type\":\"user\",\"content\":\"thanks\"}}\n"
+    );
+    let session = parse_one("nrb.jsonl", &raw);
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    assert_eq!(session.metrics.user_messages, 2);
+    assert_eq!(session.metrics.tokens_input, 10);
+    assert_eq!(session.metrics.tokens_output, 2);
+}
