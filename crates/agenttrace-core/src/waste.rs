@@ -5,6 +5,27 @@ use crate::{
     Metrics, ReportLanguage, Session, VERSION,
 };
 
+// rm-695 (run c53d1688 cycle 3): the waste severity ladder's caps and
+// tier floors as named, derived arithmetic. The cache+bloat+loop group
+// caps at 30, the stuck family at 20 and the cache-read-ratio rung adds
+// at most 6 — no session can score above WASTE_LADDER_CEILING (56). The
+// tier floors are DERIVED from these caps, never hand-picked: the red
+// arm used to sit at a hand-picked 70, above the 56 ceiling, so no
+// corpus could ever grade red — a maximally degenerate session (dead
+// cache, severe bloat, 90% loop cost, three stuck patterns) scored
+// 50/56 and read "orange" (assess 566f3a43 N1). Red now means both
+// capped component families are exhausted; the ratio rung is headroom
+// toward the ceiling, not a red precondition.
+const WASTE_COMPONENT_CAP: f64 = 30.0;
+const WASTE_STUCK_CAP: f64 = 20.0;
+const WASTE_CACHE_RATIO_RUNG: f64 = 6.0;
+/// The most any session can score: the sum of every ladder cap.
+const WASTE_LADDER_CEILING: i32 =
+    (WASTE_COMPONENT_CAP + WASTE_STUCK_CAP + WASTE_CACHE_RATIO_RUNG) as i32;
+/// Red fires once both capped component families are exhausted.
+const WASTE_RED_FLOOR: i32 = (WASTE_COMPONENT_CAP + WASTE_STUCK_CAP) as i32;
+const WASTE_ORANGE_CEILING: i32 = WASTE_RED_FLOOR - 1;
+
 #[derive(Debug, Clone)]
 pub struct CacheEfficiency {
     cache_read_tokens: i64,
@@ -132,8 +153,8 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
     };
     score += bloat.bloat_score as f64 * 0.25;
     score += loop_percent * 0.6;
-    if score > 30.0 {
-        score = 30.0;
+    if score > WASTE_COMPONENT_CAP {
+        score = WASTE_COMPONENT_CAP;
     }
     let mut stuck_score = stuck.len() as f64 * 7.0;
     for item in &stuck {
@@ -141,20 +162,22 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
             stuck_score += 5.0;
         }
     }
-    if stuck_score > 20.0 {
-        stuck_score = 20.0;
+    if stuck_score > WASTE_STUCK_CAP {
+        stuck_score = WASTE_STUCK_CAP;
     }
     score += stuck_score;
     if session.metrics.tokens_cache_r > 0
         && session.metrics.tokens_input > 0
         && session.metrics.tokens_cache_r as f64 / (session.metrics.tokens_input as f64) < 0.3
     {
-        score += 6.0;
+        score += WASTE_CACHE_RATIO_RUNG;
     }
     let waste_score = (score as i32).clamp(0, 100);
     let waste_level = match waste_score {
-        70.. => "red",
-        40..=69 => "orange",
+        // rm-695: floors derived from the cap constants above — a
+        // hand-picked floor above the cap sum is a dead rung.
+        WASTE_RED_FLOOR.. => "red",
+        40..=WASTE_ORANGE_CEILING => "orange",
         15..=39 => "yellow",
         _ => "green",
     };
@@ -181,17 +204,29 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
                 ""
             }
         ),
-        "red" => format!(
-            "severe waste ${:.2}: loops {:.0}%, {} stuck, no cache{}",
-            total_wasted,
-            loop_percent,
-            stuck.len(),
-            if synthetic_loop_disclosure {
-                " (synthetic estimate)"
-            } else {
-                ""
-            }
-        ),
+        "red" => {
+            // rm-695: red no longer implies a dead cache — a corpus can
+            // exhaust both capped families on loop or bloat mass alone
+            // with a healthy cache, so the clause states the actual
+            // rating instead of asserting one.
+            let cache_clause = match cache.rating {
+                "none" => ", no cache",
+                "poor" => ", poor cache",
+                _ => "",
+            };
+            format!(
+                "severe waste ${:.2}: loops {:.0}%, {} stuck{}{}",
+                total_wasted,
+                loop_percent,
+                stuck.len(),
+                cache_clause,
+                if synthetic_loop_disclosure {
+                    " (synthetic estimate)"
+                } else {
+                    ""
+                }
+            )
+        }
         _ => String::new(),
     };
 
@@ -634,16 +669,27 @@ fn waste_summary(report: &WasteReport, language: ReportLanguage) -> String {
                 ""
             }
         ),
-        _ => format!(
-            "严重浪费 ${:.2}：{} 个卡住信号，且未有效使用缓存{}",
-            report.total_wasted,
-            report.stuck.len(),
-            if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
-                "（循环部分为合成估算）"
+        _ => {
+            // rm-695: red no longer implies a dead cache (loop or bloat
+            // mass alone can exhaust both capped families) — the clause
+            // states the actual rating, mirroring the EN arm.
+            let cache_clause = if report.cache.rating == "none" || report.cache.rating == "poor" {
+                "，未有效使用缓存"
             } else {
                 ""
-            }
-        ),
+            };
+            format!(
+                "严重浪费 ${:.2}：{} 个卡住信号{}{}",
+                report.total_wasted,
+                report.stuck.len(),
+                cache_clause,
+                if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
+                    "（循环部分为合成估算）"
+                } else {
+                    ""
+                }
+            )
+        }
     }
 }
 
@@ -1026,6 +1072,153 @@ mod tests {
         let rendered = render_waste_report_with_language(&session, ReportLanguage::En);
         assert!(rendered.contains("allocated share of session cost"));
         assert!(rendered.contains("75% of session"));
+    }
+
+    #[test]
+    fn max_adversarial_sessions_grade_red_not_capped_at_orange() {
+        // rm-695 red-first fixture (run c53d1688 cycle 3; the assess
+        // 566f3a43 N1 PoC rebuilt as a pinned corpus): the tier floors
+        // used to be hand-picked, and the red arm sat at 70 while the
+        // ladder's caps sum to 30 + 20 + 6 = 56 — a dead top rung that
+        // capped genuinely degenerate corpora at "orange". On unfixed
+        // source this corpus scored 50 and 56 and graded ORANGE both
+        // times; every grading assertion below was red before the
+        // floors were re-derived from the caps.
+        use std::collections::BTreeMap;
+        let adversarial = |cache_reads: i64, stuck_patterns: Vec<crate::StuckPattern>| Session {
+            org: String::new(),
+            org_email: String::new(),
+            name: "max-adversarial".to_string(),
+            path: "/tmp/max-adversarial.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                // Cache arm maxed at "none" (hit rate ~0% with zero
+                // cache writes); a trace-level read keeps the
+                // cache-read-ratio rung lit at 1 and dark at 0.
+                tokens_input: 10_000,
+                tokens_cache_r: cache_reads,
+                tokens_cache_w: 0,
+                // Bloat "severe" (10 tools/turn) plus 90% loop cost
+                // pins the cache+bloat+loop group at its cap.
+                assistant_turns: 10,
+                tool_calls_total: 100,
+                cost_estimated: 1.0,
+                tool_usage: BTreeMap::from([
+                    ("read".to_string(), 60),
+                    ("grep".to_string(), 40),
+                ]),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics {
+                // 90% loop cost on a $1 session: the group is at cap
+                // whatever the other rungs contribute.
+                loop_cost: crate::diagnostics::LoopCost {
+                    cost_basis: LoopCostBasis::Priced,
+                    total_loop_cost: 0.9,
+                    retry_events: 3,
+                    retry_cost: 0.9,
+                    tool_loop_cost: 0.0,
+                    loop_groups: 1,
+                    loop_type: "identical".to_string(),
+                    turns: 4,
+                },
+                stuck_patterns,
+                ..Diagnostics::default()
+            },
+        };
+        let stuck_three_one_critical = vec![
+            crate::StuckPattern {
+                pattern: "long_gaps".to_string(),
+                description: "3 gaps exceed 120s".to_string(),
+                severity: "critical".to_string(),
+            },
+            crate::StuckPattern {
+                pattern: "repeated_response".to_string(),
+                description: "Repeated assistant response 5 times".to_string(),
+                severity: "warning".to_string(),
+            },
+            crate::StuckPattern {
+                pattern: "no_tool_result".to_string(),
+                description: "4 tool calls have no result".to_string(),
+                severity: "warning".to_string(),
+            },
+        ];
+        // Ceiling corpus: group cap 30 + stuck cap 20 (7*3 + 5 = 26
+        // clamped) + cache-read-ratio rung 6 = 56, the most any
+        // session can score.
+        let ceiling = compute_waste_report(&adversarial(1, stuck_three_one_critical.clone()));
+        assert_eq!(ceiling.waste_score, 56, "the corpus must reach the ladder ceiling");
+        assert_eq!(
+            ceiling.waste_level, "red",
+            "the ceiling corpus must grade red, not orange"
+        );
+        assert!(
+            ceiling.summary.starts_with("severe waste $"),
+            "the red summary arm must render: {}",
+            ceiling.summary
+        );
+        assert!(
+            ceiling.summary.contains("no cache"),
+            "the dead-cache clause stays for a cache-less corpus: {}",
+            ceiling.summary
+        );
+        // The assess-PoC shape: both capped families exhausted, ratio
+        // rung dark — 30 + 20 = 50, the exact score the swept PoC
+        // measured while the tier was dead.
+        let floored = compute_waste_report(&adversarial(0, stuck_three_one_critical));
+        assert_eq!(floored.waste_score, 50);
+        assert_eq!(
+            floored.waste_level, "red",
+            "exhausting both capped families must grade red"
+        );
+        // Band stability: the re-derivation must not swallow the
+        // orange tier — 30 (group cap) + 14 (two non-critical stuck
+        // patterns) = 44 stays orange.
+        let stuck_two_plain = vec![
+            crate::StuckPattern {
+                pattern: "repeated_response".to_string(),
+                description: "Repeated assistant response 5 times".to_string(),
+                severity: "warning".to_string(),
+            },
+            crate::StuckPattern {
+                pattern: "no_tool_result".to_string(),
+                description: "4 tool calls have no result".to_string(),
+                severity: "warning".to_string(),
+            },
+        ];
+        let still_orange = compute_waste_report(&adversarial(0, stuck_two_plain));
+        assert_eq!(still_orange.waste_score, 44);
+        assert_eq!(still_orange.waste_level, "orange");
+    }
+
+    #[test]
+    fn tier_floors_stay_derived_from_the_ladder_caps() {
+        // rm-695 contract: the red tier died because a hand-picked floor
+        // (70) sat above the sum of the caps (56) and nothing pinned the
+        // relationship. The floors are now derived constants; this pins
+        // the arithmetic so a future rung edit cannot re-deaden a tier,
+        // push a band past the ceiling, or desynchronize the derived
+        // floors from the caps they name.
+        assert_eq!(
+            WASTE_LADDER_CEILING, 56,
+            "the ceiling is the sum of the caps: 30 + 20 + 6"
+        );
+        assert_eq!(
+            WASTE_RED_FLOOR, 50,
+            "red = both capped component families exhausted (30 + 20)"
+        );
+        assert!(
+            WASTE_RED_FLOOR <= WASTE_LADDER_CEILING,
+            "a tier floor above the ladder ceiling is a dead rung (the rm-695 defect)"
+        );
+        assert!(
+            40 <= WASTE_ORANGE_CEILING,
+            "the orange band must stay non-empty below the red floor"
+        );
     }
 }
 
