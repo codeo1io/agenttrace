@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 73;
 // Bumped 71 -> 72 (integration of run 4eeea89188b245068a569ba76f8caa71
 // cycle 2 "truth of the default surfaces", rm-1553: the claude identity
 // capture (orgIdentifier/loginEmail) is now capped at capture
@@ -973,6 +973,10 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
 // flat-transcript parser now preserves the tool_use_id -> tool_call_id
 // join (explicit ids verbatim, id-less entries paired positionally per
 // tool) and loop detection keys on (tool name, argument identity)
+// Bumped 72 -> 73 (run 64b6f06e, rm-233): the loop fingerprint lane
+// re-keys from result-content hash to (tool name, argument identity),
+// matching loop_cost; warm v72 entries carry result-keyed
+// fingerprints (false-positive "loops" attention) and regenerate once.
 // instead of the name alone, so v20 entries carry stale
 // tool_latencies.unmatched counts, trace-step result pairing, and
 // loop_cost groups under the old name-only key. Entries regenerate

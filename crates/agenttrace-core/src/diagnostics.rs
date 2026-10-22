@@ -74,7 +74,11 @@ pub struct LoopCost {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopFingerprint {
     pub tool_name: String,
-    pub result_hash: String,
+    /// rm-233 (run 64b6f06e): the fingerprint hashes the call's
+    /// canonicalized arguments, not its result content. The alias
+    /// keeps v72-and-older cached diagnostics deserializable.
+    #[serde(default, alias = "result_hash")]
+    pub argument_hash: String,
     pub count: usize,
     pub first_index: usize,
     pub last_index: usize,
@@ -922,19 +926,19 @@ fn priced_event_cost(event: &Event, session_model: &str) -> Option<f64> {
 }
 
 fn loop_fingerprints(events: &[Event]) -> Vec<LoopFingerprint> {
-    let results = events
-        .iter()
-        .filter(|event| event.role == "tool" && !event.tool_call_id.is_empty())
-        .map(|event| (event.tool_call_id.as_str(), hash(&event.content)))
-        .collect::<HashMap<_, _>>();
+    // rm-233 (run 64b6f06e): this lane keyed on result content, so
+    // >=3 distinct-argument parallel calls returning byte-identical
+    // output (same-dir `ls`, identical error strings) flagged
+    // priority-1 "loops" attention in inspect_reason while loop_cost
+    // — keyed on (tool name, argument identity) since the v21 cache
+    // bump — correctly reported no loop. Key both lanes the same
+    // way: (tool name, canonicalized arguments), consecutive runs of
+    // >=3, result presence not required (loop_cost doesn't require
+    // it either).
     let pairs = events
         .iter()
         .flat_map(|event| &event.tool_calls)
-        .filter_map(|call| {
-            results
-                .get(call.id.as_str())
-                .map(|hash| (call.name.as_str(), *hash))
-        })
+        .map(|call| (call.name.as_str(), canonical_args(&call.args)))
         .collect::<Vec<_>>();
     let mut out = Vec::new();
     let mut start = 0;
@@ -947,13 +951,13 @@ fn loop_fingerprints(events: &[Event]) -> Vec<LoopFingerprint> {
         if count >= 3 {
             out.push(LoopFingerprint {
                 tool_name: pairs[start].0.to_string(),
-                result_hash: format!("{:x}", pairs[start].1),
+                argument_hash: format!("{:x}", hash(&pairs[start].1)),
                 count,
                 first_index: start,
                 last_index: end - 1,
                 severity: if count >= 5 { "critical" } else { "high" }.to_string(),
                 detail: format!(
-                    "Tool '{}' returned the same result {count} times",
+                    "Tool '{}' re-issued the same call {count} times",
                     pairs[start].0
                 ),
             });
@@ -1244,7 +1248,7 @@ mod tests {
         assert_eq!(diagnostics.loop_fingerprints[0].count, 4);
         assert_eq!(diagnostics.loop_fingerprints[0].first_index, 0);
         assert_eq!(diagnostics.loop_fingerprints[0].last_index, 3);
-        assert!(!diagnostics.loop_fingerprints[0].result_hash.is_empty());
+        assert!(!diagnostics.loop_fingerprints[0].argument_hash.is_empty());
         assert!(diagnostics.loop_cost.total_loop_cost > 0.0);
         assert_eq!(diagnostics.loop_cost.loop_type, "bash_loop");
         assert_eq!(diagnostics.loop_cost.turns, 4);
