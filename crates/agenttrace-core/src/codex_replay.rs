@@ -81,6 +81,42 @@
 //!   decode yields no evidence (never a second loud failure), and family
 //!   identity is content-based, so a zstd parent and an uncompressed
 //!   child of the same rollout still tie (integration case 4404ce94).
+//!
+//! rm-1907 (run 0779d26b, cycle 6): shape alone does not make a parent.
+//! Two SIBLINGS that share a long onboarding template pass every shape
+//! gate — identical ≥384-byte 2+-item opening, both continue past it,
+//! the later one's final covers the earlier's — and the rebase then
+//! silently destroyed the later sibling's real usage under a FALSE
+//! replay disclosure (assess PoC: corpus reported 900 in / $0.0027
+//! against a true 1,400 / $0.0042, −36%, "500 tokens dropped"). The
+//! wire carries no pointer/turn-id linkage, so positive parent evidence
+//! is measured from the two files' own content: the presumed parent's
+//! billed usage must already be COMPLETE inside the byte-identical
+//! prefix (its cumulative snapshot at the divergence boundary equals
+//! its final — it billed nothing the child did not replay), and the
+//! child's FIRST cumulative snapshot must already cover that boundary
+//! input (it really billed the replayed prefix, not merely started from
+//! a template it billed itself). A family without that evidence is
+//! UNRESOLVED: no member's usage moves, and the would-be child discloses
+//! `codex_multiagent_replay_family_unresolved` — numbers never drift
+//! silently in either direction.
+//!
+//! rm-1908 (run 0779d26b, cycle 6, disclosure arm — title-reconciled at
+//! this integration onto the landed rm-1542 lane): reconciliation
+//! re-reads rollout files, and a corpus whose rollouts turned
+//! unreadable between runs (permission flips, mid-delete, vanished
+//! paths on a warm session cache) used to lose its families SILENTLY —
+//! reported totals flipped between runs with no disclosure. That gap
+//! is closed by the landed rm-1542 arm this merge composes with: every
+//! unreadable rollout keeps its session in the corpus and marks it with
+//! `codex_multiagent_reconcile_skipped_unreadable` (or
+//! `..._skipped_over_read_cap` for the read-cap refusal), counted in
+//! `CodexReplayAdjustment::rollouts_unreadable` / `rollouts_over_cap`.
+//! The run's own spelling of the same arm
+//! (`codex_multiagent_replay_scan_unreadable` /
+//! `CodexReplayAdjustment::scans_unreadable`) is superseded by the
+//! landed names — one arm, one counter, never two disclosures for the
+//! same unreadable file.
 
 use crate::{lookup_price_tiered, round4, Metrics, Session};
 use std::collections::hash_map::DefaultHasher;
@@ -117,6 +153,13 @@ pub struct CodexReplayAdjustment {
     /// rather than risked — with a per-child disclosure
     /// (`codex_multiagent_replay_family_no_task_started`).
     pub families_skipped_no_task_started: usize,
+    /// rm-1907: family children left untouched because the family is
+    /// UNRESOLVED — no positive parent evidence (the presumed parent
+    /// billed usage past the shared prefix, or the child's first
+    /// cumulative snapshot does not cover it), so the rebase would eat
+    /// real usage. Disclosed per child via
+    /// `codex_multiagent_replay_family_unresolved`; usage never moves.
+    pub children_unresolved: usize,
     /// Replayed tokens removed from children, per class.
     pub tokens_input_dropped: i64,
     pub tokens_cache_read_dropped: i64,
@@ -136,6 +179,7 @@ impl CodexReplayAdjustment {
             && self.rollouts_over_cap == 0
             && self.children_skipped_upstream == 0
             && self.children_below_baseline == 0
+            && self.children_unresolved == 0
         {
             return None;
         }
@@ -167,6 +211,19 @@ impl CodexReplayAdjustment {
                 "{} child{} skipped (below parent baseline; usage kept)",
                 self.children_below_baseline,
                 if self.children_below_baseline == 1 {
+                    ""
+                } else {
+                    "ren"
+                }
+            ));
+        }
+        // rm-1907: the unresolved-family skip class rides the same line
+        // — every reason a reconcile moved no numbers is named here.
+        if self.children_unresolved > 0 {
+            parts.push(format!(
+                "{} child{} skipped (no positive parent evidence; usage kept)",
+                self.children_unresolved,
+                if self.children_unresolved == 1 {
                     ""
                 } else {
                     "ren"
@@ -262,6 +319,13 @@ struct RolloutScan {
     over_cap: bool,
     /// Final cumulative `total_token_usage` snapshot (the file's last one).
     total: TotalSnapshot,
+    /// FIRST cumulative `total_token_usage` snapshot — rm-1907's
+    /// child-side parent evidence: a true replay child bills the
+    /// replayed prefix on its first token event, so that snapshot
+    /// already covers the prefix's usage (a sibling that merely shares
+    /// a template opening also starts low, but the parent-side boundary
+    /// check is what separates the two).
+    first_total: Option<TotalSnapshot>,
     /// First RFC3339 `timestamp` seen on any line of the file — the
     /// session's true start, re-derived from disk so it survives the
     /// session-cache round-trip that drops `metrics.timestamps`
@@ -302,6 +366,7 @@ fn scan_rollout(path: &Path, cap: u64) -> RolloutScan {
         unreadable: false,
         over_cap: false,
         total: TotalSnapshot::default(),
+        first_total: None,
         first_timestamp: None,
         response_items: 0,
         task_started_seen: false,
@@ -339,7 +404,7 @@ fn scan_rollout(path: &Path, cap: u64) -> RolloutScan {
             }
         }
     }
-    let Ok(text) = String::from_utf8(raw) else {
+    let Some(text) = String::from_utf8(raw).ok() else {
         // rm-1542: no longer valid UTF-8 — ditto.
         scan.unreadable = true;
         return scan;
@@ -395,13 +460,20 @@ fn scan_rollout(path: &Path, cap: u64) -> RolloutScan {
                         if let Some(usage) = info.get("total_token_usage") {
                             let get =
                                 |key: &str| usage.get(key).and_then(|x| x.as_i64()).unwrap_or(0);
-                            scan.total = TotalSnapshot {
+                            let snapshot = TotalSnapshot {
                                 input: get("input_tokens"),
                                 cached: get("cached_input_tokens"),
                                 cache_creation: get("cache_creation_input_tokens"),
                                 output: get("output_tokens"),
                                 reasoning: get("reasoning_output_tokens"),
                             };
+                            // rm-1907: keep the FIRST cumulative snapshot —
+                            // the child-side half of the parent-evidence
+                            // check below.
+                            if scan.first_total.is_none() {
+                                scan.first_total = Some(snapshot);
+                            }
+                            scan.total = snapshot;
                         }
                     }
                 } else if payload_type == Some("task_started") {
@@ -427,6 +499,136 @@ fn scan_rollout(path: &Path, cap: u64) -> RolloutScan {
         });
     }
     scan
+}
+
+/// rm-1908 (run 0779d26b, cycle 6): a rollout's text through the shared
+/// container handling — `None` when the file cannot be read, decoded or
+/// interpreted as UTF-8, or refuses the read cap. The pass-2
+/// corroboration reads through here; it mirrors `scan_rollout`'s read
+/// path exactly (metadata fast-path, same bounded reader, same cap,
+/// same zstd probe) so the two passes can never disagree about what a
+/// file says. A file that was readable in pass 1 failing here is a
+/// mid-run race — the resulting unresolved-family disclosure still
+/// covers the totals.
+fn rollout_text(path: &Path, cap: u64) -> Option<String> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > cap {
+            return None;
+        }
+    }
+    let mut raw = crate::parser::read_session_file_bounded(path, cap).ok()?;
+    // The zstd magic `28 B5 2F FD` — same probe as `parse_session_bytes`
+    // (rm-992). Plain rollouts take the direct path byte-for-byte.
+    if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        let label = path.display().to_string();
+        raw = crate::parser::decode_zstd_rollout_bounded(raw, &label).ok()?;
+    }
+    String::from_utf8(raw).ok()
+}
+
+/// rm-1907 (run 0779d26b, cycle 6): stream both rollouts in lockstep over
+/// their `response_item` payloads and measure how deep the byte-identical
+/// opening actually goes. Returns the shared item count and the PARENT's
+/// cumulative `total_token_usage` at the divergence point — the parent's
+/// billed state as of the last item the child replays. `None` when either
+/// file cannot be read; the caller treats that as no evidence (a file that
+/// was readable in pass 1 failing here is a mid-run race — the resulting
+/// unresolved-family disclosure still covers the totals).
+fn scan_shared_prefix(parent: &Path, child: &Path) -> Option<(usize, TotalSnapshot)> {
+    let cap = crate::parser::file_read_cap_bytes();
+    let parent_text = rollout_text(parent, cap)?;
+    let child_text = rollout_text(child, cap)?;
+    let mut parent_lines = parent_text.lines();
+    let mut child_lines = child_text.lines();
+    let mut parent_usage = TotalSnapshot::default();
+    let mut child_usage = TotalSnapshot::default();
+    let mut shared = 0usize;
+    loop {
+        match (
+            next_response_hash(&mut parent_lines, &mut parent_usage),
+            next_response_hash(&mut child_lines, &mut child_usage),
+        ) {
+            (Some(parent_hash), Some(child_hash)) if parent_hash == child_hash => shared += 1,
+            _ => break,
+        }
+    }
+    Some((shared, parent_usage))
+}
+
+/// Advance to the next `response_item` line, folding `token_count`
+/// cumulative snapshots seen on the way into `usage`. Returns the hashed
+/// payload — the SAME stable per-item hash the opening fingerprint chains,
+/// so "shared item" here means byte-identical payload exactly as family
+/// detection means it.
+fn next_response_hash(lines: &mut std::str::Lines, usage: &mut TotalSnapshot) -> Option<u64> {
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let payload = v.get("payload").unwrap_or(&serde_json::Value::Null);
+        match kind {
+            "response_item" => {
+                let mut item_hasher = DefaultHasher::new();
+                payload.hash(&mut item_hasher);
+                return Some(item_hasher.finish());
+            }
+            "event_msg" => {
+                let payload_type = payload.get("type").and_then(|t| t.as_str());
+                if payload_type == Some("token_count") {
+                    if let Some(info) = payload.get("info") {
+                        if let Some(usage_value) = info.get("total_token_usage") {
+                            let get = |key: &str| {
+                                usage_value.get(key).and_then(|x| x.as_i64()).unwrap_or(0)
+                            };
+                            *usage = TotalSnapshot {
+                                input: get("input_tokens"),
+                                cached: get("cached_input_tokens"),
+                                cache_creation: get("cache_creation_input_tokens"),
+                                output: get("output_tokens"),
+                                reasoning: get("reasoning_output_tokens"),
+                            };
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// rm-1907: POSITIVE parent evidence for rebasing this child onto the
+/// promoted member's FINAL snapshot. The byte-identical opening only
+/// proves the two files share a prefix; a replay family and two siblings
+/// with the same onboarding template are indistinguishable by shape. Two
+/// wire facts separate them, both measurable from the files themselves:
+///
+/// 1. the presumed parent's billed usage was already COMPLETE inside the
+///    shared prefix — its cumulative snapshot at the divergence boundary
+///    equals its final (cumulative snapshots are monotone, so equality
+///    means it billed nothing the child did not replay; the parent-final
+///    baseline is then exactly what the child replayed);
+/// 2. the child's FIRST cumulative snapshot already covers the boundary's
+///    input — it really billed the replayed prefix on its first turn, not
+///    merely started from a template it billed itself.
+///
+/// Anything else (a parent that billed past the boundary — the sibling and
+/// mid-spawn shapes alike) leaves the family unresolved: no rebase, no
+/// drop, disclosure instead.
+fn parent_final_is_evidenced(
+    shared: usize,
+    parent_at_boundary: &TotalSnapshot,
+    parent_final: &TotalSnapshot,
+    child_first: Option<TotalSnapshot>,
+) -> bool {
+    shared > 0
+        && parent_at_boundary.input == parent_final.input
+        && parent_at_boundary.cached == parent_final.cached
+        && parent_at_boundary.cache_creation == parent_final.cache_creation
+        && parent_at_boundary.output == parent_final.output
+        && parent_at_boundary.reasoning == parent_final.reasoning
+        && child_first.is_some_and(|first| first.input >= parent_at_boundary.input)
 }
 
 /// Recompute a child's estimated cost from its rebased token classes with
@@ -487,6 +689,7 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
         started_at: chrono::DateTime<chrono::Utc>,
         path: PathBuf,
         total: TotalSnapshot,
+        first_total: Option<TotalSnapshot>,
         fingerprint_items: usize,
         response_items: usize,
         task_started_seen: bool,
@@ -522,6 +725,12 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
             stats.rollouts_over_cap += 1;
             continue;
         }
+        // rm-1542 (the landed title of this run's rm-1908 arm): the file
+        // cannot be re-read at reconcile time (vanished path, permission
+        // flip, mid-delete race, undecodable container) — the session
+        // keeps its whole (possibly double-counted) usage and the corpus
+        // learns the verification gap loudly instead of flipping totals
+        // between warm and cold runs.
         if scan.unreadable {
             note_reconcile_skip(session);
             stats.rollouts_unreadable += 1;
@@ -553,6 +762,10 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
                 started_at,
                 path,
                 total: scan.total,
+                // rm-1907: the child-side half of the parent-evidence
+                // check — carried through so pass 2 never re-reads a
+                // file pass 1 already scanned.
+                first_total: scan.first_total,
                 fingerprint_items: fingerprint.items,
                 response_items: scan.response_items,
                 // rm-1949 arm d composes with the rm-1956 key (the
@@ -631,6 +844,33 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
                 stats.children_below_baseline += 1;
+                continue;
+            }
+            // rm-1907 (run 0779d26b, cycle 6): shape alone does not make a
+            // parent — rebase only on positive parent evidence (see
+            // `parent_final_is_evidenced`). A family without it is
+            // UNRESOLVED: no member's usage moves, the would-be child
+            // discloses. This is the sibling-shape guard: two independent
+            // sessions sharing a long onboarding template used to lose
+            // the later one's real usage here (−36% in the assess PoC).
+            let corroborated = scan_shared_prefix(&members[0].path, &child.path).is_some_and(
+                |(shared, parent_at_boundary)| {
+                    parent_final_is_evidenced(
+                        shared,
+                        &parent_at_boundary,
+                        &parent_total,
+                        child.first_total,
+                    )
+                },
+            );
+            if !corroborated {
+                session
+                    .metrics
+                    .disclosure_counters
+                    .entry("codex_multiagent_replay_family_unresolved".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                stats.children_unresolved += 1;
                 continue;
             }
             let before_input = session.metrics.tokens_input;
@@ -727,6 +967,7 @@ mod disclosure_tests {
             rollouts_over_cap: 1,
             children_skipped_upstream: 3,
             children_below_baseline: 2,
+            children_unresolved: 4,
             ..Default::default()
         };
         let line = skipped.disclosure_line().expect("skips are disclosed");
@@ -745,6 +986,10 @@ mod disclosure_tests {
             line.contains("2 children skipped (below parent baseline"),
             "{line}"
         );
+        assert!(
+            line.contains("4 children skipped (no positive parent evidence"),
+            "{line}"
+        );
         let singular = CodexReplayAdjustment {
             families_skipped_no_task_started: 1,
             ..Default::default()
@@ -757,5 +1002,14 @@ mod disclosure_tests {
         };
         let line = singular.disclosure_line().expect("skips are disclosed");
         assert!(line.contains("1 child skipped"), "{line}");
+        let singular = CodexReplayAdjustment {
+            children_unresolved: 1,
+            ..Default::default()
+        };
+        let line = singular.disclosure_line().expect("skips are disclosed");
+        assert!(
+            line.contains("1 child skipped (no positive parent evidence"),
+            "{line}"
+        );
     }
 }

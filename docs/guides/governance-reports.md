@@ -567,7 +567,10 @@ named unhandled format instead of classifying it session-less — a v13
 snapshot banked before either change replays the same database with no
 unreadable disclosure on an unchanged (size, mtime) fingerprint, so one
 regeneration per database retires the stale entry (rm-1926/rm-1927, run
-9d3b927c cycle 1; rm-230 convention). Older versions are discarded and
+9d3b927c cycle 1; rm-230 convention; run 0779d26b's rm-1913 bump for a
+NULL-leg counter landed at this integration onto the same rung — same
+defect, one landed disclosure, the numeral stays 14). Older versions are
+discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
 pruned the next time the cache loads, and the JSONL-backed session cache is

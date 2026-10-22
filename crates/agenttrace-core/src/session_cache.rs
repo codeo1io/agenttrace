@@ -1076,6 +1076,15 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 73;
 // disclosure on an unchanged (size, mtime) fingerprint — one
 // regeneration per database retires the stale entry (rm-230
 // convention).
+// Integration note (run 0779d26b, this merge): that run's rm-1913
+// bump (its own 13 -> 14 for a NULL-leg counter
+// `opencode_summary_diffs_crosscheck_null_leg`) is SUPERSEDED by the
+// landed rm-1926 arm above — same defect (the rm-1509 cross-check
+// silently skipping NULL/non-numeric `summary_*` legs), same fresh
+// parse site, one landed disclosure (`summary_cross_check_unreadable`
+// + the `opencode_summary_cross_check_unreadable` counter) instead
+// of two. The numeral stays 14 (the landed-rung-keeps-numeral
+// convention); no second invalidation is owed.
 const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 14;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
@@ -3779,6 +3788,65 @@ mod tests {
     }
 
     #[test]
+    fn stale_sqlite_snapshot_schema_version_never_serves() {
+        // Review 0531858e F1 (rm-1913): the null-leg cross-check counter
+        // is computed in `session_from_sqlite_agg`, which a warm snapshot
+        // hit bypasses — a snapshot banked by a pre-counter binary serves
+        // the pre-counter aggregate and the NULL legs reconcile silently
+        // again. The version bump is the whole fix: same bytes, one stale
+        // field, must never serve.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-sqlite-schema-version-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let database = root.join("state.db");
+        let snapshot = root.join("snapshot.json");
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(&database, b"db").expect("write database");
+        let session = Session {
+            name: "cached".to_string(),
+            path: database.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0)
+            .expect("store current-version snapshot");
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot).is_some(),
+            "a current-version snapshot must serve"
+        );
+        // Forge exactly one stale field: the pre-bump binary's ledger.
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&snapshot).expect("read stored ledger"))
+                .expect("parse stored ledger");
+        assert_eq!(
+            ledger["schema_version"].as_i64(),
+            Some(SQLITE_SNAPSHOT_SCHEMA_VERSION),
+            "stored ledger must carry the current version"
+        );
+        ledger["schema_version"] = (SQLITE_SNAPSHOT_SCHEMA_VERSION - 1).into();
+        fs::write(
+            &snapshot,
+            serde_json::to_vec(&ledger).expect("serialize ledger"),
+        )
+        .expect("write stale ledger");
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot).is_none(),
+            "a pre-bump (v{}) snapshot must be rejected so the aggregate — and its null-leg counter — recompute",
+            SQLITE_SNAPSHOT_SCHEMA_VERSION - 1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn sqlite_snapshot_is_invalidated_by_database_wal_or_shm_changes() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-cache-{}-{:?}",
@@ -3995,7 +4063,9 @@ mod tests {
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
         let ledger_key = database.to_string_lossy().to_string();
-        // Version fourteen (rm-1926/rm-1927, cycle 1 of run 9d3b927c):
+        // Version fourteen (rm-1926/rm-1927, cycle 1 of run 9d3b927c,
+        // which supersedes run 0779d26b's rm-1913 bump at this merge —
+        // same NULL/non-numeric-leg defect, one landed disclosure):
         // present-but-unreadable `summary_*` integers beside a decoded
         // payload began emitting `summary_cross_check_unreadable` — a
         // snapshot without the field would replay those rows silent

@@ -337,3 +337,67 @@ fn overview_by_agent_still_keys_on_the_agent_column() {
         .expect("builder bucket");
     assert_eq!(builder.sessions, 2);
 }
+
+/// rm-1913 (run 0779d26b, cycle 6 — superseded at integration by the
+/// landed rm-1926 arm, which owns this defect with a richer
+/// disclosure; the run's fixture and per-leg shapes ride on and pin
+/// the landed counter): the rm-1509 cross-check silently skipped
+/// when either integer `summary_*` leg was NULL or non-numeric
+/// — even with the per-file list present and healthy (sums 130/10) —
+/// so a writer that recorded diffs but lost a summary column was
+/// never checked AND never disclosed. The skip is per-session
+/// visible and names the broken column and storage class; the
+/// numbers themselves still never move, and the healthy path (both
+/// legs present, sums matching) stays counter-free.
+#[test]
+fn null_or_non_numeric_summary_leg_discloses_the_skipped_crosscheck() {
+    let sessions = loaded("opencode-summary-diffs-nulllegs/opencode.db");
+    const COUNTER: &str = "opencode_summary_cross_check_unreadable";
+    let expected = [
+        ("ses-null-add", "summary_additions", "stored as NULL"),
+        ("ses-null-del", "summary_deletions", "stored as NULL"),
+        ("ses-text-leg", "summary_additions", "non-numeric text"),
+    ];
+    for (key, column, reason) in expected {
+        let session = session_named(&sessions, key);
+        // The per-file payload is present and healthy — the check had
+        // something to compare and could not run.
+        assert_eq!(
+            session.metrics.summary_diffs.as_ref().unwrap().len(),
+            2,
+            "{key}: per-file list present"
+        );
+        assert_eq!(session.metrics.summary_diffs_dropped, 0);
+        assert!(
+            session.metrics.summary_diffs_divergence.is_none(),
+            "{key}: no divergence verdict without both legs"
+        );
+        // The landed rm-1926 disclosure names the broken column and
+        // its storage class — the run's counter spelling is retired.
+        let detail = session
+            .metrics
+            .summary_cross_check_unreadable
+            .as_ref()
+            .unwrap_or_else(|| panic!("{key}: unreadable detail missing"));
+        assert_eq!(detail.len(), 1, "{key}: one broken leg");
+        assert_eq!(detail[0].column, column, "{key}: broken column named");
+        assert_eq!(detail[0].reason, reason, "{key}: storage class named");
+        assert_eq!(
+            session.metrics.disclosure_counters.get(COUNTER),
+            Some(&1),
+            "{key}: the skipped cross-check is disclosed"
+        );
+    }
+
+    // Healthy control: both legs present and matching the per-file
+    // sums — no divergence, and no skip disclosure.
+    let healthy = session_named(&sessions, "ses-healthy");
+    assert_eq!(healthy.metrics.summary_additions, Some(130));
+    assert_eq!(healthy.metrics.summary_deletions, Some(10));
+    assert!(healthy.metrics.summary_diffs_divergence.is_none());
+    assert!(healthy.metrics.summary_cross_check_unreadable.is_none());
+    assert!(!healthy.metrics.disclosure_counters.contains_key(COUNTER));
+
+    // The rm-991 contract (opencode_agent_summary.rs) stays the
+    // authority for the legacy column set: its fixture is untouched.
+}

@@ -1625,7 +1625,9 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     // discloses WHY the cross-check cannot run instead of silently
     // skipping it — `summary_diffs_divergence`'s early-`?` seam read
     // missing integers as "nothing to compare", hiding exactly the
-    // writer defect the cross-check exists to catch.
+    // writer defect the cross-check exists to catch. (This landed arm
+    // supersedes run 0779d26b's rm-1913 NULL-leg counter at this
+    // integration — same defect, same site, one disclosure.)
     let summary_cross_check_unreadable =
         if agg.summary_diffs.is_some() && !agg.summary_unreadable.is_empty() {
             Some(agg.summary_unreadable.clone())
@@ -1730,6 +1732,9 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         metrics.duration_sec = agg.end_unix - agg.start_unix;
         metrics.provenance.duration = "timestamp_span".to_string();
     }
+    // (Run 0779d26b's rm-1913 counter block was superseded here by the
+    // landed rm-1926 disclosure above — see the Metrics literal and
+    // the `opencode_summary_cross_check_unreadable` bump below.)
     // rm-790: the source row id makes the derived-history identity per-row
     // (two same-second sessions from one database no longer hash to one
     // history record). rm-791: the raw parent row id is the pre-link marker
