@@ -2479,6 +2479,25 @@
 
 ### Changed
 
+- `agenttrace export --format otel`: the GenAI semantic-convention pin refreshed from the
+  2026-10-05 snapshot to 2026-10-21 (open-telemetry/semantic-conventions-genai commit
+  9ffc7e00c639, the #602 merge; rm-493). The optional token-breakdown attributes
+  `gen_ai.usage.cache_read.input_tokens`/`gen_ai.usage.cache_write.input_tokens` now emit
+  only when non-zero — the #548 "recommended when available and non-zero" clarification —
+  so zero-cache sessions no longer carry zero rows (the always-on honest-zero disclosure
+  stays on the `agenttrace.session.*` mirrors; `gen_ai.usage.input_tokens`/`output_tokens`
+  remain plain `Recommended` and keep zeros). A new contract test pins the exact
+  `gen_ai.*` attribute-name set to the snapshot. The remaining post-pin deltas are
+  dispositioned in otel.rs, not code: #602's positive-only rule and #453's session-duration
+  attribute target the GenAI token METRICS this export never emitted (spans-only), #525
+  execute_tool and #452 MCP error attributes are N/A for the same reason, and #506's
+  Mistral system value has no Mistral lane to rename. Also: opencode session info-doc
+  admission reads are now bounded by the same `take(cap + 1)` discipline the dedup lane
+  uses (rm-548 hardening half) — a doc that grows between stat and read can no longer
+  push an unbounded read past `OPENCODE_INFO_DOC_READ_CAP_BYTES`, with the inclusive cap
+  boundary test-pinned — and the seven cfg-symmetry dead-code warnings on the windows-gnu
+  cross-check are gated away (unix/linux-only test helpers now carry their tests' gates),
+  restoring a warning-free cross-target check for agenttrace-core.
 - One shared cache-directory resolver replaces the four byte-identical per-module copies (rm-1536, assess F4, run 79fe78c0 cycle 3; adoption of salvage 9b2a7a1 U2): doctor, pricing, session_cache, and statusline each carried their own `user_cache_dir` ladder for locating the `agenttrace` cache root (sessions.json, pricing.json, the statusline capture journal, the doctor cache report). The ladder now lives once in `agenttrace-core::cache_dir` — `resolve_user_cache_dir(home, xdg_cache_home, macos)` takes the platform arm as an injected boolean so the Linux CI legs can pin the macOS behavior that `cfg!` copies made compile-time dead code, and one 17-row decision table replaces the four per-module pin tests. Two order-of-precedence disclosures ride the consolidation: an ABSOLUTE, non-empty `$XDG_CACHE_HOME` now wins on EVERY OS — the old macOS arm returned `$HOME/Library/Caches` first, so the rm-596 doctor demo sandbox (HOME + absolute XDG override asserting no $HOME text in the report) was unsatisfiable on macOS — and the landed rm-248 rider stays on the home arms (a set-but-empty OR RELATIVE `HOME` is unset-equivalent on both arms; an unusable HOME never yields a per-cwd cache). No environment variable is read anywhere new — the `user_cache_dir()` wrapper reads exactly the same two variables through one code path.
 - `resolve_user_cache_dir` is defined exactly once (rm-1389, run 1a4cce3a cycle 3, batch "one truth on the money-and-cache path"; reliability 30.0): the user-cache base resolver existed as four hand-synced private copies (session_cache, doctor, pricing, statusline — byte-identical 29-line bodies at the consolidation base 3e90993, verified) that had already drifted twice in three days — the empty/relative-HOME fix (rm-248 rider, dade9cd) landed on three copies while statusline's lagged, and the relative-HOME review fix then landed on statusline alone. The session_cache copy — the module that owns the cache-root policy — is now the single `pub(crate)` definition, imported by the other three; it stays pure over `(HOME, XDG_CACHE_HOME)` so every call path remains test-injectable. No behavior change (the bodies were identical); the consolidation is pinned by `shared_user_cache_resolver_census_pins_one_definition` (session_cache unit test that walks every `crates/**/*.rs` and asserts exactly one `fn` definition — the needle is assembled at runtime so the test's own source cannot count itself) on top of the existing per-module parity tests (`user_cache_dir_treats_empty_and_relative_home_as_unset` in session_cache/doctor/pricing plus statusline's historical pins), which now exercise the one shared body from all four beds. (Integration, conflict case 4d82812f: this run's session_cache-hosted consolidation is superseded at the merge by the landed rm-1536 `cache_dir` consolidation above — same one-definition intent, mechanics rehomed: the shared resolver lives in `agenttrace-core::cache_dir` as `resolve_user_cache_dir(home, xdg_cache_home, macos)` with an injected macOS arm, so the Linux CI legs can pin it; the census pin `shared_user_cache_resolver_census_pins_one_definition` relocated to cache_dir.rs beside the one definition, and the per-module parity tests this entry cites were themselves folded into cache_dir's 17-row `user_cache_dir_decision_table`.)
 

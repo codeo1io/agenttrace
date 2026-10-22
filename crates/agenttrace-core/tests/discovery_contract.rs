@@ -1,10 +1,14 @@
 use agenttrace_core::SESSION_CACHE_SCHEMA_VERSION;
 use agenttrace_core::{
-    build_doctor_report, collect_session_files, data_health, data_health_scoped,
-    find_session_files, load_sessions_from_dir, load_sessions_with_options,
-    load_sessions_with_progress, parse_file, render_waste_report, search_sessions,
-    session_cache_path, session_capability, total_tokens, LoadOptions,
+    build_doctor_report, data_health, data_health_scoped, find_session_files,
+    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress, parse_file,
+    render_waste_report, search_sessions, session_cache_path, session_capability, total_tokens,
+    LoadOptions,
 };
+// `collect_session_files` backs the unix-only symlink-aliasing test
+// below; gating the import keeps the windows cross-check clean.
+#[cfg(unix)]
+use agenttrace_core::collect_session_files;
 use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;

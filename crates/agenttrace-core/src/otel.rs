@@ -2,8 +2,9 @@
 //!
 //! Emits an OTLP/HTTP-JSON `ExportTraceServiceRequest` document with one
 //! INTERNAL span per session carrying `gen_ai.*` attributes per the GenAI
-//! semantic conventions (open-telemetry/semantic-conventions docs/gen-ai,
-//! attribute names verified on [`SEMCONV_SNAPSHOT_DATE`]). The render is a
+//! semantic conventions (open-telemetry/semantic-conventions-genai, pin
+//! commit `9ffc7e00c639`; attribute names verified on
+//! [`SEMCONV_SNAPSHOT_DATE`]). The render is a
 //! file/stdout write only — there is no network transport in this module,
 //! honoring PRIVACY.md's offline-first posture.
 //!
@@ -26,16 +27,35 @@
 //! The deviation is disclosed on every span as
 //! `agenttrace.export.input_token_basis` so consumers never have to
 //! guess which basis the numbers are on.
+//!
+//! Snapshot 2026-10-21 delta dispositions (pin `9ffc7e00c639`), so a
+//! future re-pin knows what was adjudicated: #548 — optional token
+//! BREAKDOWN attributes (the cache buckets) are recommended only when
+//! available and NON-ZERO, so zero buckets are omitted and the
+//! honest-zero disclosure stays on the `agenttrace.session.*` mirrors
+//! (input/output tokens stay plain `Recommended` and keep zeros);
+//! #602 — the positive-only rule amends the
+//! `gen_ai.client.inference.usage.*` METRIC counters, which this
+//! spans-only export never emitted, so no code change is owed;
+//! #525 execute_tool and #452 MCP error attributes — N/A, no such
+//! events are emitted; #453 session-duration — metric-side, stays
+//! unclaimed here; #444 — strict-conformance wording recorded in this
+//! note rather than in code; #506 — the Mistral system-value rename
+//! has no Mistral lane to rename (`infer_gen_ai_system` knows
+//! claude-code/codex/workbuddy only).
 
 use crate::Session;
 use serde::Serialize;
 use std::path::Path;
 
 /// Date the GenAI semantic-convention attribute names used below were
-/// verified against the `docs/gen-ai` tree. Golden tests pin this constant
-/// so a future semconv drift forces a conscious refresh of the attribute
-/// names rather than silent staleness.
-pub const SEMCONV_SNAPSHOT_DATE: &str = "2026-10-05";
+/// verified against: 2026-10-21, pin =
+/// open-telemetry/semantic-conventions-genai commit `9ffc7e00c639`
+/// (the #602 merge; verified 2026-10-23 — see the module doc's delta
+/// dispositions). Golden tests pin this constant so a future semconv
+/// drift forces a conscious refresh of the attribute names rather
+/// than silent staleness.
+pub const SEMCONV_SNAPSHOT_DATE: &str = "2026-10-21";
 
 /// Recorded input-token basis of the emitted `gen_ai.usage.*` counters —
 /// see the module docs for the rationale. Emitted on every span so
@@ -305,22 +325,30 @@ fn session_span(session: &Session, ordinal: u64) -> Span {
         attr_str("gen_ai.system", infer_gen_ai_system(&session.path)),
         attr_str("gen_ai.request.model", metrics.model_used.clone()),
         // Delta basis — see the module docs and the basis disclosure
-        // attribute below.
+        // attribute below. input/output_tokens stay plain Recommended
+        // at the 2026-10-21 pin and keep emitting zeros.
         attr_int("gen_ai.usage.input_tokens", metrics.tokens_input),
         attr_int("gen_ai.usage.output_tokens", metrics.tokens_output),
-        // GenAI semconv snapshot 2026-10-05: cache_read/cache_write are
-        // input-subset counters and reasoning is an output-subset
-        // counter. The cache buckets always emit (honest zeros);
-        // reasoning emits only when the session recorded any — a zero
-        // cannot distinguish "none" from "source does not report".
-        attr_int(
+    ];
+    // GenAI semconv snapshot 2026-10-21 (pin 9ffc7e00c639):
+    // cache_read/cache_write are input-subset counters and reasoning
+    // is an output-subset counter. The optional token BREAKDOWN
+    // attributes are recommended only when available and NON-ZERO
+    // (#548), so zero buckets are omitted — the always-on honest-zero
+    // disclosure lives on the agenttrace.session.* mirrors below.
+    if metrics.tokens_cache_r > 0 {
+        attributes.push(attr_int(
             "gen_ai.usage.cache_read.input_tokens",
             metrics.tokens_cache_r,
-        ),
-        attr_int(
+        ));
+    }
+    if metrics.tokens_cache_w > 0 {
+        attributes.push(attr_int(
             "gen_ai.usage.cache_write.input_tokens",
             metrics.tokens_cache_w,
-        ),
+        ));
+    }
+    attributes.extend([
         attr_int(
             "agenttrace.session.cache_read_tokens",
             metrics.tokens_cache_r,
@@ -347,7 +375,7 @@ fn session_span(session: &Session, ordinal: u64) -> Span {
             SEMCONV_SNAPSHOT_DATE,
         ),
         attr_str("agenttrace.export.input_token_basis", INPUT_TOKEN_BASIS),
-    ];
+    ]);
     if metrics.tokens_reasoning != 0 {
         attributes.push(attr_int(
             "gen_ai.usage.reasoning.output_tokens",
@@ -468,7 +496,11 @@ mod tests {
 
     #[test]
     fn semconv_snapshot_date_is_pinned() {
-        assert_eq!(SEMCONV_SNAPSHOT_DATE, "2026-10-05");
+        // 2026-10-21 = semantic-conventions-genai commit 9ffc7e00c639
+        // (the #602 merge). Moving this pin is a conscious refresh:
+        // re-verify every emitted attribute name and the module doc's
+        // delta dispositions first.
+        assert_eq!(SEMCONV_SNAPSHOT_DATE, "2026-10-21");
     }
 
     #[test]
