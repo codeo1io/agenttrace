@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 72 and the SQLite snapshot is schema 14; the
+The session cache is schema 73 and the SQLite snapshot is schema 14; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -513,7 +513,20 @@ then prefix+digest past the 96-char cap, subsuming the byte bound —
 with an `org_identity_truncated` counter beside the per-field
 `org_truncated:*` counters and an idempotent materialization cap in
 `GoSession::into_session`, so no further rung is required — rung 72
-already regenerates every pre-cap row)
+already regenerates every pre-cap row),
+and to 73 when the tiered-pricing match began folding case before
+pricing (run 96287e100a56469babf0aae93fd0e9ed cycle 1's rm-164 rider:
+service tiers enter journals verbatim from user configuration, so a
+`"Flex"` or `"ULTRAFAST"` journal used to fall to the standard-rate
+arm and silently reprice — the fold now bills the tier's row while the
+metrics keep the verbatim string for disclosure; the repricing is pure
+code over a byte-identical `pricing_snapshot.json`, so the
+catalog-identity freshness gate keys an unchanged digest (the rm-485
+class) and a warm v72 entry would keep replaying the standard-rate
+cost for unchanged files — the rung lands at the run's independent
+review, conflict case b277d011cb77415eb0b83126f274404a, as 72 → 73,
+the lowest rung unique above the ceiling, one invalidation either way;
+the SQLite snapshot stays 14 — no snapshot semantics moved)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

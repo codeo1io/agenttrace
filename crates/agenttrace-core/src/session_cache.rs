@@ -8,7 +8,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 73;
+// Bumped 72 -> 73 (independent review of run 96287e100a56469babf0aae93fd0e9ed
+// cycle 1 "pricing-drift svg-golden red + installer unbounded", conflict
+// case b277d011cb77415eb0b83126f274404a, the rm-164 tier-case rider): the
+// rider changed derived COST SEMANTICS for UNCHANGED source files —
+// lookup_price_tiered folds service_tier to lowercase before the
+// flex/ultrafast/priority match, so a journal carrying "Flex" or
+// "ULTRAFAST" (config casing; live since opencode v1.19.0 enabled the
+// OpenAI ultrafast tier on 2026-10-11) bills its tier's row instead of
+// silently repricing at the standard rates — but the batch shipped NO
+// rung of its own and pricing_snapshot.json is byte-identical (the fold
+// is pure code), so the rm-196 catalog-identity freshness gate keys an
+// unchanged digest (the rm-485 class) and a warm v72 entry keeps
+// replaying the standard-rate cost_estimated for unchanged files
+// forever. The rung lands as 73, the lowest rung unique above the
+// ceiling, one invalidation either way; pinned by
+// pricing_tier_case_warm_cache.rs (the rm-1511 precedent). No SQLite
+// snapshot semantics moved; the landed 14 remains the snapshot ceiling.
+// Entries regenerate once on next scan.
 // Bumped 71 -> 72 (integration of run 4eeea89188b245068a569ba76f8caa71
 // cycle 2 "truth of the default surfaces", rm-1553: the claude identity
 // capture (orgIdentifier/loginEmail) is now capped at capture

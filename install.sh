@@ -80,7 +80,7 @@ SRC_URL="${AGENTTRACE_SOURCE_URL:-https://github.com/${REPO}.git}"
 # — download —
 echo "⬇️  Downloading agenttrace (${OS}/${ARCH})..."
 TMP=$(mktemp)
-if ! curl -fsSL -o "$TMP" "$RELEASE_URL"; then
+if ! curl -fsSL --connect-timeout 15 --max-time 120 -o "$TMP" "$RELEASE_URL"; then
   rm -f "$TMP"
   echo "❌ No binary found for ${OS}/${ARCH}"
   if [ "${VERSION}" != "latest" ]; then
@@ -101,7 +101,7 @@ chmod 0755 "$TMP"
 # in crates/agenttrace-core/src/lib.rs).
 CHECKSUM_URL="${RELEASE_URL}.sha256"
 TMP_SHA=$(mktemp)
-if ! curl -fsSL -o "$TMP_SHA" "$CHECKSUM_URL"; then
+if ! curl -fsSL --connect-timeout 15 --max-time 120 -o "$TMP_SHA" "$CHECKSUM_URL"; then
   rm -f "$TMP" "$TMP_SHA"
   echo "❌ No checksum sidecar at ${CHECKSUM_URL}."
   echo "   The release is incomplete or the download URL was tampered with; not installing."

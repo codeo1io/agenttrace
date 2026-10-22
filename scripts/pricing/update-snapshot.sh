@@ -10,10 +10,14 @@
 # skipped on the live side: the lookup is exact-key, so a glob row can never
 # match; concrete-region commitment keys stay (exact-matchable, priced).
 #
-# Run from the repository root, then commit the result, update
-# PRICING_SNAPSHOT_DATE in crates/agenttrace-core/src/pricing.rs to match
-# the printed date, and append the printed added/removed delta to the
-# rm-176 row in ROADMAP.md (rm-588 acceptance clause 3).
+# Run from the repository root, then commit the result (including
+# crates/agenttrace-core/tests/fixtures/svg-card — the card footer embeds the
+# snapshot date + priced-model count, so UPDATE_CARD_GOLDEN=1 cargo test -p
+# agenttrace-core --test svg_card_contract must re-pin the 3 goldens first,
+# rm-1514), update PRICING_SNAPSHOT_DATE in
+# crates/agenttrace-core/src/pricing.rs to match the printed date, and append
+# the printed added/removed delta to the rm-176 row in ROADMAP.md (rm-588
+# acceptance clause 3).
 #
 # The refresh takes NO arguments: no-args runs it; --help/-h prints usage;
 # any other argument is REFUSED, so a stray invocation can never rewrite
@@ -54,9 +58,12 @@ Environment overrides:
     SNAPSHOT_DATE         date stamped into _snapshot.date and compared
                           against manual-drop notes (default: today UTC)
 
-After a refresh: update PRICING_SNAPSHOT_DATE in pricing.rs, append the
-printed added/removed delta to the rm-176 row in ROADMAP.md (rm-588 clause 3),
-and commit the result.
+After a refresh: UPDATE_CARD_GOLDEN=1 cargo test -p agenttrace-core
+--test svg_card_contract (the card footer embeds the snapshot date +
+priced-model count, so every refresh moves the 3 pinned goldens — rm-1514),
+update PRICING_SNAPSHOT_DATE in pricing.rs, append the printed added/removed
+delta to the rm-176 row in ROADMAP.md (rm-588 clause 3), and commit the
+result including crates/agenttrace-core/tests/fixtures/svg-card.
 USAGE
 }
 
@@ -361,7 +368,9 @@ if adds:
 if retained:
     print(f"retained by union: {', '.join(retained)}")
 print(
-    f"next: set PRICING_SNAPSHOT_DATE in crates/agenttrace-core/src/pricing.rs "
+    f"next: UPDATE_CARD_GOLDEN=1 cargo test -p agenttrace-core --test "
+    "svg_card_contract (every refresh moves the pinned card goldens — rm-1514), "
+    f"then set PRICING_SNAPSHOT_DATE in crates/agenttrace-core/src/pricing.rs "
     f"to {date}, then append the added/removed delta above to the rm-176 row "
     "in ROADMAP.md (rm-588 clause 3)"
 )

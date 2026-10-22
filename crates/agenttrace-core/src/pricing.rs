@@ -474,7 +474,10 @@ fn models_dev_key(model: &str) -> Option<String> {
 /// "default", ...) bills at the standard rates. A model without tier
 /// rates bills tiered turns at the standard rates: that is the
 /// published behavior (codeburn #1642, held for every tier family),
-/// not a guess.
+/// not a guess. Tier matching is case-insensitive (rm-164 rider, run
+/// 96287e10 cycle 1): journals carry the tier string verbatim from
+/// user configuration, and 'Flex'/'ULTRAFAST' must price on their
+/// rows, not silently reprice at the standard rates.
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
     // rm-1053 (run f2fccaa9 cycle 3, assess 53af6c9e F1): resolve
@@ -497,7 +500,13 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
             .unwrap_or_default(),
         _ => lookup_price_in(model, &catalog.aliases, &catalog.entries),
     };
-    let (input_tier, output_tier, cw_tier, cr_tier) = match service_tier {
+    // rm-164 rider (run 96287e10 cycle 1): fold the tier to lowercase
+    // before the match — journals carry the tier verbatim from user
+    // configuration, and 'Flex'/'ULTRAFAST' must hit their rows. The
+    // verbatim string still rides the metrics/disclosure lanes; only
+    // the comparison folds.
+    let service_tier = service_tier.map(str::to_ascii_lowercase);
+    let (input_tier, output_tier, cw_tier, cr_tier) = match service_tier.as_deref() {
         Some("flex") => (
             price.input_flex,
             price.output_flex,

@@ -139,3 +139,47 @@ fn test_match_discloses_the_ultrafast_tier() {
         "--test-match must disclose ultrafast rates; got:\n{rendered}"
     );
 }
+
+#[test]
+fn tier_matching_is_case_insensitive() {
+    // rm-164 rider (run 96287e10 cycle 1): journals carry the tier
+    // string verbatim from user configuration, and case variance
+    // ('Flex', 'ULTRAFAST') is live in the wild now that opencode
+    // >= 1.19.0 exposes the tier. An exact-case match would silently
+    // reprice those turns at the standard rates.
+    assert_eq!(
+        per_million(&lookup_price_tiered("gpt-6-astra", Some("Flex"))),
+        (5.0, 25.0),
+        "mixed-case flex must hit the flex row"
+    );
+    assert_eq!(
+        per_million(&lookup_price_tiered("gpt-6-astra", Some("ULTRAFAST"))),
+        (60.0, 300.0),
+        "upper-case ultrafast must hit the ultrafast row"
+    );
+    assert_eq!(
+        per_million(&lookup_price_tiered("gpt-6-astra", Some("FLEX"))),
+        (5.0, 25.0),
+        "upper-case flex must hit the flex row"
+    );
+    // End to end: a mixed-case journal still bills the tier it ran
+    // on — 1M in + 1M out at flex $5/$25 is $30, not the $60 the
+    // standard row would bill — and the verbatim tier string stays
+    // recorded on the metrics.
+    let events = vec![usage_event(
+        "gpt-6-astra",
+        Some("Flex"),
+        1_000_000,
+        1_000_000,
+    )];
+    let metrics = analyze(&events, "gpt-6-astra");
+    assert_eq!(
+        metrics.cost_estimated, 30.0,
+        "mixed-case flex turns must bill the flex row"
+    );
+    assert_eq!(
+        metrics.service_tier.as_deref(),
+        Some("Flex"),
+        "the verbatim tier string stays recorded on the metrics"
+    );
+}

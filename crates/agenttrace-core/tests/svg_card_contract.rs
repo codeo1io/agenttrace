@@ -13,8 +13,8 @@
 ///   `Utc::now()`, so the card cannot drift between renders;
 /// - an empty corpus renders a valid card instead of panicking.
 use agenttrace_core::{
-    compute_overview, demo_sessions, report_overview_svg, report_overview_svg_with_context,
-    SvgCardTheme,
+    bundled_snapshot_date, compute_overview, demo_sessions, report_overview_svg,
+    report_overview_svg_with_context, SvgCardTheme,
 };
 
 const GOLDEN_DIR: &str = "tests/fixtures/svg-card";
@@ -175,25 +175,40 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
             .unwrap_or("<no date labels>")
     );
     // The demo corpus's fixed timestamps are far from today; if the card
-    // were anchored to `Utc::now()` today's date would leak in.
-    // rm-1556/cycle-4: the pricing-snapshot disclosure footer
-    // legitimately carries the bundle date — which equals today's
-    // wall date on the very day a snapshot ships. The footer is a
-    // label, not a data axis, so strip its line before scanning for
-    // leakage; the label's presence is separately asserted.
+    // were anchored to `Utc::now()` today's date would leak in. The ONE
+    // date the card legitimately carries that is not corpus-derived is
+    // the pricing-snapshot disclosure in the footer (rm-1514, run
+    // 96287e10 cycle 1): a same-day snapshot refresh — the weekly
+    // automation's normal mode (SNAPSHOT_DATE defaults to today UTC) and
+    // a supported manual path — stamps today into that disclosure, so
+    // scrub the disclosure before the leak check. The scrub targets the
+    // whole "LiteLLM snapshot <date> (bundled)" phrase (the only
+    // date-bearing shape the offline footer produces — pricing.rs
+    // `catalog_source`; override suffixes append after the paren), NOT
+    // the bare date: on a same-day refresh the snapshot date IS today,
+    // and scrubbing the bare date would mask a genuine leak of today
+    // anywhere else. A wall-clock leak into the sparkline, the window,
+    // or any other position — including the REST of the disclosure line
+    // itself — stays fully caught.
+    //
+    // Integration seam (2026-10-22, conflict case c2c6a4d1, landing run
+    // 96287e10's rm-1514 onto a wall that had independently landed the
+    // same calendar-luck guard as an rm-1556 rider of run 1fb75154
+    // cycle 4): the wall's arm stripped the WHOLE disclosure line from
+    // the scan; this landing keeps its label-presence pin below and
+    // replaces the line-strip with the exact-phrase scrub — strictly
+    // tighter, since the remainder of the disclosure line stays scanned
+    // for a wall-clock leak instead of being dropped with it.
     assert!(
         card.contains("LiteLLM snapshot"),
         "snapshot disclosure label missing"
     );
-    let axis_only: String = card
-        .lines()
-        .filter(|l| !l.contains("LiteLLM snapshot"))
-        .collect::<Vec<_>>()
-        .join("\n");
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let disclosure = format!("LiteLLM snapshot {} (bundled)", bundled_snapshot_date());
+    let scrubbed = card.replace(&disclosure, "\u{2039}pricing-snapshot-disclosure\u{203a}");
     assert!(
-        !axis_only.contains(&today),
-        "wall-clock date leaked into a corpus-anchored card (data axes)"
+        !scrubbed.contains(&today),
+        "wall-clock date leaked into a corpus-anchored card"
     );
 }
 

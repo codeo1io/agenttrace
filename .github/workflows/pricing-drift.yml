@@ -38,6 +38,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (same pin as ci.yml/release.yml; targeted_tests: was @v4 — repo convention pins full SHAs, rm-405 discipline)
 
+      - name: Set up Rust (golden regen — rm-1514)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          # Same pin + version input as ci.yml's "Set up Rust" (rm-173): the
+          # golden regen below compiles svg_card_contract, which needs cargo.
+          toolchain: "1.98.1"
+
       - name: Run the drift gate (keep-filter basis)
         id: gate
         run: |
@@ -102,6 +109,13 @@ jobs:
           sed -i "s/const PRICING_SNAPSHOT_DATE: &str = \"[0-9-]*\";/const PRICING_SNAPSHOT_DATE: \&str = \"$new_date\";/" crates/agenttrace-core/src/pricing.rs
           grep -q "PRICING_SNAPSHOT_DATE: &str = \"$new_date\"" crates/agenttrace-core/src/pricing.rs
 
+          # rm-1514: the card footer embeds the snapshot date + priced-model
+          # count (doctor pricing line -> audit.pricing_source), so EVERY
+          # refresh moves the pinned goldens. Regenerate them here, or the
+          # merge ships a svg_card_contract red to master — this PR is
+          # GITHUB_TOKEN-authored and runs no CI (see note above).
+          UPDATE_CARD_GOLDEN=1 cargo test -p agenttrace-core --test svg_card_contract
+
           # Post-regeneration verification: the refreshed pair must pass the gate clean
           # (rc 0 on the keep-filter basis, desync cleared, removal guard still clear),
           # verified against the same single fetch the bundle was regenerated from
@@ -114,7 +128,7 @@ jobs:
             exit 1
           fi
 
-          git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs
+          git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs crates/agenttrace-core/tests/fixtures/svg-card
           git commit -m "chore(pricing): refresh bundled snapshot to $new_date (pricing-drift gate)"
 
           counts="$(grep -E 'costed-chat models' refresh-check.txt | tr -s ' ' | tr '\n' ';')"

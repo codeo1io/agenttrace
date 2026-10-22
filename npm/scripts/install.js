@@ -39,7 +39,11 @@ function getAssetName() {
 
 function download(url, destination, redirects = 0) {
 	return new Promise((resolve, reject) => {
-		get(
+		// rm-1515: a stalled CDN must not hang install. setTimeout fires on
+		// socket inactivity (slow-but-alive downloads keep resetting it);
+		// destroy() routes into the .on("error", reject) below. Per-request,
+		// so every redirect hop gets its own bound.
+		const req = get(
 			url,
 			{
 				headers: {
@@ -70,6 +74,9 @@ function download(url, destination, redirects = 0) {
 				);
 			},
 		).on("error", reject);
+		req.setTimeout(30000, () => {
+			req.destroy(new Error(`download stalled for 30s: ${url}`));
+		});
 	});
 }
 

@@ -1322,6 +1322,60 @@
 
 ### Fixed
 
+- Tiered pricing matches the service tier case-insensitively: a journal carrying "Flex"/"ULTRAFAST" (the tier comes from user configuration and journals keep it verbatim; opencode >= 1.19.0 now exposes the tier) priced at the standard rates with no mismatch disclosure; the tier string is lowercased before the match and a mixed-case test pins the flex/ultrafast rows plus the end-to-end lane (rm-164 rider, run 96287e10 cycle 1, batch "pricing & release-channel reliability hardening").
+- The weekly pricing-drift automation now refreshes the svg-card goldens it necessarily breaks: the Monday gate staged only pricing_snapshot.json + pricing.rs while the card footer embeds the snapshot date and priced-model count, and its GITHUB_TOKEN-authored PR runs no CI — so the breakage surfaced only as a svg_card_contract red on master after merge; the workflow now installs the pinned toolchain (same pin + version input as ci.yml), runs UPDATE_CARD_GOLDEN=1 cargo test -p agenttrace-core --test svg_card_contract during regeneration and stages tests/fixtures/svg-card with the bundle, and update-snapshot.sh's checklist and next-print say the same. The local dry-run drill (snapshot date = today, the automation's normal mode) caught the regen command tripping its own gate: `sparkline_is_anchored_to_the_corpus_clock_not_wall_clock` asserts today's date appears nowhere in the card, and the footer's pricing-snapshot disclosure legitimately carries it on a same-day refresh — the leak check now scrubs exactly the snapshot-date disclosure (exposed via the new `bundled_snapshot_date()` re-export) before asserting, so a wall-clock leak into the sparkline or window is still caught (rm-1514, run 96287e10 cycle 1, batch "pricing & release-channel reliability hardening").
+- Installer downloads are bounded end to end: install.sh's release and checksum fetches carry --connect-timeout 15 --max-time 120, and the npm installer's registry fetch and every redirect hop destroy the request after 30s of socket inactivity and route request-level errors into the existing rejection path (bound is on inactivity, not total time — slow-but-alive downloads pass) (rm-1515, run 96287e10 cycle 1, batch "pricing & release-channel reliability hardening").
+
+  Integration seam (2026-10-22, conflict case c2c6a4d1, landing run
+  96287e10's conductor-landing 4437986f onto a wall that had since
+  integrated runs 1fb75154 and 7ee18a0d past the run's base 445450b):
+  the three rows above land atop Fixed as the newest landing commit,
+  and every seam composes rather than replaces. (1) The tier case-fold
+  (rm-164 rider) is reimplemented over the wall's advanced
+  `lookup_price_tiered` — the wall had since grown the rm-1532
+  models.dev serving-catalog seam, the rm-1053 raw-first ladder and
+  the rm-1556 priority/fast tier families; the fold lowercases the
+  tier COPY before the match (mixed-case `Flex`/`ULTRAFAST` now hit
+  their rows through every family, the wall's newer ones included),
+  the verbatim string still rides the metrics and disclosure lanes,
+  and `tier_matching_is_case_insensitive` pins all three casings plus
+  the end-to-end dollars lane. (2) The calendar-luck guard the wall
+  landed as an rm-1556 rider (strip the whole disclosure line before
+  the leak scan) is superseded by this run's tighter exact-phrase
+  scrub in `sparkline_is_anchored_to_the_corpus_clock_not_wall_clock`:
+  the wall's label-presence pin stays, the REST of the disclosure line
+  stays scanned instead of being dropped with it, and the scrub keys
+  on `bundled_snapshot_date()` — a fn the wall already shipped for
+  doctor's provenance line but had not re-exported from the crate
+  root; the run's re-export lands (the lib.rs export list unions both
+  sides). (3) The automation-golden mechanism composes unchanged with
+  the wall's own refresh work: update-snapshot.sh keeps the wall's
+  rm-1508 cache-rate-absence and rm-1556 priority-field trim arms
+  beside this run's golden-regen checklist/next-print additions
+  (disjoint hunks), pricing-drift.yml's toolchain install +
+  UPDATE_CARD_GOLDEN regen + golden staging arm had no wall-side
+  counterpart, and the wall's 2026-10-17 bundle and its regenerated
+  goldens ride under the run's mechanism untouched — this landing
+  moves no bundle or golden bytes. (4) Semantic seam, landed at this
+  merge's independent review (conflict case b277d011cb77415eb0b83126f274404a,
+  the rm-485 warm-replay class the run's own validation could not see):
+  seam (1)'s tier case-fold moves derived cost for UNCHANGED files
+  while `pricing_snapshot.json` stays byte-identical (the fold is pure
+  code), so the rm-196 catalog-identity freshness gate keys an
+  unchanged digest and a warm store built pre-fold would keep
+  replaying the standard-rate `cost_estimated` forever — the same
+  shape as the rm-1511 effort-alias rung. The integration lands
+  SESSION_CACHE_SCHEMA_VERSION 72 → 73 (the lowest rung unique above
+  the ceiling, one invalidation either way; SQLite snapshot stays 14),
+  sweeps every pinned surface per the schema-bump rule (const + dated
+  ladder rung, governance sentence + enumeration rung,
+  always-literal occurrence oracle fn/assert/message, sweep-doc sites
+  5/6; the TUI fixture and both discovery pins read the constant
+  dynamically), and pins the rung red-first with
+  `pricing_tier_case_warm_cache.rs` — a mixed-case `Flex` codex journal
+  cold-prices at the flex row, a degraded v72 store is refused with a
+  ledgered schema invalidation, and the tier price regenerates once on
+  the next scan (own test binary per the rm-1522 cache-file-race rule).
 - the `--latest` docs no longer promise combinations the gate rejects (rm-1560, run
   1fb75154 cycle 4, assess F1): the clap help and README row claimed `--latest`
   "works with `--waste` and report actions" while the runtime gate has only ever
