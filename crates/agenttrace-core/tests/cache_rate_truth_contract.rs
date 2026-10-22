@@ -196,20 +196,29 @@ fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_publishe
     // --- census: the population is answerable without code -------
     // The override rows merged into the bundled catalog, so absolute
     // totals are bundle-vintage-dependent (pricing_snapshot_hygiene.rs
-    // pins those). What this binary pins: the classification itself —
-    // exactly the absent rows it contributes (the 2026-10-08 bundle
-    // zero-fills, so every bundled row classifies published), and the
-    // per-class sum invariant absent + zero + nonzero == total.
+    // pins the catalog-only values at the same refresh). What this
+    // binary pins: the classification itself — the bundle's absent
+    // contribution plus exactly the absent rows this test's override
+    // adds (the 2026-10-08 bundle zero-filled so that contribution
+    // was 0/0; the 2026-10-22 refresh, rm-176 run d5e143bce25e cycle
+    // 7, restored live-side absence: 2,139 read / 3,227 write on the
+    // catalog alone, +1/+1 for this test's override row), and the
+    // per-class sum invariant absent + zero + nonzero == total. The
+    // values assume the no-machine-cache env (clean-HOME conductor
+    // procedure — the rm-1954 guard hardening of this suite is its
+    // own rider and stays separate).
     let census: CacheRateCensus = cache_rate_census();
     assert_eq!(
-        census.cache_read_absent, 1,
-        "the absent-rate row must classify as absent: {census:?}"
+        census.cache_read_absent, 2140,
+        "bundle live-side absence (2,139, pinned in pricing_snapshot_hygiene.rs) \
+         + this test's override (1): the absent-rate row must classify as absent: {census:?}"
     );
-    // rm-1508: the only absent rates in this process's catalog are
-    // the ones this test's override contributes — the 2026-10-08
-    // bundle zero-fills and upstream even publishes an explicit $0 on
-    // the gpt-5.3-codex rows, so the vend row is Some(0.0) too.
-    assert_eq!(census.cache_write_absent, 1);
+    // rm-1508: the absent rates in this process's catalog are the
+    // bundle's live-side rows (3,227) plus this test's own override
+    // (1) — upstream publishes no cache-write rate on most rows, and
+    // the rows that publish an explicit $0 (gpt-5.3-codex) classify
+    // as published-zero, not absent.
+    assert_eq!(census.cache_write_absent, 3228);
     assert_eq!(
         census.cache_read_absent + census.cache_read_zero + census.cache_read_published,
         census.models,

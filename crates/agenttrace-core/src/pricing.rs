@@ -3990,10 +3990,20 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // The 1M-window default class (rm-231's motivating case) still
+        // has a first-party flagship carrier — and the 2026-10-22
+        // refresh (rm-176, run d5e143bce25e cycle 7) also records the
+        // upstream correction of claude-sonnet-4-5's window 1M -> 200k
+        // (one of the refresh's 17 window-only mutations), so both
+        // facts are pinned here: the 1M class on opus-4-8, and
+        // sonnet-4-5 faithfully at its corrected 200k.
+        assert_eq!(
+            catalog.entries["claude-opus-4-8"].max_input_tokens,
+            Some(1_000_000)
+        );
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 
