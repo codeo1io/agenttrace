@@ -69,9 +69,9 @@ pub use parser::{
     parse_file, parse_raw_session, parse_stdin_bytes, ReadCapRefused, FILE_READ_CAP_BYTES,
 };
 pub use pricing::{
-    cache_rate_census, catalog_identity, effort_tier_of, has_specific_price, list_pricing,
-    lookup_context_window, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
-    pricing_source_for, provider_for, render_model_pricing_list, render_test_match,
+    cache_rate_census, catalog_identity, effort_tier_of, has_specific_price, is_locally_defined,
+    list_pricing, lookup_context_window, lookup_price, lookup_price_tiered, pricing_cache_path,
+    pricing_source, pricing_source_for, provider_for, render_model_pricing_list, render_test_match,
     specific_base_for_unpriced, update_pricing, CacheRateCensus, Price,
 };
 pub use reports::{
@@ -1176,6 +1176,11 @@ fn counts_toward_disclosure_cap(key: &str) -> bool {
         || key.starts_with("usage_alias_unmapped:")
         || key.starts_with("usage_unconsumed_location:")
         || key.starts_with("kimi_usage_alias:")
+        // rm-1426: per-slug fan-out, the `kimi_usage_alias` shape — a fleet
+        // of distinct locally-defined catalog slugs must not mint unbounded
+        // distinct keys. The fixed `locally_defined_priced_cents` key stays
+        // out, exactly like rm-1052's single-key counters.
+        || key.starts_with("locally_defined_model_pricing:")
 }
 
 /// Mint one disclosure key (with its occurrence count) into a
@@ -2089,6 +2094,31 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // same way, per the parser-agnostic rule the batch itself states
     // ("any journal family whose usage-bearing events carry model
     // attribution prices each block at its own model").
+    // rm-1426: locally-defined-model census. Usage-bearing events whose
+    // effective model resolves to no pricing row of any kind (see
+    // `pricing::is_locally_defined`) are priced at the builtin default
+    // ($3.00/$15.00 per Mtok) — the codex `model_catalog_json` /
+    // private-proxy class: bare `glm-5.2` resolves nowhere while ~90
+    // prefixed `zai/glm-5.2`-style carrier rows exist. Counted per slug
+    // and disclosed below, never silently billed at fabricated defaults.
+    // Recorded-cost blocks stay out — rm-1052 owns recorded-zero truth.
+    let mut locally_defined_models: BTreeMap<String, usize> = BTreeMap::new();
+    let mut locally_defined_cents = 0usize;
+    for event in events.iter() {
+        if event.usage.is_empty() || event.recorded_cost_usd.is_some() {
+            continue;
+        }
+        let priced_model = if event.model_used.is_empty() || event.model_used == "unknown" {
+            model
+        } else {
+            event.model_used.as_str()
+        };
+        if pricing::is_locally_defined(priced_model) {
+            *locally_defined_models
+                .entry(priced_model.to_string())
+                .or_insert(0) += 1;
+        }
+    }
     let session_model_is_real = !matches!(model, "" | "default" | "unknown");
     let usage_blocks_multi_model = usage_models.len() > 1
         || (!usage_models.is_empty()
@@ -2295,12 +2325,58 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 + block_cache_w as f64 / 1e6 * block_cw
                 + block_cache_r as f64 / 1e6 * block_cr;
             per_block_cost += block_cost;
+            // rm-1426: dollars priced at the fabricated builtin default
+            // for a locally-defined slug (multi-model sessions price per
+            // block here; the single-model arm below uses the catalog
+            // formula).
+            if pricing::is_locally_defined(
+                if event.model_used.is_empty() || event.model_used == "unknown" {
+                    model
+                } else {
+                    event.model_used.as_str()
+                },
+            ) {
+                locally_defined_cents += (round4(block_cost) * 100.0).round() as usize;
+            }
             entry.cost_usd = round4(entry.cost_usd + block_cost);
         }
         round4(per_block_cost)
     } else {
+        if (metrics.tokens_input > 0 || metrics.tokens_output > 0)
+            && pricing::is_locally_defined(model)
+        {
+            // rm-1426: single-model usage session priced wholesale at the
+            // catalog formula — when the session model itself is
+            // locally-defined, that whole figure is fabricated-default
+            // dollars (recorded cost is excluded from catalog_cost).
+            // Guard on priced tokens, not usage_models: codex counted
+            // sessions price through this arm without populating
+            // usage_models.
+            locally_defined_cents += (round4(catalog_cost) * 100.0).round() as usize;
+        }
         round4(catalog_cost + metrics.upstream_cost_usd)
     };
+    // rm-1426: publish the census — per-slug occurrence counters ride the
+    // same disclosure channel as rm-1052 (metrics.disclosure_counters →
+    // insights data_health.disclosures + doctor's session fold), and the
+    // cents counter states the dollars actually priced at the fabricated
+    // builtin-default rate (per-block arm for multi-model sessions,
+    // catalog formula for single-model ones; both exclude
+    // upstream-recorded cost, so no dollar is counted twice).
+    for (slug, count) in &locally_defined_models {
+        mint_disclosure(
+            &mut metrics.disclosure_counters,
+            format!("locally_defined_model_pricing:{slug}"),
+            *count,
+        );
+    }
+    if locally_defined_cents > 0 {
+        mint_disclosure(
+            &mut metrics.disclosure_counters,
+            "locally_defined_priced_cents".to_string(),
+            locally_defined_cents,
+        );
+    }
     // rm-485: a session-wide credit counter is billing truth — never
     // report below it, never stack it on top of the token-priced
     // estimate. (Integration of run 32192d92: `token_priced` is the

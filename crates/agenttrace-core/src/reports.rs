@@ -2701,7 +2701,15 @@ pub fn pricing_basis_label(model: &str) -> Option<&'static str> {
     if matches!(model, "default" | "unknown" | "multiple") {
         return Some("unknown");
     }
-    if crate::pricing::has_specific_price(model) {
+    // rm-1426 composition (conflict case bcdd1a88): the mirror rule this
+    // doc comment promises — governance's cost audit counts a
+    // locally-defined slug (no row NAMES it; it only shares a collapsed
+    // carrier name) as `fallback_estimate`, so this label must agree or
+    // the machine/human surfaces contradict the census and the
+    // `locally_defined_model_pricing:{slug}` disclosure on the same
+    // report. Named-through-own-row ids (raw keys, vend rows, the
+    // models.dev extract, ladder bases) stay `None`/exact.
+    if crate::pricing::has_specific_price(model) && !crate::pricing::is_locally_defined(model) {
         None
     } else {
         Some("fallback")

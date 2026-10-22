@@ -4,6 +4,107 @@
 
 ### Added
 
+- locally-defined model pricing is disclosed, not silently fabricated (rm-1426,
+  run 7ee18a0d cycle 3): codex `model_catalog_json` / private-proxy deployments
+  record slugs no pricing row backs — bare `glm-5.2` is absent from the bundled
+  snapshot, live LiteLLM and the builtin table while ~90 prefixed `zai/glm-5.2`
+  carrier rows exist — so every lookup priced such usage at the builtin default
+  ($3.00/$15.00 per Mtok) with zero indication. `pricing::is_locally_defined`
+  classifies the slug against the RAW keys of the ACTIVE catalog origin — the
+  downloaded cache when one is served, else the bundled snapshot (kept in
+  lockstep by catalog load and `--update-pricing`) — pre-collapse: a bare
+  name that only matches a carrier-prefixed row after `convert_litellm`
+  collapses it is still locally-defined — arm b — which the collapsed-catalog
+  `has_specific_price` cannot see; conversely a slug the LIVE cache names is
+  never locally-defined just because the older bundle predates it); `analyze` now mints
+  `locally_defined_model_pricing:{slug}` occurrence counters and a
+  `locally_defined_priced_cents` total (both arms: per-block and the
+  single-model catalog formula; upstream-recorded cost excluded, staying in the
+  rm-1052 lane) into the metrics disclosure channel — insights
+  `data_health.disclosures` and doctor's per-session fold render them with no
+  further plumbing, and the guard families agree again:
+  `data_health.fallback_pricing` and the governance cost-audit coverage /
+  `session_cost_audit` classification count locally-defined slugs as fallback,
+  never `specific`/`catalog_estimate`. Per-slug counters ride the rm-594
+  distinct-key cap family (`kimi_usage_alias` precedent). An
+  `AGENTTRACE_PRICING_FILE` row for the slug is the operator escape hatch and
+  flips the disclosure off.
+
+  Integration seam (2026-10-23, conflict case d40508bdc06444459b7a8ebcdaf5e5a8,
+  landing run 7ee18a0d's conductor-landing d8b0e18d onto a wall many commits
+  past its base): both sides had prepended to the Unreleased Added list, so
+  this row lands atop it as the newest landing commit. Five seams were
+  adjudicated against the advanced wall. (1) The one textual code conflict,
+  `update_pricing`, composes both mechanics: the wall's rm-1570 daybreak
+  refresh parity (`apply_daybreak_responses_entries`) and this run's raw-key
+  refresh both stand — the vend rows are code-side inserts, never raw-origin
+  keys, so the `PRICING_RAW_KEYS` set deliberately excludes them, matching
+  `load_catalog_for_current_env`'s origin-then-insert order (that loader
+  merged clean). (2) The lib.rs pricing re-export is the union: the run's
+  `is_locally_defined` joins the wall's expanded surface (cache_rate_census,
+  catalog_identity, tier lookups, provider_for, specific_base_for_unpriced).
+  (3) The wall's rm-1556 snapshot refresh to 2026-10-17 (3,237 keys) was
+  re-verified against the classification goldens: bare `glm-5.2` stays absent
+  from the merged bundle (0 raw keys) while 11 carrier-prefixed glm-5.2 rows
+  exist and `zai/glm-5.2` remains a raw key, so arm (a), arm (b) and the
+  named-row controls all hold unchanged; the governance/insights guard
+  composition (`has_specific_price` && !`is_locally_defined`) also composes
+  with the wall's rm-1053 raw-first serving ladder, and the override-file arm
+  rides the wall's rm-1508 `Option<f64>` cache-rate discipline unchanged.
+  (4) The wall's rm-1954 battery-truth hygiene postdates this run's tests
+  and supersedes their unguarded shape: `is_locally_defined` judges the
+  ACTIVE catalog origin, so a machine pricing cache at the default location
+  flips the goldens in BOTH directions (a cache naming bare `glm-5.2` makes
+  it “named”; a cache missing `zai/glm-5.2` makes that control
+  locally-defined). The catalog-census arms in `rm1426_locally_defined_units.rs`
+  and `rm1426_locally_defined_sessions.rs` now run inside
+  `tests/support`'s `with_isolated_pricing_env` (fresh scratch session cache,
+  scratch HOME, override cleared); the cache-catalog and override-file
+  binaries self-isolate by setting their env before the process's first
+  pricing call and are unchanged. (5) The wall's rm-1053 landing (run
+  d130035f) also reshaped `resolve_alias` into `resolve_alias_detail`, which
+  seeds its chain with the RAW slug and returns the un-redirected input
+  when no alias applies — defeating this run's alias-baseline comparison
+  (`resolve_alias(model) != normalized`), which then early-returned
+  “not locally-defined” for EVERY carrier-prefixed slug and silently
+  re-exempted the whole private-proxy recording class (re-proven red by the
+  cache-catalog arm: a one-row cache origin that does not name `zai/glm-5.2`
+  stopped calling it locally-defined). The predicate now uses the
+  resolver's own `redirected` flag — an alias names the model exactly when
+  a chain step actually redirected it — and the units suite pins the
+  recorded-with-carrier-prefix class (`myco/gpt-9-private`) as a golden.
+
+  Independent review (2026-10-23, conflict case bcdd1a88b658497890bc15f704599b7b,
+  latent conflicts in the combined tree after seam case d40508bd): the
+  predicate as merged flagged ids the WALL prices through rows that name a
+  real published id of the same model — a class the run's base never saw,
+  and the direct cost of seam (1) above (vend rows are never raw-origin
+  keys). Hardest hit: codex 0.163's DEFAULT model set — rm-1570's
+  `gpt-daybreak-red/blue-latest` vend rows carry hand-pinned published
+  rates, yet every such session would have disclosed
+  `locally_defined_model_pricing:` fabricated dollars and counted as
+  fallback in the guard families, contradicting the landed money-truth
+  pins. `is_locally_defined` now treats a slug as NAMED when (1) a
+  code-side vend row publishes its own id (`code_vended_pricing_ids`,
+  with `vend_rows_stay_named_locally_defined` pinning that every id the
+  `apply_*_entries` inserters publish stays in the list), (2) the
+  embedded models.dev extract (rm-1532) names the id, or (3) the rm-1053
+  serving ladder resolves it onto an own-model row (rm-1511
+  effort/minor-tail bases like `claude-sonnet-5-5-medium` at
+  `claude-sonnet-5-5`'s raw row; the pre-base deepseek family pushers) —
+  a row that names a real published id of the SAME model bills that
+  model's own rate, never a fabricated one. Arms (a)/(b) are untouched:
+  `glm-5.2`'s ladder variants name no raw key of the active origin, so a
+  foreign carrier's collapsed row still does not name the deployment's
+  slug (all four rm-1426 batteries re-verified green, including the
+  cache-catalog ACTIVE-origin contract). And `pricing_basis_label` /
+  `session_pricing_basis` (rm-1574) now mirror the census rule the
+  promise in their own doc makes — `has_specific_price &&
+  !is_locally_defined` — so the by-model CSV/JSON/TUI basis cell says
+  `fallback` exactly when governance's cost audit says
+  `fallback_estimate`, instead of contradicting the disclosure on the
+  same report.
+
 - priority-tier pricing now bills the published priority rate, and codex `fast` bills the
   community-published multiplier table (rm-1556 fused with rm-1538, run 1fb75154 cycle 4):
   the bundled LiteLLM snapshot refreshed to 2026-10-17 (3,237 keys, up from 3,130; the

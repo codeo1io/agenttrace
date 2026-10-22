@@ -24,6 +24,11 @@ static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
 static MODELS_DEV_PARSE_FAILURE: OnceLock<String> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
+// rm-1426: exact keys of the ACTIVE catalog's raw origin (downloaded
+// cache when one is served, else the bundled snapshot), captured when
+// the catalog singleton loads — `--update-pricing` refreshes it in
+// lockstep with the catalog it publishes.
+static PRICING_RAW_KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
 static PRICING_OVERRIDE_STATUS: OnceLock<PricingOverrideStatus> = OnceLock::new();
 
 /// Cycle-4 B1: what actually happened to a requested
@@ -626,6 +631,129 @@ pub fn has_specific_price(model: &str) -> bool {
     serving_catalog(model, catalog).is_some()
 }
 
+/// rm-1426: true when no pricing row NAMES this deployment's model, so any
+/// quoted price is fabricated for it. Two arms, both silent before this:
+/// (a) nothing matches and `lookup_price_in` answers the builtin default
+/// ($3.00/$15.00 per Mtok — the `builtin.get("default")` fall-through);
+/// (b) `convert_litellm` collapses carrier prefixes onto bare slugs
+/// (`zai/glm-5.2` -> `glm-5.2`), so a locally-defined slug that shares a
+/// name with ANY public carrier row is priced from whichever carrier wins
+/// `provider_priority` (research 2026-10-14: bare `glm-5.2`, the codex
+/// `model_catalog_json` / CLIProxyAPI deployment slug, prices at a foreign
+/// carrier's $0.152/$12.00 while the ~90 real carrier rows disagree and
+/// the operator is privately billed at different rates). Neither arm is
+/// the model's own price. Confirmed — false — when an exact published row
+/// (bare key or the carrier-prefixed slug as recorded), an operator alias,
+/// an `AGENTTRACE_PRICING_FILE` row (see `PRICING_OVERRIDE_MODELS`), or an
+/// exact builtin row names the model; `""`/`"default"`/`"unknown"` stay
+/// out (missing identity is a different disclosure). Callers disclose
+/// (`locally_defined_model_pricing:{slug}`, plus the dollars at the
+/// fabricated rate), never silently bill; rm-1052 is the sibling rule for
+/// recorded-zero providers.
+pub fn is_locally_defined(model: &str) -> bool {
+    if matches!(model.trim(), "" | "default" | "unknown") {
+        return false;
+    }
+    let catalog = pricing_catalog();
+    let normalized = normalize_model(model);
+    // Operator or built-in SKU alias mapping this slug onto a named row.
+    // rm-1053 composition (wall, post-base): `resolve_alias` grew a
+    // `resolve_alias_detail` core that seeds its chain with the RAW slug
+    // as well as the normalized one and returns the UN-redirected input
+    // when no alias applies — so the authored baseline comparison
+    // (`resolve_alias(model) != normalized`) early-returned here for
+    // EVERY carrier-prefixed slug ("myco/gpt-9-private"), silently
+    // exempting the whole private-proxy recording class from disclosure
+    // (re-proven red by the cache-catalog arm: a one-row cache origin
+    // that does not name `zai/glm-5.2` stopped calling it
+    // locally-defined). The resolver's own `redirected` flag is the
+    // alias-baseline truth under either resolver shape: an alias names
+    // the model exactly when a chain step actually redirected it,
+    // whatever string the resolver hands back.
+    if resolve_alias_detail(model, &catalog.aliases).1 {
+        return false;
+    }
+    // Exact published row — the bare key, or the slug carrying its own
+    // carrier prefix as the session recorded it.
+    if pricing_raw_keys().contains(model) || pricing_raw_keys().contains(&normalized) {
+        return false;
+    }
+    // Operator override file binds this slug (the pricing-catalog loader
+    // records every model an accepted override file names).
+    if pricing_override_models().contains(&normalized) {
+        return false;
+    }
+    // Curated builtin row naming this exact model.
+    if builtin_pricing().contains_key(&normalized) {
+        return false;
+    }
+    // Composition with the naming lanes the wall landed AFTER this
+    // predicate's base (independent review, conflict case bcdd1a88):
+    // a slug the ACTIVE catalog prices through a row that names a real
+    // published id of the same model is NOT locally-defined — those
+    // dollars are the model's own published rate, never a fabricated
+    // one. Three lanes, none of which the base knew:
+    // (1) code-side vend rows — rm-610's `gpt-5.3-codex` and rm-1570's
+    //     `gpt-daybreak-*-latest` are inserted under their own exact
+    //     ids while LiteLLM's chat-mode filter keeps the same ids out
+    //     of the raw envelope, so the raw-key arm above can never see
+    //     them (without this arm every codex 0.163 daybreak session —
+    //     the DEFAULT model set — disclosed fabricated pricing at the
+    //     ids' own hand-pinned rates);
+    // (2) the embedded models.dev extract (rm-1532) — first-party rows
+    //     for exact dated ids the LiteLLM envelope does not carry;
+    // (3) the resolution ladder's own-model variants (rm-1511 effort /
+    //     minor tails, the deepseek family pushers) — the ladder bills
+    //     `claude-sonnet-5-5-medium` at `claude-sonnet-5-5`'s own raw
+    //     row, which is that model's published rate, not a borrowed
+    //     carrier collapse.
+    // Arm (b) is untouched: `glm-5.2`'s ladder variants (`glm-5.2`,
+    // `glm`) name no raw key of the active origin, so a foreign
+    // carrier's collapsed row still does not name the deployment's
+    // slug and the disclosure keeps firing.
+    let vend = code_vended_pricing_ids();
+    if vend.contains(&normalized.as_str()) {
+        return false;
+    }
+    if models_dev_key(model).is_some() {
+        return false;
+    }
+    let raw_keys = pricing_raw_keys();
+    let extract = &models_dev_catalog().entries;
+    let builtin = builtin_pricing();
+    let named_through_the_ladder =
+        resolution_ladder(model, &catalog.aliases)
+            .iter()
+            .any(|variant| {
+                raw_keys.contains(variant)
+                    || vend.contains(&variant.as_str())
+                    || extract.contains_key(variant)
+                    || builtin.contains_key(variant)
+            });
+    !named_through_the_ladder
+}
+
+/// Exact keys of the ACTIVE catalog's raw origin — the downloaded
+/// cache when one is served, else the bundled snapshot — BEFORE
+/// `convert_litellm` normalizes/collapses carrier prefixes. rm-1426 uses
+/// this to tell a row that names the deployment's own slug from a foreign
+/// carrier's row that merely shares the collapsed name; the set follows
+/// the same origin `pricing_catalog()` serves entries from, so a slug the
+/// LIVE catalog names is never locally-defined just because the bundled
+/// snapshot predates it (and a slug only the stale bundle names is
+/// locally-defined, exactly like any other borrowed rate).
+fn pricing_raw_keys() -> &'static BTreeSet<String> {
+    PRICING_RAW_KEYS.get_or_init(|| litellm_raw_keys(PRICING_SNAPSHOT_JSON.as_bytes()))
+}
+
+/// Top-level keys of a raw LiteLLM-format catalog (the snapshot constant
+/// and the on-disk cache store the same envelope).
+fn litellm_raw_keys(raw: &[u8]) -> BTreeSet<String> {
+    serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(raw)
+        .map(|rows| rows.into_keys().collect())
+        .unwrap_or_default()
+}
+
 pub fn list_pricing() -> BTreeMap<String, Price> {
     let mut entries = builtin_pricing();
     entries.remove("default");
@@ -1137,6 +1265,13 @@ pub fn update_pricing() -> anyhow::Result<usize> {
     apply_codex_sku_entries(&mut catalog);
     apply_codex_sku_aliases(&mut catalog);
     apply_daybreak_responses_entries(&mut catalog);
+    // rm-1426 refresh parity: `--update-pricing` publishes a new ACTIVE
+    // origin, so its raw keys replace the singleton's set in lockstep with
+    // the catalog published just above. The vend rows (codex SKU, daybreak)
+    // are code-side inserts, never raw-origin keys, so they deliberately
+    // stay out of the set — same shape as `load_catalog_for_current_env`,
+    // which captures the origin's keys before any insert runs.
+    let _ = PRICING_RAW_KEYS.set(litellm_raw_keys(raw.as_bytes()));
     let _ = PRICING_CATALOG.set(catalog);
     Ok(count)
 }
@@ -1294,7 +1429,18 @@ fn pricing_catalog() -> &'static PricingCatalog {
 /// bundled snapshot is used. The only network path is the explicit
 /// `--update-pricing` action.
 fn load_catalog_for_current_env() -> PricingCatalog {
-    let mut catalog = load_pricing_cache().unwrap_or_else(fallback_catalog);
+    let mut catalog = match load_pricing_cache() {
+        Some((catalog, raw_keys)) => {
+            // rm-1426: the active origin is the cache — its raw keys (not
+            // the bundled snapshot's) decide which slugs are named.
+            let _ = PRICING_RAW_KEYS.set(raw_keys);
+            catalog
+        }
+        None => {
+            let _ = PRICING_RAW_KEYS.set(litellm_raw_keys(PRICING_SNAPSHOT_JSON.as_bytes()));
+            fallback_catalog()
+        }
+    };
     let override_models = apply_pricing_overrides(&mut catalog);
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
     apply_codex_sku_entries(&mut catalog);
@@ -1338,6 +1484,23 @@ fn apply_codex_sku_aliases(catalog: &mut PricingCatalog) {
 /// row the day upstream ships a chat-mode entry — the same
 /// drop-on-upstream-ship discipline as the aliases, and a user
 /// override price for the id still wins (overrides merge first).
+/// rm-610 / rm-1570 (composition, conflict case bcdd1a88): the ids the
+/// build vendors pricing rows for code-side. `apply_codex_sku_entries`
+/// and `apply_daybreak_responses_entries` insert under these exact ids
+/// while LiteLLM's chat-mode filter keeps the same ids OUT of the raw
+/// snapshot envelope, so no raw-origin key ever names them — the rates
+/// are the models' own published rows (drop-on-upstream-ship `or_insert`
+/// discipline), and `is_locally_defined` therefore treats each as NAMED.
+/// Every new vend row MUST land here together with its inserter;
+/// `vend_rows_stay_named_locally_defined` pins the sync.
+fn code_vended_pricing_ids() -> &'static [&'static str] {
+    &[
+        "gpt-5.3-codex",
+        "gpt-daybreak-red-latest",
+        "gpt-daybreak-blue-latest",
+    ]
+}
+
 fn apply_codex_sku_entries(catalog: &mut PricingCatalog) {
     catalog
         .entries
@@ -1484,7 +1647,7 @@ fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
     override_models
 }
 
-fn load_pricing_cache() -> Option<PricingCatalog> {
+fn load_pricing_cache() -> Option<(PricingCatalog, BTreeSet<String>)> {
     let path = pricing_cache_path();
     let metadata = path.metadata().ok()?;
     let stale = metadata
@@ -1494,21 +1657,27 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
         .map(|age| age > CACHE_MAX_AGE)
         .unwrap_or(false);
     let raw = std::fs::read(&path).ok()?;
+    // rm-1426: the raw keys travel with the catalog they came from —
+    // the active origin decides which slugs count as "named".
+    let raw_keys = litellm_raw_keys(&raw);
     let converted = convert_litellm(&raw);
     if converted.entries.is_empty() {
         return None;
     }
-    Some(PricingCatalog {
-        entries: converted.entries,
-        aliases: BTreeMap::new(),
-        source: if stale { "cache(stale)" } else { "cache" }.to_string(),
-        providers: converted.providers,
-        // A cached catalog's vintage is its fetch date (rm-419); when
-        // the provenance stamp is missing (pre-rm-167 cache) fall back
-        // to the bundled snapshot date as a conservative anchor.
-        reference_date: pricing_cache_vintage_ymd(&path)
-            .or_else(|| iso_to_ymd(PRICING_SNAPSHOT_DATE)),
-    })
+    Some((
+        PricingCatalog {
+            entries: converted.entries,
+            aliases: BTreeMap::new(),
+            source: if stale { "cache(stale)" } else { "cache" }.to_string(),
+            providers: converted.providers,
+            // A cached catalog's vintage is its fetch date (rm-419); when
+            // the provenance stamp is missing (pre-rm-167 cache) fall back
+            // to the bundled snapshot date as a conservative anchor.
+            reference_date: pricing_cache_vintage_ymd(&path)
+                .or_else(|| iso_to_ymd(PRICING_SNAPSHOT_DATE)),
+        },
+        raw_keys,
+    ))
 }
 
 /// YYYYMMDD of the fetch recorded in a pricing cache's provenance
@@ -4706,6 +4875,33 @@ mod tests {
             18.0,
             "the fallback default's own 1M+1M bill — the understated side of the 4.86x ratio"
         );
+    }
+
+    #[test]
+    fn vend_rows_stay_named_locally_defined() {
+        // Composition pin (conflict case bcdd1a88): every id the
+        // code-side vend inserters publish must sit in
+        // `code_vended_pricing_ids`, or `is_locally_defined` flags the
+        // model's own vend row as fabricated pricing — the rm-1570
+        // daybreak regression this merge review closed (codex 0.163's
+        // DEFAULT model set carried exact hand-pinned rates yet
+        // disclosed `locally_defined_model_pricing:` on every session).
+        let mut catalog = PricingCatalog {
+            entries: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: None,
+        };
+        apply_codex_sku_entries(&mut catalog);
+        apply_daybreak_responses_entries(&mut catalog);
+        assert!(!catalog.entries.is_empty(), "vend inserters ran");
+        for id in catalog.entries.keys() {
+            assert!(
+                code_vended_pricing_ids().contains(&id.as_str()),
+                "vend row {id} is missing from code_vended_pricing_ids"
+            );
+        }
     }
 
     #[test]
