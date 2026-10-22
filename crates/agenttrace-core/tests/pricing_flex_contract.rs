@@ -29,16 +29,23 @@ fn flex_turns_bill_at_the_published_flex_rates() {
         (flex.cr.unwrap() - 0.2).abs() < 1e-9,
         "4e-6 scaled is 0.2 within f64"
     );
-    // Tiers other than "flex" — including the None a tier-less turn
-    // prices at — keep the standard rates exactly as before.
+    // The tier-less None keeps the standard rates exactly as before.
     assert_eq!(
         per_million(&lookup_price_tiered("gpt-5.6", None)),
         (4.0, 20.0)
     );
-    assert_eq!(
-        per_million(&lookup_price_tiered("gpt-5.6", Some("priority"))),
-        (4.0, 20.0)
-    );
+    // rm-1556 (cycle-4, run 1fb751544907): priority became a priced
+    // tier. The 2026-10-17 snapshot publishes gpt-5.6's priority row
+    // at 2x standard ($8/$40 per million, cw $10, cr $0.80), and a
+    // priority turn bills it instead of silently falling through to
+    // the standard row.
+    let priority = lookup_price_tiered("gpt-5.6", Some("priority"));
+    assert_eq!(per_million(&priority), (8.0, 40.0));
+    // Post-base composition (rm-1508 landed on the wall after this
+    // run's base): `Price::cw/cr` are Option — the priority row
+    // publishes both rates, so Some()/unwrap() keeps the pin strict.
+    assert_eq!(priority.cw, Some(10.0));
+    assert!((priority.cr.unwrap() - 0.8).abs() < 1e-9);
 }
 
 #[test]

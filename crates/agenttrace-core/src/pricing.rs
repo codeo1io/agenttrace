@@ -18,7 +18,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-17";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -114,6 +114,26 @@ pub struct Price {
     pub cw_ultrafast: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cr_ultrafast: Option<f64>,
+    /// Priority-tier rates (rm-1556, cycle-4): the rate a turn that
+    /// ran on `service_tier: "priority"` bills at. Live as of
+    /// 2026-10-17 on 275 bundled keys (gpt-5.5/5.6 sol/terra/luna,
+    /// gpt-6 families, o-series, grok-5, glm/qwen/mini-max classes) at
+    /// a consistent 2x of standard on the OpenAI families. Same
+    /// semantics as flex/ultrafast: absent means "no published
+    /// priority rate" and a priority turn of such a model bills at
+    /// the standard rates — disclosed, never zero and never silently
+    /// repriced. `_above_272k_tokens_priority` variants are
+    /// deliberately not ingested (no long-context tier extraction to
+    /// pair them with — the rm-610 flex decision, held for every tier
+    /// family).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_priority: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_priority: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cw_priority: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cr_priority: Option<f64>,
 }
 
 /// rm-1508: the cache-write fallback multiple — the vendor convention
@@ -221,6 +241,19 @@ struct LiteLlmModel {
     cache_write_cost_ultrafast: Option<f64>,
     #[serde(default, rename = "cache_read_input_token_cost_ultrafast")]
     cache_read_cost_ultrafast: Option<f64>,
+    // Priority-tier rates (rm-1556, cycle-4): LiteLLM publishes
+    // `input_cost_per_token_priority`/`output_cost_per_token_priority`
+    // (and cache-variant) fields; `_above_272k_tokens_priority`
+    // variants deliberately not ingested — same decision as flex and
+    // ultrafast: no long-context tier extraction to pair them with.
+    #[serde(default, rename = "input_cost_per_token_priority")]
+    input_cost_priority: Option<f64>,
+    #[serde(default, rename = "output_cost_per_token_priority")]
+    output_cost_priority: Option<f64>,
+    #[serde(default, rename = "cache_creation_input_token_cost_priority")]
+    cache_write_cost_priority: Option<f64>,
+    #[serde(default, rename = "cache_read_input_token_cost_priority")]
+    cache_read_cost_priority: Option<f64>,
 }
 
 pub fn lookup_price(model: &str) -> Price {
@@ -424,16 +457,19 @@ fn models_dev_key(model: &str) -> Option<String> {
     None
 }
 
-/// rm-610 (flex) + cycle-2 rider (ultrafast): resolve a model's
-/// rates for the service tier the turn actually ran on.
-/// `Some("flex")`/`Some("ultrafast")` bills at the entry's tier
-/// slots when the catalog row carries them — input AND output must
-/// both be present, and a missing cache slot falls back to that
-/// standard rate — while every other tier (None, "default",
-/// "priority", ...) bills at the standard rates. A model without
-/// tier rates bills tiered turns at the standard rates: that is the
-/// published behavior (codeburn #1642, held for the third tier
-/// family), not a guess.
+/// rm-610 (flex) + cycle-2 rider (ultrafast) + cycle-4 rider
+/// (priority/fast, rm-1556): resolve a model's rates for the service
+/// tier the turn actually ran on. `Some("flex")`/`Some("ultrafast")`/
+/// `Some("priority")` bills at the entry's tier slots when the
+/// catalog row carries them — input AND output must both be present,
+/// and a missing cache slot falls back to that standard rate —
+/// while `Some("fast")` bills a published model-specific multiplier
+/// over the resolved standard rates (LiteLLM publishes no `_fast`
+/// cost fields; see [`fast_tier_price`]) and every other tier (None,
+/// "default", ...) bills at the standard rates. A model without tier
+/// rates bills tiered turns at the standard rates: that is the
+/// published behavior (codeburn #1642, held for every tier family),
+/// not a guess.
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
     // rm-1053 (run f2fccaa9 cycle 3, assess 53af6c9e F1): resolve
@@ -469,6 +505,23 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
             price.cw_ultrafast,
             price.cr_ultrafast,
         ),
+        // Priority tier (rm-1556, cycle-4): bill the entry's published
+        // `_priority` slots when both input and output are present —
+        // identical semantics to flex/ultrafast.
+        Some("priority") => (
+            price.input_priority,
+            price.output_priority,
+            price.cw_priority,
+            price.cr_priority,
+        ),
+        // Codex "fast" tier (rm-1556, cycle-4): LiteLLM publishes no
+        // `_fast` cost fields (only a `supports_fast_mode` boolean),
+        // so fast is billed as a published model-specific multiplier
+        // over the resolved standard rates — the same convention
+        // ccusage adopted for OpenAI's "Fast = 2× API Priority rate"
+        // products (ccusage#1855). Unknown models bill standard,
+        // disclosed, never guessed.
+        Some("fast") => return fast_tier_price(price, model),
         _ => return price,
     };
     if let (Some(input), Some(output)) = (input_tier, output_tier) {
@@ -481,6 +534,83 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
             price.cr = Some(cr);
         }
     }
+    price
+}
+
+/// Published fast-tier multipliers (rm-1556, cycle-4), mirrored from
+/// ccusage's `fast-multiplier-overrides.json` (fetched 2026-10-17, main;
+/// OpenAI documents Fast as "2× API Priority rate" for the GPT-5.6
+/// Sol/Terra/Luna family, and ccusage tracks the older GPT-5.x/6
+/// multipliers from the same source). Keys are exact model ids;
+/// `FAST_TIER_PREFIX_MULTIPLIERS` matches normalized prefixes
+/// (longest first). An id with no published multiplier returns None —
+/// the turn bills at the standard rates, disclosed, in ccusage parity
+/// ("reports standard pricing rather than assuming a multiplier for
+/// unknown models").
+const FAST_TIER_MULTIPLIERS: &[(&str, f64)] = &[
+    ("gpt-5.6-sol", 2.0),
+    ("gpt-5.6-terra", 2.0),
+    ("gpt-5.6-luna", 2.0),
+    ("gpt-5.5", 2.5),
+    ("gpt-5.4", 2.0),
+    ("gpt-5.3-codex", 2.0),
+    ("gpt-6-astra", 2.0),
+    ("gpt-6-sol", 2.0),
+    ("gpt-6.1-sol", 2.0),
+    ("gpt-6-luna", 2.0),
+];
+
+const FAST_TIER_PREFIX_MULTIPLIERS: &[(&str, f64)] = &[
+    ("claude-opus-4-6", 6.0),
+    ("claude-opus-4-7", 6.0),
+    ("claude-opus-4-8", 2.0),
+];
+
+fn fast_multiplier_for(model: &str) -> Option<f64> {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Some((_, multiplier)) = FAST_TIER_MULTIPLIERS
+        .iter()
+        .find(|(id, _)| *id == normalized)
+    {
+        return Some(*multiplier);
+    }
+    FAST_TIER_PREFIX_MULTIPLIERS
+        .iter()
+        // Longest prefix first so claude-opus-4-7x cannot be captured
+        // by a shorter prefix later in the table.
+        .filter(|(prefix, _)| normalized.len() > prefix.len() && normalized.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, multiplier)| *multiplier)
+}
+
+fn fast_tier_price(mut price: Price, model: &str) -> Price {
+    // Resolve through the same raw-first ladder the tier slots use:
+    // a vendor-qualified id WITHOUT its own catalog row falls through
+    // to its base id and inherits the base row's multiplier, while a
+    // qualified id that IS its own row (azure/gpt-5.6-luna) stays
+    // itself — outside the override table it bills standard,
+    // disclosed, never guessed (test-pinned).
+    let catalog = pricing_catalog();
+    let resolved = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries)
+        .unwrap_or_else(|| model.to_string());
+    let Some(multiplier) = fast_multiplier_for(&resolved) else {
+        return price;
+    };
+    price.input *= multiplier;
+    price.output *= multiplier;
+    // rm-1508 composition (wall, post-base): cache slots are Option —
+    // a PUBLISHED rate scales with the multiplier, while an absent
+    // rate stays absent: its disclosed fallback
+    // ([`Price::cache_write_billed`]/[`Price::cache_read_billed`])
+    // derives from the input rate, which is already scaled above, so
+    // scaling a fallback placeholder here would double-apply the
+    // multiplier and invent a published-looking rate the vendor never
+    // published.
+    price.cw = price.cw.map(|rate| rate * multiplier);
+    price.cr = price.cr.map(|rate| rate * multiplier);
     price
 }
 
@@ -726,12 +856,13 @@ pub fn catalog_identity() -> &'static str {
 }
 
 /// Digest of every catalog fact that can change a cost or an
-/// attribution: rate values (standard AND flex, rm-610), context
+/// attribution: rate values (standard AND every tier family — flex,
+/// rm-610; ultrafast, cycle-2; priority, cycle-4), context
 /// windows, deprecation dates, alias rows, and provider labels
 /// (rm-613). Only `source` and `reference_date` are excluded — they
 /// describe where the data came from, not what it prices. The session
 /// cache freshness key consumes this: a rate-identical provider flip
-/// or a gained flex slot must reprice cached sessions.
+/// or a gained tier slot (any family) must reprice cached sessions.
 pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
     fn fnv1a(bytes: &[u8], state: u64) -> u64 {
         bytes.iter().fold(state, |hash, byte| {
@@ -765,7 +896,11 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
         // the flag byte keeps gained/lost tier pricing from colliding
         // with a value change (flex and, since the cycle-2 rider,
         // ultrafast — a gained ultrafast slot must reprice cached
-        // sessions the same way).
+        // sessions the same way). The rm-1556 cycle-4 rider extends
+        // the loop to priority: a refresh that changes ONLY priority
+        // rates must reprice warm caches, not serve stale
+        // standard-priced priority turns (the same class rm-610
+        // closed for flex).
         for tier in [
             price.input_flex,
             price.output_flex,
@@ -775,6 +910,10 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
             price.output_ultrafast,
             price.cw_ultrafast,
             price.cr_ultrafast,
+            price.input_priority,
+            price.output_priority,
+            price.cw_priority,
+            price.cr_priority,
         ] {
             hash = fnv1a(&[tier.is_some() as u8], hash);
             if let Some(value) = tier {
@@ -2011,6 +2150,12 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             output_ultrafast: tier_slot(model.output_cost_ultrafast),
             cw_ultrafast: tier_slot(model.cache_write_cost_ultrafast),
             cr_ultrafast: tier_slot(model.cache_read_cost_ultrafast),
+            // Priority-tier slots (rm-1556, cycle-4): scaled and filtered
+            // identically — zero/absent means "no published rate".
+            input_priority: tier_slot(model.input_cost_priority),
+            output_priority: tier_slot(model.output_cost_priority),
+            cw_priority: tier_slot(model.cache_write_cost_priority),
+            cr_priority: tier_slot(model.cache_read_cost_priority),
         };
         // Hostile or overflowing catalog rates must not reach costing:
         // the 1e6 scaling can turn a near-f64-max per-token cost into
@@ -3991,9 +4136,12 @@ mod tests {
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
         // The 1M-window default class (rm-231's motivating case).
+        // The vendor re-published claude-sonnet-4-5's window at 200k
+        // in the 2026-10-17 snapshot (was 1M through 2026-10-08); the
+        // pin follows the vendor, the ingestion claim stays the same.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 
@@ -4360,7 +4508,13 @@ mod tests {
         // Codeburn #1642 published numbers for GPT-5.6: flex is half.
         assert_eq!((flex.input, flex.output), (2.0, 10.0));
         assert!(near(flex.cw.unwrap(), 2.5) && near(flex.cr.unwrap(), 0.2));
-        for tier in ["default", "priority", "fast", "scale", "garbage"] {
+        // rm-1556 (cycle-4): the refreshed catalog publishes a
+        // priority row for gpt-5.6 at exactly 2x standard
+        // (8e-6/4e-5 per token), so priority now BILLS the published
+        // priority rate instead of the pre-refresh standard fallback.
+        // "fast" stays standard for bare gpt-5.6 — the ccusage
+        // override table carries only the -sol/-terra/-luna variants.
+        for tier in ["default", "fast", "scale", "garbage"] {
             let priced = lookup_price_tiered("gpt-5.6", Some(tier));
             assert_eq!(
                 (priced.input, priced.output),
@@ -4368,6 +4522,14 @@ mod tests {
                 "tier {tier} is not flex"
             );
         }
+        assert_eq!(
+            {
+                let p = lookup_price_tiered("gpt-5.6", Some("priority"));
+                (p.input, p.output)
+            },
+            (8.0, 40.0),
+            "priority bills the published 2x priority row"
+        );
         // A model without flex slots bills flex at standard rates.
         let no_flex = lookup_price_tiered("deepseek-chat", Some("flex"));
         let plain = lookup_price("deepseek-chat");
@@ -4746,15 +4908,255 @@ mod tests {
             (5.0, 25.0),
             "flex is not ultrafast"
         );
-        // Tiers other than flex/ultrafast keep the standard row.
-        for tier in ["default", "priority", "fast", "scale"] {
+        // rm-1556 (cycle-4): the refreshed catalog publishes a
+        // priority row for gpt-6-astra at 2x standard ($20/$100), so
+        // priority bills it; "fast" ALSO bills 2x here because the
+        // ccusage fast-multiplier override table pins gpt-6-astra at
+        // 2.0 exactly. "default"/"scale" keep the standard row.
+        for tier in ["default", "scale"] {
             let priced = lookup_price_tiered("gpt-6-astra", Some(tier));
             assert_eq!((priced.input, priced.output), (10.0, 50.0), "tier {tier}");
         }
+        assert_eq!(
+            {
+                let p = lookup_price_tiered("gpt-6-astra", Some("priority"));
+                (p.input, p.output)
+            },
+            (20.0, 100.0),
+            "priority bills the published 2x priority row"
+        );
+        assert_eq!(
+            {
+                let p = lookup_price_tiered("gpt-6-astra", Some("fast"));
+                (p.input, p.output)
+            },
+            (20.0, 100.0),
+            "fast bills the ccusage-published 2.0x multiplier"
+        );
         // A model without ultrafast slots bills ultrafast at standard.
         let no_uf = lookup_price_tiered("deepseek-chat", Some("ultrafast"));
         let plain = lookup_price("deepseek-chat");
         assert_eq!((no_uf.input, no_uf.output), (plain.input, plain.output));
+    }
+
+    #[test]
+    fn rm1556_priority_slots_ingest_scale_filter_and_bill() {
+        // rm-1556 (cycle-4, run 1fb751544907): the fourth tier family.
+        // The bundled 2026-10-17 snapshot publishes the full priority
+        // row for gpt-5.6 at exactly 2x standard ($8/$40, cache $10/
+        // $0.80 per million), so the loader must ingest, 1e6-scale,
+        // and bill it — a priority turn previously fell through to
+        // the standard row silently.
+        let converted = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes());
+        let gpt = &converted.entries["gpt-5.6"];
+        assert_eq!(
+            gpt.input_priority,
+            Some(8.0),
+            "priority input scales per-million"
+        );
+        assert_eq!(gpt.output_priority, Some(40.0));
+        assert_eq!(gpt.cw_priority, Some(10.0));
+        assert!(
+            matches!(gpt.cr_priority, Some(v) if (v - 0.8).abs() < 1e-9),
+            "priority cache-read scales per-million: {:?}",
+            gpt.cr_priority
+        );
+        // Ingest contract mirrors flex/ultrafast exactly: zero and
+        // negative rates mean "no published rate", and the
+        // `_above_272k_tokens_priority` long-context variant is
+        // deliberately not ingested (the rm-610 decision, held for
+        // every tier family).
+        let raw = br#"{"m": {
+            "mode": "chat",
+            "input_cost_per_token": 4e-6,
+            "output_cost_per_token": 2e-5,
+            "input_cost_per_token_priority": 2e-6,
+            "output_cost_per_token_priority": 0,
+            "cache_creation_input_token_cost_priority": -1,
+            "cache_read_input_token_cost_priority": 8e-7,
+            "input_cost_per_token_above_272k_tokens_priority": 9e-6
+        }}"#;
+        let converted = convert_litellm(raw);
+        let price = &converted.entries["m"];
+        assert_eq!(
+            price.input_priority,
+            Some(2.0),
+            "priority scales like every tier family"
+        );
+        assert_eq!(price.output_priority, None, "a zero rate is 'no rate'");
+        assert_eq!(price.cw_priority, None, "a negative rate is dropped");
+        assert!(
+            matches!(price.cr_priority, Some(v) if (v - 0.8).abs() < 1e-9),
+            "positive priority cache rates scale like every tier family: {:?}",
+            price.cr_priority
+        );
+        assert_eq!(price.input, 4.0, "the standard row is untouched");
+        // Bill: the public tiered API bills all four axes of the
+        // published priority row.
+        let priority = lookup_price_tiered("gpt-5.6", Some("priority"));
+        assert_eq!((priority.input, priority.output), (8.0, 40.0));
+        // rm-1508 composition (wall, post-base): the published cache
+        // slots are Option here; unwrap() keeps the pin strict.
+        assert!((priority.cw.unwrap() - 10.0).abs() < 1e-9);
+        assert!((priority.cr.unwrap() - 0.8).abs() < 1e-9);
+        // A vendor-qualified row with its own published priority
+        // fields bills them (azure/gpt-5.6-luna: 2x of its own
+        // standard, not the base row's absolute numbers).
+        let qualified = lookup_price_tiered("azure/gpt-5.6-luna", Some("priority"));
+        assert!(
+            (qualified.input - 0.2 * 2.0).abs() < 1e-9
+                && (qualified.output - 1.2 * 2.0).abs() < 1e-9,
+            "the qualified row bills its own published 2x priority numbers"
+        );
+    }
+
+    #[test]
+    fn rm1556_priority_zero_vs_absent_input_parity() {
+        // The test-first None-parity guard the stewardship request
+        // pinned BEFORE the snapshot swap: a zero published priority
+        // rate and an absent priority field mean the same thing — no
+        // published rate — so both must ingest to None and a priority
+        // turn of a model without priority slots bills the standard
+        // row, never zero and never silently repriced.
+        let raw = br#"{
+            "zero": {
+                "mode": "chat",
+                "input_cost_per_token": 4e-6,
+                "output_cost_per_token": 2e-5,
+                "input_cost_per_token_priority": 0,
+                "output_cost_per_token_priority": 0
+            },
+            "absent": {
+                "mode": "chat",
+                "input_cost_per_token": 4e-6,
+                "output_cost_per_token": 2e-5
+            }
+        }"#;
+        let converted = convert_litellm(raw);
+        let zero = &converted.entries["zero"];
+        let absent = &converted.entries["absent"];
+        assert_eq!(zero.input_priority, None, "zero publishes no rate");
+        assert_eq!(absent.input_priority, None);
+        assert_eq!(zero.output_priority, absent.output_priority);
+        assert_eq!((zero.input, zero.output), (absent.input, absent.output));
+        // End-to-end: deepseek-chat carries no priority slots in the
+        // 2026-10-17 catalog, so a priority turn bills standard.
+        let priority = lookup_price_tiered("deepseek-chat", Some("priority"));
+        let standard = lookup_price("deepseek-chat");
+        assert_eq!(
+            (priority.input, priority.output),
+            (standard.input, standard.output)
+        );
+    }
+
+    #[test]
+    fn rm1556_priority_zero_vs_absent_cache_parity() {
+        // Same guard on the cache axes: zero-published and absent
+        // priority cache rates both mean "no rate", and when a model
+        // publishes priority input/output but no priority cache
+        // rates, the priority turn keeps the STANDARD cache rates on
+        // those axes (the flex/ultrafast partial-row discipline).
+        let raw = br#"{
+            "zero": {
+                "mode": "chat",
+                "input_cost_per_token": 4e-6,
+                "output_cost_per_token": 2e-5,
+                "cache_creation_input_token_cost": 5e-6,
+                "cache_read_input_token_cost": 4e-7,
+                "cache_creation_input_token_cost_priority": 0,
+                "cache_read_input_token_cost_priority": 0
+            },
+            "absent": {
+                "mode": "chat",
+                "input_cost_per_token": 4e-6,
+                "output_cost_per_token": 2e-5,
+                "cache_creation_input_token_cost": 5e-6,
+                "cache_read_input_token_cost": 4e-7
+            }
+        }"#;
+        let converted = convert_litellm(raw);
+        let zero = &converted.entries["zero"];
+        let absent = &converted.entries["absent"];
+        assert_eq!(zero.cw_priority, None, "zero publishes no cache rate");
+        assert_eq!(zero.cr_priority, None);
+        assert_eq!(zero.cw_priority, absent.cw_priority);
+        assert_eq!(zero.cr_priority, absent.cr_priority);
+        // gpt-5.5 publishes priority input/output/cache-read but no
+        // priority cache-creation rate in the 2026-10-17 catalog: the
+        // priority turn keeps the standard cache-creation axis.
+        let priority = lookup_price_tiered("gpt-5.5", Some("priority"));
+        let standard = lookup_price("gpt-5.5");
+        assert!(
+            (priority.input - standard.input * 2.5).abs() < 1e-9
+                && (priority.output - standard.output * 2.5).abs() < 1e-9,
+            "the published 2.5x priority row bills"
+        );
+        assert_eq!(
+            priority.cw, standard.cw,
+            "absent priority cw keeps standard"
+        );
+    }
+
+    #[test]
+    fn rm1556_fast_multiplier_table_bills_published_overrides_only() {
+        // The ccusage #1855 override set mirrored verbatim: exact ids,
+        // strictly-longer family prefixes for dated variants, and
+        // everything else — including a vendor-qualified id that IS
+        // its own catalog row — bills standard, disclosed, in
+        // ccusage parity ("reports standard pricing rather than
+        // assuming a multiplier for unknown models").
+        let gpt55 = lookup_price("gpt-5.5");
+        let fast = lookup_price_tiered("gpt-5.5", Some("fast"));
+        assert_eq!(
+            (fast.input, fast.output),
+            (gpt55.input * 2.5, gpt55.output * 2.5)
+        );
+        let sol = lookup_price("gpt-5.6-sol");
+        let fast = lookup_price_tiered("gpt-5.6-sol", Some("fast"));
+        assert_eq!(
+            (fast.input, fast.output),
+            (sol.input * 2.0, sol.output * 2.0)
+        );
+        // Dated variants inherit by family prefix, and the cache
+        // axes scale with the token axes.
+        let dated = lookup_price("claude-opus-4-6-20260205");
+        let fast = lookup_price_tiered("claude-opus-4-6-20260205", Some("fast"));
+        assert_eq!(
+            (fast.input, fast.output),
+            (dated.input * 6.0, dated.output * 6.0)
+        );
+        // rm-1508 composition (wall, post-base): published cache
+        // slots are Option; the dated claude row publishes both, so
+        // unwrap() keeps the pin strict. A row without a published
+        // cache rate would keep None — its fallback derives from the
+        // already-scaled input rate (see fast_tier_price).
+        assert!((fast.cw.unwrap() - dated.cw.unwrap() * 6.0).abs() < 1e-9);
+        assert!((fast.cr.unwrap() - dated.cr.unwrap() * 6.0).abs() < 1e-9);
+        // The bare family id is NOT strictly longer than its own
+        // prefix and has no exact-table entry: standard, never guessed.
+        let bare = lookup_price("claude-opus-4-6");
+        let fast = lookup_price_tiered("claude-opus-4-6", Some("fast"));
+        assert_eq!((fast.input, fast.output), (bare.input, bare.output));
+        // Unknown models and own-row qualified ids bill standard.
+        for model in ["deepseek-chat", "azure/gpt-5.6-luna"] {
+            let standard = lookup_price(model);
+            let fast = lookup_price_tiered(model, Some("fast"));
+            assert_eq!(
+                (fast.input, fast.output),
+                (standard.input, standard.output),
+                "{model}"
+            );
+        }
+        // Table unit pins: normalization and the prefix bounds.
+        assert_eq!(fast_multiplier_for("  GPT-5.5 "), Some(2.5));
+        assert_eq!(fast_multiplier_for("claude-opus-4-7-anything"), Some(6.0));
+        assert_eq!(fast_multiplier_for("claude-opus-4-8-20260101"), Some(2.0));
+        assert_eq!(fast_multiplier_for(""), None);
+        assert_eq!(
+            fast_multiplier_for("gpt-5.6"),
+            None,
+            "bare gpt-5.6 has no fast row"
+        );
     }
 
     #[test]
@@ -4838,6 +5240,48 @@ mod tests {
         assert_ne!(
             gained, changed,
             "an ultrafast value change must reprice the cache"
+        );
+    }
+
+    #[test]
+    fn catalog_identity_covers_priority_slots() {
+        // rm-1556 cycle-4 rider (independent review case
+        // 19787e53f2b8): the run landed the priority tier family but
+        // not its digest arm, so a snapshot refresh changing ONLY
+        // priority rates would have kept the identity byte-stable and
+        // served stale standard-priced priority turns from warm
+        // caches — exactly the collision class rm-610 closed for flex
+        // (and cycle-2 for ultrafast). A gained or changed priority
+        // rate changes what a `service_tier: "priority"` turn bills
+        // at, so it must reprice cached sessions like every tier
+        // family.
+        fn catalog_with(input_priority: Option<f64>) -> PricingCatalog {
+            PricingCatalog {
+                entries: BTreeMap::from([(
+                    "m".to_string(),
+                    Price {
+                        input: 1.0,
+                        output: 2.0,
+                        input_priority,
+                        ..Price::default()
+                    },
+                )]),
+                aliases: BTreeMap::new(),
+                source: "test".to_string(),
+                providers: BTreeMap::new(),
+                reference_date: None,
+            }
+        }
+        let base = catalog_identity_of(&catalog_with(None));
+        let gained = catalog_identity_of(&catalog_with(Some(60.0)));
+        let changed = catalog_identity_of(&catalog_with(Some(61.0)));
+        assert_ne!(
+            base, gained,
+            "gaining priority pricing must reprice the cache"
+        );
+        assert_ne!(
+            gained, changed,
+            "a priority value change must reprice the cache"
         );
     }
 }

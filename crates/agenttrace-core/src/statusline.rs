@@ -434,11 +434,32 @@ pub fn is_joiner_format_control(c: char) -> bool {
     matches!(c, '\u{200C}' | '\u{200D}')
 }
 
+/// rm-933 follow-up (cycle-4, run 1fb75154, assess F3): the invisible
+/// MATH operators — function application U+2061, invisible times
+/// U+2062, invisible separator U+2063, invisible plus U+2064 —
+/// category Cf, zero-width and invisible in every terminal, and with
+/// no orthographic role in any human-written session name. They were
+/// od-verified riding RAW through `--sessions` TSV and CSV cells at
+/// b894d2c (delegate assess a760b2bc: E2 81 A2 byte-for-byte in the
+/// name cell) — the same cell-gluing spoofing class the rm-933
+/// widening arm closed for the joiner pair. U+00AD SOFT HYPHEN is
+/// deliberately OUT: it is real typography (hyphenation points) that
+/// legitimately appears in prose, so it keeps its documented spoof
+/// trade-off — raw in rendered cells, disclosed here as the accepted
+/// residue of the rm-933 exclusion set.
+pub fn is_invisible_operator_control(c: char) -> bool {
+    matches!(c, '\u{2061}'..='\u{2064}')
+}
+
 pub fn sanitize_line_segment(segment: &str) -> String {
     segment
         .chars()
         .map(|c| {
-            if c.is_control() || is_spoofing_format_control(c) || is_joiner_format_control(c) {
+            if c.is_control()
+                || is_spoofing_format_control(c)
+                || is_joiner_format_control(c)
+                || is_invisible_operator_control(c)
+            {
                 '\u{FFFD}'
             } else {
                 c
@@ -463,7 +484,10 @@ pub fn sanitize_line_segment(segment: &str) -> String {
 /// (2026-10-16) composes the joiner pair
 /// ([`is_joiner_format_control`]) into the same substitution class at
 /// this boundary, so markdown/HTML cells — which carry no line-segment
-/// pass — cannot ride a raw ZWJ/ZWNJ either. Idempotent by
+/// pass — cannot ride a raw ZWJ/ZWNJ either. The rm-933 follow-up
+/// (cycle-4) composes the invisible math operators
+/// ([`is_invisible_operator_control`]) into the same substitution at
+/// both boundaries. Idempotent by
 /// construction: U+FFFD is
 /// printable, so already-sanitized documents (including cells that
 /// first went through the rm-383/rm-540 line sanitizer) pass through
@@ -471,7 +495,10 @@ pub fn sanitize_line_segment(segment: &str) -> String {
 pub fn sanitize_output_document(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if (c.is_control() || is_spoofing_format_control(c) || is_joiner_format_control(c))
+            if (c.is_control()
+                || is_spoofing_format_control(c)
+                || is_joiner_format_control(c)
+                || is_invisible_operator_control(c))
                 && c != '\n'
                 && c != '\r'
                 && c != '\t'
@@ -2363,6 +2390,44 @@ mod tests {
         // Idempotence + the clean fast path.
         assert_eq!(escape_spoofing_json(&esc), esc);
         assert_eq!(escape_spoofing_json("plain text 100%"), "plain text 100%");
+    }
+
+    #[test]
+    fn rm933_invisible_operator_control_bounds() {
+        // rm-933 follow-up (cycle-4, assess F3): the invisible math
+        // operators, each pinned in — zero-width Cf with no orthographic
+        // role, od-verified riding raw at b894d2c.
+        for c in ['\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}'] {
+            assert!(is_invisible_operator_control(c), "{c:?} must be flagged");
+        }
+        // Boundary neighbors stay out: soft hyphen is legitimate
+        // typography (documented residue), U+2065 is unassigned, the
+        // bidi isolates belong to the directional set, and word joiner
+        // U+2060 already belongs to the invisible-spoofing set.
+        for c in [
+            '\u{00AD}', '\u{2065}', '\u{2066}', 'a', '\u{FFFD}', '\u{1B}',
+        ] {
+            assert!(!is_invisible_operator_control(c), "{c:?} stays out");
+        }
+    }
+
+    #[test]
+    fn rm933_line_segment_kills_invisible_operators() {
+        let out = sanitize_line_segment("a\u{2061}b\u{2062}c\u{2063}d\u{2064}e\u{00AD}f");
+        assert_eq!(out, "a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}e\u{00AD}f");
+        assert_eq!(sanitize_line_segment(&out), out);
+    }
+
+    #[test]
+    fn rm933_document_keeps_layout_kills_invisible_operators() {
+        let doc = "x\u{2062}y\n\t z\u{2064}w\r\u{2063}q";
+        let out = sanitize_output_document(doc);
+        assert_eq!(out, "x\u{FFFD}y\n\t z\u{FFFD}w\r\u{FFFD}q");
+        assert_eq!(sanitize_output_document(&out), out);
+        // The JSON lane's escape carve-out is deliberately NOT widened:
+        // 2062 passes escape_spoofing_json untouched as before.
+        let esc = escape_spoofing_json("a\u{2062}b");
+        assert_eq!(esc, "a\u{2062}b");
     }
 
     #[test]
