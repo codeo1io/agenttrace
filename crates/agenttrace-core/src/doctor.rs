@@ -138,6 +138,22 @@ pub struct DoctorReport {
     /// the pre-rm-1534 report.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub future_timestamp_sessions: usize,
+    /// rm-2271: Claude Code journals whose head was trimmed by the
+    /// client's local transcript GC (`CLAUDE_CODE_TRANSCRIPT_LOCAL_GC`,
+    /// claude-code 2.1.304 changelog — pre-2.1.304 disk-full trims
+    /// could DROP messages from the saved transcript). The parser
+    /// flags the detectable shape (assistant-led journal with a
+    /// dangling `parentUuid` and no leading `summary` head marker) on
+    /// the session's `disclosure_counters`
+    /// (`claude_transcript_trimmed_head`), and this row counts the
+    /// flagged sessions across BOTH doctor lanes — the per-session
+    /// key already folds into `disclosures`, and this census keeps
+    /// the rm-1534 row discipline (an invisible-at-the-source class
+    /// gets a visible count; no alias disclosure key — same-key
+    /// discipline). 0-count-clean: healthy corpora render
+    /// identically to the pre-rm-2271 report.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub transcripts_trimmed_sessions: usize,
     /// Parse-time journal disclosures aggregated over scanned sessions
     /// (rm-436/rm-437, pi-family journals): `pi_usage_entry:<kind>`,
     /// `pi_branches`, `pi_entry_skipped:<type>`,
@@ -498,6 +514,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         mut project_decode,
         zero_usage,
         future_timestamp_sessions,
+        transcripts_trimmed_sessions,
         disclosure_fold,
         // scanned_sessions is consumed inside doctor_directories by the
         // rm-904 linkage pass — nothing here needs the corpus again.
@@ -612,6 +629,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         project_decode,
         zero_usage,
         future_timestamp_sessions,
+        transcripts_trimmed_sessions,
         disclosures,
         dropped_lines,
         directories,
@@ -1031,6 +1049,11 @@ struct DoctorScanState {
     /// corpus — counted once here so the doctor row and the
     /// disclosure fold agree.
     future_timestamp_sessions: usize,
+    /// rm-2271: census over the scanned corpus — sessions whose
+    /// claude journal disclosed `claude_transcript_trimmed_head`.
+    /// Computed once at the end of `doctor_directories` (both lanes
+    /// have folded by then), exactly like `future_timestamp_sessions`.
+    transcripts_trimmed_sessions: usize,
     // rm-367/rm-904 accumulator (folded into the rm-862 scan state at
     // the integration of run 5eb82325, after both landed on this wall
     // post-base): every session a directory report parses or a cache
@@ -1103,6 +1126,7 @@ fn doctor_directories(
             project_decode,
             zero_usage,
             future_timestamp_sessions: _,
+            transcripts_trimmed_sessions: _,
             disclosure_fold,
             scanned_sessions,
         } = scan;
@@ -1210,6 +1234,22 @@ fn doctor_directories(
             scan.future_timestamp_sessions,
         );
     }
+    // rm-2271: same census shape as rm-1534 above, over the trimmed-
+    // head disclosure key instead of an anomaly kind — the sessions
+    // were ADMITTED (accounting counted what the journal still holds),
+    // so this is an undercount risk census, not an exclusion census.
+    // The per-session key is already in the fold's `disclosures`; the
+    // row lands on DoctorReport only.
+    scan.transcripts_trimmed_sessions = scan
+        .scanned_sessions
+        .iter()
+        .filter(|session| {
+            session
+                .metrics
+                .disclosure_counters
+                .contains_key("claude_transcript_trimmed_head")
+        })
+        .count();
     dirs
 }
 
@@ -1502,6 +1542,16 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
             crate::insights::FUTURE_ADMISSION_GRACE_SECS / 3600
         ));
     }
+    // rm-2271: repair pointer for the trimmed-head census — the
+    // journal cannot be repaired locally (the client already dropped
+    // the records), so the pointer names the honest recourse: exact
+    // spend comes from the billing console, not the trimmed file.
+    if report.transcripts_trimmed_sessions > 0 {
+        recommendations.push(format!(
+            "{} session(s) likely had their transcript head-trimmed by Claude Code's CLAUDE_CODE_TRANSCRIPT_LOCAL_GC: totals may undercount actual spend; the journal cannot be repaired locally — re-derive exact spend from the billing console if it matters.",
+            report.transcripts_trimmed_sessions
+        ));
+    }
     // rm-607: sibling sqlite databases suppressed as duplicates are
     // disclosed, not silently skipped — the numbers are honest but the
     // user should learn their backups are inside the discovery glob.
@@ -1658,6 +1708,19 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
         out.push_str(&format!(
             "Future timestamps: {} session(s) with activity beyond now+{}h (rm-1534) — excluded from ranged views, disclosed here and as `future_timestamp` anomalies\n",
             report.future_timestamp_sessions, crate::insights::FUTURE_ADMISSION_GRACE_SECS / 3600
+        ));
+    }
+    // rm-2271: the local-GC trimmed-head census — the client's own
+    // trimming is invisible in the journal, so `--doctor` names the
+    // sessions whose accounting may undercount what was actually
+    // spent. Twin discipline with the future-timestamp row above: an
+    // invisible-at-the-source class gets a visible count, and the
+    // sessions stay admitted (their usage is what the journal still
+    // holds). 0-count-clean: healthy corpora render identically.
+    if report.transcripts_trimmed_sessions > 0 {
+        out.push_str(&format!(
+            "Trimmed transcripts: {} session(s) start mid-conversation (claude_transcript_trimmed_head, rm-2271) — likely Claude Code local transcript GC (`CLAUDE_CODE_TRANSCRIPT_LOCAL_GC`); usage counts what remains, never fabricated\n",
+            report.transcripts_trimmed_sessions
         ));
     }
     for sample in &report.zero_usage.samples {

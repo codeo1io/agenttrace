@@ -2005,9 +2005,39 @@ fn parse_claude_transcript_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut flat_call_ordinals: BTreeMap<String, usize> = BTreeMap::new();
     let mut flat_result_ordinals: BTreeMap<String, usize> = BTreeMap::new();
+    // rm-2271 (Claude-transcript local-GC awareness), flat-lane arm:
+    // the flat format carries no parent chain, so the head shape is
+    // the only witness. A conversation that opens on an
+    // assistant-family record (assistant / tool_use / tool_result)
+    // before any `user` record starts mid-conversation — the exact
+    // shape CLAUDE_CODE_TRANSCRIPT_LOCAL_GC trimming leaves behind
+    // when it drops the leading turns from the head of the journal.
+    // A leading `summary` record is the format's deliberate-
+    // continuation marker (the flat mirror of the journal lane's
+    // resume negative): the head was chosen, not lost, so it clears
+    // the flag. Accounting is untouched — the journal keeps every
+    // record it still has; the counter only discloses that the head
+    // is not the session start, so totals may undercount.
+    let mut trimmed_head = false;
+    let mut head_decided = false;
+    let mut saw_leading_summary = false;
     for entry in objs.iter() {
         let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();
-        match string(entry.get("type")).unwrap_or("") {
+        let record_type = string(entry.get("type")).unwrap_or("");
+        if !head_decided {
+            match record_type {
+                "user" => head_decided = true, // opens on the prompt: clean head
+                "assistant" | "tool_use" | "tool_result" => {
+                    head_decided = true;
+                    if !saw_leading_summary {
+                        trimmed_head = true;
+                    }
+                }
+                "summary" => saw_leading_summary = true,
+                _ => {}
+            }
+        }
+        match record_type {
             "user" | "assistant" => events.push(Event {
                 role: string(entry.get("type")).unwrap_or("").to_string(),
                 content: string(entry.get("content")).unwrap_or("").to_string(),
@@ -2083,6 +2113,26 @@ fn parse_claude_transcript_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             }
             _ => {}
         }
+    }
+    // rm-2271: the disclosure rides the same one-carrier meta event
+    // the claude_code journal lane uses, so the flat lane's counters
+    // land on Metrics.disclosure_counters (the non-loss channel the
+    // session cache persists and --doctor folds) with no accounting
+    // change. Named in the SESSION_CACHE_SCHEMA_VERSION ladder entry
+    // for 73: a warm pre-rung entry keeps serving the head-shape-blind
+    // parse, so the disclosure would never materialize for an
+    // upgraded fleet with a warm store (the rm-1522 class).
+    if trimmed_head && !events.is_empty() {
+        let mut disclosure: BTreeMap<String, i64> = BTreeMap::new();
+        disclosure.insert(disclosure_key("claude_transcript", "trimmed_head"), 1);
+        events.insert(
+            0,
+            Event {
+                role: "meta".to_string(),
+                disclosure_counters: disclosure,
+                ..Event::default()
+            },
+        );
     }
     non_empty(events)
 }
@@ -5678,6 +5728,19 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_claude = false;
+    // rm-2271 (claude-code CHANGELOG 2.1.304): the client's local
+    // transcript GC (`CLAUDE_CODE_TRANSCRIPT_LOCAL_GC`, undocumented
+    // knob — zero `TRANSCRIPT` occurrences in the live settings page)
+    // trims the SAVED journal from the head, and pre-2.1.304 disk-full
+    // trims could DROP messages mid-trim — so a journal can start
+    // mid-conversation on real hosts today. Track the head shape for
+    // the disclosure arm at the carrier below: the first content
+    // record (user/assistant) decides, and a `summary` record before
+    // it is the client's own continuation/compaction marker, which
+    // clears the flag (a deliberate head is never GC loss).
+    let mut saw_leading_summary = false;
+    let mut saw_first_content_record = false;
+    let mut transcript_trimmed_head = false;
     // rm-601 (upstream #312): streaming writes one assistant row per
     // content block, each repeating the message's usage with growing
     // totals on the SAME message id. Fold re-emissions into ONE meta
@@ -5804,6 +5867,30 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 org = capped_org;
                 org_email = capped_email;
                 org_identity_truncated |= org_truncated || email_truncated;
+            }
+        }
+        // rm-2271: head-trim detection — evaluated exactly once, at
+        // the first content record. The detectable shape is an
+        // assistant-led journal whose `parentUuid` dangles (any
+        // non-null parent on the FIRST record points at a record the
+        // file no longer holds — the opening user turn the GC took).
+        // A leading `summary` head marker (compaction/resume) or any
+        // user-led journal (fresh session, resume, fork) never flags;
+        // a user turn the trim left at the head is indistinguishable
+        // from a fresh session, so it stays unflagged rather than
+        // guessed. Disclosure only — usage is never fabricated and
+        // the session is never refused.
+        if !saw_first_content_record {
+            if typ == "summary" {
+                saw_leading_summary = true;
+            } else if typ == "user" || typ == "assistant" {
+                saw_first_content_record = true;
+                if typ == "assistant" && !saw_leading_summary {
+                    let parent = string(obj.get("parentUuid")).unwrap_or("");
+                    if !parent.is_empty() {
+                        transcript_trimmed_head = true;
+                    }
+                }
             }
         }
         match typ {
@@ -6120,6 +6207,14 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             for (key, count) in unmatched_kinds {
                 *tool_result_refolds.entry(key).or_insert(0) += count;
             }
+        }
+        // rm-2271: the local-GC head-trim disclosure rides the SAME
+        // single carrier (one counter per session, additive only —
+        // accounting above is untouched by the flag).
+        if transcript_trimmed_head {
+            *tool_result_refolds
+                .entry("claude_transcript_trimmed_head".to_string())
+                .or_insert(0) += 1;
         }
         if !tool_result_refolds.is_empty() {
             events.insert(

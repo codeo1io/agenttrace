@@ -8,7 +8,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 73;
+// Bumped 72 -> 73 (integration of run d3bd7260ae0748c88b5d0ef15883ae99
+// cycle 6 "Claude-transcript local-GC awareness", rm-2271: claude
+// journals — both the claude_code journal lane and the flat
+// claude_transcript lane — that open mid-conversation (journal lane:
+// an assistant-led head whose parentUuid names a record the journal
+// never contained; flat lane: an assistant/tool record before the
+// first user record, a leading summary clearing it) now carry a
+// claude_transcript_trimmed_head disclosure counter on the lane's
+// one-carrier meta event, riding Metrics.disclosure_counters into
+// --doctor's Disclosed-facts fold and a transcripts_trimmed_sessions
+// census row. Cached rows written before this rung carry no such
+// counter — a warm store would keep serving the head-shape-blind
+// parse and the upgraded fleet's --doctor census would read 0 (the
+// rm-1522 class, proven live for claude_unmatched_type) — so the
+// bump regenerates them. Minted 72 -> 73 straight at the base
+// 9ebd0460 ceiling 72, the lowest rung unique above the ceiling at
+// the fleet census, one invalidation either way. No SQLite snapshot
+// rung rides the batch; the landed 13 remains the snapshot ceiling.
+// Entries regenerate once on next scan.
 // Bumped 71 -> 72 (integration of run 4eeea89188b245068a569ba76f8caa71
 // cycle 2 "truth of the default surfaces", rm-1553: the claude identity
 // capture (orgIdentifier/loginEmail) is now capped at capture
