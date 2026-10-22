@@ -1489,6 +1489,115 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
 }
 
 #[test]
+fn warm_v72_cache_row_with_raw_antigravity_1050_regenerates_under_the_mapping() {
+    // rm-2354 red-first pin (run c870ab5a cycle 2): the antigravity
+    // numeric-model map (ANTIGRAVITY_NUMERIC_MODEL_MAP, the 1050 ->
+    // gemini-3.1-flash-lite arm) landed in 6f76dbdd with NO rung of
+    // its own, so a warm cache serialized at schema 72 holds the
+    // pre-mapping raw "1050" spelling. This fixture is warm and fresh
+    // by every other gate (schema stamp 72, exact mod_time/size
+    // fingerprints, unstamped legacy pricing id — accepted as-is), so
+    // at rung 72 the row SERVES and the session reports the unpriced
+    // raw id: exactly the replay this batch cures. Under the landed
+    // rung 73 the row is invalidated once, the file re-parses under
+    // the mapping, and the rewritten cache carries the mapped model.
+    // If this test fails with model_used == "1050", the rung was
+    // reverted without reverting the mapping (or a new map arm landed
+    // bump-less) — see the CACHE-RUNG GUARD note on the map.
+    let root = temp_root("agenttrace-v72-antigravity-rung-pin");
+    let home = root.join("home");
+    let sessions_dir = root.join("sessions");
+    let cache_dir = root.join("cache");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+    fs::create_dir_all(&cache_dir).expect("create cache dir");
+
+    // The same numeric-1050 trajectory the parser lane pins
+    // (antigravity 1050 maps through the numeric map, priced via the
+    // bundled gemini-3.1-flash-lite catalog row).
+    let trajectory = concat!(
+        r#"{"timestamp":"2026-10-15T10:00:00Z","trajectoryId":"traj-1","#,
+        r#""isTruncated":false,"userTips":null,"projectId":"/tmp/probe","#,
+        r#""sessionId":"session-1","tracks":[{"id":"0","#,
+        r#""attributes":{"settings":{"enabled":false,"keyIntervals":null,"type":"MARKER"},"type":"DEFAULT"},"#,
+        r#""segments":[{"id":"0","startTime":"2026-10-15T10:00:00.000Z","#,
+        r#""endTime":"2026-10-15T10:00:30.000Z","#,
+        r#""commitMetadata":{"clientUser":"agent-cli@example.com","type":"INDEXED_AGENT_TRACE","oid":"abc123"},"#,
+        r#""attributes":{"checkpointId":null,"workspaceOrigin":"IDE","type":"AGENTIC","#,
+        r#""state":"SUCCESS","generationNum":1,"scope":"AGENT","dataListEndpoint":"","#,
+        r#""summary":"five words","remoteEndpoint":""},"#,
+        r#""models":[{"model":1050,"attributes":{"ok":true}}],"context":{},"userTips":null}]},"#,
+        r#"{"id":"1","attributes":{},"segments":[]}]},"#,
+        r#"{"id":"2","attributes":{},"segments":[]}]}"#,
+    );
+    let trajectory_path = sessions_dir.join("conversation.trajectory.json");
+    fs::write(&trajectory_path, trajectory).expect("write trajectory");
+
+    let mod_time = {
+        let metadata = fs::metadata(&trajectory_path).expect("trajectory metadata");
+        file_mod_time_nanos_for_test(&metadata)
+    };
+    let size = fs::metadata(&trajectory_path).expect("trajectory metadata").len();
+    let session_path = trajectory_path.to_string_lossy().replace('\\', "/");
+    // The stale row: schema stamp 72, exact fingerprints, and the
+    // PRE-mapping raw "1050" model the cache replayed.
+    let stale = serde_json::json!({
+        "schema_version": 72,
+        "entries": {
+            session_path.clone(): {
+                "mod_time": mod_time,
+                "size": size,
+                "session": {
+                    "Name": "cached",
+                    "Path": session_path,
+                    "Metrics": {
+                        "SourceTool": "antigravity",
+                        "ModelUsed": "1050",
+                        "SessionStart": "2026-10-15T10:00:00Z",
+                    },
+                },
+            },
+        },
+    });
+    fs::write(session_cache_path(), stale.to_string())
+        .expect("write stale cache");
+
+    with_home_and_cache(&home, &cache_dir, || {
+        let sessions = load_sessions_from_dir(Some(&sessions_dir));
+        assert_eq!(sessions.len(), 1, "trajectory must be admitted");
+        assert_eq!(
+            sessions[0].metrics.model_used,
+            "gemini-3.1-flash-lite",
+            "warm v72 row must regenerate under the numeric map, not replay raw 1050"
+        );
+
+        // The rewrite carries the landed rung and the mapped model, so
+        // the immediate rerun serves the corrected row.
+        let doc: Value = serde_json::from_str(
+            &fs::read_to_string(session_cache_path()).expect("read rewritten cache"),
+        )
+        .expect("rewritten cache is json");
+        assert_eq!(
+            doc.get("schema_version").and_then(Value::as_i64),
+            Some(SESSION_CACHE_SCHEMA_VERSION),
+            "rewrite must land at the current rung"
+        );
+        let entry = doc
+            .pointer(&format!("/entries/{}", escape_json_pointer(&trajectory_path)))
+            .expect("cache entry");
+        assert_eq!(
+            entry
+                .pointer("/session/Metrics/ModelUsed")
+                .and_then(Value::as_str),
+            Some("gemini-3.1-flash-lite"),
+            "persisted row must carry the mapped model"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rust_refreshes_cache_entries_missing_tool_arg_usage() {
     let root = temp_root("agenttrace-rust-session-cache-tool-args");
     let home = root.join("home");

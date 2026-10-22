@@ -8,7 +8,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 73;
+// Bumped 72 -> 73 (integration of run c870ab5a84b84c58a92afd611fc96b00
+// cycle 2 repository-maintenance, rm-2354, from assess 7a5752ed F1):
+// the antigravity numeric-model map (ANTIGRAVITY_NUMERIC_MODEL_MAP,
+// parser.rs — the 1050 -> gemini-3.1-flash-lite arm) landed in 6f76dbdd
+// (run 18f9b98a stewardship) and changed parser OUTPUT for UNCHANGED
+// source files, but that landing carried no rung of its own, so every
+// warm cache built before it kept serving the stale raw "1050" model
+// string with banked-unknown pricing instead of re-parsing under the
+// mapping — the rm-485 class (derived output moving for unchanged
+// files) under the rm-230 convention: cached sessions must regenerate
+// under corrected accounting. The bump drops parsed entries once; the
+// discard is disclosed through the schema_invalidations journal and
+// doctor summarizes it (the rm-230 disclosure convention). Per the
+// landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c) the landed
+// 72 keeps its numeral and this integration lands the rung as 73, the
+// lowest rung unique above the ceiling, one invalidation either way.
+// No SQLite snapshot rung rode the batch; the landed 13 (run
+// b01c2b6a, below) remains the snapshot ceiling. Entries regenerate
+// once on next scan.
 // Bumped 71 -> 72 (integration of run 4eeea89188b245068a569ba76f8caa71
 // cycle 2 "truth of the default surfaces", rm-1553: the claude identity
 // capture (orgIdentifier/loginEmail) is now capped at capture

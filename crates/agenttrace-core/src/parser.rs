@@ -1567,6 +1567,14 @@ struct AntigravityModelId {
 /// pricing still rides the catalog's normal lookup, so a mapped id whose
 /// model is absent from the catalog degrades through the disclosed
 /// unknown-model path rather than this table inventing a price.
+///
+/// CACHE-RUNG GUARD (rm-230 convention, rm-2354 instance): every edit
+/// to this table changes parser OUTPUT for UNCHANGED source files, so
+/// warm session-cache rows replay the stale pre-mapping spelling
+/// until `SESSION_CACHE_SCHEMA_VERSION` is bumped (the 1050 arm landed
+/// in 6f76dbdd with no rung; run c870ab5a cycle 2 bumped 72 -> 73 to
+/// regenerate those rows). An edit here REQUIRES a bump decision
+/// recorded beside the const — the convention cannot silently lapse.
 const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
     (1417, "gemini-4-argon"),
     // rm-1533 (run 18f9b98a cycle 2, research 0418480c): ccusage
