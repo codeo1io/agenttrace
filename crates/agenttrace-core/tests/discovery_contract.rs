@@ -3345,6 +3345,151 @@ fn codex_compressed_rollout_is_admitted_by_name_and_decoded() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// rm-2056a helper: seeds one codex day dir with `stems.len()` zst stem
+/// twin pairs. Each plain `<stem>.jsonl` carries DISTINCT content (so the
+/// rm-1886 content dedup cannot collapse the plain survivors into one and
+/// muddle the pair census); each `<stem>.jsonl.zst` shadow is opaque bytes
+/// — suppression is by NAME, the shadow is never parsed. Returns the
+/// (plain, shadow) pairs in the GIVEN stem order.
+fn seed_zst_twin_pairs(
+    day: &std::path::Path,
+    stems: &[&str],
+) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+    fs::create_dir_all(day).expect("create codex day dir");
+    stems
+        .iter()
+        .map(|stem| {
+            let plain = day.join(format!("{stem}.jsonl"));
+            fs::write(
+                &plain,
+                format!(
+                    "{{\"type\":\"session_meta\",\"timestamp\":\"2026-10-15T10:00:00Z\",\"id\":\"{stem}\"}}\n"
+                ),
+            )
+            .expect("write plain twin");
+            let shadow = day.join(format!("{stem}.jsonl.zst"));
+            fs::write(&shadow, format!("opaque-frame-{stem}")).expect("write zst twin");
+            (plain, shadow)
+        })
+        .collect()
+}
+
+/// rm-2056a helper: pin a file's mtime — the walk's candidate order keys
+/// on it (Reverse(mtime), stable, so equal mtimes leak readdir order).
+/// std `FileTimes`, no extra dependency.
+fn pin_mtime(path: &std::path::Path, mtime: std::time::SystemTime) {
+    let file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open for mtime pin");
+    file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .expect("pin mtime");
+}
+
+#[test]
+fn zst_twin_disclosure_samples_pick_the_lexicographically_first_five() {
+    // rm-2056a (run 1f1f8ca1 cycle 3): the rm-2056 twin ledger's first
+    // five named samples rode the PRE-sort walk order — the per-
+    // directory mtime-desc sort is stable (equal mtimes leak readdir
+    // order) and roots merge in registration order — so which five
+    // pairs an operator saw was walk luck, not a contract. The
+    // ci-audit sort behind #31 sits AFTER the twin pass: it made the
+    // rm-1886 SURVIVOR deterministic but left the disclosure samples
+    // riding the walk. The sort now runs BEFORE the twin pass in both
+    // lanes, so the disclosed set is the five lexicographically-first
+    // pairs.
+    //
+    // RED is deterministic by construction: seven twins with mtimes
+    // assigned newest-first in REVERSE lexicographic stem order force
+    // the pre-hoist walk order g..a with no readdir luck in play —
+    // before the hoist the ledger discloses g..c and this test fails
+    // on exactly the wrong five.
+    let root = temp_root("agenttrace-zst-twin-disclosure-lex");
+    let home = root.join("home");
+    let day = home.join(".codex/sessions/2026/10/15");
+    let stems = [
+        "rollout-2026-10-15-10-00-00-aaaaaa",
+        "rollout-2026-10-15-10-00-00-bbbbbb",
+        "rollout-2026-10-15-10-00-00-cccccc",
+        "rollout-2026-10-15-10-00-00-dddddd",
+        "rollout-2026-10-15-10-00-00-eeeeee",
+        "rollout-2026-10-15-10-00-00-ffffff",
+        "rollout-2026-10-15-10-00-00-gggggg",
+    ];
+    let pairs = seed_zst_twin_pairs(&day, &stems);
+    let base = std::time::SystemTime::now();
+    for (index, (plain, shadow)) in pairs.iter().enumerate() {
+        // aaaaaa gets the oldest stamp, gggggg the newest: the walk's
+        // Reverse(mtime) order is then g,f,e,d,c,b,a — deterministically
+        // NOT lexicographic.
+        let mtime = base - std::time::Duration::from_secs((stems.len() - index) as u64);
+        pin_mtime(plain, mtime);
+        pin_mtime(shadow, mtime);
+    }
+    with_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.zst_stem_twins, 7,
+            "every pair is counted, never silently dropped"
+        );
+        assert_eq!(
+            report.zst_stem_twin_pairs.len(),
+            5,
+            "named samples cap at five; the count above stays exact"
+        );
+        assert_eq!(
+            report.zst_stem_twin_pairs,
+            &pairs[..5],
+            "the disclosed samples are the lexicographically-first five \
+             pairs (a..e), not the mtime-first five (g..c) the walk order \
+             would pick"
+        );
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn zst_twin_disclosure_samples_hold_under_mtime_ties() {
+    // rm-2056a, the tie class the unit names outright: with every twin
+    // sharing ONE mtime, the per-directory sort degenerates to readdir
+    // order — the least controllable order there is. Pre-hoist, the
+    // disclosed five were whatever the filesystem happened to return;
+    // post-hoist the sorted candidate list makes the first five the
+    // lexicographic a..e regardless of readdir order.
+    let root = temp_root("agenttrace-zst-twin-disclosure-tie");
+    let home = root.join("home");
+    let day = home.join(".codex/sessions/2026/10/15");
+    let stems = [
+        "rollout-2026-10-15-11-00-00-aaaaaa",
+        "rollout-2026-10-15-11-00-00-bbbbbb",
+        "rollout-2026-10-15-11-00-00-cccccc",
+        "rollout-2026-10-15-11-00-00-dddddd",
+        "rollout-2026-10-15-11-00-00-eeeeee",
+        "rollout-2026-10-15-11-00-00-ffffff",
+        "rollout-2026-10-15-11-00-00-gggggg",
+    ];
+    let pairs = seed_zst_twin_pairs(&day, &stems);
+    let tied = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for (plain, shadow) in &pairs {
+        pin_mtime(plain, tied);
+        pin_mtime(shadow, tied);
+    }
+    with_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.zst_stem_twins, 7,
+            "the tie corpus still counts every pair"
+        );
+        assert_eq!(
+            report.zst_stem_twin_pairs,
+            &pairs[..5],
+            "under a full mtime tie the disclosed five are still the \
+             lexicographically-first pairs, not readdir luck"
+        );
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn symlinked_child_directories_are_discovered_and_cycles_terminate() {

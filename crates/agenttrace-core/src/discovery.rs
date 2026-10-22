@@ -409,11 +409,15 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     // with its other silent passes; the cached lane owns the counts
     // that reach the operator.
     let mut twin_ledger = SuppressedSessions::default();
-    all = suppress_zst_stem_twins(all, &mut twin_ledger);
-    // ci-audit 2026-10-22: mirror the cached lane — sort before the
-    // content-signature dedup so cold/warm/ad-hoc runs pick the same
-    // survivor (lexicographically-first path), not readdir luck.
+    // ci-audit 2026-10-22, hoisted above the twin pass 2026-10-23
+    // (rm-2056a): mirror the cached lane — sort before the twin pass
+    // AND the content-signature dedup so cold/warm/ad-hoc runs pick
+    // the same survivor (lexicographically-first path), not readdir
+    // luck; the cached lane's disclosure samples see the same sorted
+    // order, and this lane feeds its twin pass identically so neither
+    // lane's semantics can drift apart.
     all.sort();
+    all = suppress_zst_stem_twins(all, &mut twin_ledger);
     let mut signatures: HashSet<(i64, u64)> = HashSet::new();
     all.retain(|path| {
         // Unreadable: keep (the parse lane owns and discloses those).
@@ -1181,28 +1185,39 @@ pub(crate) fn find_session_files_cached(
     // duplicates resolve by the canonical store, then byte-level copies
     // collapse first-seen, so both landed rules stay observable.
     retain_single_cline_session_per_id(&mut all);
+    // ci-audit 2026-10-22, hoisted above the twin pass 2026-10-23
+    // (rm-2056a): the first-seen survivor is only deterministic if
+    // `all` itself is. The walk sorts per-directory, but the root
+    // merge order rides `discover_session_dirs()` (registration order)
+    // and the cline/zst passes reorder nothing — on CI the beta copy
+    // repeatedly became the survivor over alpha (master reds
+    // 39749246398/39635038200), breaking the pair's contract. Sort the
+    // candidate list BEFORE the twin pass and the dedup: the
+    // lexicographically-first path always survives, and the twin
+    // ledger's first-5 disclosure samples become the
+    // lexicographically-first pairs instead of walk-order luck
+    // (rm-2056a); final output order is still set by
+    // `sort_paths_by_cache` below, and the uncached lane mirrors
+    // this.
+    all.sort();
     // rm-2056: zst stem twins — one admission per stem, plain `.jsonl`
     // wins, the shadowed `.jsonl.zst` counted for disclosure. Ordered
     // after the cline-id pass and before the rm-1886 content dedup:
     // the twin's compressed bytes never collide with the plain file's
     // signature, so this pass is the only one that can collapse the
-    // pair. Deterministic by NAME, so cold and warm runs agree.
+    // pair. Survivor choice is deterministic by NAME (cold and warm
+    // runs agree); the disclosure samples are deterministic because
+    // the sort above already ran (rm-2056a).
     all = suppress_zst_stem_twins(all, &mut suppressed);
-    // ci-audit 2026-10-22: the first-seen survivor is only deterministic
-    // if `all` itself is. The walk sorts per-directory, but the root
-    // merge order rides `discover_session_dirs()` (registration order)
-    // and the cline/zst passes reorder nothing — on CI the beta copy
-    // repeatedly became the survivor over alpha (master reds
-    // 39749246398/39635038200), breaking the pair's contract. Sort the
-    // candidate list before the dedup so the lexicographically-first
-    // path always survives; final output order is still set by
-    // `sort_paths_by_cache` below, and the uncached lane mirrors this.
-    all.sort();
     // rm-1886: content dedup at admission — a byte-identical journal
     // at a second path re-emits the same events and double-banks every
     // aggregate it feeds. First-seen survivor wins (deterministic: the
-    // walk yields sorted per-directory files, roots in registration
-    // order); a file whose bytes cannot be read is KEPT — the parse
+    // `all.sort()` above makes first-seen the lexicographically-first
+    // path — the ci-audit correction after master reds
+    // 39749246398/39635038200 proved the walk's per-directory mtime
+    // order and registration-order root merge do NOT give a stable
+    // survivor, the claim this comment used to carry); a file whose
+    // bytes cannot be read is KEPT — the parse
     // lane owns unreadable files and discloses them, dedup must not
     // silently drop what it cannot verify. Unreadable-file stance
     // keeps this pass observable: suppressed copies are counted and
