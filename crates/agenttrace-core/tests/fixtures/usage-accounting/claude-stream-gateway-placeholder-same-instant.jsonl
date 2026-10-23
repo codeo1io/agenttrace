@@ -1,0 +1,3 @@
+{"cwd":"/home/a/sameinstant","sessionId":"s_gateway_same_instant","type":"user","timestamp":"2026-01-15T10:00:00.000Z","message":{"role":"user","content":"run the same instant audit"}}
+{"type":"assistant","timestamp":"2026-01-15T10:00:05.000Z","message":{"id":"gateway-9","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"same instant once"}],"usage":{"input_tokens":200,"output_tokens":20}}}
+{"type":"assistant","timestamp":"2026-01-15T10:00:05.000Z","message":{"id":"gateway-9","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"same instant twice"}],"usage":{"input_tokens":150,"output_tokens":15}}}

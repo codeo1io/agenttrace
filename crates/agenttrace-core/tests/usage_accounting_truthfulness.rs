@@ -88,6 +88,46 @@ fn claude_idless_usage_still_counts_every_emission() {
     assert_eq!(session.metrics.tokens_output, 20);
 }
 
+// rm-601 id-class split (run 6e8da59d cycle 1; upstream ccusage #1838):
+// gateway/relay journals synthesize per-response placeholder ids and can
+// reuse the SAME placeholder across two DISTINCT responses. The fold used
+// to key by message id alone, so the second response max-merged into the
+// first — total usage undercounted and the second reply's content
+// replaced the first. Real `msg_` ids are stream-continuation handles and
+// keep the cross-timestamp fold (pinned above); every other non-empty id
+// keys on (id, timestamp).
+#[test]
+fn claude_gateway_placeholder_id_reuse_counts_each_message() {
+    // Base behavior (the residual): both rows fold into ONE meta event
+    // under the reused id and usage max-merges to 200/20 — the 100/10
+    // response vanishes. Split-expected totals: 300 input / 30 output.
+    let session = fixture("claude-stream-gateway-placeholder-reuse.jsonl");
+    assert_eq!(session.metrics.tokens_input, 300);
+    assert_eq!(session.metrics.tokens_output, 30);
+}
+
+// Same id-class split on the tool-result dedupe tuple: a reused tool
+// result id on a second placeholder response is a DISTINCT result, not a
+// stream re-emission to skip (the msg_-class re-emission pin lives in the
+// toolresult-reemit fixtures above). Base behavior: the second result
+// dedupes away and usage stays 25/3; split-expected: 50 input / 5 output.
+#[test]
+fn claude_gateway_placeholder_tool_id_reuse_counts_each_result() {
+    let session = fixture("claude-stream-gateway-tool-id-reuse.jsonl");
+    assert_eq!(session.metrics.tokens_input, 50);
+    assert_eq!(session.metrics.tokens_output, 5);
+}
+
+// Guard: exact (id, timestamp) duplicates still fold — placeholder
+// keying splits distinct instants, never double-counts a same-instant
+// relay retry (max of the two emissions, single meta event).
+#[test]
+fn claude_gateway_placeholder_same_id_and_timestamp_still_folds() {
+    let session = fixture("claude-stream-gateway-placeholder-same-instant.jsonl");
+    assert_eq!(session.metrics.tokens_input, 200);
+    assert_eq!(session.metrics.tokens_output, 20);
+}
+
 #[test]
 fn qwen_input_aliases_are_cache_inclusive_and_first_wins() {
     // rm-602: promptTokenCount (1000) already contains the 600-token

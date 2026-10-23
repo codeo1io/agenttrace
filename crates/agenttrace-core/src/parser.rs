@@ -5685,6 +5685,27 @@ fn claude_org_identity(obj: &JsonObject) -> Option<(String, String)> {
     Some((org.to_string(), email.to_string()))
 }
 
+// rm-601 id-class split (run 6e8da59d cycle 1; upstream ccusage #1838):
+// real Anthropic `msg_…` ids are stream-continuation handles — one
+// logical message re-emits across timestamps — so they keep the
+// cross-timestamp fold. Every OTHER non-empty id is a per-response
+// placeholder (gateway/relay synthesized: "gateway-1", "temp-0", numeric
+// echo ids); distinct responses can COLLIDE on one, and folding on it
+// alone max-merged them into a single event and silently undercounted
+// usage. Placeholders therefore key on (id, timestamp): distinct
+// timestamps stay distinct messages, an exact (id, timestamp) duplicate
+// still folds. `\u{1}` cannot occur in a JSON string, so the composite
+// never aliases a real id. Empty ids (idless rows) never reach this key —
+// the idless arm bypasses the fold entirely (pinned: every emission
+// counts).
+fn claude_message_fold_key(id: &str, timestamp: &str) -> String {
+    if id.starts_with("msg_") {
+        id.to_string()
+    } else {
+        format!("{id}\u{1}{timestamp}")
+    }
+}
+
 fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
@@ -5840,7 +5861,10 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 }
                 if let Some(usage) = message.get("usage").and_then(usage_from_value) {
                     let message_id = string(message.get("id")).unwrap_or("");
-                    match usage_by_message.get(message_id).copied() {
+                    match usage_by_message
+                        .get(&claude_message_fold_key(message_id, &ts))
+                        .copied()
+                    {
                         Some(index) => {
                             for (key, value) in usage {
                                 let slot = events[index].usage.entry(key).or_insert(0);
@@ -5857,7 +5881,8 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         }
                         None => {
                             if !message_id.is_empty() {
-                                usage_by_message.insert(message_id.to_string(), events.len());
+                                usage_by_message
+                                    .insert(claude_message_fold_key(message_id, &ts), events.len());
                             }
                             events.push(Event {
                                 role: "meta".to_string(),
@@ -5938,7 +5963,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             };
                             if !message_id.is_empty()
                                 && !tool_results_by_message
-                                    .insert((message_id.to_string(), dedup_key))
+                                    .insert((claude_message_fold_key(message_id, &ts), dedup_key))
                             {
                                 let label = if idless {
                                     format!("#{ordinal}")
@@ -5989,7 +6014,10 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     if message_id.is_empty() {
                         events.push(assistant_event);
                     } else {
-                        match assistant_by_message.get_mut(message_id) {
+                        match assistant_by_message.get_mut(&claude_message_fold_key(
+                            message_id,
+                            &assistant_event.timestamp,
+                        )) {
                             Some(index) => {
                                 // rm-891: the fold is keep-max for usage
                                 // but used to be last-wins for content — a
@@ -6015,7 +6043,10 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                                 }
                             }
                             None => {
-                                assistant_by_message.insert(message_id.to_string(), events.len());
+                                assistant_by_message.insert(
+                                    claude_message_fold_key(message_id, &assistant_event.timestamp),
+                                    events.len(),
+                                );
                                 events.push(assistant_event);
                             }
                         }
@@ -6170,7 +6201,7 @@ fn claude_iterations_events(
     // Id-less messages mirror the legacy rm-601 behavior for top-level
     // usage (every emission counts); an id-bearing message is mined
     // exactly once no matter how many streaming rows repeat the array.
-    if !message_id.is_empty() && !mined.insert(message_id.to_string()) {
+    if !message_id.is_empty() && !mined.insert(claude_message_fold_key(message_id, ts)) {
         return;
     }
     let Some(iterations) = message

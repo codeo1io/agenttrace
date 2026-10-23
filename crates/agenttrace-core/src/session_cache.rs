@@ -8,7 +8,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 75;
+// Bumped 72 -> 75 (run 6e8da59d cycle 1 'usage-accounting id-class
+// truth', rm-601 residual x upstream ccusage #1838): non-`msg_` message
+// ids now fold on (id, timestamp) instead of id alone, so a gateway/
+// relay journal reusing a placeholder id across DISTINCT responses no
+// longer max-merges them into one event (silent undercount). Cached rows
+// written before this rung may hold id-alone folded counts — the bump
+// regenerates them. Rung math at mint: tree ceiling 72; 73 landed
+// upstream at the tier-case-fold of run 0779d26b (fog over base
+// 769453c3: 453a5e34/70948540); 74 held in-flight by sibling run
+// 57f9c885 (envelope 495bcb95) — so per the landed-rung-keeps-numeral
+// convention (c7c07e48/58fbbd6c) this rung lands as 75, the lowest rung
+// unique above the ceiling, one invalidation either way. No SQLite
+// snapshot semantics moved. Entries regenerate once on next scan.
 // Bumped 71 -> 72 (integration of run 4eeea89188b245068a569ba76f8caa71
 // cycle 2 "truth of the default surfaces", rm-1553: the claude identity
 // capture (orgIdentifier/loginEmail) is now capped at capture
