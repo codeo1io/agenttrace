@@ -1575,6 +1575,13 @@ const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
     // bundled snapshot, so this stays an identity-only mapping like
     // its sibling.
     (1050, "gemini-3.1-flash-lite"),
+    // rm-1533 (run e90edd6c cycle 1, prioritize 7093c792): ccusage
+    // v20.0.36 (#1905) extends the argon family — upstream carries them
+    // as a 1417..=1419 range; this fork maps each id explicitly so every
+    // arm cites its own provenance. Priced through the bare alias the
+    // 2026-10-22 refresh injects into the bundled snapshot (rm-2348).
+    (1418, "gemini-4-argon"),
+    (1419, "gemini-4-argon"),
 ];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
@@ -11237,6 +11244,63 @@ mod tests {
             session.metrics.cost_estimated > 0.0,
             "the bare gemini-3.1-flash-lite key is priced in the bundled snapshot"
         );
+    }
+
+    #[test]
+    fn antigravity_numeric_1418_and_1419_map_to_gemini_4_argon() {
+        // rm-1533 (run e90edd6c cycle 1, prioritize 7093c792): ccusage
+        // v20.0.36 (2026-10-18, #1905) extends the antigravity numeric
+        // map with 1418/1419 -> gemini-4-argon (upstream carries them as
+        // a 1417..=1419 range arm; this fork maps each id explicitly so
+        // every arm cites its own provenance). Identity-only like their
+        // 1417 sibling: the spend prices through the catalog's bare
+        // gemini-4-argon key — injected into the bundled snapshot at the
+        // 2026-10-22 refresh by update-snapshot.sh's bare-alias arm
+        // (rm-2348), pinned in tests/pricing_refresh_truth.rs — instead
+        // of banking under a stringified "1418"/"1419".
+        for id in [1418, 1419] {
+            let raw = serde_json::json!({
+                "trajectoryId": "44444444-5555-6666-7777-888888888888",
+                "steps": [
+                    {
+                        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                        "status": "COMPLETED",
+                        "metadata": { "createdAt": "2026-10-20T10:00:05Z" },
+                        "plannerResponse": {
+                            "response": "Argon generation.",
+                            "usageStats": {
+                                "inputTokens": 1000,
+                                "outputTokens": 500
+                            },
+                            "modelConfigId": id
+                        }
+                    }
+                ]
+            })
+            .to_string();
+            let session = parse_raw_session(
+                &format!("numeric-{id}"),
+                "conversation.trajectory.json",
+                &raw,
+            )
+            .unwrap();
+            assert_eq!(
+                session.metrics.model_used, "gemini-4-argon",
+                "{id} maps through ANTIGRAVITY_NUMERIC_MODEL_MAP instead of stringifying"
+            );
+            assert_eq!(
+                session
+                    .metrics
+                    .disclosure_counters
+                    .get("antigravity_model:numeric_id"),
+                Some(&1),
+                "the {id} sighting still discloses its numeric origin"
+            );
+            assert!(
+                session.metrics.cost_estimated > 0.0,
+                "the bare gemini-4-argon key must be priced (2026-10-22 bundle alias)"
+            );
+        }
     }
 
     #[test]

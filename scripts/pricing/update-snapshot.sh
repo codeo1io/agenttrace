@@ -254,6 +254,40 @@ if len(overlap) * 2 < len(prior):
         "models (<50% overlap; refusing an implausibly partial refresh)"
     )
 
+# rm-2348 arm (a) — bare-alias injection (run e90edd6c cycle 1,
+# prioritize 7093c792, research 9d7cb7a2): antigravity numeric
+# modelConfigIds map to BARE vendor ids (ANTIGRAVITY_NUMERIC_MODEL_MAP in
+# parser.rs — identity-only), but the live source prices some of those
+# models ONLY under vendor prefixes. The runtime resolution ladder
+# deliberately never synthesizes prefixes (rejected arm (b): an invented
+# prefix can shadow a real row — pricing.rs resolution_ladder is
+# suffix-stripping only), so the refresh itself emits the bare key as a
+# copy of the canonical first-party vendor row, disclosed in
+# _snapshot.bare_aliases. Injection rules (fail-closed):
+#  - the vendor row must be priced in THIS live vintage (never inject
+#    from stale prior data; if upstream stops pricing the vendor row,
+#    the union retains the last committed bare copy and the drift
+#    gate's removal_guard adjudicates any drop);
+#  - a live side that already prices the bare key wins (no override);
+#  - the copy is byte-identical to the vendor row, so the alias rate can
+#    never disagree with the row it was minted from.
+BARE_ALIASES = {
+    # ccusage #1894/#1905: antigravity ids 1417..=1419 map to the bare
+    # gemini-4-argon; the first-party vendor row is the gemini/ prefix
+    # (2e-06/1e-05 per research 9d7cb7a2 C-C).
+    "gemini-4-argon": "gemini/gemini-4-argon",
+}
+bare_aliases = {}
+for bare, vendor in sorted(BARE_ALIASES.items()):
+    if bare in live:
+        continue
+    if vendor not in live:
+        print(f"bare alias source not priced live this vintage (not injected): {vendor}")
+        continue
+    live[bare] = dict(live[vendor])
+    bare_aliases[bare] = vendor
+    print(f"bare alias injected (copy of {vendor}): {bare}")
+
 # Union merge (rm-588 arm 1): start from the trimmed live catalog, then
 # carry every previously priced key live no longer provides as-is.
 merged = dict(live)
@@ -313,6 +347,9 @@ snapshot = {
         # Keys that survived ONLY through the never-drop union: upstream
         # no longer prices them, the committed bundle did. rm-588.
         "retained_from_previous": retained,
+        # rm-2348: bare keys this refresh minted as copies of their
+        # canonical vendor row (the disclosure the drift gate mirrors).
+        "bare_aliases": bare_aliases,
     }
 }
 snapshot.update(merged)
@@ -336,7 +373,7 @@ print(
     f"wrote {len(merged)} chat models to {dst} (snapshot date {date}): "
     f"{len(prior)} pre-refresh | +{len(adds)} added | {len(rate_mutations)} rate-mutated | "
     f"{len(window_mutations)} window-only-changed | {len(retained)} retained-by-union | "
-    f"{honored} manual drop(s)"
+    f"{honored} manual drop(s) | +{len(bare_aliases)} bare alias(es)"
 )
 if adds:
     sample = ", ".join(adds[:8])

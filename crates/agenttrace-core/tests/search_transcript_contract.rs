@@ -287,6 +287,84 @@ fn refused_zstd_content_is_skipped_loudly() {
 }
 
 #[test]
+fn decompressed_body_over_the_per_file_cap_is_skipped_with_a_dedicated_verdict() {
+    // rm-2349 (run e90edd6c cycle 1, assess 855e1234 F4): the plain-file
+    // arm checks the on-disk length against the per-file byte cap BEFORE
+    // reading (:551), but the zstd arm charged only the shared total
+    // budget — a compressed body may be under the cap on disk yet expand
+    // past it decompressed (a 2,833-byte frame holds 22,652 bytes), so a
+    // single file could consume the ENTIRE corpus budget through one
+    // decode. Parity: the per-file cap binds in DEcompressed bytes for
+    // zstd files exactly as it binds in on-disk bytes for plain files,
+    // skipped with a dedicated verdict + counter, and the budget
+    // arithmetic stays charged in decompressed bytes (rm-1872) — the
+    // skip happens BEFORE any budget charge.
+    //
+    // The compressed twin reuses fixtures/codex-zstd/rollout.jsonl (2,833
+    // zstd bytes on disk, 22,652 decompressed) under a 4,000-byte per-file
+    // cap: it passes the on-disk guard, decodes, and must be skipped
+    // past the cap. The plain twin is an incompressible 22,652-byte body
+    // skipped by the pre-existing on-disk arm. Both files sit in ONE
+    // corpus so the summary proves the parity side by side.
+    let cap = 4_000u64;
+    let mut compressed = parse_file(&codex_compressed_fixture()).unwrap();
+    compressed.name = "a-compressed-over-cap".to_string();
+    compressed.path = codex_compressed_fixture().to_string_lossy().to_string();
+    // Plain twin: "p\n" repeated keeps every read path honest; the body
+    // byte-matches the compressed twin's decompressed size.
+    let dir = std::env::temp_dir().join(format!("agenttrace-zst-cap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let plain_body = "p\n".repeat(11_326); // 22,652 bytes
+    assert_eq!(plain_body.len(), 22_652);
+    let plain_path = dir.join("plain-over-cap.jsonl");
+    std::fs::write(&plain_path, plain_body.as_bytes()).unwrap();
+    let mut plain = parse_file(&fixture("body-only.jsonl")).unwrap();
+    plain.name = "b-plain-over-cap".to_string();
+    plain.path = plain_path.to_string_lossy().to_string();
+    let report = search_sessions_detailed(
+        &[compressed, plain],
+        "zygomorphic-nonmatching-needle",
+        20,
+        cap,
+        1 << 20,
+    );
+    assert!(report.results.is_empty(), "the query matches nothing");
+    assert_eq!(report.scan.files_considered, 2);
+    assert_eq!(report.scan.scanned_files, 0, "neither file is scanned");
+    assert_eq!(
+        report.scan.scanned_bytes, 0,
+        "no budget is charged for a skipped file"
+    );
+    assert_eq!(
+        report.scan.skipped_oversized, 1,
+        "the plain twin is skipped by the pre-existing on-disk arm"
+    );
+    assert_eq!(
+        report.scan.skipped_decompressed_oversized, 1,
+        "the compressed twin is skipped by the new decompressed-body arm"
+    );
+    assert_eq!(
+        report.scan.skipped_budget, 0,
+        "no budget exhaustion is involved"
+    );
+    assert_eq!(
+        report.scan.skipped_zstd, 0,
+        "the frame decodes fine; only its size refuses it"
+    );
+    let text = agenttrace_core::report_search_text_detailed(&report, "needle");
+    assert!(
+        text.contains("decompressed body over per-file cap"),
+        "the text summary must name the new skip class: {text}"
+    );
+    let full_json = agenttrace_core::report_search_json_detailed(&report);
+    assert!(
+        full_json.contains("\"skipped_decompressed_oversized\": 1"),
+        "the json summary must carry the new counter: {full_json}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scan_charge_saturates_when_a_file_reads_past_its_stat_length() {
     // rm-1872 seam (rm-1993 cession): the budget pre-check runs on the
     // stat length; the charge uses the ACTUAL read. /proc/self/status is

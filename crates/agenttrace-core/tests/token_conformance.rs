@@ -77,14 +77,29 @@ fn snapshot_derived_cost(model: &str, tokens: &Value) -> f64 {
     });
     let term = |key: &str| tokens[key].as_f64().unwrap_or(0.0) / 1_000_000.0;
     // rm-1508: standard cache slots are Option — the conformance
-    // oracle prices only models whose bundle rows publish rates
-    // (explicit 0 included), so unwrap() fails loudly rather than
-    // silently repricing an absent-rate row at $0.
+    // oracle prices a token class only from a row that publishes a
+    // rate for it (explicit 0 included), so an absent rate on a
+    // cache-BILLING case fails loudly rather than silently repricing
+    // the row at $0. The 2026-10-22 refresh rider narrowed the demand
+    // to the classes a case actually bills: glm-5.2's new consensus
+    // lane publishes no cache-write rate and case 005 bills zero
+    // cache tokens — requiring the absent rate there was a false
+    // alarm (0 tokens contribute 0 whatever the slot says), while a
+    // cache-billing case (008/009) still demands its rates.
+    let billed_rate = |key: &str, slot: Option<f64>| -> f64 {
+        if tokens[key].as_f64().unwrap_or(0.0) > 0.0 {
+            slot.unwrap_or_else(|| {
+                panic!("cache-billing case requires its row to publish the {key} rate")
+            })
+        } else {
+            0.0
+        }
+    };
     round4(
         term("input") * price.input
             + term("output") * price.output
-            + term("cache_w") * price.cw.unwrap()
-            + term("cache_r") * price.cr.unwrap(),
+            + term("cache_w") * billed_rate("cache_w", price.cw)
+            + term("cache_r") * billed_rate("cache_r", price.cr),
     )
 }
 

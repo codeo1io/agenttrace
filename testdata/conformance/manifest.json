@@ -86,8 +86,8 @@
         "model": "glm-5.2",
         "source_tool": "workbuddy",
         "tokens": { "input": 0, "output": 10, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
-        "cost_estimated": 0.0001,
-        "cost_derivation": "snapshot-refreshed per docs/solutions/workflow-issues/conformance-pack-refresh-contract.md rule 1: glm-5.2 resolves to openrouter/z-ai/glm-5.2 (priority winner), whose output rate moved 3.99e-6 -> 1.2e-5 per token in the 2026-10-08 snapshot refresh (rm-588 never-drop union); round4(10 * 1.2e-5) = 0.0001 (was round4(10 * 3.99e-6) = 0.0 at the 2026-10-04 derivation snapshot)"
+        "cost_estimated": 0.0,
+        "cost_derivation": "snapshot-refreshed per docs/solutions/workflow-issues/conformance-pack-refresh-contract.md rule 1: glm-5.2's 2026-10-08 priority winner openrouter/z-ai/glm-5.2 (output 1.2e-5 per token) was withdrawn by live LiteLLM and left the bundle via the 2026-10-22 manual-drop note (rm-588 gate, scripts/pricing/snapshot-drops.txt); glm-5.2 now bills from the 4.4e-6-per-token consensus output rate shared by every remaining plain-glm-5.2 lane (zai, dashscope, novita, qwencloud, tencent, cloudflare), so round4(10 * 4.4e-6) = 0.0 (was round4(10 * 1.2e-5) = 0.0001 at the 2026-10-08 derivation snapshot; the 2026-10-04 derivation billed round4(10 * 3.99e-6) = 0.0 on the pre-refresh openrouter rate)"
       }
     },
     {

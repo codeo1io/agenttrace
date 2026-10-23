@@ -39,7 +39,7 @@
 #   ... --bundle F.json --pricing-rs F.rs          # overrides for red-arm testing
 #   ... --json                                     # emit the machine report on stdout (summary goes to stderr
 #                                                  #   then — stdout is PURE JSON; review-2 fix F2)
-#   scripts/pricing/drift-check.sh --selftest      # eight embedded offline arms, rc 0 iff all pass
+#   scripts/pricing/drift-check.sh --selftest      # nine embedded offline arms, rc 0 iff all pass
 
 set -euo pipefail
 
@@ -122,6 +122,21 @@ COST_FIELDS = ["input_cost_per_token", "output_cost_per_token",
 
 try:
     live_kept, bundle_kept = kept(live), kept(bundle)
+    # rm-2348 mirror: update-snapshot.sh injects disclosed bare-key copies of
+    # canonical vendor rows into the LIVE side of its merge (BARE_ALIASES,
+    # disclosed in _snapshot.bare_aliases). The gate mirrors that step on its
+    # own live side — the same mirroring doctrine as kept() itself — or every
+    # committed alias would read as permanent retired drift and wedge
+    # removal_guard SET. The keep-filter basis above is UNTOUCHED: every
+    # upstream row still compares 1:1. Drive the mirror from the bundle's own
+    # disclosure (single source of truth): a vendor row that leaves live
+    # stops the mirror, so BOTH the vendor row and the bare copy report as
+    # retired and the gate stays fail-closed.
+    bare_alias_disclosed = (bundle.get("_snapshot") or {}).get("bare_aliases") or {}
+    for bare, vendor in sorted(bare_alias_disclosed.items()):
+        if bare in live_kept or vendor not in live_kept:
+            continue
+        live_kept[bare] = dict(live_kept[vendor])
     meta = bundle.get("_snapshot") or {}
     bundle_date = meta.get("date")
     if not bundle_date:
@@ -231,7 +246,7 @@ run_check() { # resolves inputs, fetches live if needed, dispatches analyze; ret
   return "$rc"
 }
 
-self_test() { # eight embedded offline arms; rc 0 iff all pass (fixtures never touch the repo)
+self_test() { # nine embedded offline arms; rc 0 iff all pass (fixtures never touch the repo)
   local t rc ok=0
   t="$(mktemp -d -t drift-selftest.XXXXXX)"
   trap 'rm -rf "$t"' RETURN
@@ -372,6 +387,38 @@ PY
     echo "  arm 8 rm-903 wildcard ..... PASS (glob row = parity rc 0; concrete commitment key still new-costed rc 1)"
   else echo "  arm 8 rm-903 wildcard ..... FAIL (parity sub-arm e=$e, commitment sub-arm f=$f)"; sed -n '1,8p' "$t/out8a.txt"; sed -n '1,12p' "$t/out8b.txt"; ok=1; fi
 
+  # Arm 9 — rm-2348 bare-alias mirror: the builder injects disclosed bare-key
+  # copies of canonical vendor rows (update-snapshot.sh BARE_ALIASES ->
+  # _snapshot.bare_aliases), and the gate mirrors the injection on its live
+  # side. Sub-arm (a): bundle carries the alias + disclosure, live carries the
+  # vendor row only -> mirrored PARITY (rc 0, no phantom retired/new).
+  # Sub-arm (b): live stops pricing the vendor row -> the mirror stops too, so
+  # BOTH the vendor row and the bare copy report retired with removal_guard
+  # SET (fail-closed: an alias can never launder its vendor row's removal).
+  python3 - "$t" <<'PY'
+import json, sys
+t = sys.argv[1]
+bundle = json.load(open(f"{t}/base.json"))
+vendor_row = {"mode": "chat", "input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05}
+bundle["gemini/gemini-4-argon"] = dict(vendor_row)
+bundle["gemini-4-argon"] = dict(vendor_row)
+bundle["_snapshot"]["bare_aliases"] = {"gemini-4-argon": "gemini/gemini-4-argon"}
+bundle["_snapshot"]["models"] = 5
+json.dump(bundle, open(f"{t}/alias-bundle.json", "w"))
+live_vendor = json.load(open(f"{t}/live-parity.json"))
+live_vendor["gemini/gemini-4-argon"] = dict(vendor_row)
+json.dump(live_vendor, open(f"{t}/alias-live-vendor.json", "w"))
+PY
+  local g=0 h=0
+  rc=0; "$0" --live "$t/alias-live-vendor.json" --bundle "$t/alias-bundle.json" --pricing-rs "$t/pricing.rs" --json > "$t/out9a.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] && grep -q '"new_costed": 0' "$t/out9a.txt" && grep -q '"retired": 0' "$t/out9a.txt" && g=1
+  rc=0; "$0" --live "$t/live-parity.json" --bundle "$t/alias-bundle.json" --pricing-rs "$t/pricing.rs" --json > "$t/out9b.txt" 2>&1 || rc=$?
+  if [ "$rc" -eq 1 ] && grep -q '"retired": 2' "$t/out9b.txt" && grep -q '"removal_guard": true' "$t/out9b.txt" \
+     && grep -q 'gemini/gemini-4-argon' "$t/out9b.txt" && grep -q 'gemini-4-argon' "$t/out9b.txt"; then h=1; fi
+  if [ "$g" -eq 1 ] && [ "$h" -eq 1 ]; then
+    echo "  arm 9 rm-2348 alias mirror  PASS (mirrored alias = parity rc 0; vendor gone -> alias+laundered row retired, guard SET)"
+  else echo "  arm 9 rm-2348 alias mirror  FAIL (parity sub-arm g=$g, vendor-gone sub-arm h=$h)"; sed -n '1,8p' "$t/out9a.txt"; sed -n '1,12p' "$t/out9b.txt"; ok=1; fi
+
   # Control — the keep-filter basis itself: non-chat and uncosted rows never count either side.
   if grep -q 'costed-chat models' "$t/out1.txt"; then
     echo "  control keep-filter ...... PASS (basis line present)"
@@ -381,7 +428,7 @@ PY
 }
 
 if [ "$selftest" -eq 1 ]; then
-  echo "drift-check --selftest (eight offline arms, no network)"
+  echo "drift-check --selftest (nine offline arms, no network)"
   self_test
   rc=$?
   [ "$rc" -eq 0 ] && echo "selftest: ALL ARMS PASS" || echo "selftest: FAILURES PRESENT"

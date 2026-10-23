@@ -18,7 +18,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-22";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -855,16 +855,71 @@ fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
     // label serves the attribution, so rate and vendor can never
     // disagree about which row spoke.
     match serving_catalog(model, catalog) {
-        Some(ServingCatalog::Primary { key }) => catalog
-            .providers
-            .get(&key)
-            .cloned()
-            .filter(|provider| !provider.trim().is_empty()),
+        Some(ServingCatalog::Primary { key }) => {
+            let row_provider = catalog
+                .providers
+                .get(&key)
+                .cloned()
+                .filter(|provider| !provider.trim().is_empty());
+            // 2026-10-22 refresh rider — rm-1532's mirror. Live LiteLLM
+            // withdrew every openrouter-published row, so an explicitly
+            // `openrouter/…`-qualified id base-collapses onto another
+            // reseller's mirror (the vercel one) for its rate. The session
+            // still ran through the lane its id names: attribution keeps
+            // the explicit qualifier while the row supplies the rate —
+            // exactly what rm-1532 guarantees in the other direction (a
+            // first-party session never attributes to a reseller). Only
+            // this reseller fall-through arm is touched: first-party rows
+            // and user overrides return early in `serving_catalog` and
+            // keep the serving row's provider.
+            if row_provider
+                .as_deref()
+                .is_some_and(|p| !is_first_party_provider(p))
+            {
+                if let Some(lane) = explicit_reseller_qualifier(model) {
+                    // The id's own provider-namespace form (rm-1053
+                    // raw-first: `amazon-nova/nova-lite-v1` hits its own
+                    // row) keeps the row's label byte-stable — the
+                    // redirect only fires when the head names a lane
+                    // DIFFERENT from the row serving the rate
+                    // (separator-normalized: `amazon-nova` ≡ `amazon_nova`).
+                    // Ownership is a property of the serving KEY, not of
+                    // the row's provider label: the 2026-10-22 census
+                    // relabeled `vertex_ai/…` rows to provider
+                    // `vertex_ai-anthropic_models`, and an id served by
+                    // its own row must keep that (new) label rather than
+                    // re-attribute to the head — byte-stability of the
+                    // by-provider grouping is the bundled-catalog
+                    // sweep's contract.
+                    let head_lane = lane.replace('-', "_");
+                    let serving_lane = key.split('/').next().unwrap_or_default().replace('-', "_");
+                    if serving_lane != head_lane {
+                        return Some(lane.to_string());
+                    }
+                }
+            }
+            row_provider
+        }
         Some(ServingCatalog::ModelsDev { key }) => {
             models_dev_catalog().providers.get(&key).cloned()
         }
         None => None,
     }
+}
+
+/// The reseller lane the recorded id itself names: the first path
+/// segment of a '/'-qualified id when it is not a first-party vendor
+/// (`openrouter/…`, `vercel_ai_gateway/…`). Vendor-qualified
+/// first-party forms (`anthropic/claude-…`) and dotted regional ids
+/// carry no reseller qualifier and stay on the serving row's provider.
+fn explicit_reseller_qualifier(model: &str) -> Option<String> {
+    let raw = model.trim();
+    let (head, _) = raw.split_once('/')?;
+    let head = head.trim().to_ascii_lowercase();
+    if head.is_empty() || is_first_party_provider(&head) {
+        return None;
+    }
+    Some(head)
 }
 
 fn pricing_source_for_catalog(
@@ -3222,6 +3277,13 @@ mod tests {
         let _guard = crate::test_env::lock_env();
         let prior_xdg = std::env::var_os("XDG_CACHE_HOME");
         let prior_home = std::env::var_os("HOME");
+        // N1 (assess 855e1234; run e90edd6c cycle 1): the session-relocation
+        // layer is checked FIRST in pricing_cache_path(), so an ambient
+        // AGENTTRACE_SESSION_CACHE_DIR silently re-pointed every
+        // "isolated" body at a host cache outside the scratch dir. The
+        // helper owns this layer like the other two: save, set to the
+        // isolated dir, restore.
+        let prior_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!(
             "agenttrace-pricing-test-{}-{seq}",
@@ -3231,6 +3293,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp cache dir");
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("HOME", &dir);
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &dir);
         let result = body();
         match prior_xdg {
             Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
@@ -3240,8 +3303,58 @@ mod tests {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+        match prior_session_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
         result
+    }
+
+    #[test]
+    fn with_isolated_cache_env_owns_the_session_cache_env_layer() {
+        // N1 (assess 855e1234; "pricing-truth discharge + scan-cap
+        // fairness", run e90edd6c cycle 1): the helper neutralized
+        // XDG_CACHE_HOME and HOME but NOT AGENTTRACE_SESSION_CACHE_DIR —
+        // and pricing_cache_path() checks the session override FIRST
+        // (:964), so a host exporting it silently re-pointed every
+        // "isolated" body at an ambient pricing cache (two-layer
+        // poisoning: the XDG layer was covered, the session-relocation
+        // layer was not). The helper must own that layer too: save, set
+        // to the isolated scratch, restore.
+        //
+        // The ambient var is planted while holding the env lock, then
+        // the lock is DROPPED before the helper re-acquires it
+        // (lock_env is a non-reentrant mutex) — the planted-var window
+        // between the drop and the helper's acquisition is exactly the
+        // seam the fix closes for other tests: post-fix, every
+        // with_isolated_cache_env body re-points the var itself.
+        let ambient =
+            std::env::temp_dir().join(format!("agenttrace-n1-ambient-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ambient);
+        std::fs::create_dir_all(&ambient).expect("ambient scratch");
+        // A foreign cache file: an ambient layer a poisoned host would
+        // really carry (any parseable content proves the path was used).
+        std::fs::write(ambient.join("pricing.json"), b"{}").expect("poison file");
+        {
+            let _guard = crate::test_env::lock_env();
+            std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &ambient);
+        }
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        let result = std::panic::catch_unwind(|| with_isolated_cache_env(pricing_cache_path));
+        // Restore BEFORE asserting, so a failed assert cannot leak the
+        // planted ambient var into sibling tests.
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        let path = result.expect("the isolated body must not panic");
+        assert!(
+            !path.starts_with(&ambient),
+            "the isolated body must never resolve pricing_cache_path() into the \
+             ambient AGENTTRACE_SESSION_CACHE_DIR ({path:?} vs {ambient:?})"
+        );
+        let _ = std::fs::remove_dir_all(&ambient);
     }
 
     #[test]
@@ -3990,10 +4103,18 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // rm-231's motivating class: entries carry vendor windows. The
+        // 2026-10-22 refresh corrected claude-sonnet-4-5 to its published
+        // 200k (the 2026-10-08 bundle's 1M was upstream error), so the
+        // ≥1M-window class now rides the rows that truly carry it.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
+        );
+        assert_eq!(
+            catalog.entries["global.openai.gpt-5.4"].max_input_tokens,
+            Some(1_050_000),
+            "the 1M-window class stays represented after the refresh"
         );
     }
 
@@ -4838,6 +4959,61 @@ mod tests {
         assert_ne!(
             gained, changed,
             "an ultrafast value change must reprice the cache"
+        );
+    }
+
+    // --- 2026-10-22 refresh rider: explicit reseller qualification -----
+
+    #[test]
+    fn explicit_reseller_qualifier_names_the_lanes_id_prefix() {
+        use super::explicit_reseller_qualifier as lane_of;
+        let cases = [
+            ("openrouter/claude-sonnet-4-20250514", Some("openrouter")),
+            (
+                "vercel_ai_gateway/anthropic/claude-sonnet-4",
+                Some("vercel_ai_gateway"),
+            ),
+            // Provider-namespace forms that merely hyphenate the
+            // vendor's own label still NAME a lane (`amazon-nova/…` ≡
+            // provider `amazon_nova`) — the redirect compares them
+            // separator-normalized and never re-labels them.
+            ("amazon-nova/nova-lite-v1", Some("amazon-nova")),
+            // Vendor-qualified first-party forms are not reseller
+            // lanes, and neither are bare or dotted-regional ids.
+            ("anthropic/claude-sonnet-4-20250929", None),
+            ("claude-sonnet-4-20250514", None),
+            ("eu.anthropic.claude-sonnet-4-6", None),
+        ];
+        for (id, want) in cases {
+            assert_eq!(lane_of(id).as_deref(), want, "id {id}");
+        }
+    }
+
+    #[test]
+    fn provider_namespaced_ids_keep_their_rows_provider_label() {
+        // The 2026-10-22 refresh rider must not re-label a qualified
+        // id whose head IS the serving row's own provider namespace
+        // (`amazon-nova/…` ≡ provider `amazon_nova`): byte-stability
+        // of by-provider grouping is the bundled-catalog sweep's
+        // contract (regional_pricing_contract.rs).
+        let p = super::provider_for("amazon-nova/nova-lite-v1");
+        assert_eq!(p.as_deref(), Some("amazon_nova"));
+    }
+
+    #[test]
+    fn reseller_qualified_id_attributes_to_its_own_lane() {
+        // The 2026-10-22 refresh withdrew every openrouter-published
+        // row from live LiteLLM, so the openrouter-qualified dated id
+        // prices through the vercel mirror (base collapse) — the
+        // attribution must still name the lane the session ran
+        // through. This pins the bundled-catalog end of the contract
+        // the first_party_pricing_extract_contract suite holds for
+        // the extract seam (rm-1532's mirror).
+        let p = super::provider_for("openrouter/claude-sonnet-4-20250514");
+        assert_eq!(
+            p.as_deref(),
+            Some("openrouter"),
+            "attribution keeps the id's explicit lane even when the rate arrives from another reseller's mirror row"
         );
     }
 }

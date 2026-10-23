@@ -195,21 +195,25 @@ fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_publishe
 
     // --- census: the population is answerable without code -------
     // The override rows merged into the bundled catalog, so absolute
-    // totals are bundle-vintage-dependent (pricing_snapshot_hygiene.rs
-    // pins those). What this binary pins: the classification itself —
-    // exactly the absent rows it contributes (the 2026-10-08 bundle
-    // zero-fills, so every bundled row classifies published), and the
-    // per-class sum invariant absent + zero + nonzero == total.
+    // totals are bundle-vintage-dependent. Two binaries pin the two
+    // halves: pricing_snapshot_hygiene.rs pins the BUNDLED baseline
+    // (2026-10-22 vintage: 2229 read-absent / 3372 write-absent), and
+    // THIS binary pins that baseline plus its own three rows — the
+    // planted rm1508-absent row classifies absent on both sides,
+    // rm1508-zero as published $0, rm1508-published as nonzero. The
+    // rm-176 2026-10-22 refresh is the first bundle carrying
+    // genuinely-absent rows (upstream no longer zero-fills), so the
+    // baseline is no longer 0 — the numbers below move ONLY with a
+    // sanctioned refresh, never silently.
     let census: CacheRateCensus = cache_rate_census();
     assert_eq!(
-        census.cache_read_absent, 1,
-        "the absent-rate row must classify as absent: {census:?}"
+        census.cache_read_absent, 2230,
+        "bundled baseline (2229) + the planted absent row: {census:?}"
     );
-    // rm-1508: the only absent rates in this process's catalog are
-    // the ones this test's override contributes — the 2026-10-08
-    // bundle zero-fills and upstream even publishes an explicit $0 on
-    // the gpt-5.3-codex rows, so the vend row is Some(0.0) too.
-    assert_eq!(census.cache_write_absent, 1);
+    assert_eq!(
+        census.cache_write_absent, 3373,
+        "bundled baseline (3372) + the planted absent row: {census:?}"
+    );
     assert_eq!(
         census.cache_read_absent + census.cache_read_zero + census.cache_read_published,
         census.models,

@@ -30,6 +30,11 @@ pub struct TranscriptScanSummary {
     pub skipped_missing: usize,
     pub skipped_unreadable: usize,
     pub skipped_oversized: usize,
+    /// rm-2349: zstd frames skipped because their DEcompressed body
+    /// exceeds the per-file byte cap (the on-disk frame passed the
+    /// plain-file guard). Parity with `skipped_oversized`, which caps
+    /// plain files in on-disk bytes.
+    pub skipped_decompressed_oversized: usize,
     pub skipped_non_file: usize,
     pub skipped_budget: usize,
     pub skipped_zstd: usize,
@@ -48,6 +53,7 @@ impl TranscriptScanSummary {
             skipped_missing: 0,
             skipped_unreadable: 0,
             skipped_oversized: 0,
+            skipped_decompressed_oversized: 0,
             skipped_non_file: 0,
             skipped_budget: 0,
             skipped_zstd: 0,
@@ -72,6 +78,10 @@ impl TranscriptScanSummary {
             ("missing", self.skipped_missing),
             ("unreadable", self.skipped_unreadable),
             ("over byte cap", self.skipped_oversized),
+            (
+                "decompressed body over per-file cap",
+                self.skipped_decompressed_oversized,
+            ),
             ("non-file", self.skipped_non_file),
             ("read budget exhausted", self.skipped_budget),
             ("zstd decode refused", self.skipped_zstd),
@@ -361,6 +371,13 @@ fn write_transcript_summary_json(out: &mut String, scan: &TranscriptScanSummary)
         ("skipped_missing", scan.skipped_missing.to_string()),
         ("skipped_unreadable", scan.skipped_unreadable.to_string()),
         ("skipped_oversized", scan.skipped_oversized.to_string()),
+        // rm-2349: the compressed twin of skipped_oversized — a frame
+        // whose decompressed body exceeds the per-file cap is a
+        // first-class summary fact, not a text-only footnote.
+        (
+            "skipped_decompressed_oversized",
+            scan.skipped_decompressed_oversized.to_string(),
+        ),
         ("skipped_non_file", scan.skipped_non_file.to_string()),
         ("skipped_budget", scan.skipped_budget.to_string()),
         // rm-1872: the compressed-corpus truth — zstd refusals and decodes
@@ -588,6 +605,23 @@ fn transcript_evidence(
         match crate::parser::decode_zstd_rollout_bounded(bytes, path) {
             Ok(decoded) => {
                 let decoded_len = decoded.len() as u64;
+                // rm-2349: the per-file cap binds in DEcompressed bytes —
+                // parity with the plain-file arm just above, which checks
+                // the on-disk length BEFORE reading. A 2,833-byte frame
+                // can hold a 22,652-byte body; without this check one
+                // compressed file could lawfully consume the entire
+                // corpus budget through a single decode (rm-1872 charged
+                // decompressed bytes but never capped them per-file).
+                // The skip happens BEFORE any budget charge.
+                if decoded_len > file_byte_cap {
+                    scan.skipped_decompressed_oversized += 1;
+                    return (
+                        Vec::new(),
+                        format!(
+                            "skipped: decompressed body over per-file cap ({decoded_len} > {file_byte_cap})"
+                        ),
+                    );
+                }
                 if decoded_len > *budget_left {
                     scan.skipped_budget += 1;
                     return (
