@@ -904,6 +904,9 @@ pub fn data_health_scoped(
     cache_hits: usize,
     opencode_fork_excluded: usize,
     future_excluded: usize,
+    sessions_skipped_over_budget: usize,
+    load_budget_bytes: u64,
+    load_budget_charged_bytes: u64,
     sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
 ) -> DataHealth {
     let parsed = sessions.len();
@@ -942,6 +945,39 @@ pub fn data_health_scoped(
             .disclosures
             .get_mut("future_timestamp_sessions")
             .expect("just inserted") += future_excluded;
+    }
+    // Stewardship 0c50f658 (run 14b0479295b7, cycle 3, unit A):
+    // sessions the load lane's aggregate decoded/retained byte budget
+    // (AGENTTRACE_LOAD_BUDGET_BYTES) refused. Same disclosure
+    // discipline as the two counts above — the corpus visibly
+    // shrinks with a named reason instead of silently — plus the
+    // budget/charged pair so the reason is quantifiable (charged ==
+    // budget means the census was budget-bound, not corpus-bound).
+    if sessions_skipped_over_budget > 0 {
+        health
+            .disclosures
+            .entry("sessions_skipped_over_budget".to_string())
+            .or_insert(0);
+        *health
+            .disclosures
+            .get_mut("sessions_skipped_over_budget")
+            .expect("just inserted") += sessions_skipped_over_budget;
+        health
+            .disclosures
+            .entry("load_budget_bytes".to_string())
+            .or_insert(0);
+        *health
+            .disclosures
+            .get_mut("load_budget_bytes")
+            .expect("just inserted") += load_budget_bytes as usize;
+        health
+            .disclosures
+            .entry("load_budget_charged_bytes".to_string())
+            .or_insert(0);
+        *health
+            .disclosures
+            .get_mut("load_budget_charged_bytes")
+            .expect("just inserted") += load_budget_charged_bytes as usize;
     }
     health
 }

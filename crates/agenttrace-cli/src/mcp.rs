@@ -761,6 +761,9 @@ fn usage_overview(root: Option<&Path>, range: TimeRange) -> Result<Value, (i64, 
         // rm-1534: keep MCP and CLI disclosures agreeing — the
         // future-bound exclusion count flows through here too.
         report.future_excluded_sessions,
+        report.sessions_skipped_over_budget,
+        report.load_budget_bytes,
+        report.load_budget_charged_bytes,
         report.sqlite.unreadable.clone(),
     );
     let text = report_overview_json_with_context(

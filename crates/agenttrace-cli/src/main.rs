@@ -1108,6 +1108,9 @@ fn run() -> anyhow::Result<()> {
                 // disclosure channel as fork copies — counted and
                 // disclosed, never a silent drop.
                 report.future_excluded_sessions,
+                report.sessions_skipped_over_budget,
+                report.load_budget_bytes,
+                report.load_budget_charged_bytes,
                 report.sqlite.unreadable.clone(),
             ),
             None => data_health(&sessions, sessions.len(), 0),
@@ -1603,6 +1606,25 @@ fn attach_admission_disclosures(
         map.insert(
             "recorded_costs_negative_rejected".to_string(),
             serde_json::json!(negative_rejected),
+        );
+    }
+    // Stewardship 0c50f658 (run 14b0479295b7, cycle 3, unit A): the
+    // aggregate load budget's refusals ride the same channel - a
+    // corpus that shrank because of AGENTTRACE_LOAD_BUDGET_BYTES says
+    // so here instead of rendering as the whole corpus. Budget/
+    // charged ride along so the shrink is quantifiable.
+    if report.sessions_skipped_over_budget > 0 {
+        map.insert(
+            "sessions_skipped_over_budget".to_string(),
+            serde_json::json!(report.sessions_skipped_over_budget),
+        );
+        map.insert(
+            "load_budget_bytes".to_string(),
+            serde_json::json!(report.load_budget_bytes),
+        );
+        map.insert(
+            "load_budget_charged_bytes".to_string(),
+            serde_json::json!(report.load_budget_charged_bytes),
         );
     }
 }

@@ -3147,6 +3147,9 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
             all.cache_hits,
             all.opencode_fork_excluded,
             all.future_excluded_sessions,
+            all.sessions_skipped_over_budget,
+            all.load_budget_bytes,
+            all.load_budget_charged_bytes,
             all.sqlite.unreadable.clone(),
         );
         let health_day = data_health_scoped(
@@ -3156,6 +3159,9 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
             day.cache_hits,
             day.opencode_fork_excluded,
             day.future_excluded_sessions,
+            day.sessions_skipped_over_budget,
+            day.load_budget_bytes,
+            day.load_budget_charged_bytes,
             day.sqlite.unreadable.clone(),
         );
         assert_eq!(health_all.parsed, 2);
@@ -3241,6 +3247,9 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.cache_hits,
             report.opencode_fork_excluded,
             report.future_excluded_sessions,
+            report.sessions_skipped_over_budget,
+            report.load_budget_bytes,
+            report.load_budget_charged_bytes,
             report.sqlite.unreadable.clone(),
         );
         assert_eq!(health.non_finite_costs, 1, "non-finite cost is counted");
@@ -3252,6 +3261,9 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.cache_hits,
             report.opencode_fork_excluded,
             report.future_excluded_sessions,
+            report.sessions_skipped_over_budget,
+            report.load_budget_bytes,
+            report.load_budget_charged_bytes,
             report.sqlite.unreadable.clone(),
         );
         assert_eq!(clean.non_finite_costs, 0);
@@ -4059,6 +4071,9 @@ fn opencode_json_fork_copies_excluded_from_aggregation_and_disclosed() {
             report.cache_hits,
             report.opencode_fork_excluded,
             report.future_excluded_sessions,
+            report.sessions_skipped_over_budget,
+            report.load_budget_bytes,
+            report.load_budget_charged_bytes,
             report.sqlite.unreadable.clone(),
         );
         assert_eq!(
@@ -4386,6 +4401,9 @@ fn corrupt_sqlite_lane_surfaces_in_load_report_data_health_and_doctor() {
             report.cache_hits,
             report.opencode_fork_excluded,
             report.future_excluded_sessions,
+            report.sessions_skipped_over_budget,
+            report.load_budget_bytes,
+            report.load_budget_charged_bytes,
             report.sqlite.unreadable.clone(),
         );
         assert_eq!(
@@ -4403,6 +4421,9 @@ fn corrupt_sqlite_lane_surfaces_in_load_report_data_health_and_doctor() {
             report.discovered,
             report.skipped,
             report.cache_hits,
+            0,
+            0,
+            0,
             0,
             0,
             Vec::new(),

@@ -3818,6 +3818,23 @@ fn truncate_runes(value: &str, limit: usize) -> String {
 /// parse arm) are disclosed the same way (rm-502), so that UTC
 /// assumption never hides behind a plain coverage number.
 fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
+    fn humanize_bytes(bytes: u64) -> String {
+        if bytes == 0 {
+            return "0 B".to_string();
+        }
+        let mut rendered = format!("{bytes} B");
+        for (unit, scale) in [
+            ("GiB", 1024 * 1024 * 1024),
+            ("MiB", 1024 * 1024),
+            ("KiB", 1024),
+        ] {
+            if bytes >= scale {
+                rendered = format!("{:.1} {unit}", bytes as f64 / scale as f64);
+                break;
+            }
+        }
+        rendered
+    }
     let base = if health.parsed > health.discovered {
         format!(
             "{} sessions from {} sources",
@@ -3837,6 +3854,32 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
         phrase.push_str(&format!(
             "{} naive-UTC timestamp sessions{sep}",
             health.naive_utc_sessions
+        ));
+    }
+    // Stewardship 0c50f658 (run 14b0479295b7, cycle 3, unit A): name
+    // the load-budget share of the skips in the rendered phrase too,
+    // so a report from a budget-truncated census says why it shrank
+    // ("2 over load budget (charged 96 MiB of 1 GiB)") instead of
+    // rendering as the whole corpus.
+    if let Some(over_budget) = health
+        .disclosures
+        .get("sessions_skipped_over_budget")
+        .filter(|count| **count > 0)
+    {
+        let charged = health
+            .disclosures
+            .get("load_budget_charged_bytes")
+            .copied()
+            .unwrap_or_default();
+        let budget = health
+            .disclosures
+            .get("load_budget_bytes")
+            .copied()
+            .unwrap_or_default();
+        phrase.push_str(&format!(
+            "{over_budget} over load budget (charged {} of {}){sep}",
+            humanize_bytes(charged as u64),
+            humanize_bytes(budget as u64)
         ));
     }
     phrase.push_str(&format!("{} cache hits", health.cache_hits));
@@ -4404,6 +4447,51 @@ mod tests {
         assert_eq!(
             parse_coverage_phrase(&health, "; "),
             "1410 sessions from 364 sources; 0 skipped; 330 cache hits"
+        );
+    }
+
+    #[test]
+    fn parse_coverage_phrase_names_load_budget_skips() {
+        // Stewardship 0c50f658 (run 14b0479295b7, cycle 3, unit A): a
+        // budget-truncated census must say so in the rendered phrase —
+        // without this arm, budget skips read as parse failures. Zero
+        // budget skips keep the phrase byte-identical (demo golden);
+        // nonzero inserts the humanized charged/budget pair after the
+        // naive-UTC segment and before cache hits, mirroring rm-502's
+        // additive-disclosure ordering.
+        let mut health = crate::DataHealth {
+            discovered: 10,
+            parsed: 2,
+            skipped: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_coverage_phrase(&health, ", "),
+            "2/10 parsed, 8 skipped, 0 cache hits",
+            "zero budget skips keep the phrase byte-identical"
+        );
+        health
+            .disclosures
+            .insert("sessions_skipped_over_budget".to_string(), 8);
+        health
+            .disclosures
+            .insert("load_budget_bytes".to_string(), 1024 * 1024 * 1024);
+        health
+            .disclosures
+            .insert("load_budget_charged_bytes".to_string(), 96 * 1024 * 1024);
+        assert_eq!(
+            parse_coverage_phrase(&health, ", "),
+            "2/10 parsed, 8 skipped, 8 over load budget \
+             (charged 96.0 MiB of 1.0 GiB), 0 cache hits"
+        );
+        // Ordering pin: every disclosure segment active at once, with
+        // the budget arm between naive-UTC and cache hits.
+        health.naive_utc_sessions = 2;
+        health.cache_hits = 3;
+        assert_eq!(
+            parse_coverage_phrase(&health, "; "),
+            "2/10 parsed; 8 skipped; 2 naive-UTC timestamp sessions; \
+             8 over load budget (charged 96.0 MiB of 1.0 GiB); 3 cache hits"
         );
     }
 

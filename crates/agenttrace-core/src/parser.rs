@@ -17,8 +17,24 @@ type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 type ParseCounters = Vec<(String, i64)>;
 
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
+    parse_file_costed(path).map(|(session, _charge)| session)
+}
+
+/// Stewardship 0c50f658 (run 14b0479295b7, cycle 3) - unit A of the
+/// "zst amplification cap + fs-surface hardening" batch: the costed
+/// twin of [`parse_file`] for the discovery load lane's aggregate
+/// decoded/retained byte budget. Returns the parsed session PAIRED
+/// with the byte charge the lane must reserve against its budget:
+/// the DECODED size for a zstd rollout (the amplification channel -
+/// the cycle's 24-file PoC decoded 842 KB on disk into ~864 MiB of
+/// retained sessions at the pristine base) and the raw size for any
+/// other file; cline task directories charge the aggregate on-disk
+/// size of their members. Pure plumbing: parse behavior, caps, and
+/// failure wording are identical to [`parse_file`] - the only
+/// difference is the charge riding along.
+pub(crate) fn parse_file_costed(path: &Path) -> anyhow::Result<(Session, u64)> {
     if path.is_dir() {
-        return parse_cline_task_dir(path);
+        return parse_cline_task_dir(path).map(|session| (session, dir_member_bytes(path)));
     }
     if is_cline_task_file(path) {
         if let Some(dir) = path.parent() {
@@ -28,7 +44,7 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
             // duplicate the refusal or, worse, parse the small
             // named file and silently drop its over-cap siblings.
             match parse_cline_task_dir(dir) {
-                Ok(session) => return Ok(session),
+                Ok(session) => return Ok((session, dir_member_bytes(dir))),
                 Err(err) if err.downcast_ref::<ReadCapRefused>().is_some() => return Err(err),
                 Err(_) => {}
             }
@@ -61,7 +77,26 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     };
     let name = session_name(path);
     let path_text = path.to_string_lossy().to_string();
-    parse_session_bytes(raw, &path_text, &name)
+    parse_session_bytes_costed(raw, &path_text, &name)
+}
+
+/// Unit A charge for the cline task directory arms of
+/// [`parse_file_costed`]: the aggregate on-disk size of the
+/// directory's regular members. Member reads stay individually
+/// read-capped; this keeps the lane's budget honest about what a
+/// many-member directory makes the process retain.
+fn dir_member_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    total += meta.len();
+                }
+            }
+        }
+    }
+    total
 }
 
 /// rm-451: named-file read cap — the last unbounded member of the
@@ -224,6 +259,20 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 /// wording the file path produced, with `label` standing in for the
 /// path so stdin failures read `session file <stdin> is …`.
 fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<Session> {
+    parse_session_bytes_costed(raw, label, name).map(|(session, _charge)| session)
+}
+
+/// Costed core of [`parse_session_bytes`] (stewardship 0c50f658,
+/// run 14b0479295b7 cycle 3, unit A): the charge is the DECODED byte
+/// count for a zstd rollout and the raw byte count otherwise,
+/// computed while the buffer is still in hand - it is what the
+/// discovery load lane reserves against its aggregate budget.
+/// Parsing itself is unchanged.
+fn parse_session_bytes_costed(
+    raw: Vec<u8>,
+    label: &str,
+    name: &str,
+) -> anyhow::Result<(Session, u64)> {
     // Windows tooling (notably PowerShell 5.1's `>` redirection) writes
     // UTF-16 with a BOM by default; name the encoding instead of failing
     // with a generic read error (pass-7 P7-2).
@@ -253,6 +302,7 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
     } else {
         raw
     };
+    let charge = raw.len() as u64;
     let raw = String::from_utf8(raw)
         .with_context(|| format!("read session file {} (not valid UTF-8)", label))?;
     let mut session = parse_raw_session(name, label, &raw)?;
@@ -266,7 +316,7 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
             .entry("zstd_rollout_decoded".to_string())
             .or_insert(0) += 1;
     }
-    Ok(session)
+    Ok((session, charge))
 }
 
 /// Output cap for in-process zstd rollout decode (rm-992). Compressed
@@ -13568,15 +13618,40 @@ mod tests {
         // and it never invents an instant that did not exist (the
         // spring-forward gap still yields the empty string, as before).
         // chrono caches the local zone and only re-reads TZ once its
-        // cache is older than a second, so the sleeps below force the
-        // swap to be observed; the shared env lock keeps the process-
-        // wide mutation serialized (aider_time is the only
-        // chrono::Local user in this crate, so nothing else can poison
-        // the cache first).
+        // cache is older than a second; the poll loops below wait
+        // until the zone swap is OBSERVED (the repeat hour maps to
+        // Ambiguous under the new rules) instead of sleeping a fixed
+        // 1.1 s per side — stewardship 0c50f658 (run 14b0479295b7,
+        // cycle 3, unit C) cut the fixed cost of this test while
+        // keeping the same observation contract. The shared env lock
+        // keeps the process-wide mutation serialized (aider_time is
+        // the only chrono::Local user in this crate, so nothing else
+        // can poison the cache first).
         let _env = crate::test_env::lock_env();
+        let fallback_probe = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+            .unwrap()
+            .and_hms_opt(1, 30, 0)
+            .unwrap();
+        let zone_observes_fallback = |probe: chrono::NaiveDateTime| {
+            use chrono::TimeZone;
+            matches!(
+                chrono::Local.from_local_datetime(&probe),
+                chrono::MappedLocalTime::Ambiguous(_, _)
+            )
+        };
+        let wait_for_zone_shift = |want: bool| {
+            let start = std::time::Instant::now();
+            while zone_observes_fallback(fallback_probe) != want {
+                if start.elapsed() >= std::time::Duration::from_millis(1_500) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        };
+        let baseline_observes_fallback = zone_observes_fallback(fallback_probe);
         let prior = std::env::var_os("TZ");
         std::env::set_var("TZ", "America/New_York");
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        wait_for_zone_shift(true);
         // Fall-back repeat hour (2026-11-01 01:30 happens twice: EDT
         // -04:00 at 05:30Z, then EST -05:00 at 06:30Z). chrono 0.4.45's
         // tz_info backend orders MappedLocalTime::Ambiguous by OFFSET
@@ -13613,7 +13688,7 @@ mod tests {
             Some(value) => std::env::set_var("TZ", value),
             None => std::env::remove_var("TZ"),
         }
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        wait_for_zone_shift(baseline_observes_fallback);
         drop(_env);
     }
 

@@ -3,8 +3,7 @@ use crate::session_cache::{
     load_session_cache, save_session_cache, store_dir_listing, store_session, SessionCache,
 };
 use crate::{
-    merge_preserved_history, parse_file, preserve_derived_history, skip_sqlite_backed_file_dir,
-    Session,
+    merge_preserved_history, preserve_derived_history, skip_sqlite_backed_file_dir, Session,
 };
 use chrono::{DateTime, Utc};
 use std::cmp::Reverse;
@@ -104,6 +103,25 @@ pub struct LoadReport {
     /// parse failure; a subclass of `parse_failures`, never an extra
     /// count.
     pub read_cap_refused: usize,
+    /// Stewardship 0c50f658 (run 14b0479295b7, cycle 3, unit A):
+    /// sessions skipped because the load lane's aggregate
+    /// decoded/retained byte budget (`AGENTTRACE_LOAD_BUDGET_BYTES`,
+    /// default [`LOAD_AGGREGATE_BUDGET_BYTES`]) was spent before
+    /// their admission. The lane-side mirror of the doctor root
+    /// bound family (doctor.rs): the per-file decode/read caps in
+    /// parser.rs bound ONE file; this bounds the census as a whole
+    /// (the cycle's 24-file zst PoC had every file individually
+    /// in-cap yet drove `--overview` to 1883 MiB RSS). Disclosed,
+    /// never silent - these files are already inside `skipped`;
+    /// this counter names the budget's share of it and is never a
+    /// `parse_failures` subclass.
+    pub sessions_skipped_over_budget: usize,
+    /// Unit A: the aggregate budget this load ran with (bytes).
+    pub load_budget_bytes: u64,
+    /// Unit A: the decoded/retained bytes actually charged to the
+    /// budget. `load_budget_charged_bytes == load_budget_bytes`
+    /// means the census was budget-bound, not corpus-bound.
+    pub load_budget_charged_bytes: u64,
     /// rm-799: subagent transcripts whose parent session is NOT part
     /// of the loaded corpus (orphaned children — moved transcripts,
     /// partial copies). They still render as standalone rows, but the
@@ -560,12 +578,149 @@ mod org_identity_fallback_tests {
     }
 }
 
+/// Stewardship 0c50f658 (run 14b0479295b7, cycle 3, unit A): the
+/// non-doctor load lane's aggregate decoded/retained byte budget,
+/// in bytes. Default 1 GiB, overridable through
+/// `AGENTTRACE_LOAD_BUDGET_BYTES` (same tolerance family as the
+/// doctor root bound env knobs in doctor.rs: unparseable, empty, or
+/// non-positive values fall back to this default). The per-file
+/// decode/read caps in parser.rs bound ONE file; this bounds the
+/// census as a whole - the cycle's 24-file zst PoC (842 KB on disk,
+/// ~864 MiB decoded, every file individually in-cap) drove
+/// `--overview` to 1883 MiB RSS at the pristine base.
+pub(crate) const LOAD_AGGREGATE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Env knob resolver for [`LOAD_AGGREGATE_BUDGET_BYTES`],
+/// mirroring the doctor root bound family (doctor.rs) so operators
+/// can raise the ceiling for trusted corpora instead of re-running
+/// with narrower roots.
+pub(crate) fn resolve_load_aggregate_budget_bytes(value: Option<&std::ffi::OsStr>) -> u64 {
+    let Some(raw) = value else {
+        return LOAD_AGGREGATE_BUDGET_BYTES;
+    };
+    let Some(text) = raw.to_str() else {
+        return LOAD_AGGREGATE_BUDGET_BYTES;
+    };
+    match text.trim().parse::<u64>() {
+        Ok(parsed) if parsed > 0 => parsed,
+        _ => LOAD_AGGREGATE_BUDGET_BYTES,
+    }
+}
+
+/// The shared, thread-safe reservation ledger behind the aggregate
+/// load budget (stewardship 0c50f658, unit A). Workers reserve the
+/// decoded/raw byte charge of a session they just parsed, BEFORE
+/// retaining it; the first reservation that does not fit CLOSES the
+/// budget for the rest of the census - later files skip before
+/// paying their parse, because a closed budget cannot admit
+/// anything and decoding another 36 MiB zstd rollout just to
+/// discard the session would be pure waste.
+#[derive(Debug)]
+pub(crate) struct AggregateLoadBudget {
+    limit: u64,
+    charged: std::sync::atomic::AtomicU64,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl AggregateLoadBudget {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            charged: std::sync::atomic::AtomicU64::new(0),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Attempt to charge `bytes` against the budget. Returns false -
+    /// and closes the budget - when it does not fit. A zero-charge
+    /// session reserves nothing but still cannot be admitted once a
+    /// refusal has closed the budget.
+    pub(crate) fn reserve(&self, bytes: u64) -> bool {
+        let mut current = self.charged.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            let Some(next) = current.checked_add(bytes) else {
+                // Overflow: cannot fit under any reading of the ledger.
+                self.closed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            };
+            if next > self.limit {
+                // Refuse AND close the budget for the whole census -
+                // later files skip before paying their parse, because
+                // a closed budget cannot admit anything and decoding
+                // another 36 MiB zstd rollout just to discard the
+                // session would be pure waste.
+                self.closed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+            match self.charged.compare_exchange(
+                current,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => {
+                    current = observed;
+                }
+            }
+        }
+    }
+
+    /// True once the budget is spent or a refusal closed it.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Relaxed)
+            || self.charged.load(std::sync::atomic::Ordering::Relaxed) >= self.limit
+    }
+
+    /// Bytes actually charged (refusals add nothing).
+    pub(crate) fn charged(&self) -> u64 {
+        self.charged.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 pub fn load_sessions_with_progress_from_cache_mode(
     dir: Option<&Path>,
     options: &LoadOptions,
     cache: &mut SessionCache,
     emit_progress_sessions: bool,
+    on_progress: impl FnMut(LoadProgress),
+) -> LoadReport {
+    // Stewardship 0c50f658 (unit A): existing callers keep the exact
+    // pre-batch behavior shape - the default budget comes from the
+    // env knob family, exactly like the doctor root bounds.
+    load_sessions_with_progress_from_cache_mode_bounded(
+        dir,
+        options,
+        cache,
+        emit_progress_sessions,
+        on_progress,
+        resolve_load_aggregate_budget_bytes(
+            std::env::var_os("AGENTTRACE_LOAD_BUDGET_BYTES").as_deref(),
+        ),
+    )
+}
+
+/// Bounded twin of [`load_sessions_with_progress_from_cache_mode`]
+/// (stewardship 0c50f658, unit A): identical lane, plus an aggregate
+/// decoded/retained byte budget. Every PARSED session charges its
+/// decoded (zstd) or raw (otherwise) byte size to the shared ledger
+/// before it is retained; once the budget is spent - or one
+/// reservation is refused - the remaining files skip BEFORE their
+/// parse and the report discloses them through
+/// [`LoadReport::sessions_skipped_over_budget`] instead of silently
+/// shrinking the corpus.
+pub(crate) fn load_sessions_with_progress_from_cache_mode_bounded(
+    dir: Option<&Path>,
+    options: &LoadOptions,
+    cache: &mut SessionCache,
+    emit_progress_sessions: bool,
     mut on_progress: impl FnMut(LoadProgress),
+    budget_bytes: u64,
 ) -> LoadReport {
     // rm-1405 reap (run 4f2af62e5b7e): hoisted once — whether the
     // transcripts root came from a CLAUDE_CONFIG_DIR override (the
@@ -584,12 +739,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // parse fine by construction, so theirs is None).
     /// Parsed session (None on failure), rm-835 parse-failure message,
     /// cache-hit flag.
-    type Slot = Option<(Option<Session>, Option<String>, bool, bool)>;
+    type Slot = Option<(Option<Session>, Option<String>, bool, bool, bool)>;
     let mut slots: Vec<Slot> = Vec::with_capacity(files.len());
     let mut misses = Vec::new();
     for (index, path) in files.iter().enumerate() {
         match cached_session(path, cache) {
-            Some(session) => slots.push(Some((Some(session), None, true, false))),
+            Some(session) => slots.push(Some((Some(session), None, true, false, false))),
             None => {
                 slots.push(None);
                 misses.push(index);
@@ -622,16 +777,50 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // parse_failures so the advisory can name the cap class without
     // string-matching the parser's message.
     let mut read_cap_refused = 0usize;
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<Session>, Option<String>, bool)>();
+    // Stewardship 0c50f658 (unit A): sessions the aggregate load
+    // budget refused - disclosed through LoadReport, never silent.
+    let mut skipped_over_budget = 0usize;
+    // Stewardship 0c50f658 (unit A): the aggregate decoded/retained
+    // byte ledger shared by the parse workers.
+    let budget = AggregateLoadBudget::new(budget_bytes);
+    let (tx, rx) =
+        std::sync::mpsc::channel::<(usize, Option<Session>, Option<String>, bool, bool)>();
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let tx = tx.clone();
-            let (files, misses, next_miss) = (&files, &misses, &next_miss);
+            let (files, misses, next_miss, budget) = (&files, &misses, &next_miss, &budget);
             scope.spawn(move || {
                 while let Some(&index) =
                     misses.get(next_miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
-                    let mut parsed = parse_file(&files[index]);
+                    // Stewardship 0c50f658 (run 14b0479295b7, cycle 3,
+                    // unit A): aggregate decoded/retained byte budget
+                    // gate. A refusal closes the budget for the WHOLE
+                    // census, so files after it skip BEFORE paying their
+                    // parse - a closed budget cannot admit anything, so
+                    // decoding another 36 MiB zstd rollout just to
+                    // discard the session would be pure waste. The skip
+                    // rides the channel as `over_budget` and LoadReport
+                    // discloses it.
+                    if budget.exhausted() {
+                        if tx.send((index, None, None, false, true)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    let parsed_costed = crate::parser::parse_file_costed(&files[index]);
+                    let mut parsed = match parsed_costed {
+                        Ok((session, charge)) => {
+                            if !budget.reserve(charge) {
+                                if tx.send((index, None, None, false, true)).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Ok(session)
+                        }
+                        Err(err) => Err(err),
+                    };
                     // rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension
                     // truth"): when a claude_code journal carries no org
                     // identity and the transcripts root came from a
@@ -664,7 +853,10 @@ pub fn load_sessions_with_progress_from_cache_mode(
                         })
                         .unwrap_or(false);
                     let failure = parsed.as_ref().err().map(|error| format!("{error:#}"));
-                    if tx.send((index, parsed.ok(), failure, read_cap)).is_err() {
+                    if tx
+                        .send((index, parsed.ok(), failure, read_cap, false))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -674,15 +866,24 @@ pub fn load_sessions_with_progress_from_cache_mode(
 
         let mut next = 0;
         let mut drain = |slots: &mut Vec<Slot>, cache: &mut SessionCache| {
-            while let Some((result, failure, from_cache, read_cap)) =
+            while let Some((result, failure, from_cache, read_cap, over_budget)) =
                 slots.get_mut(next).and_then(Option::take)
             {
-                match (&result, from_cache) {
-                    (Some(_), true) => cache_hits += 1,
-                    (Some(session), false) => {
+                match (&result, from_cache, over_budget) {
+                    (Some(_), true, _) => cache_hits += 1,
+                    (Some(session), false, _) => {
                         let _ = store_session(&files[next], session, cache);
                     }
-                    (None, _) => {
+                    (None, _, true) => {
+                        // Stewardship 0c50f658 (unit A): the aggregate
+                        // load budget refused this file. It joins
+                        // `skipped` (counted, never silent) but is NOT
+                        // a parse failure - nothing failed to parse,
+                        // the census simply does not fit the budget.
+                        skipped += 1;
+                        skipped_over_budget += 1;
+                    }
+                    (None, _, false) => {
                         skipped += 1;
                         // rm-835: keep the first failure's parser message
                         // (discovery order) for the LoadReport.
@@ -716,8 +917,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
             }
         };
         drain(&mut slots, cache);
-        for (index, result, failure, read_cap) in rx {
-            slots[index] = Some((result, failure, false, read_cap));
+        for (index, result, failure, read_cap, over_budget) in rx {
+            slots[index] = Some((result, failure, false, read_cap, over_budget));
             drain(&mut slots, cache);
         }
     });
@@ -828,6 +1029,9 @@ pub fn load_sessions_with_progress_from_cache_mode(
         first_parse_failure,
         parse_failure_paths,
         read_cap_refused,
+        sessions_skipped_over_budget: skipped_over_budget,
+        load_budget_bytes: budget_bytes,
+        load_budget_charged_bytes: budget.charged(),
         unlinked_subagents,
         future_excluded_sessions,
     }
@@ -2058,5 +2262,235 @@ mod session_file_name_tests {
         assert!(!is_session_file_name("archive.tar.zst"));
         assert!(!is_session_file_name("rollout-2026-09-26.zst"));
         assert!(!is_session_file_name("rollout-2026-09-26.jsonl.zst.tmp"));
+    }
+}
+
+/// Stewardship 0c50f658 (run 14b0479295b7, cycle 3) - unit A of the
+/// selected "zst amplification cap + fs-surface hardening" batch:
+/// the non-doctor load lane's aggregate decoded/retained byte budget.
+/// The per-file decode cap (rm-487/rm-1025, parser.rs) bounds ONE
+/// file; a census of many in-cap files still retains everything it
+/// parses - the 24-file zst PoC of this cycle (842 KB on disk,
+/// ~864 MiB decoded) drove the pristine base to 1883 MiB RSS in
+/// `--overview`. These tests pin the aggregate contract: the charge
+/// is decoded-bytes-when-zst/raw-otherwise, skips are disclosed
+/// through [`LoadReport`] (never silent), and the budget CLOSES on
+/// first refusal so later files skip before paying their parse.
+#[cfg(test)]
+mod load_budget_tests {
+    use super::*;
+
+    fn temp_dir_unique(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "at-load-budget-{tag}-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        dir
+    }
+
+    fn claude_user_line(id: &str, pad: usize) -> String {
+        let pad = "p".repeat(pad);
+        format!(
+            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{id} {pad}\"}}]}},\"timestamp\":\"2026-10-22T12:00:00+00:00\",\"sessionId\":\"{id}\"}}\n"
+        )
+    }
+
+    /// One raw-block zstd frame (single-segment, 4-byte frame content
+    /// size, no checksum). Raw blocks do not compress - the ratio is
+    /// 1:1 - but they let the tests build decodable `.jsonl.zst`
+    /// fixtures without an encoder dependency (ruzstd is decode-only)
+    /// and make the DECODED byte total exactly known.
+    fn zst_raw_frame(payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() <= 131_072, "raw block max is 128 KiB");
+        let mut frame = Vec::with_capacity(payload.len() + 16);
+        frame.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD]);
+        frame.push(0xA0); // single_segment=1, FCS field size flag 2 (4 bytes)
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let block_header = 1u32 | (0u32 << 1) | ((payload.len() as u32) << 3); // last=1, type=raw
+        frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn budget_resolver_mirrors_doctor_env_family_tolerance() {
+        use std::ffi::OsStr;
+        let default = LOAD_AGGREGATE_BUDGET_BYTES;
+        assert_eq!(resolve_load_aggregate_budget_bytes(None), default);
+        assert_eq!(
+            resolve_load_aggregate_budget_bytes(Some(OsStr::new("1048576"))),
+            1_048_576
+        );
+        assert_eq!(
+            resolve_load_aggregate_budget_bytes(Some(OsStr::new("  2097152  "))),
+            2_097_152
+        );
+        // unparseable / empty / non-positive values fall back to the
+        // default, mirroring the doctor bound family's tolerance.
+        assert_eq!(
+            resolve_load_aggregate_budget_bytes(Some(OsStr::new("0"))),
+            default
+        );
+        assert_eq!(
+            resolve_load_aggregate_budget_bytes(Some(OsStr::new("-1"))),
+            default
+        );
+        assert_eq!(
+            resolve_load_aggregate_budget_bytes(Some(OsStr::new("garbage"))),
+            default
+        );
+        assert_eq!(
+            resolve_load_aggregate_budget_bytes(Some(OsStr::new(""))),
+            default
+        );
+    }
+
+    #[test]
+    fn aggregate_budget_reserves_exactly_then_closes_on_refusal() {
+        let budget = AggregateLoadBudget::new(1_000);
+        assert!(!budget.exhausted());
+        assert!(budget.reserve(600));
+        assert!(budget.reserve(400));
+        assert!(budget.exhausted());
+        assert_eq!(budget.charged(), 1_000);
+        // A refusal CLOSES the budget: files after it skip before their
+        // parse instead of burning CPU on sessions that cannot be kept.
+        assert!(!budget.reserve(1));
+        assert!(!budget.reserve(0));
+        // A single charge larger than the whole budget closes it too.
+        let tiny = AggregateLoadBudget::new(10);
+        assert!(!tiny.reserve(11));
+        assert!(tiny.exhausted());
+        assert_eq!(tiny.charged(), 0, "a refusal charges nothing");
+    }
+
+    /// Runs `f` with the session cache pointed INSIDE `dir` so the
+    /// lane's `save_session_cache` cannot touch the developer's real
+    /// cache (the contract-suite `with_session_cache` pattern).
+    fn with_isolated_cache<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", dir.join("cache"));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match previous {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[test]
+    fn load_lane_admits_one_of_equal_files_until_budget_then_discloses_skips() {
+        let dir = temp_dir_unique("plain");
+        // Three EQUAL-length plain sessions with DISTINCT content (the
+        // census dedup keys on size + fast hash - equal size, distinct
+        // hash survives). Equal charges make the outcome deterministic
+        // under the worker race: any ONE file fits the budget, any
+        // PAIR exceeds it, so exactly one is admitted - which one is
+        // the race's choice and the test does not pin it.
+        let mut lengths = Vec::new();
+        for index in 0..3 {
+            let line = claude_user_line(&format!("budget-plain-{index}"), 50_000);
+            std::fs::write(dir.join(format!("session-plain-{index}.jsonl")), line)
+                .expect("write session");
+            lengths.push(
+                std::fs::metadata(dir.join(format!("session-plain-{index}.jsonl")))
+                    .expect("stat")
+                    .len(),
+            );
+        }
+        assert_eq!(
+            lengths[0], lengths[1],
+            "fixture must be equal-length for determinism"
+        );
+        assert_eq!(lengths[0], lengths[2]);
+        let one = lengths[0];
+        // Budget between one and two file charges.
+        let budget = one + one / 2;
+        let report = with_isolated_cache(&dir, || {
+            let mut cache = SessionCache::default();
+            load_sessions_with_progress_from_cache_mode_bounded(
+                Some(&dir),
+                &LoadOptions::default(),
+                &mut cache,
+                true,
+                |_| {},
+                budget,
+            )
+        });
+        assert_eq!(report.discovered, 3);
+        assert_eq!(report.parsed, 1);
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.parse_failures, 0);
+        assert_eq!(report.sessions_skipped_over_budget, 2);
+        assert_eq!(report.skipped, 2);
+        assert_eq!(report.load_budget_bytes, budget);
+        assert_eq!(report.load_budget_charged_bytes, one);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_lane_charges_zstd_rollouts_by_decoded_bytes() {
+        let dir = temp_dir_unique("zstd");
+        let payload_one = claude_user_line("budget-zstd-0", 45_000).repeat(2);
+        let payload_two = claude_user_line("budget-zstd-1", 40_000).repeat(2);
+        let decoded_total = (payload_one.len() + payload_two.len()) as u64;
+        let mut zst = zst_raw_frame(payload_one.as_bytes());
+        zst.extend(zst_raw_frame(payload_two.as_bytes()));
+        let path = dir.join("session-zstd.jsonl.zst");
+        std::fs::write(&path, &zst).expect("write zst session");
+        let file_len = std::fs::metadata(&path).expect("stat").len();
+        // Raw frames carry 12 bytes of overhead each (magic + FHD +
+        // 4-byte FCS + 3-byte block header), so file size and decoded
+        // size differ: a charge equal to the DECODED total is the
+        // pinned contract, not the compressed/on-disk length.
+        assert_eq!(file_len, decoded_total + 24);
+
+        // Roomy budget: the rollout parses and charges its decoded bytes.
+        let report = with_isolated_cache(&dir, || {
+            let mut cache = SessionCache::default();
+            load_sessions_with_progress_from_cache_mode_bounded(
+                Some(&dir),
+                &LoadOptions::default(),
+                &mut cache,
+                true,
+                |_| {},
+                1024 * 1024 * 1024,
+            )
+        });
+        assert_eq!(report.discovered, 1);
+        assert_eq!(report.parsed, 1);
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions_skipped_over_budget, 0);
+        assert_eq!(report.load_budget_charged_bytes, decoded_total);
+
+        // Budget under the decoded size: the single file is refused and
+        // disclosed as a budget skip - not a parse failure, not silent.
+        let refused = with_isolated_cache(&dir, || {
+            let mut cache = SessionCache::default();
+            load_sessions_with_progress_from_cache_mode_bounded(
+                Some(&dir),
+                &LoadOptions::default(),
+                &mut cache,
+                true,
+                |_| {},
+                100_000,
+            )
+        });
+        assert_eq!(refused.discovered, 1);
+        assert_eq!(refused.parsed, 0);
+        assert_eq!(refused.sessions.len(), 0);
+        assert_eq!(refused.parse_failures, 0);
+        assert_eq!(refused.sessions_skipped_over_budget, 1);
+        assert_eq!(refused.skipped, 1);
+        assert_eq!(refused.load_budget_charged_bytes, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
