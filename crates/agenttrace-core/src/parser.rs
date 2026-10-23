@@ -687,11 +687,18 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             }
             return Ok(session);
         }
-        let probes: [JsonlProbe; 5] = [
+        let probes: [JsonlProbe; 6] = [
             parse_antigravity_jsonl,
             parse_cursor_transcript_jsonl,
             parse_claude_transcript_jsonl,
             parse_copilot_session_jsonl,
+            // rm-1373 (grok lane): the `_x.ai/session/update` envelope —
+            // params.update.sessionUpdate present — claims before gemini
+            // because no other family nests usage under params.update;
+            // a claude/cursor/antigravity corpus never matches it, so
+            // every earlier probe keeps its claim precedence and the
+            // generic-lane fallback below stays byte-identical.
+            parse_grok_updates_jsonl,
             // rm-715 (silent-zero closeout LEAD): last, with the
             // strictest claim rule in the array — the gemini-cli >= 0.63
             // chats record stream (metadata line carrying sessionId +
@@ -2390,6 +2397,204 @@ fn workbuddy_usage(entry: &Map<String, Value>) -> Option<(TokenUsage, bool)> {
     // both cache keys.
     let clamped = subtract_cached_input(&mut usage, &["cache_read_input_tokens"]);
     Some((usage, clamped))
+}
+
+// Grok Build CLI (rm-1373): ~/.grok/sessions/<project>/<session-id>/updates.jsonl
+// carries one line per session update as
+// `{"timestamp": <unix-sec>, "method": "_x.ai/session/update", "params":
+//   {"sessionId": ..., "update": {"sessionUpdate": "turn_completed", "usage": {...}}},
+//  "_meta": {"eventId": ..., "agentTimestampMs": ...}}`.
+// Only `turn_completed` rows carry usage (the ccusage v20.0.40 parity survey,
+// rust/adapters/grok/src/parser.rs — the snapshot instrument for this lane);
+// every other sessionUpdate kind is counted on the grok_session_updates_ignored
+// disclosure (a scope decision, not a loss: usage never rides those rows).
+// usage shape: {inputTokens, outputTokens, cachedReadTokens,
+// cacheCreationTokens, reasoningTokens, costUsdTicks, modelUsage: {model:
+// {same token keys, costUsdTicks}}} — costUsdTicks is 1e-10 USD per tick
+// (verified against 58 real turns by the same survey), so the recorded cost
+// rides the rm-499 recorded-cost lane and the block's tokens never reprice
+// from the catalog. When modelUsage is present each turn splits per model
+// (totals come from the same rows — the vendor's top-level aggregate is the
+// sum of the per-model rows, so minting one counted meta event per model row
+// counts each token exactly once); when it is absent the single top-level
+// usage block becomes one event attributed to "default" (the repo's
+// unnamed-model convention — the wire never names a model there).
+// All-zero usage rows are skipped and counted (grok_zero_usage_rows), the
+// survey's disposition for empty turns.
+fn grok_timestamp_string(line: &JsonObject) -> String {
+    let secs = line
+        .get("timestamp")
+        .and_then(number_as_i64)
+        .or_else(|| {
+            line.get("_meta")
+                .and_then(|meta| meta.get("agentTimestampMs"))
+                .and_then(number_as_i64)
+                .map(|ms| ms / 1000)
+        });
+    match secs {
+        Some(secs) if secs > 0 => chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+            .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn grok_usage_tokens(usage: &Map<String, Value>) -> BTreeMap<String, i64> {
+    let mut map = BTreeMap::new();
+    map.insert("input_tokens".to_string(), usage.get("inputTokens").and_then(number_as_i64).unwrap_or(0));
+    map.insert("output_tokens".to_string(), usage.get("outputTokens").and_then(number_as_i64).unwrap_or(0));
+    map.insert("cache_read_input_tokens".to_string(), usage.get("cachedReadTokens").and_then(number_as_i64).unwrap_or(0));
+    map.insert("cache_creation_input_tokens".to_string(), usage.get("cacheCreationTokens").and_then(number_as_i64).unwrap_or(0));
+    map.insert("reasoning_tokens".to_string(), usage.get("reasoningTokens").and_then(number_as_i64).unwrap_or(0));
+    map
+}
+
+fn grok_usage_is_zero(tokens: &BTreeMap<String, i64>) -> bool {
+    tokens.values().all(|value| *value <= 0)
+}
+
+fn grok_recorded_cost_usd(ticks: Option<&Value>) -> Option<f64> {
+    let ticks = ticks.and_then(number_as_i64)?;
+    if ticks <= 0 {
+        return None;
+    }
+    Some(ticks as f64 / 1e10)
+}
+
+fn parse_grok_updates_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
+    // Claim rule: at least one line carries a params.update.sessionUpdate
+    // string — a vendor-unique envelope (method `_x.ai/session/update` and
+    // the nested update object exist nowhere else in the probe families).
+    let mut claimed = false;
+    for value in objs {
+        if let Some(update) = value
+            .get("params")
+            .and_then(|params| params.get("update"))
+            .and_then(Value::as_object)
+        {
+            if update.get("sessionUpdate").and_then(Value::as_str).is_some() {
+                claimed = true;
+                break;
+            }
+        }
+    }
+    if !claimed {
+        return None;
+    }
+    let mut events: Vec<Event> = Vec::new();
+    let mut updates_ignored: i64 = 0;
+    let mut zero_usage_rows: i64 = 0;
+    for value in objs {
+        let Some(update) = value
+            .get("params")
+            .and_then(|params| params.get("update"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        if update.get("sessionUpdate").and_then(Value::as_str) != Some("turn_completed") {
+            updates_ignored += 1;
+            continue;
+        }
+        let Some(usage) = update.get("usage").and_then(Value::as_object) else {
+            updates_ignored += 1;
+            continue;
+        };
+        let line_timestamp = grok_timestamp_string(value);
+        let model_usage = usage
+            .get("modelUsage")
+            .and_then(Value::as_object)
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(|(model, row)| {
+                        let row = row.as_object()?;
+                        let tokens = grok_usage_tokens(row);
+                        if grok_usage_is_zero(&tokens) {
+                            return None;
+                        }
+                        Some((model.clone(), tokens, row.get("costUsdTicks")))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if model_usage.is_empty() {
+            let tokens = grok_usage_tokens(usage);
+            if grok_usage_is_zero(&tokens) {
+                zero_usage_rows += 1;
+                continue;
+            }
+            let recorded = grok_recorded_cost_usd(usage.get("costUsdTicks"));
+            let mut disclosure: BTreeMap<String, i64> = BTreeMap::new();
+            if recorded.is_none() {
+                disclosure.insert("grok_usage_without_recorded_cost".to_string(), 1);
+            }
+            events.push(Event {
+                role: "session_meta".to_string(),
+                timestamp: line_timestamp,
+                model_used: "default".to_string(),
+                source_tool: "grok".to_string(),
+                disclosure_counters: disclosure,
+                usage: tokens,
+                recorded_cost_usd: recorded,
+                ..Event::default()
+            });
+            continue;
+        }
+        for (model, tokens, ticks) in model_usage {
+            let recorded = grok_recorded_cost_usd(ticks);
+            let mut disclosure: BTreeMap<String, i64> = BTreeMap::new();
+            if recorded.is_none() {
+                disclosure.insert("grok_usage_without_recorded_cost".to_string(), 1);
+            }
+            events.push(Event {
+                role: "session_meta".to_string(),
+                timestamp: line_timestamp.clone(),
+                model_used: model,
+                source_tool: "grok".to_string(),
+                disclosure_counters: disclosure,
+                usage: tokens,
+                recorded_cost_usd: recorded,
+                ..Event::default()
+            });
+        }
+    }
+    // The ignored-update and zero-row censuses ride the LAST minted event so
+    // they survive the event fold (per-event disclosure counters sum).
+    if let Some(event) = events.last_mut() {
+        if updates_ignored > 0 {
+            *event
+                .disclosure_counters
+                .entry("grok_session_updates_ignored".to_string())
+                .or_insert(0) += updates_ignored;
+        }
+        if zero_usage_rows > 0 {
+            *event
+                .disclosure_counters
+                .entry("grok_zero_usage_rows".to_string())
+                .or_insert(0) += zero_usage_rows;
+        }
+    }
+    if events.is_empty() {
+        // Claimed but nothing countable: an empty event list would silently
+        // vanish the lane, so carry the censuses on one structural meta event.
+        let mut disclosure: BTreeMap<String, i64> = BTreeMap::new();
+        if updates_ignored > 0 {
+            disclosure.insert("grok_session_updates_ignored".to_string(), updates_ignored);
+        }
+        if zero_usage_rows > 0 {
+            disclosure.insert("grok_zero_usage_rows".to_string(), zero_usage_rows);
+        }
+        events.push(Event {
+            role: "session_meta".to_string(),
+            timestamp: String::new(),
+            model_used: "default".to_string(),
+            source_tool: "grok".to_string(),
+            disclosure_counters: disclosure,
+            ..Event::default()
+        });
+    }
+    Some(events)
 }
 
 fn parse_openclaw_value(value: &Value) -> Option<Vec<Event>> {
@@ -8630,6 +8835,142 @@ fn timestamp_millis_nanos(ms: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsec)
         .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod rm_1373_grok_tests {
+    //! rm-1373 (grok lane) — the `~/.grok/sessions/**/updates.jsonl`
+    //! format, pinned against the ccusage v20.0.40 survey (the
+    //! lane's snapshot instrument): usage rides ONLY
+    //! `params.update.sessionUpdate == "turn_completed"` rows,
+    //! `costUsdTicks` is the vendor's own cost record at 1e-10 USD
+    //! per tick, and `modelUsage` splits a turn per model without
+    //! double-counting the top-level aggregate.
+    use super::{parse_grok_updates_jsonl, Value};
+
+    fn lines(body: &str) -> Vec<Value> {
+        body.lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("fixture line"))
+            .collect()
+    }
+
+    #[test]
+    fn turn_completed_usage_and_recorded_costs_parse() {
+        let body = concat!(
+            "{\"timestamp\":1792600000,\"method\":\"_x.ai/session/update\",",
+            "\"params\":{\"sessionId\":\"s-grok-1\",\"update\":",
+            "{\"sessionUpdate\":\"user_message\"}},",
+            "\"_meta\":{\"eventId\":\"e-1\",\"agentTimestampMs\":1792600000000}},\n",
+            "{\"timestamp\":1792600060,\"method\":\"_x.ai/session/update\",",
+            "\"params\":{\"sessionId\":\"s-grok-1\",\"update\":",
+            "{\"sessionUpdate\":\"turn_completed\",\"usage\":",
+            "{\"inputTokens\":100,\"outputTokens\":50,",
+            "\"cachedReadTokens\":10,\"cacheCreationTokens\":5,",
+            "\"reasoningTokens\":40,\"costUsdTicks\":15000000000,",
+            "\"modelUsage\":{\"grok-4\":{\"inputTokens\":80,\"outputTokens\":30,",
+            "\"cachedReadTokens\":10,\"cacheCreationTokens\":5,",
+            "\"reasoningTokens\":40,\"costUsdTicks\":12000000000},",
+            "\"grok-4-fast\":{\"inputTokens\":20,\"outputTokens\":20,",
+            "\"costUsdTicks\":3000000000}}}}},",
+            "\"_meta\":{\"eventId\":\"e-2\",\"agentTimestampMs\":1792600060000}}\n"
+        );
+        let events =
+            parse_grok_updates_jsonl(&lines(body)).expect("grok lane claims its envelope");
+        // Two per-model rows; the turn's top-level aggregate is NOT
+        // double-minted (each token counted exactly once — the
+        // survey's totals come from the same rows).
+        assert_eq!(events.len(), 2);
+        let grok4 = events
+            .iter()
+            .find(|event| event.model_used == "grok-4")
+            .expect("grok-4 row");
+        assert_eq!(grok4.source_tool, "grok");
+        assert_eq!(grok4.usage.get("input_tokens"), Some(&80));
+        assert_eq!(grok4.usage.get("output_tokens"), Some(&30));
+        assert_eq!(grok4.usage.get("cache_read_input_tokens"), Some(&10));
+        assert_eq!(grok4.usage.get("cache_creation_input_tokens"), Some(&5));
+        assert_eq!(grok4.usage.get("reasoning_tokens"), Some(&40));
+        assert_eq!(grok4.recorded_cost_usd, Some(1.2));
+        assert!(grok4.timestamp.contains('T'), "unix seconds render RFC3339");
+        let fast = events
+            .iter()
+            .find(|event| event.model_used == "grok-4-fast")
+            .expect("grok-4-fast row");
+        assert_eq!(fast.recorded_cost_usd, Some(0.3));
+        // Non-usage sessionUpdates are counted, not minted: the census
+        // rides the last minted event (per-event counters sum in the
+        // fold, so first-or-last placement is equivalent; pinned to
+        // last because the zero-row census needs a minted carrier).
+        let last = events.last().expect("last event carries censuses");
+        assert_eq!(
+            last.disclosure_counters.get("grok_session_updates_ignored"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn usage_without_model_usage_attributes_default() {
+        let body = concat!(
+            "{\"timestamp\":1792600120,\"params\":{\"update\":{",
+            "\"sessionUpdate\":\"turn_completed\",\"usage\":",
+            "{\"inputTokens\":7,\"outputTokens\":3,\"costUsdTicks\":0}}}},",
+            "\"_meta\":{\"agentTimestampMs\":1792600120000}}\n"
+        );
+        let events =
+            parse_grok_updates_jsonl(&lines(body)).expect("grok lane claims its envelope");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.model_used, "default");
+        assert_eq!(event.usage.get("input_tokens"), Some(&7));
+        // Zero ticks read as unrecorded (the vendor's placeholder),
+        // not as a zero-dollar bill.
+        assert_eq!(event.recorded_cost_usd, None);
+        assert_eq!(
+            event.disclosure_counters.get("grok_usage_without_recorded_cost"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn zero_usage_rows_are_counted_not_minted() {
+        let body = concat!(
+            "{\"timestamp\":1792600000,\"params\":{\"update\":",
+            "{\"sessionUpdate\":\"turn_completed\",\"usage\":",
+            "{\"inputTokens\":0,\"outputTokens\":0}}}},\n",
+            "{\"timestamp\":1792600100,\"params\":{\"update\":",
+            "{\"sessionUpdate\":\"turn_completed\",\"usage\":",
+            "{\"inputTokens\":5,\"outputTokens\":1,\"costUsdTicks\":0}}}}\n"
+        );
+        let events =
+            parse_grok_updates_jsonl(&lines(body)).expect("grok lane claims its envelope");
+        assert_eq!(events.len(), 1, "only the nonzero turn mints");
+        assert_eq!(
+            events[0].disclosure_counters.get("grok_zero_usage_rows"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn the_envelope_claims_and_foreign_lines_do_not() {
+        // A claude-transcript-shaped line never claims the grok lane.
+        let body = "{\"type\":\"user\",\"message\":{\"usage\":{}}}\n";
+        assert!(parse_grok_updates_jsonl(&lines(body)).is_none());
+        // A file with no turn_completed rows still claims (the
+        // envelope IS the format) and carries the ignored census on a
+        // structural meta event — the lane never silently vanishes.
+        let empty =
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"user_message\"}}}\n";
+        let events = parse_grok_updates_jsonl(&lines(empty))
+            .expect("envelope present, nothing countable");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .disclosure_counters
+                .get("grok_session_updates_ignored"),
+            Some(&1)
+        );
+        assert!(events[0].usage.is_empty());
+    }
 }
 
 #[cfg(test)]

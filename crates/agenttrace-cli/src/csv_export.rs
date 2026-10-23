@@ -170,7 +170,10 @@ pub fn overview_csv(overview: &Overview) -> String {
         }
         let model_basis = name == "by_model";
         if model_basis {
-            out.push_str(&table(name, &["name", "sessions", "cost", "pricing_basis"]));
+            out.push_str(&table(
+                name,
+                &["name", "sessions", "cost", "pricing_basis", "stored_cost"],
+            ));
         } else {
             out.push_str(&table(name, &["name", "sessions", "cost"]));
         }
@@ -182,10 +185,15 @@ pub fn overview_csv(overview: &Overview) -> String {
             let cost = money_cell(entry.cost);
             if model_basis {
                 let basis = match pricing_basis_label(group) {
+                    None if entry.stored_cost > 0.0 => "stored",
                     None => "exact",
                     Some(label) => label,
                 };
-                out.push_str(&csv_row(&[group, &sessions, &cost, basis]));
+                // rm-2032: the same column set as the JSON by_model row
+                // (stored_cost echoes `storedCost`; 0.0 renders as the
+                // plain zero, keeping the column count honest).
+                let stored = money_cell(entry.stored_cost);
+                out.push_str(&csv_row(&[group, &sessions, &cost, basis, &stored]));
             } else {
                 out.push_str(&csv_row(&[group, &sessions, &cost]));
             }
