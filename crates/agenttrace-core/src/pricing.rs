@@ -1950,6 +1950,37 @@ fn qualified_catalog_id(key: &str, normalized: &str) -> Option<String> {
     None
 }
 
+/// rm-1900: the cohort identity a dotted regional/vendor-marker SKU
+/// twin keeps in the cost-anomaly baseline — its own lowercased raw
+/// id — or `None` when the id is not such a twin. Pricing
+/// deliberately retains these ids as their own catalog rows at their
+/// own list prices (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`
+/// bills $3.30/M where the base bills $3.00/M), so the anomaly cohort
+/// must not fold them onto the base model's baseline: that would judge
+/// the twin against a foreign rate norm. Case variants of the SAME
+/// twin still pool (the identity is the lowercased raw id). Matches
+/// the dotted-regional arm of `qualified_catalog_id`; the `/`-path
+/// deployment ids are deliberately NOT twins here — the cohort pools
+/// those spellings through `normalize_model`, pinned by
+/// `cost_anomaly_cohort_pools_pricing_spellings`. Re-implements, for
+/// the cohort lane, the twin boundary the single-pass date/version
+/// fold used to provide before the fixed-point loop folded
+/// dated+versioned twins onto the base id as well.
+pub(crate) fn regional_sku_twin_identity(raw: &str, normalized: &str) -> Option<String> {
+    let canonical = raw.trim().to_ascii_lowercase();
+    if canonical == normalized {
+        return None;
+    }
+    for marker in [".anthropic.", ".google.", ".meta.", ".amazon."] {
+        if let Some(idx) = canonical.find(marker) {
+            if idx > 0 {
+                return Some(canonical);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PricingOverrides {
@@ -2530,7 +2561,15 @@ pub fn specific_base_for_unpriced(model: &str) -> Option<String> {
     None
 }
 
-fn normalize_model(raw: &str) -> String {
+/// rm-1900: consumed by diagnostics' anomaly cohort pooling, so the
+/// cost baseline keys on the same identity the rate lookup prices by.
+/// Every fold this function performs (case, `/`-path tails, provider
+/// markers, date/version suffixes) is a fold the anomaly cohort must
+/// mirror or mixed-spelling histories silently skip the check. The one
+/// deliberate exception — the dotted regional SKU twins, which pricing
+/// bills from their own rows — is discriminated by
+/// `regional_sku_twin_identity`, not by weakening any fold here.
+pub(crate) fn normalize_model(raw: &str) -> String {
     if raw.is_empty() || raw == "unknown" {
         return "default".to_string();
     }

@@ -497,16 +497,43 @@ pub fn predict_cost_anomaly(history: &[Session], current: &Session) -> CostAlert
     // into three cohorts. Residual window, disclosed here: a "multiple"
     // session prices exactly per-block (rm-521) but its model mix varies,
     // so a pooled sentinel baseline can still carry cross-mix variance.
-    fn cohort_of(model: &str) -> Option<&str> {
-        let model = model.trim();
-        if model.is_empty() || matches!(model, "default" | "unknown" | "multiple") {
-            None
-        } else {
-            Some(model)
+    fn cohort_of(model: &str) -> Option<String> {
+        // rm-1900: the cohort key is the PRICING-normalized model id, not
+        // the raw `model_used` string. The pricing layer folds dated,
+        // versioned and provider-qualified spellings of one model onto a
+        // single rate row (pricing.rs `normalize_model`), so raw-string
+        // cohorting fragmented exactly those corpora: mixed-spelling
+        // histories priced identically side by side yet the check
+        // silently skipped with "no same-model cost history". Pooling on
+        // the same key the rate lookup uses keeps the baseline and the
+        // rate on one identity. Sentinels stay pooled as the
+        // unattributed cohort: `normalize_model` maps the empty label and
+        // the exact `unknown` spelling onto `default`, lowercases every
+        // other casing of it onto `unknown`, and `multiple` survives
+        // normalization verbatim, so the match below catches both
+        // spellings of every sentinel.
+        let trimmed = model.trim();
+        let normalized = crate::pricing::normalize_model(trimmed);
+        if matches!(normalized.as_str(), "default" | "unknown" | "multiple") {
+            return None;
         }
+        // Integration seam (conflict case fe1305f0): the wall landed a
+        // fixed-point date/version fold inside `normalize_model` past
+        // this run's base, so the dotted regional SKU twins
+        // (`us.anthropic.…-v1:0`) now fold onto the base id too. The twin
+        // boundary this run pinned — a twin is its own catalog row at its
+        // own list price and is never judged against the base model's
+        // rate norm — is therefore re-implemented explicitly: a regional
+        // twin keeps its own cohort under its lowercased raw id (case
+        // variants of the same twin still pool), while every other
+        // spelling pools through the normalization above.
+        if let Some(twin) = crate::pricing::regional_sku_twin_identity(trimmed, &normalized) {
+            return Some(twin);
+        }
+        Some(normalized)
     }
     let current_cohort = cohort_of(current.metrics.model_used.as_str());
-    let basis = match current_cohort {
+    let basis = match current_cohort.as_deref() {
         None => "sessions without model attribution".to_string(),
         Some(model) => format!("'{model}' sessions"),
     };
@@ -1581,6 +1608,139 @@ mod tests {
                 && !alert.message.contains("'unknown'")
                 && !alert.message.contains("'multiple'"),
             "sentinel labels must not leak into the message: {}",
+            alert.message
+        );
+    }
+
+    #[test]
+    fn cost_anomaly_cohort_pools_pricing_spellings() {
+        // rm-1900: pricing folds dated, `/`-pathed and provider-qualified
+        // spellings of one model onto a single rate row; the anomaly
+        // cohort must key on that same identity or mixed-spelling
+        // histories silently skip the check. Assess F2 PoC: an undated
+        // current session over a dated-spelling history rendered "No
+        // same-model cost history ... skipped" while every session in
+        // the corpus priced identically.
+        // Spelling families pricing folds onto ONE rate row with the
+        // undated id: dated snapshots, provider `/`-path forms, and case
+        // variants. The rm-1053 regional twins (us./global./…-v1:0) are
+        // deliberately absent — they bill at their OWN catalog rows
+        // ($3.30 vs the base $3.00), so pooling them onto the base cohort
+        // would judge them against a foreign rate norm; see the
+        // keeps_regional_sku_twins_separate test below.
+        for history_spelling in [
+            "claude-sonnet-4-5-20250929",
+            "anthropic/claude-sonnet-4-5-20250929",
+            "Claude-Sonnet-4-5-20250929",
+        ] {
+            let history: Vec<Session> = (0..6)
+                .map(|i| {
+                    let mut s = session_with_cost(&format!("hist-{i}"), 10, 3.0);
+                    s.metrics.model_used = history_spelling.to_string();
+                    s
+                })
+                .collect();
+            let mut current = session_with_cost("current", 10, 9.12);
+            current.metrics.model_used = "claude-sonnet-4-5".to_string();
+            let alert = predict_cost_anomaly(&history, &current);
+            assert!(
+                alert.triggered,
+                "spelling {history_spelling:?} must pool with the undated id, not skip: {}",
+                alert.message
+            );
+            assert_eq!(alert.level, "critical");
+            assert!((alert.ratio - 3.04).abs() < 1e-9, "ratio {}", alert.ratio);
+            assert_eq!(
+                alert.basis, "'claude-sonnet-4-5' sessions",
+                "basis must name the normalized cohort identity"
+            );
+        }
+    }
+
+    #[test]
+    fn cost_anomaly_cohort_normalization_keeps_distinct_models_separate() {
+        // rm-1900 complement: the fold collapses spellings of ONE model,
+        // never two models. A qualified different-model history must not
+        // enter an attributed current session's baseline (over-pooling
+        // would re-create the rm-1438 cross-model false baseline).
+        let history: Vec<Session> = (0..6)
+            .map(|i| {
+                let mut s = session_with_cost(&format!("hist-{i}"), 10, 3.0);
+                s.metrics.model_used = "us.anthropic.claude-opus-4-6-20260101-v1:0".to_string();
+                s
+            })
+            .collect();
+        let mut current = session_with_cost("current", 10, 9.12);
+        current.metrics.model_used = "claude-sonnet-4-5".to_string();
+        let alert = predict_cost_anomaly(&history, &current);
+        assert!(!alert.triggered);
+        assert_eq!(alert.level, "info");
+        assert!(
+            alert.message.to_lowercase().contains("same-model"),
+            "distinct-model history must keep the same-model skip: {}",
+            alert.message
+        );
+    }
+
+    #[test]
+    fn cost_anomaly_cohort_keeps_regional_sku_twins_separate() {
+        // rm-1900 boundary, mirroring rm-1053 pricing semantics: the
+        // region/vendor-qualified twins (us./global./us-gov. …-v1:0) are
+        // their own SKUs with their own list prices, deliberately retained
+        // under raw ids — the pricing render pins us $3.30 vs base $3.00.
+        // The cohort key must respect that identity: a qualified-twin
+        // session baselines against its own spelling family, never against
+        // the differently-priced base cohort (pre- and post-fix alike it
+        // keeps the same-model skip over base-only history).
+        let mut twin = session_with_cost("twin", 10, 3.3);
+        twin.metrics.model_used = "us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string();
+        let mut base = session_with_cost("base", 10, 3.0);
+        base.metrics.model_used = "claude-sonnet-4-5".to_string();
+        let alert = predict_cost_anomaly(&[base], &twin);
+        assert!(!alert.triggered);
+        assert_eq!(alert.level, "info");
+        assert!(
+            alert.message.to_lowercase().contains("same-model"),
+            "a differently-priced SKU twin must not enter the base cohort: {}",
+            alert.message
+        );
+        // The twin family still pools with its own spelling variants
+        // (dated/case forms of the SAME qualified id), so the check
+        // evaluates there instead of silently skipping.
+        let mut peer = session_with_cost("peer", 10, 3.3);
+        peer.metrics.model_used = "US.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string();
+        let peer_alert = predict_cost_anomaly(&[peer], &twin);
+        assert!(
+            (peer_alert.ratio - 1.0).abs() < 1e-9,
+            "ratio {}",
+            peer_alert.ratio
+        );
+    }
+
+    #[test]
+    fn cost_anomaly_cohort_sentinel_casings_stay_unattributed() {
+        // rm-1900: case variants of the sentinels reach the cohort through
+        // pricing normalization ("UNKNOWN" lowercases onto the folded
+        // sentinel identities) and must pool as the unattributed cohort
+        // exactly like their canonical spellings — never surface as
+        // pseudo-model cohorts of their own (pre-fix "UNKNOWN" was
+        // case-mismatched by the raw-string sentinel match and formed its
+        // own empty cohort).
+        let mut odd = session_with_cost("odd", 10, 3.0);
+        odd.metrics.model_used = "UNKNOWN".to_string();
+        let mut current = session_with_cost("current", 10, 3.0);
+        current.metrics.model_used = "Multiple".to_string();
+        let alert = predict_cost_anomaly(&[odd], &current);
+        assert!(
+            (alert.ratio - 1.0).abs() < 1e-9,
+            "casing variants must pool as one unattributed cohort: ratio {}",
+            alert.ratio
+        );
+        assert_eq!(alert.basis, "sessions without model attribution");
+        assert!(!alert.triggered);
+        assert!(
+            !alert.message.contains("UNKNOWN") && !alert.message.contains("Multiple"),
+            "casing variants must not leak as pseudo-models: {}",
             alert.message
         );
     }
