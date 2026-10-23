@@ -11239,6 +11239,234 @@ mod tests {
         );
     }
 
+    fn decode_model_id(value: serde_json::Value) -> AntigravityModelId {
+        let mut obj = serde_json::Map::new();
+        obj.insert("modelConfigId".to_string(), value);
+        antigravity_model_id(&obj).expect("modelConfigId decodes")
+    }
+
+    #[test]
+    fn antigravity_numeric_map_carries_the_ccusage_v20_0_41_census() {
+        // rm-1533 completion (run 8a5372ee cycle 7): the numeric table
+        // is completed to ccusage parity (#1948, ships v20.0.41,
+        // merged 2026-10-22; ported from
+        // rust/adapters/antigravity/src/parser.rs `model_name_from_id`
+        // @main 2026-10-23). Identity-only arms: pricing still rides
+        // the catalog's normal lookup — 1402's claude-opus-5-5 is
+        // priced in the bundled snapshot, while gemini-4-argon, the
+        // gemini-3.6/3.5 families, the claude-4/4.5 spellings and
+        // gpt-oss degrade through the disclosed fallback, never a
+        // table-invented price.
+        let census: &[(i64, &str)] = &[
+            (1417, "gemini-4-argon"),
+            (1418, "gemini-4-argon"),
+            (1419, "gemini-4-argon"),
+            (1402, "claude-opus-5-5"),
+            (1050, "gemini-3.1-flash-lite"),
+            (246, "gemini-2.5-pro"),
+            (312, "gemini-2.5-flash"),
+            (313, "gemini-2.5-flash-thinking"),
+            (329, "gemini-2.5-flash-thinking"),
+            (330, "gemini-2.5-flash-lite"),
+            (281, "claude-4-sonnet"),
+            (282, "claude-4-sonnet"),
+            (290, "claude-4-opus"),
+            (291, "claude-4-opus"),
+            (333, "claude-4.5-sonnet"),
+            (334, "claude-4.5-sonnet"),
+            (340, "claude-4.5-haiku"),
+            (341, "claude-4.5-haiku"),
+            (342, "model_openai_gpt_oss_120b_medium"),
+            (1318, "gemini-3.8-flash-high"),
+            (1319, "gemini-3.8-flash-medium"),
+            (1320, "gemini-3.8-flash-low"),
+            (1298, "gemini-3.7-flash-high"),
+            (1299, "gemini-3.7-flash-medium"),
+            (1300, "gemini-3.7-flash-low"),
+            (1071, "gemini-3.6-flash-high"),
+            (1072, "gemini-3.6-flash-medium"),
+            (1073, "gemini-3.6-flash-low"),
+        ];
+        for (id, expected) in census {
+            let decoded = decode_model_id(serde_json::json!(id));
+            assert_eq!(&decoded.display, expected, "numeric id {id}");
+            assert!(
+                decoded.numeric,
+                "numeric ids keep their numeric disclosure"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_numeric_fallbacks_spell_placeholder_and_unknown_forms() {
+        // ccusage's two fallback spellings for ids with no proven arm
+        // (v20.0.41): >= 1000 mints model_placeholder_m<id-1000>, below
+        // 1000 spells antigravity-model-<id>. PARITY PIN: the numeric
+        // lane stops at the spelling — 1187 mints
+        // model_placeholder_m187 and must NOT resolve through the
+        // string lane's placeholder table (whose m187 entry names
+        // gemini-3.5-flash-extra-low), because ccusage's numeric
+        // fallback does not consult its string table either; resolving
+        // here would diverge cross-tool attribution for exactly the
+        // ids neither tool has proven.
+        let decoded = decode_model_id(serde_json::json!(1277));
+        assert_eq!(decoded.display, "model_placeholder_m277");
+        let decoded = decode_model_id(serde_json::json!(1187));
+        assert_eq!(decoded.display, "model_placeholder_m187");
+        let decoded = decode_model_id(serde_json::json!(16));
+        assert_eq!(decoded.display, "antigravity-model-16");
+        // rm-1864 review F5 canonicalization composes with the
+        // completion: an integral float spelling feeds the table.
+        let decoded = decode_model_id(serde_json::json!(1071.0));
+        assert_eq!(decoded.display, "gemini-3.6-flash-high");
+    }
+
+    #[test]
+    fn antigravity_placeholder_string_sightings_resolve_to_models() {
+        // The antigravity config surface spells unproven models
+        // `model_placeholder_m<N>` as STRING sightings too, and
+        // ccusage resolves the observed spellings through its
+        // normalize table. Ported 1:1 from
+        // `normalize_antigravity_model` @main 2026-10-23 (#1948) —
+        // including the m132/m133/m187/m20 gemini-3.5 arms upstream
+        // merged after this run's 20:00 research snapshot.
+        let table: &[(&str, &str)] = &[
+            ("model_placeholder_m318", "gemini-3.8-flash-high"),
+            ("model_placeholder_m319", "gemini-3.8-flash-medium"),
+            ("model_placeholder_m320", "gemini-3.8-flash-low"),
+            ("model_placeholder_m298", "gemini-3.7-flash-high"),
+            ("model_placeholder_m299", "gemini-3.7-flash-medium"),
+            ("model_placeholder_m300", "gemini-3.7-flash-low"),
+            ("model_placeholder_m71", "gemini-3.6-flash-high"),
+            ("model_placeholder_m72", "gemini-3.6-flash-medium"),
+            ("model_placeholder_m73", "gemini-3.6-flash-low"),
+            ("model_placeholder_m417", "gemini-4-argon"),
+            ("model_placeholder_m418", "gemini-4-argon"),
+            ("model_placeholder_m419", "gemini-4-argon"),
+            ("model_placeholder_m402", "claude-opus-5-5"),
+            ("model_placeholder_m50", "gemini-3.1-flash-lite"),
+            ("model_placeholder_m26", "claude-opus-4-6"),
+            ("model_placeholder_m35", "claude-sonnet-4-6"),
+            ("model_placeholder_m36", "gemini-3.1-pro"),
+            ("model_placeholder_m37", "gemini-3.1-pro"),
+            ("model_placeholder_m16", "gemini-3.1-pro"),
+            ("model_placeholder_m18", "gemini-3-flash-preview"),
+            ("model_placeholder_m84", "gemini-3-flash-preview"),
+            ("model_placeholder_m47", "gemini-3-flash-preview"),
+            ("model_placeholder_m132", "gemini-3.5-flash-high"),
+            ("model_placeholder_m133", "gemini-3.5-flash-high"),
+            ("model_placeholder_m187", "gemini-3.5-flash-extra-low"),
+            ("model_placeholder_m20", "gemini-3.5-flash-medium"),
+        ];
+        for (raw, expected) in table {
+            let decoded = decode_model_id(serde_json::json!(raw));
+            assert_eq!(&decoded.display, expected, "placeholder string {raw}");
+            assert!(!decoded.numeric, "a string sighting is not numeric");
+        }
+        // ccusage's normalize lowercases before matching; a
+        // case-variant config spelling resolves the same model.
+        let decoded = decode_model_id(serde_json::json!("Model_Placeholder_M402"));
+        assert_eq!(decoded.display, "claude-opus-5-5");
+        // SCOPE PIN: only placeholder spellings resolve. Plain display
+        // names pass through verbatim — ccusage's effort-variant and
+        // base-name alias halves stay OUT of this batch (the pricing
+        // lane's own effort-alias arm covers suffixed ids).
+        for passthrough in [
+            "gemini-3-pro",
+            "gemini 3.8 flash (high)",
+            "model_openai_gpt_oss_120b_medium",
+        ] {
+            let decoded = decode_model_id(serde_json::json!(passthrough));
+            assert_eq!(
+                decoded.display, passthrough,
+                "non-placeholder strings pass through"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_numeric_1402_maps_to_priced_claude_opus_5_5() {
+        // rm-1533 completion flagship: ccusage #1948 maps 1402 to
+        // claude-opus-5-5, whose bare key is priced in the bundled
+        // snapshot (present in BOTH the 2026-10-08 worktree bundle and
+        // the 2026-10-17 tip bundle) — the spend prices at the model's
+        // own rates instead of banking under a stringified "1402".
+        let raw = serde_json::json!({
+            "trajectoryId": "55555555-6666-7777-8888-999999999999",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-22T10:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Opus generation.",
+                        "usageStats": {
+                            "inputTokens": 1000,
+                            "outputTokens": 500
+                        },
+                        "modelConfigId": 1402
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("numeric-1402", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "claude-opus-5-5",
+            "1402 maps through the completed census table instead of stringifying"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+            "the mapped sighting still discloses its numeric origin"
+        );
+        assert!(
+            session.metrics.cost_estimated > 0.0,
+            "the bare claude-opus-5-5 key is priced in the bundled snapshot"
+        );
+    }
+
+    #[test]
+    fn antigravity_numeric_1418_identity_maps_as_1417s_sibling() {
+        // The 1418/1419 siblings of 1417 complete ccusage's
+        // 1417..=1419 range: identity maps to gemini-4-argon (bare
+        // key ABSENT from the bundled snapshot — disclosed fallback
+        // pricing, exactly like the landed 1417 arm).
+        let raw = serde_json::json!({
+            "trajectoryId": "55555555-6666-7777-8888-aaaaaaaaaaaa",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-22T11:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Argon sibling generation.",
+                        "usageStats": { "inputTokens": 7, "outputTokens": 3 },
+                        "modelConfigId": 1418
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("numeric-1418", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "gemini-4-argon",
+            "1418 maps to its 1417 sibling's model per the 1417..=1419 range"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1)
+        );
+    }
+
     #[test]
     fn antigravity_numeric_model_ids_stringify_map_and_disclose() {
         // rm-1864 red-first: with the string-only decode, a corpus whose
@@ -11280,8 +11508,8 @@ mod tests {
         let session =
             parse_raw_session("numeric-model-ids", "conversation.trajectory.json", &raw).unwrap();
         assert_eq!(
-            session.metrics.model_used, "1277",
-            "last numeric id wins and an unmapped numeric attributes to its stringified id"
+            session.metrics.model_used, "model_placeholder_m277",
+            "last numeric id wins; an unmapped >= 1000 numeric attributes to ccusage's placeholder spelling (rm-1533 completion), never its bare stringification"
         );
         assert_eq!(
             session
