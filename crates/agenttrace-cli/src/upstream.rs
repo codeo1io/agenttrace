@@ -336,6 +336,11 @@ const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@zack78%2fagenttrace/
 /// network touch the flag triggers, derived from the same constants the code
 /// uses, so the disclosure cannot drift from the behavior it describes
 /// (rm-950 added the two opencode vendor-watch probes to this list).
+/// Review c176f5f2 F2: the count is "three or four" — the opencode npm
+/// probe touches its URL twice (a status read, then a bounded version
+/// read once the registry answers), so three URLs can mean four HTTPS
+/// requests; PRIVACY.md states the same count and the two must stay in
+/// step.
 /// rm-979 review rider: the URL is remote-derived — a tracked repo's git
 /// config can carry hostile bytes — and stderr is a terminal render too, so
 /// it goes through the same control-byte sanitizer as the report body.
@@ -343,7 +348,7 @@ const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@zack78%2fagenttrace/
 /// 3986 admits no control bytes), so the disclosure stays truthful.
 fn fetch_disclosure_line(remote_url: &str) -> String {
     format!(
-        "network: --fetch upstream is opt-in — `git fetch {remote_url}` plus three HTTPS metadata requests: {NPM_REGISTRY_URL} (published version), {OPENCODE_NPM_URL} and {OPENCODE_RELEASES_URL} (opencode vendor watch; see PRIVACY.md)",
+        "network: --fetch upstream is opt-in — `git fetch {remote_url}` plus three or four HTTPS metadata requests: {NPM_REGISTRY_URL} (published version), {OPENCODE_NPM_URL} (status read, plus a bounded version read when the registry answers) and {OPENCODE_RELEASES_URL} (opencode vendor watch; see PRIVACY.md)",
         remote_url = sanitize_line_segment(remote_url)
     )
 }
@@ -376,10 +381,13 @@ pub struct UpstreamStatus {
     /// `registry@X` after a successful `--fetch` probe, `unavailable`
     /// when the probe failed, `unknown (offline)` otherwise.
     pub npm_state: String,
-    /// opencode vendor-watch channel state (rm-950, cycle 3): the release
-    /// tag from the anomalyco/opencode releases API, with an explicit
-    /// `npm channel retired` label once the registry probe 404s — a dead
-    /// channel is a state, not a probe failure.
+    /// opencode vendor-watch channel state (rm-950, cycle 3; corrected by
+    /// the cycle-6 vendor-channel truth batch): the release tag from the
+    /// anomalyco/opencode releases API, annotated with the live npm
+    /// `opencode-ai` version when the registry answers (skew between the
+    /// two disclosed), or with an explicit `npm channel retired` label
+    /// once the registry probe genuinely 404s — a dead channel is a
+    /// state, not a probe failure.
     pub opencode_state: String,
 }
 
@@ -488,8 +496,10 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
     };
 
     // rm-950: the opencode vendor watch anchors on the releases API of the
-    // renamed home (anomalyco/opencode) and reports the retired npm channel
-    // explicitly rather than as a probe failure.
+    // renamed home (anomalyco/opencode). The cycle-6 vendor-channel truth
+    // batch corrected the npm anchor: the live channel publishes as
+    // `opencode-ai`, so a live registry answer renders the npm version
+    // alongside the tag, and only a genuine 404 reports retirement.
     let opencode_state = if fetch {
         opencode_channel_state()
     } else {
@@ -731,13 +741,20 @@ impl NpmProbeFailure {
 /// curl argv for the registry probe, split out so tests can pin the
 /// bounding flags without shelling out.
 fn npm_registry_curl_args() -> Vec<String> {
+    npm_registry_curl_args_at(NPM_REGISTRY_URL)
+}
+
+/// Same pinned shape (rm-052), parameterized by URL: the opencode npm
+/// probe reuses the identical read-only bounding flags as the agenttrace
+/// registry probe.
+fn npm_registry_curl_args_at(url: &str) -> Vec<String> {
     [
         "-fsSL".to_string(),
         "--max-time".to_string(),
         "15".to_string(),
         "--max-filesize".to_string(),
         NPM_REGISTRY_MAX_BYTES.to_string(),
-        NPM_REGISTRY_URL.to_string(),
+        url.to_string(),
     ]
     .into()
 }
@@ -840,13 +857,17 @@ fn npm_registry_version() -> Result<String, NpmProbeFailure> {
     parse_npm_registry_version(&String::from_utf8_lossy(&body)).ok_or(NpmProbeFailure::Unparseable)
 }
 
-/// opencode vendor-watch authority (rm-950, cycle 3). The npm channel the
-/// watch originally anchored on is retired (registry.npmjs.org/opencode and
-/// /@opencode-ai/opencode both 404); the releases API of the renamed home,
-/// github.com/anomalyco/opencode, is the authority for latest.
+/// opencode vendor-watch authority (rm-950, cycle 3). The releases API of
+/// the renamed home, github.com/anomalyco/opencode, is the authority for
+/// latest. The npm channel publishes as `opencode-ai` (maintained by the
+/// opencode author, in lockstep with those releases): rm-950 anchored the
+/// npm probe on the retired bare `opencode` name — two dead names probed,
+/// the live one missed — so the cycle-6 vendor-channel truth batch
+/// repointed it. A genuine 404 here still renders as a retired channel:
+/// a dead channel is a state, not a probe failure.
 const OPENCODE_RELEASES_URL: &str =
     "https://api.github.com/repos/anomalyco/opencode/releases/latest";
-const OPENCODE_NPM_URL: &str = "https://registry.npmjs.org/opencode";
+const OPENCODE_NPM_URL: &str = "https://registry.npmjs.org/opencode-ai/latest";
 
 /// Ceiling for the opencode releases-API read (rm-950), the sibling bound
 /// of NPM_REGISTRY_MAX_BYTES: a `releases/latest` document is a few KB, and
@@ -900,25 +921,150 @@ fn parse_release_tag(body: &str) -> Option<String> {
     value.get("tag_name")?.as_str().map(str::to_string)
 }
 
-/// Pure classification so the retired-channel contract is testable
-/// offline: `Some(404)` from the npm registry + a live tag from the
-/// releases API renders `tag (npm channel retired; authority:
-/// anomalyco/opencode releases)` — never a bare failure.
-fn classify_opencode_channel(registry_status: Option<u32>, release_tag: Option<&str>) -> String {
-    let retired = registry_status == Some(404);
-    match (retired, release_tag) {
-        (true, Some(tag)) => {
-            format!("{tag} (npm channel retired; authority: anomalyco/opencode releases)")
+/// Live state of the opencode npm channel probe.
+#[derive(Debug, Clone, PartialEq)]
+enum OpencodeNpmChannel {
+    /// The registry answered 404: the package is gone. A dead channel is
+    /// a state we still disclose (rm-950).
+    Retired,
+    /// The registry answered 2xx; `Some(version)` when the `/latest`
+    /// document parsed. A 2xx is the only answer that can support a
+    /// liveness claim — and even then the render asserts the parsed
+    /// version, never a bare "live" on an unparseable document (review
+    /// c176f5f2 F1: a `-L`-followed redirect parked on an opaque 200
+    /// must not be able to claim the channel).
+    Live(Option<String>),
+    /// The registry answered 2xx but the bounded version read itself
+    /// failed (curl error mid-read, or the byte cap tripped): the
+    /// channel answered; the version read did not. Distinct from
+    /// `Live(None)` so a network failure cannot masquerade as an
+    /// unparseable document (review c176f5f2 F1).
+    BodyUnread,
+    /// The registry answered a status that carries no channel-state
+    /// information (401/403/429/5xx, or a redirect parked on an answer
+    /// this probe cannot interpret). Unknown is a non-state: it renders
+    /// as such — never as live, never as retired (review c176f5f2 F1,
+    /// the rm-950 mislabel class this batch exists to kill).
+    Answered(u32),
+    /// The probe could not reach the registry at all (offline, timeout).
+    Unreachable,
+}
+
+fn opencode_npm_channel() -> OpencodeNpmChannel {
+    match http_status_via_curl(OPENCODE_NPM_URL) {
+        None => OpencodeNpmChannel::Unreachable,
+        Some(404) => OpencodeNpmChannel::Retired,
+        // Review c176f5f2 F1/F7: only a 2xx answer can support a live
+        // claim, and only it earns the bounded version read — no second
+        // request fires behind 401/403/429/5xx any more, so the doomed
+        // repeat after a server error is gone.
+        Some(status) if (200..=299).contains(&status) => {
+            match curl_output_bounded(
+                &npm_registry_curl_args_at(OPENCODE_NPM_URL),
+                NPM_REGISTRY_MAX_BYTES,
+            ) {
+                Ok(body) => match parse_npm_registry_version(&String::from_utf8_lossy(&body)) {
+                    Some(version) => OpencodeNpmChannel::Live(Some(version)),
+                    None => OpencodeNpmChannel::Live(None),
+                },
+                // The registry answered 2xx but the bounded read failed
+                // (curl error or byte-cap overflow) — a distinct state
+                // from an unparseable document (review c176f5f2 F1).
+                Err(_) => OpencodeNpmChannel::BodyUnread,
+            }
         }
-        (true, None) => "channel retired; releases authority unreachable (network?)".to_string(),
-        (false, Some(tag)) => tag.to_string(),
-        (false, None) => "unknown (offline; agenttrace --fetch upstream)".to_string(),
+        // Any other status carries no channel state: render it as the
+        // unknown it is, never as live.
+        Some(status) => OpencodeNpmChannel::Answered(status),
+    }
+}
+
+/// Pure classification so the channel contract is testable offline.
+/// rm-950 rendered any non-404 registry answer plainly because both
+/// probeable npm names were dead; the cycle-6 vendor-channel truth batch
+/// found the live `opencode-ai` channel. Review c176f5f2 F1 hardened the
+/// triage: only a 2xx answer is live evidence and only a genuine 404
+/// renders retired — every other status the registry can answer
+/// (401/403/429/5xx, a redirect parked on an opaque 200) renders
+/// `npm registry answered {status}; channel state unknown`, because
+/// asserting "live" on an error answer is the rm-950 mislabel class
+/// this batch exists to kill. Even under 2xx the render asserts only
+/// what the evidence shows: a parsed version is live; an unparseable
+/// document or a failed read claims no more than "answered 2xx". The
+/// retired label carries its evidence (`registry 404`) so a future
+/// rename cannot launder absence through vagueness (F5), and the
+/// releases-authority qualifier stays cause-neutral ("did not
+/// answer") because a GitHub rate-limit 403 is not a network failure
+/// (F6).
+fn classify_opencode_channel(npm: OpencodeNpmChannel, release_tag: Option<&str>) -> String {
+    match (npm, release_tag) {
+        // npm and the releases authority agree: one line, both sources.
+        (OpencodeNpmChannel::Live(Some(npm_version)), Some(tag))
+            if npm_version == tag.trim_start_matches('v') =>
+        {
+            format!("{tag} (npm opencode-ai@{npm_version})")
+        }
+        // Both answered but disagree: disclose the skew instead of
+        // silently picking a winner.
+        (OpencodeNpmChannel::Live(Some(npm_version)), Some(tag)) => {
+            format!("{tag} (npm opencode-ai@{npm_version}; differs from releases tag)")
+        }
+        // npm answered but the releases authority did not — cause-neutral:
+        // unreachable and rate-limited (403) both render here (F6).
+        (OpencodeNpmChannel::Live(Some(npm_version)), None) => {
+            format!("npm opencode-ai@{npm_version} (releases authority did not answer)")
+        }
+        // The registry answered 2xx but the document did not parse:
+        // the answer is disclosed literally; a parked 200-HTML page
+        // cannot claim "live" through this arm (F1).
+        (OpencodeNpmChannel::Live(None), Some(tag)) => {
+            format!("{tag} (npm registry answered 2xx; version unparseable)")
+        }
+        (OpencodeNpmChannel::Live(None), None) => {
+            "npm registry answered 2xx; version unparseable (releases authority did not answer)"
+                .to_string()
+        }
+        // 2xx answer, but the bounded version read itself failed
+        // (network error or byte cap) — distinct from an unparseable
+        // document (F1).
+        (OpencodeNpmChannel::BodyUnread, Some(tag)) => {
+            format!("{tag} (npm registry answered 2xx; version read failed: network or byte cap)")
+        }
+        (OpencodeNpmChannel::BodyUnread, None) => {
+            "npm registry answered 2xx; version read failed: network or byte cap (releases authority did not answer)"
+                .to_string()
+        }
+        // A status this probe cannot interpret (401/403/429/5xx) is
+        // evidence of nothing: unknown, stated as such (F1).
+        (OpencodeNpmChannel::Answered(status), Some(tag)) => {
+            format!("{tag} (npm registry answered {status}; channel state unknown)")
+        }
+        (OpencodeNpmChannel::Answered(status), None) => {
+            format!("unknown (npm registry answered {status}; channel state unknown)")
+        }
+        // The npm package is gone; the renamed home's releases API is
+        // the only remaining authority for "latest". The label carries
+        // its evidence — `registry 404` — so a rename cannot launder
+        // itself through vagueness (F5).
+        (OpencodeNpmChannel::Retired, Some(tag)) => {
+            format!("{tag} (npm channel retired: registry 404; authority: anomalyco/opencode releases)")
+        }
+        // No releases answer to qualify the retirement against.
+        (OpencodeNpmChannel::Retired, None) => {
+            "npm channel retired: registry 404 (releases authority did not answer)".to_string()
+        }
+        // An unreachable probe is not a channel state: render what the
+        // authority knows, plainly.
+        (OpencodeNpmChannel::Unreachable, Some(tag)) => tag.to_string(),
+        (OpencodeNpmChannel::Unreachable, None) => {
+            "unknown (offline; agenttrace --fetch upstream)".to_string()
+        }
     }
 }
 
 fn opencode_channel_state() -> String {
     classify_opencode_channel(
-        http_status_via_curl(OPENCODE_NPM_URL),
+        opencode_npm_channel(),
         github_latest_release_tag(OPENCODE_RELEASES_URL).as_deref(),
     )
 }
@@ -1100,7 +1246,10 @@ fn short(sha: &str, len: usize) -> String {
 
 #[cfg(test)]
 mod opencode_channel_tests {
-    use super::{classify_opencode_channel, opencode_releases_curl_args, parse_release_tag};
+    use super::{
+        classify_opencode_channel, opencode_releases_curl_args, parse_release_tag,
+        OpencodeNpmChannel,
+    };
 
     #[test]
     fn opencode_releases_probe_args_are_time_and_byte_bounded() {
@@ -1132,30 +1281,115 @@ mod opencode_channel_tests {
 
     #[test]
     fn retired_channel_renders_as_state_not_failure() {
-        // rm-950 contract: a 404 registry is "retired", and when the
-        // releases authority answers, the tag leads.
+        // rm-950 contract: a genuine 404 registry is "retired", and when
+        // the releases authority answers, the tag leads. The retired arm
+        // stays live for the day the package is actually gone — and
+        // carries its evidence (`registry 404`) so a rename cannot
+        // launder absence through vagueness (review c176f5f2 F5).
         assert_eq!(
-            classify_opencode_channel(Some(404), Some("v1.18.35")),
-            "v1.18.35 (npm channel retired; authority: anomalyco/opencode releases)"
+            classify_opencode_channel(OpencodeNpmChannel::Retired, Some("v1.18.35")),
+            "v1.18.35 (npm channel retired: registry 404; authority: anomalyco/opencode releases)"
         );
+        // Cause-neutral qualifier: a rate-limited GitHub 403 is not a
+        // network failure (review c176f5f2 F6).
         assert_eq!(
-            classify_opencode_channel(Some(404), None),
-            "channel retired; releases authority unreachable (network?)"
+            classify_opencode_channel(OpencodeNpmChannel::Retired, None),
+            "npm channel retired: registry 404 (releases authority did not answer)"
         );
     }
 
     #[test]
-    fn live_or_absent_registry_renders_plainly() {
+    fn live_npm_channel_renders_version_alongside_the_releases_tag() {
+        // Cycle-6 vendor-channel truth correction: the npm channel is live
+        // at `opencode-ai` (maintained by the opencode author, publishing
+        // in lockstep with the releases the watch already trusts). A live
+        // registry answer must render the npm version — never the retired
+        // label rm-950 pinned when both probed names 404'd.
         assert_eq!(
-            classify_opencode_channel(Some(200), Some("v1.18.35")),
+            classify_opencode_channel(
+                OpencodeNpmChannel::Live(Some("1.19.3".to_string())),
+                Some("v1.19.3")
+            ),
+            "v1.19.3 (npm opencode-ai@1.19.3)"
+        );
+        // Skew between npm and the releases authority is disclosed
+        // rather than silently collapsed to either side.
+        assert_eq!(
+            classify_opencode_channel(
+                OpencodeNpmChannel::Live(Some("1.19.0".to_string())),
+                Some("v1.19.3")
+            ),
+            "v1.19.3 (npm opencode-ai@1.19.0; differs from releases tag)"
+        );
+        // A 2xx answer whose document does not parse is disclosed
+        // literally — "answered 2xx; version unparseable" — so a parked
+        // 200-HTML redirect cannot claim "live" through this arm
+        // (review c176f5f2 F1).
+        assert_eq!(
+            classify_opencode_channel(OpencodeNpmChannel::Live(None), Some("v1.19.3")),
+            "v1.19.3 (npm registry answered 2xx; version unparseable)"
+        );
+        // npm answered but the releases authority did not — cause-neutral
+        // wording (403 rate limit is not a network failure, F6).
+        assert_eq!(
+            classify_opencode_channel(OpencodeNpmChannel::Live(Some("1.19.3".to_string())), None),
+            "npm opencode-ai@1.19.3 (releases authority did not answer)"
+        );
+        assert_eq!(
+            classify_opencode_channel(OpencodeNpmChannel::Live(None), None),
+            "npm registry answered 2xx; version unparseable (releases authority did not answer)"
+        );
+    }
+
+    #[test]
+    fn body_read_failure_renders_distinctly_from_unparseable() {
+        // Review c176f5f2 F1: a 2xx answer whose bounded version read
+        // failed (curl error mid-read, byte-cap overflow) is NOT the
+        // same state as a parsed-but-unusable document — the old triage
+        // collapsed it into "version unparseable"; now it says what
+        // actually happened instead of laundering a read failure into a
+        // channel claim.
+        assert_eq!(
+            classify_opencode_channel(OpencodeNpmChannel::BodyUnread, Some("v1.19.3")),
+            "v1.19.3 (npm registry answered 2xx; version read failed: network or byte cap)"
+        );
+        assert_eq!(
+            classify_opencode_channel(OpencodeNpmChannel::BodyUnread, None),
+            "npm registry answered 2xx; version read failed: network or byte cap (releases authority did not answer)"
+        );
+    }
+
+    #[test]
+    fn error_status_answers_render_unknown_never_live() {
+        // Review c176f5f2 F1: a 401/403/429/5xx answer — or any status
+        // this probe cannot interpret — is evidence of NOTHING about the
+        // channel. Rendering "live" off it was the rm-950 mislabel class
+        // reborn, inverted; these statuses now render an explicit
+        // unknown, and the probe makes no second request behind them.
+        assert_eq!(
+            classify_opencode_channel(OpencodeNpmChannel::Answered(403), Some("v1.19.3")),
+            "v1.19.3 (npm registry answered 403; channel state unknown)"
+        );
+        assert_eq!(
+            classify_opencode_channel(OpencodeNpmChannel::Answered(429), None),
+            "unknown (npm registry answered 429; channel state unknown)"
+        );
+        assert_eq!(
+            classify_opencode_channel(OpencodeNpmChannel::Answered(500), Some("v1.19.3")),
+            "v1.19.3 (npm registry answered 500; channel state unknown)"
+        );
+    }
+
+    #[test]
+    fn unreachable_registry_renders_plainly() {
+        // An unreachable probe is not a channel state: plain render, no
+        // suffix, and never a retired label the network invented.
+        assert_eq!(
+            classify_opencode_channel(OpencodeNpmChannel::Unreachable, Some("v1.18.35")),
             "v1.18.35"
         );
         assert_eq!(
-            classify_opencode_channel(None, Some("v1.18.35")),
-            "v1.18.35"
-        );
-        assert_eq!(
-            classify_opencode_channel(None, None),
+            classify_opencode_channel(OpencodeNpmChannel::Unreachable, None),
             "unknown (offline; agenttrace --fetch upstream)"
         );
     }
@@ -1586,7 +1820,7 @@ mod tests {
             fetched: false,
             npm_state: "unknown (offline; agenttrace --fetch upstream)".to_string(),
             opencode_state:
-                "v1.18.35 (npm channel retired; authority: anomalyco/opencode releases)".to_string(),
+                "v1.18.35 (npm channel retired: registry 404; authority: anomalyco/opencode releases)".to_string(),
         }
     }
 
@@ -1602,6 +1836,12 @@ mod tests {
         // stable-schema promise.
         assert!(text.contains("unported areas:   ci/release 2, parser 1"));
         assert!(text.contains("npm:              unknown (offline"));
+        // Review c176f5f2 F9: the vendor-watch line is a schema line
+        // like `npm:` — pin its render too, so render-format drift on
+        // the opencode lane fails here instead of shipping silently.
+        assert!(text.contains(
+            "opencode:         v1.18.35 (npm channel retired: registry 404; authority: anomalyco/opencode releases)"
+        ));
         assert!(text.contains("running agenttrace v"));
     }
 
@@ -1767,6 +2007,19 @@ mod tests {
             line.contains(OPENCODE_NPM_URL) && line.contains(OPENCODE_RELEASES_URL),
             "disclosure must name both opencode vendor-watch probe URLs"
         );
+        // Review c176f5f2 F2: the live-channel path makes a FOURTH touch
+        // (the bounded version read repeats the opencode npm URL once
+        // the registry answers), so the count pins at "three or four" —
+        // the same count PRIVACY.md states. A bare "plus three HTTPS"
+        // undercount fails here.
+        assert!(
+            line.contains("three or four HTTPS metadata requests"),
+            "disclosure must count the conditional fourth touch"
+        );
+        assert!(
+            !line.contains("plus three HTTPS"),
+            "disclosure must not under-count the --fetch HTTPS requests"
+        );
         assert!(
             !line.contains("one HTTPS request"),
             "disclosure must not under-count the --fetch HTTPS requests"
@@ -1789,5 +2042,39 @@ mod tests {
             hostile_line.contains("https://evil.example"),
             "printable URL text survives the sanitizer"
         );
+    }
+
+    #[test]
+    fn opencode_npm_probe_curl_args_are_pinned() {
+        // rm-052 read-only bounding shape, anchored on the live
+        // `opencode-ai` /latest document the cycle-6 vendor-channel
+        // truth batch repointed the watch to. Review c176f5f2 F4: full
+        // argv pin in the sibling convention
+        // (`rm052_curl_probe_args_are_time_and_byte_bounded`,
+        // `opencode_releases_probe_args_are_time_and_byte_bounded`) —
+        // length, every flag, the byte ceiling as the 262144 literal
+        // (not the const under test), and the URL literal in last
+        // position, so dropping a bounding flag fails here instead of
+        // shipping.
+        let args = npm_registry_curl_args_at(OPENCODE_NPM_URL);
+        assert_eq!(
+            args,
+            vec![
+                "-fsSL".to_string(),
+                "--max-time".to_string(),
+                "15".to_string(),
+                "--max-filesize".to_string(),
+                "262144".to_string(),
+                "https://registry.npmjs.org/opencode-ai/latest".to_string(),
+            ]
+        );
+        assert_eq!(args.len(), 6);
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://registry.npmjs.org/opencode-ai/latest")
+        );
+        assert!(!args.iter().any(|a| a.contains("config")));
+        assert!(!args.iter().any(|a| a.contains("user")));
+        assert!(!args.iter().any(|a| a.contains("token")));
     }
 }

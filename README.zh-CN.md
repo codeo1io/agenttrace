@@ -73,19 +73,19 @@ agenttrace
 macOS 和 Linux：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.sh | sh
 ```
 
 Windows PowerShell：
 
 ```powershell
-irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.ps1 | iex
 ```
 
 Windows CMD：
 
 ```bat
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
+curl -fsSL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
 安装脚本会下载对应平台的发布版程序，并在安装前按发布的校验和验证
@@ -105,13 +105,13 @@ SHA-256。脚本从不修改你的 shell 配置文件——只会打印加入 PA
 | `AGENTTRACE_DOWNLOAD_URL` | 完全覆盖二进制下载地址（离线 CI 测试用）。 |
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh \
+curl -fsSL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.sh \
   | AGENTTRACE_VERSION=v0.10.1 sh
 ```
 
 ```powershell
 $env:AGENTTRACE_VERSION = "v0.10.1"
-irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.ps1 | iex
 ```
 
 包管理器：
@@ -124,7 +124,7 @@ brew install luoyuctl/tap/agenttrace
 npm install -g @zack78/agenttrace
 
 # 从源码安装
-cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
+cargo install --git https://github.com/codeo1io/agenttrace agenttrace
 ```
 
 可用 `agenttrace --version` 检查实际版本。
@@ -135,7 +135,7 @@ cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
 | --- | --- |
 | Homebrew | `brew upgrade luoyuctl/tap/agenttrace` |
 | npm | `npm install -g @zack78/agenttrace@latest` |
-| cargo | `cargo install --git https://github.com/luoyuctl/agenttrace agenttrace --force` |
+| cargo | `cargo install --git https://github.com/codeo1io/agenttrace agenttrace --force` |
 
 
 预编译二进制与当前主机不兼容时（例如基于更新版本 libc 构建）不会
