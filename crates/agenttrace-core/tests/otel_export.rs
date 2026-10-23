@@ -148,9 +148,14 @@ fn otel_export_shape_and_genai_attributes() {
         50
     );
 
-    // rm-599: the Recommended cache/reasoning subset counters of the
-    // GenAI token-metrics set — cache buckets always emit (honest
-    // zeros), reasoning only when the session recorded any.
+    // rm-599 subset counters, as clarified at the 2026-10-21 pin
+    // (rm-493, commit 9ffc7e00c639): the optional token-breakdown
+    // attributes are recommended only when available and NON-ZERO
+    // (#548) — claude (40/20) and workbuddy (100) emit theirs, codex
+    // (all-zero buckets) omits both, and reasoning only emits when
+    // the session recorded any. The always-on honest-zero disclosure
+    // for cache buckets lives on the agenttrace.session.* mirror
+    // attributes below.
     assert_eq!(
         attr(claude_span, "gen_ai.usage.cache_read.input_tokens")["intValue"],
         40
@@ -163,13 +168,13 @@ fn otel_export_shape_and_genai_attributes() {
         attr(claude_span, "gen_ai.usage.reasoning.output_tokens")["intValue"],
         12
     );
-    assert_eq!(
-        attr(codex_span, "gen_ai.usage.cache_read.input_tokens")["intValue"],
-        0
+    assert!(
+        opt_attr(codex_span, "gen_ai.usage.cache_read.input_tokens").is_none(),
+        "zero cache_read bucket must be omitted (#548, snapshot 2026-10-21)"
     );
-    assert_eq!(
-        attr(codex_span, "gen_ai.usage.cache_write.input_tokens")["intValue"],
-        0
+    assert!(
+        opt_attr(codex_span, "gen_ai.usage.cache_write.input_tokens").is_none(),
+        "zero cache_write bucket must be omitted (#548, snapshot 2026-10-21)"
     );
     assert!(
         opt_attr(codex_span, "gen_ai.usage.reasoning.output_tokens").is_none(),
@@ -270,6 +275,75 @@ fn otel_export_shape_and_genai_attributes() {
         attr(claude_span, "agenttrace.export.semconv_snapshot_date")["stringValue"],
         SEMCONV_SNAPSHOT_DATE
     );
+}
+
+#[test]
+fn genai_attribute_name_set_matches_the_2026_10_21_pin() {
+    // rm-493: pin the EXACT gen_ai.* attribute names this export may
+    // emit at snapshot 2026-10-21 (semantic-conventions-genai commit
+    // 9ffc7e00c639). A rename, a stray addition, or a zero bucket
+    // leaking back in fails here before it reaches a consumer. The
+    // claude fixture records every bucket non-zero (full set); the
+    // codex fixture records none of the optional ones (base set).
+    let a = write_session("claude-a.jsonl", CLAUDE_BODY);
+    let b = write_session("codex-b.jsonl", CODEX_BODY);
+    let sessions = vec![parse_file(&a).unwrap(), parse_file(&b).unwrap()];
+    let doc: serde_json::Value = serde_json::from_str(&report_otel_export(&sessions)).unwrap();
+    let spans = doc["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+
+    let base = [
+        "gen_ai.system",
+        "gen_ai.request.model",
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.output_tokens",
+    ];
+    let breakdown = [
+        "gen_ai.usage.cache_read.input_tokens",
+        "gen_ai.usage.cache_write.input_tokens",
+        "gen_ai.usage.reasoning.output_tokens",
+    ];
+    let names = |span: &serde_json::Value| {
+        span["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|kv| kv["key"].as_str().unwrap().starts_with("gen_ai."))
+            .map(|kv| kv["key"].as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    let claude = &spans[0];
+    let codex = &spans[1];
+    let expected_full: std::collections::BTreeSet<String> = base
+        .iter()
+        .chain(breakdown.iter())
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        names(claude),
+        expected_full,
+        "all-buckets session emits the full pinned set"
+    );
+
+    let expected_base: std::collections::BTreeSet<String> =
+        base.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        names(codex),
+        expected_base,
+        "zero buckets are omitted (#548)"
+    );
+
+    // No unknown gen_ai.* name ever rides a span.
+    for span in [claude, codex] {
+        for name in names(span) {
+            assert!(
+                base.contains(&name.as_str()) || breakdown.contains(&name.as_str()),
+                "unpinned gen_ai.* attribute on the wire: {name}"
+            );
+        }
+    }
 }
 
 #[test]

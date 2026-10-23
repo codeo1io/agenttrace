@@ -518,6 +518,34 @@ mod rm451_info_doc_cap_tests {
     }
 
     #[test]
+    fn probe_accepts_a_doc_exactly_at_the_cap() {
+        // rm-548 hardening half: the cap boundary is inclusive — a doc
+        // of exactly OPENCODE_INFO_DOC_READ_CAP_BYTES bytes is admitted.
+        // The bounded take(cap + 1) read keeps the admission
+        // allocation-bounded even when a file grows between stat and
+        // read (the metadata-lie guard discipline of 1f153416); the
+        // over-cap neighbor test above pins the reject side.
+        let dir = temp_dir_unique("probe-cap-edge");
+        let info = dir.join("storage").join("session").join("info");
+        fs::create_dir_all(&info).expect("info dir");
+        let doc = info.join("ses-fork.json");
+        let cap = super::OPENCODE_INFO_DOC_READ_CAP_BYTES as usize;
+        let mut body =
+            String::from("{\"id\":\"ses-fork\",\"parentID\":\"ses-parent\",\"padding\":\"");
+        let fixed = body.len() + "\"}".len();
+        body.push_str(&"x".repeat(cap - fixed));
+        body.push_str("\"}");
+        assert_eq!(body.len(), cap, "fixture must be exactly at the bound");
+        fs::write(&doc, body).expect("write edge doc");
+        assert_eq!(
+            opencode_session_fork_parent(&doc),
+            Some("ses-parent".to_string()),
+            "at-cap doc must still read and yield the fork verdict"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn probe_still_reads_normal_doc() {
         let dir = temp_dir_unique("probe-ok");
         let info = dir.join("storage").join("session").join("info");
@@ -1293,18 +1321,33 @@ pub(crate) fn opencode_session_fork_parent(path: &Path) -> Option<String> {
     if !file_is_json || !path_is_session_info {
         return None;
     }
-    // rm-451: info docs are tiny metadata records. A doc larger than the
-    // bound is anomalous (a planted or foreign file the rm-212 file-kind
-    // gates admit by design) — never materialize it; skip the read and
-    // let the caller disclose the skip.
+    // rm-451 + rm-548 hardening half: info docs are tiny metadata
+    // records. A doc larger than the bound is anomalous (a planted or
+    // foreign file the rm-212 file-kind gates admit by design) — never
+    // materialize it; skip the read and let the caller disclose the
+    // skip. The stat is only an early-out for honest files: the read
+    // itself is bounded by `take(cap + 1)` and re-checked after,
+    // mirroring the `content_signature` metadata-lie guard (1f153416)
+    // so a doc that GROWS between stat and read still cannot allocate
+    // past one byte over the cap.
+    use std::io::Read;
+    let cap = OPENCODE_INFO_DOC_READ_CAP_BYTES;
     if fs::metadata(path)
         .map(|meta| meta.len())
         .unwrap_or(u64::MAX)
-        > OPENCODE_INFO_DOC_READ_CAP_BYTES
+        > cap
     {
         return None;
     }
-    let raw = fs::read_to_string(path).ok()?;
+    let mut raw = String::new();
+    fs::File::open(path)
+        .ok()?
+        .take(cap.saturating_add(1))
+        .read_to_string(&mut raw)
+        .ok()?;
+    if raw.len() as u64 > cap {
+        return None;
+    }
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value
         .get("parentID")?

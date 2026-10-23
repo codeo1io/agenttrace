@@ -3638,6 +3638,10 @@ fn lossless_key_from_bytes(bytes: &[u8]) -> String {
 /// malformed escape — only reachable through hand-edited journals)
 /// fails safe: the key is returned as-is rather than guessed at.
 fn path_from_key(key: &str) -> PathBuf {
+    // `encoded` is consumed by the unix arm only; the verbatim
+    // fallback below needs just the key. Keep the binding ungated for
+    // clarity and silence the windows cross-check instead.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let Some(encoded) = key.strip_prefix(LOSSLESS_KEY_PREFIX) else {
         return PathBuf::from(key);
     };
