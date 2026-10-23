@@ -19,7 +19,7 @@ contract (enforced in code, and pinned by
 
 - **Read-only.** The tools report on the locally discovered sessions;
   they never edit, delete, or send them anywhere. There is no second
-  renderer — both tools render through the same discovery and pricing
+  renderer — all five tools render through the same discovery and pricing
   stack as `agenttrace --overview`, and the mcp lane resolves the SAME
   layered configuration the CLI does (user/project `config.toml`,
   `--config`, `--pricing-file`, `--history-dir`): a pricing override
@@ -76,7 +76,7 @@ error naming the cap, and the messages after it still answer.
 | `server/discover` | the 2026-07-28 revision's one mandatory server RPC, stateless — `supportedVersions`, `capabilities.tools` (`listChanged: false`), the cache-hint pair (`ttlMs`/`cacheScope: public`) the revision's cacheable-result rule requires, and the reserved `_meta` server-info key; `resultType` rides the central seam like every result (rm-455) |
 | `notifications/initialized` | silence (notifications are never answered) |
 | `ping` | `{}` |
-| `tools/list` | the two tools below |
+| `tools/list` | the five tools below |
 | `tools/call` | tool result or `isError` result |
 
 JSON-RPC batching is rejected (`-32600`), matching the current MCP
@@ -157,6 +157,47 @@ Smaller answer, same discovery and pricing path.
 | --- | --- | --- | --- |
 | `range` | string | `today`, `day`, `1d`, `7d`, `week`, `weekly`, `30d`, `month`, `monthly`, `all`, `""` | `all` |
 
+### `session_list`
+
+The session listing — the same JSON `agenttrace --sessions -f json`
+renders over the same discovered corpus: matched/returned counts,
+truncation disclosure, and one row per session in the CLI's default
+`--sort recent --order desc` order.
+
+| Parameter | Type | Values | Default |
+| --- | --- | --- | --- |
+| `range` | string | `today`, `day`, `1d`, `7d`, `week`, `weekly`, `30d`, `month`, `monthly`, `all`, `""` | `all` |
+| `limit` | integer | `1` and up | `20` |
+
+`limit` mirrors the `--limit` default of `agenttrace --sessions`; the
+document discloses `truncated` and `matched_sessions`, so a capped
+listing cannot be mistaken for the whole corpus.
+
+### `session_detail`
+
+One session's full diagnostics — the same JSON `agenttrace --inspect
+<rank> -f json` renders for that rank: the session object, pricing
+basis, cost anomaly alert, and fix suggestions.
+
+| Parameter | Type | Values | Default |
+| --- | --- | --- | --- |
+| `rank` | integer | `1` and up — **required** | (none) |
+| `range` | string | `today`, `day`, `1d`, `7d`, `week`, `weekly`, `30d`, `month`, `monthly`, `all`, `""` | `all` |
+
+`rank` is the 1-based position in `session_list`'s order (the CLI
+`--sessions` order); 1 is the most recent session. A rank outside the
+window's session count is an `isError` tool result naming the valid
+range — the twin of the CLI's rc1 bail, not a protocol error.
+
+### `doctor_verdict`
+
+The corpus doctor's verdict — the same JSON the `agenttrace --doctor
+-f json` CLI action renders: agent version, mode, session cache
+census, finding categories. It takes **no arguments**: an `arguments`
+object carrying any member is `-32602` naming the unexpected keys,
+and an absent or empty one scans the same auto-discovered homes
+`--doctor` does.
+
 ## A tool call, end to end
 
 `initialize` and the `initialized` notification, then a report:
@@ -197,7 +238,7 @@ These are unrelated and easy to confuse:
 ## Verification
 
 The end-to-end wire contract (handshake and protocol-version
-negotiation, both tools, every error arm including hostile wire
+negotiation, all five tools, every error arm including hostile wire
 lines — non-UTF-8, over-cap, bad ids, non-object params/arguments —
 the empty-corpus and filter-miss `isError` paths, the honored/refused
 flag contract before the keyword, `-d` scoping and admission, and

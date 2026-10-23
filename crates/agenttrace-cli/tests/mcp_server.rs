@@ -204,7 +204,7 @@ fn handshake_tools_and_report_rendering() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect();
-    // rm-455 arm 1 (run e9eb92e2 cycle 6): the catalog grew to five —
+    // rm-455 arm 1 (run e9eb92e2 cycle 2): the catalog grew to five —
     // session_list, session_detail, and doctor_verdict close the row's
     // open acceptance (the docs always promised session list/detail and
     // a doctor verdict). Order pins the docs' Tools section order.
@@ -1071,15 +1071,24 @@ fn range_alias_schema_matches_the_enforced_parser() {
         .as_array()
         .expect("tools array")
         .iter()
+        // rm-455 arm 1 (run e9eb92e2 cycle 2): `doctor_verdict` takes no
+        // arguments at all, so it publishes no `range` property — the
+        // enforced-set invariant binds every tool that DOES take a range.
+        .filter(|tool| !tool["inputSchema"]["properties"]["range"].is_null())
         .map(|tool| tool["inputSchema"]["properties"]["range"]["enum"].clone())
         .collect();
+    assert_eq!(
+        4,
+        enums.len(),
+        "exactly the four range-taking tools bind the enforced-set invariant"
+    );
     for published in enums {
         assert_eq!(
             serde_json::json!([
                 "today", "day", "1d", "7d", "week", "weekly", "30d", "month", "monthly", "all", ""
             ]),
             published,
-            "every tool publishes the full enforced set"
+            "every range-taking tool publishes the full enforced set"
         );
     }
     for response in &responses[1..] {
@@ -1556,7 +1565,21 @@ fn tools_list_carries_2026_07_28_cache_hints() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect();
-    assert_eq!(names, vec!["usage_overview", "by_model_breakdown"]);
+    // rm-455 arm 1 (run e9eb92e2 cycle 2): the catalog grew to five —
+    // session_list, session_detail, and doctor_verdict close the row's
+    // open tool-scope acceptance. The cache-hint contract is over the
+    // tools/list RESULT (listChanged: false + the hint pair) and holds
+    // for any catalog size.
+    assert_eq!(
+        names,
+        vec![
+            "usage_overview",
+            "by_model_breakdown",
+            "session_list",
+            "session_detail",
+            "doctor_verdict"
+        ]
+    );
 
     // tools/call is NOT one of the revision's cacheable operations —
     // caching hints there would tell a host to cache a per-corpus
@@ -1602,17 +1625,14 @@ fn tools_list_carries_2026_07_28_cache_hints() {
 
 #[test]
 fn tools_catalog_pins_the_three_new_tool_schemas() {
-    // rm-455 arm 1 (run e9eb92e2 cycle 6): the schemas must not
+    // rm-455 arm 1 (run e9eb92e2 cycle 2): the schemas must not
     // under-declare what the dispatch enforces (rm-782 lesson) —
     // session_list's `limit` mirrors --limit (integer, minimum 1,
     // default 20), session_detail's `rank` is required (integer,
     // minimum 1, the row's 1-based position in session_list's
     // order), and doctor_verdict takes no arguments.
     let (home, cache) = seed_home("new-schemas", true);
-    let requests = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-        "\n",
-    );
+    let requests = concat!(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, "\n",);
     let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
     assert_eq!(Some(0), code);
     let tools = &responses[0]["result"]["tools"];
@@ -1630,9 +1650,14 @@ fn tools_catalog_pins_the_three_new_tool_schemas() {
     let limit = &session_list["inputSchema"]["properties"]["limit"];
     assert_eq!(Some("integer"), limit["type"].as_str());
     assert_eq!(1, limit["minimum"].as_i64().expect("minimum 1"));
-    assert_eq!(20, limit["default"].as_i64().expect("default mirrors --limit"));
     assert_eq!(
-        serde_json::json!(["today", "day", "1d", "7d", "week", "weekly", "30d", "month", "monthly", "all", ""]),
+        20,
+        limit["default"].as_i64().expect("default mirrors --limit")
+    );
+    assert_eq!(
+        serde_json::json!([
+            "today", "day", "1d", "7d", "week", "weekly", "30d", "month", "monthly", "all", ""
+        ]),
         session_list["inputSchema"]["properties"]["range"]["enum"],
         "session_list publishes the same range labels as the other tools"
     );
@@ -1664,7 +1689,7 @@ fn tools_catalog_pins_the_three_new_tool_schemas() {
 
 #[test]
 fn session_tools_render_the_cli_documents() {
-    // rm-455 arm 1 (run e9eb92e2 cycle 6): the three new tools render
+    // rm-455 arm 1 (run e9eb92e2 cycle 2): the three new tools render
     // through the CLI's own renderers — one truth, pinned by byte
     // parity with the CLI lanes on the same seeded home:
     // session_list is the `--sessions -f json` document, session_detail
@@ -1684,9 +1709,8 @@ fn session_tools_render_the_cli_documents() {
     assert_eq!(Some(0), code);
     assert_eq!(3, responses.len());
     for response in &responses {
-        assert_eq!(
-            false,
-            response["result"]["isError"].as_bool().unwrap_or(true),
+        assert!(
+            !response["result"]["isError"].as_bool().unwrap_or(true),
             "every new tool reports on the seeded fixture: {response}"
         );
     }
@@ -1698,13 +1722,9 @@ fn session_tools_render_the_cli_documents() {
         "the seeded fixture holds one session"
     );
     assert_eq!(1, listing["returned_sessions"]);
+    assert!(!listing["truncated"].as_bool().expect("truncated is a bool"));
     assert_eq!(
-        false,
-        listing["truncated"].as_bool().expect("truncated is a bool")
-    );
-    assert_eq!(
-        20,
-        listing["limit"],
+        20, listing["limit"],
         "the limit default mirrors the CLI --limit default"
     );
     let listed_name = listing["sessions"][0]["name"]
@@ -1751,7 +1771,13 @@ fn session_tools_render_the_cli_documents() {
         payload(1),
         "session_detail payload is byte-identical to `agenttrace --inspect 1 -f json`"
     );
-    let (_, doctor_json, _) = cli_run(&home, &cache, &["doctor", "-f", "json"]);
+    // The CLI lane is the `--doctor` FLAG — bare `doctor` parses as a
+    // session path and bails rc1 (the rm-1506 mode-word remediation) —
+    // and both lanes scan the same HOME-rooted auto-discovered homes
+    // (the server runs without `-d`), so this is the one-document
+    // parity claim the tool's description makes.
+    let (doctor_code, doctor_json, _) = cli_run(&home, &cache, &["--doctor", "-f", "json"]);
+    assert_eq!(Some(0), doctor_code, "the --doctor CLI lane must succeed");
     assert_eq!(
         doctor_json.trim(),
         payload(2),
@@ -1808,7 +1834,11 @@ fn session_tool_argument_discipline_answers_32602() {
         "the message says rank is required: {msg1}"
     );
     let (code2, msg2) = error_of(2);
-    assert_eq!(Some(-32602), code2, "a string rank is a usage error: {msg2}");
+    assert_eq!(
+        Some(-32602),
+        code2,
+        "a string rank is a usage error: {msg2}"
+    );
     assert!(
         msg2.contains("a string"),
         "the message names the JSON type sent: {msg2}"
@@ -1820,7 +1850,11 @@ fn session_tool_argument_discipline_answers_32602() {
         "the message names the argument and its floor: {msg3}"
     );
     let (code4, msg4) = error_of(4);
-    assert_eq!(Some(-32602), code4, "a string limit is a usage error: {msg4}");
+    assert_eq!(
+        Some(-32602),
+        code4,
+        "a string limit is a usage error: {msg4}"
+    );
     assert!(
         msg4.contains("a string"),
         "the message names the JSON type sent: {msg4}"
@@ -1843,7 +1877,7 @@ fn session_tool_argument_discipline_answers_32602() {
 
 #[test]
 fn legacy_protocol_versions_negotiate_to_themselves() {
-    // rm-455 arm 2 (run e9eb92e2 cycle 6): the revision ladder grows
+    // rm-455 arm 2 (run e9eb92e2 cycle 2): the revision ladder grows
     // two older published revisions — 2025-03-26 and 2024-11-05 — so
     // legacy hosts (the ones the rm-780 absent-version fallback
     // serves) can negotiate their own dialect instead of being
@@ -1885,7 +1919,11 @@ fn legacy_protocol_versions_negotiate_to_themselves() {
     );
     assert_eq!(
         serde_json::json!([
-            "2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"
+            "2026-07-28",
+            "2025-11-25",
+            "2025-06-18",
+            "2025-03-26",
+            "2024-11-05"
         ]),
         responses[3]["error"]["data"]["supported"],
         "the recovery list is the full newest-first ladder"

@@ -4,6 +4,50 @@
 
 ### Added
 
+- The MCP server closes rm-455's open tool-scope acceptance (run
+  e9eb92e2 cycle 2): the guide had promised a session list, a session
+  detail, and a doctor verdict since its first cut while the server
+  exposed exactly two report tools. `tools/list` now answers five,
+  each rendering through the CLI's own lane functions
+  (`sessions_listing_json`/`session_detail_json`/`doctor_report_json`)
+  so the MCP answer and the CLI document stay one truth:
+  `session_list` — the `--sessions -f json` document (matched/returned
+  counts, truncation disclosure, the default `--sort recent --order
+  desc` order) with an optional `limit` argument (integer ≥ 1,
+  default 20 = the CLI `--limit` default, so a capped listing cannot
+  masquerade as the whole corpus); `session_detail` — one session's
+  `--inspect <rank> -f json` diagnostics (session object, pricing
+  basis, cost anomaly alert, fix suggestions), `rank` REQUIRED as
+  the 1-based position in `session_list`'s order, a rank outside the
+  window an `isError` result; `doctor_verdict` — the `--doctor -f
+  json` verdict (agent version, mode, session-cache census, finding
+  categories), zero arguments, any member answered `-32602` naming
+  it per the schema's `additionalProperties: false` discipline. The
+  empty/window-filtered corpus keeps the rm-781 arms (discovery miss
+  vs filter miss, `isError`, server keeps serving). The version
+  ladder also gains a legacy floor (same batch, arm 2): clients
+  pinned to `2025-03-26` (the revision that introduced `_meta` and
+  JSON-RPC 2.0 framing) or `2024-11-05` (the original revision) are
+  answered with the version THEY declared instead of being negotiated
+  down to the typed `-32022` while the server could have served their
+  dialect verbatim; anything older stays `-32022`. And session-cache
+  loading stops pretending a failed quarantine rename succeeded
+  (arm 3): `let _ = fs::rename` plus the unconditional "quarantined
+  as" line became a matched rename whose failure is disclosed
+  verbatim — the io error, the blocked quarantine name, and what
+  happens next (the corrupt original stays in place and the next
+  history write will replace it, so the bytes must be copied now if
+  they matter); the generation stack also only skips names occupied
+  by files, so a directory planted at a quarantine name can no
+  longer turn a rename failure into a claimed success, and an
+  unreadable history still yields an empty derived map so the rest
+  of the run is unaffected either way. Pinned by
+  `session_tools_render_the_cli_documents`,
+  `session_tool_argument_discipline_answers_32602`,
+  `legacy_protocol_versions_negotiate_to_themselves`, and
+  `quarantine_rename_failure_is_disclosed_not_lied_about`;
+  `scripts/ci/check-docs-commands.sh` re-pins the five-tool catalog
+  and `docs/guides/mcp-server.md` documents the three new tools.
 - The MCP server speaks the 2026-07-28 revision's wire truth
   end to end (rm-455, run f62ee197 cycle 4): `server/discover` — the
   revision's ONE mandatory server RPC, whose schema description reads

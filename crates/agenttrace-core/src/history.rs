@@ -143,7 +143,7 @@ fn records_from_bytes(path: &Path, raw: &[u8]) -> BTreeMap<String, DerivedSessio
             // `<name>.json.corrupt`, `.corrupt.1`, `.corrupt.2`, ...;
             // the bound only guards a pathological directory (the
             // last slot is reused rather than looping forever).
-            // rm-455 arm 3 (run e9eb92e2 cycle 6): the stack only
+            // rm-455 arm 3 (run e9eb92e2 cycle 2): the stack only
             // advances over names a rename could actually clobber —
             // an existing FILE. A directory (or any other blocker) at
             // a candidate name can never be renamed onto (EISDIR),
@@ -156,7 +156,7 @@ fn records_from_bytes(path: &Path, raw: &[u8]) -> BTreeMap<String, DerivedSessio
                 generation += 1;
                 quarantine = path.with_extension(format!("json.corrupt.{generation}"));
             }
-            // rm-455 arm 3 (run e9eb92e2 cycle 6): the pre-fix code
+            // rm-455 arm 3 (run e9eb92e2 cycle 2): the pre-fix code
             // printed "quarantined as <name>" UNCONDITIONALLY — a
             // failed rename (a directory planted at the quarantine
             // name, a read-only parent, EBUSY) told the operator a
@@ -186,7 +186,7 @@ fn quarantine_success_message(path: &Path, quarantine: &Path) -> String {
 }
 
 /// The honest quarantine disclosure for a rename that FAILED (rm-455
-/// arm 3, run e9eb92e2 cycle 6): the io error rides verbatim, the
+/// arm 3, run e9eb92e2 cycle 2): the io error rides verbatim, the
 /// blocked quarantine name is stated, and the operator is told what
 /// happens next — the corrupt original stays in place and the next
 /// history write will replace it, so the bytes must be copied NOW if
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn quarantine_rename_failure_is_disclosed_not_lied_about() {
-        // rm-455 arm 3 (run e9eb92e2 cycle 6): the pre-fix code printed
+        // rm-455 arm 3 (run e9eb92e2 cycle 2): the pre-fix code printed
         // "quarantined as <name>" UNCONDITIONALLY — when the rename
         // failed (a directory planted at the quarantine name, a
         // read-only parent, EBUSY), the operator was told a forensic
@@ -933,8 +933,7 @@ mod tests {
 
         // And the honest paths stay honest: with the blocker removed,
         // the rename succeeds and the corrupt file moves away.
-        std::fs::remove_dir_all(root.join("history.json.corrupt"))
-            .expect("unblock quarantine");
+        std::fs::remove_dir_all(root.join("history.json.corrupt")).expect("unblock quarantine");
         let records = records_from_bytes(&history, corrupt);
         assert!(records.is_empty());
         assert!(

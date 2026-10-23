@@ -1480,7 +1480,7 @@ fn dispatch_sanitize(format: &str, out: String) -> String {
     }
 }
 
-// rm-455 arm 1 (run e9eb92e2 cycle 6): render bridge for the MCP
+// rm-455 arm 1 (run e9eb92e2 cycle 2): render bridge for the MCP
 // `session_list` tool. The tool loads its own corpus
 // (`agenttrace::mcp::load_for_range`, the same loader the CLI report
 // actions use) and hands the sessions here so the CLI's empty-corpus
@@ -1498,7 +1498,7 @@ pub(crate) fn sessions_listing_json(
     render_session_list(&sessions, "json", limit)
 }
 
-// rm-455 arm 1 (run e9eb92e2 cycle 6): render bridge for the MCP
+// rm-455 arm 1 (run e9eb92e2 cycle 2): render bridge for the MCP
 // `session_detail` tool — `agenttrace --inspect <rank> -f json`'s own
 // document for a 1-based rank into the default view's order. The
 // out-of-range wording is the CLI lane's own (the `--inspect` bail
@@ -1517,8 +1517,8 @@ pub(crate) fn session_detail_json(sessions: Vec<Session>, rank: usize) -> anyhow
     render_diagnostics(&sessions[rank - 1], &sessions, "json", ReportLanguage::En)
 }
 
-// rm-455 arm 1 (run e9eb92e2 cycle 6): render bridge for the MCP
-// `doctor_verdict` tool — `agenttrace doctor -f json`'s own document
+// rm-455 arm 1 (run e9eb92e2 cycle 2): render bridge for the MCP
+// `doctor_verdict` tool — `agenttrace --doctor -f json`'s own document
 // (`build_doctor_report` over the same auto-discovered corpus;
 // `demo: false`, the MCP server never fabricates a corpus). The tool
 // escapes via its own `tool_text_result` seam; the CLI's stdout is
@@ -1528,7 +1528,7 @@ pub(crate) fn doctor_report_json(root: Option<&Path>) -> anyhow::Result<String> 
     serde_json::to_string_pretty(&build_doctor_report(root, false)).map_err(Into::into)
 }
 
-// rm-455 arm 1 (run e9eb92e2 cycle 6): the CLI's DEFAULT view — the
+// rm-455 arm 1 (run e9eb92e2 cycle 2): the CLI's DEFAULT view — the
 // filters and ordering `--sessions`/`--inspect` run with when the
 // operator passes none. Built by parsing the CLI with no arguments
 // so the default view can never drift from the clap definitions it

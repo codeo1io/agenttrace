@@ -238,5 +238,5 @@ grep -q 'agenttrace mcp' "$out_dir/docs/mcp-help.txt" \
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
   | "$bin" mcp >"$out_dir/docs/mcp-tools.json"
-node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const names=r.result.tools.map(t=>t.name).sort(); if (names.join(",") !== "by_model_breakdown,usage_overview") { console.error("unexpected tools: " + names); process.exit(1); }' "$out_dir/docs/mcp-tools.json" \
-  || fail "the mcp server must expose exactly usage_overview and by_model_breakdown"
+node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const names=r.result.tools.map(t=>t.name).sort(); if (names.join(",") !== "by_model_breakdown,doctor_verdict,session_detail,session_list,usage_overview") { console.error("unexpected tools: " + names); process.exit(1); }' "$out_dir/docs/mcp-tools.json" \
+  || fail "the mcp server must expose exactly the five rm-455 tools: usage_overview, by_model_breakdown, session_list, session_detail, doctor_verdict"

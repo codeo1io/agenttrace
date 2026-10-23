@@ -124,7 +124,7 @@ const META_SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 /// for unknown/absent client versions. The ladder mirrored the
 /// official revision list (modelcontextprotocol repository tags,
 /// fetched live 2026-10-08) down to `2025-06-18`; rm-455 arm 2 (run
-/// e9eb92e2 cycle 6) deliberately FLOORS the ladder at the two
+/// e9eb92e2 cycle 2) deliberately FLOORS the ladder at the two
 /// legacy revisions older hosts actually declare (`2025-03-26`, the
 /// spec revision that introduced `_meta` and jsonrpc 2.0 framing, and
 /// `2024-11-05`, the original revision) — a legacy host that
@@ -195,7 +195,7 @@ const RECENT_SESSIONS_LIMIT: usize = 10;
 
 /// `session_list`'s display limit when the host sends none — the
 /// CLI's `--sessions` `--limit` default (rm-455 arm 1, run e9eb92e2
-/// cycle 6). Mirrored, not shared: the CLI default lives in the
+/// cycle 2). Mirrored, not shared: the CLI default lives in the
 /// clap attributes on `Args::limit`; the pin
 /// `session_tools_render_the_cli_documents` and the published
 /// `inputSchema` `default` keep the two honest against each other.
@@ -696,7 +696,7 @@ fn discover_result() -> Value {
 /// `resultType` is added centrally by [`with_result_type`] (it is
 /// required on all results, not just this one).
 fn tools_list_result() -> Value {
-    // rm-455 arm 1 (run e9eb92e2 cycle 6): the shared `range` property
+    // rm-455 arm 1 (run e9eb92e2 cycle 2): the shared `range` property
     // is factored out so the three new tools publish the EXACT enum +
     // description the two report tools do — schema drift between
     // tools was rm-782's original bug class.
@@ -742,7 +742,7 @@ fn tools_list_result() -> Value {
     Read-only; no network.",
                 "inputSchema": range_schema()
             },
-            // rm-455 arm 1 (run e9eb92e2 cycle 6): the tool-scope
+            // rm-455 arm 1 (run e9eb92e2 cycle 2): the tool-scope
             // acceptance — the docs had promised session list/detail and
             // a doctor verdict since the guide's first cut; the server
             // shipped two report tools and grep'd zero of the three.
@@ -800,9 +800,9 @@ fn tools_list_result() -> Value {
             {
                 "name": "doctor_verdict",
                 "description": "The corpus doctor's verdict — the same JSON \
-    the `agenttrace doctor -f json` CLI action renders (agent version, \
+    the `agenttrace --doctor -f json` CLI action renders (agent version, \
     mode, session cache census, finding categories). Takes no arguments; \
-    it scans the same auto-discovered homes `doctor` does. Read-only; \
+    it scans the same auto-discovered homes `--doctor` does. Read-only; \
     no network.",
                 "inputSchema": {
                     "type": "object",
@@ -883,7 +883,7 @@ fn call_tool(params: Value, root: Option<&Path>) -> Result<Value, (i64, String)>
     match name {
         "usage_overview" => usage_overview(root, range),
         "by_model_breakdown" => by_model_breakdown(root, range),
-        // rm-455 arm 1 (run e9eb92e2 cycle 6): the three tools the
+        // rm-455 arm 1 (run e9eb92e2 cycle 2): the three tools the
         // guide always promised. Each renders through the CLI's own
         // lane (crate::sessions_listing_json / session_detail_json /
         // doctor_report_json) so the MCP answer and the CLI document
@@ -929,7 +929,7 @@ fn call_tool(params: Value, root: Option<&Path>) -> Result<Value, (i64, String)>
                         "Invalid params: `doctor_verdict` takes no arguments \
                          (unexpected: {unexpected}) — remove every argument; the \
                          tool scans the same auto-discovered corpus \
-                         `agenttrace doctor` does"
+                         `agenttrace --doctor` does"
                     )));
                 }
             }
@@ -969,7 +969,7 @@ weekly, 30d, month, monthly, all)"
 }
 
 /// Parse `session_list`'s `limit` argument (rm-455 arm 1, run e9eb92e2
-/// cycle 6). Absent means the CLI's `--sessions` default
+/// cycle 2). Absent means the CLI's `--sessions` default
 /// ([`SESSIONS_LIMIT_DEFAULT`]); a non-integer or a value below 1 is
 /// `-32602` in the landed rm-840 wording (name the field, name what
 /// the host sent) — the CLI's rc2 usage-error twin, not an execution
@@ -995,7 +995,7 @@ fn parse_limit_argument(arguments: &Value) -> Result<usize, String> {
 }
 
 /// Parse `session_detail`'s required `rank` argument (rm-455 arm 1,
-/// run e9eb92e2 cycle 6). `rank` is REQUIRED — a rank-less detail
+/// run e9eb92e2 cycle 2). `rank` is REQUIRED — a rank-less detail
 /// call has no session to render — and must be an integer ≥ 1 (1 =
 /// the most recent session in the `--sessions` order). Out-of-window
 /// ranks are NOT a params error: a rank past the listing's end is an
@@ -1010,9 +1010,9 @@ fn parse_rank_argument(arguments: &Value) -> Result<usize, String> {
         ),
         Some(Value::Number(number)) => match number.as_i64() {
             Some(rank) if rank >= 1 => Ok(rank as usize),
-            Some(rank) => {
-                Err(format!("Invalid params: `rank` must be at least 1 (got {rank})"))
-            }
+            Some(rank) => Err(format!(
+                "Invalid params: `rank` must be at least 1 (got {rank})"
+            )),
             None => Err(format!(
                 "Invalid params: `rank` must be an integer (got {number})"
             )),
