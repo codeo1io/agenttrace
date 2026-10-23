@@ -1026,6 +1026,17 @@
 
 ### Fixed
 
+- governance `--delivery-evidence` writer-paths line now renders every
+  stored `summary_diffs` path through the shared disclosure cap (48
+  visible chars + `…#` + 12-hex digest once past 96 rendered chars,
+  rm-2312, run cd7c74de0501 cycle 1): the entry cap bounded HOW MANY
+  per-file paths rendered, not HOW BIG each one is — a single hostile
+  or corrupt 4096-char path amplified whole into the report line. The
+  whole line is now bounded by a constant regardless of payload byte
+  size; corpus paths under the cap render byte-identically, the
+  counts line keeps the writer's truthful totals, and the saturation
+  behavior is unchanged.
+
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch

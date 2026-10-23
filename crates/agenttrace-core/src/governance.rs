@@ -7,6 +7,11 @@ use crate::{
 // or tool name that begins with a spreadsheet formula introducer would paste
 // straight through. Guard at the source, like every other rm-985 text lane.
 use crate::reports::guard_formula_cell;
+// rm-2312: every writer-paths render segment passes the shared
+// disclosure choke point (48 visible chars + `…#` + 12-hex digest
+// once past 96) so a payload-controlled `summary_diffs` path can no
+// longer amplify report output byte-for-byte.
+use crate::parser::capped_disclosure_value;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1358,13 +1363,23 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
             // segments and elide the rest by count; the counts line
             // above still carries the true file total and the sums
             // saturate exactly as before.
+            //
+            // rm-2312: the entry cap bounds HOW MANY paths render,
+            // not HOW BIG each one is — one 4096-char `file` payload
+            // still amplified whole. Every segment now passes the
+            // shared render choke point (`capped_disclosure_value`:
+            // 96 rendered chars = 48 visible + `…#` + 12-hex FNV
+            // digest), so the whole line is bounded by a constant
+            // regardless of payload byte size; corpus paths under
+            // the cap render byte-identically (sanitize is
+            // idempotent and keys under the cap pass through).
             let mut path_segments: Vec<String> = diffs
                 .iter()
                 .take(WRITER_PATHS_EVIDENCE_CAP)
                 .map(|diff| {
                     format!(
                         "{} (+{}/-{})",
-                        diff.file.as_deref().unwrap_or("<unnamed>"),
+                        capped_disclosure_value(diff.file.as_deref().unwrap_or("<unnamed>")),
                         diff.additions,
                         diff.deletions
                     )

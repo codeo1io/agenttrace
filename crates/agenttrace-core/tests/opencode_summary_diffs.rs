@@ -25,6 +25,13 @@
 //! - `ses-diff-blob`    — the payload is present but stored in BLOB
 //!   storage class: counted as dropped, never silently absent.
 //!
+//! Fixture `opencode-summary-diffs/oversized.db` (rm-2312, run
+//! cd7c74de0501 cycle 1):
+//! - `ses-diff-oversized` — one 4096-char `file` path beside a normal
+//!   one: the delivery-evidence writer-paths line must render the
+//!   oversize through the shared cap discipline (48 visible + `…#` +
+//!   12-hex digest), never whole.
+//!
 //! The rm-991 contract (`opencode_agent_summary.rs`) stays the
 //! authority for the legacy column set; the fixtures there are
 //! untouched and must keep parsing byte-identically.
@@ -280,6 +287,64 @@ fn hostile_magnitudes_saturate_across_both_sums() {
         record.evidence.iter().any(|line| line
             == "writer-reported per-file diff summary: 2 files (+9223372036854775807/-2)"),
         "evidence sums must pin at i64::MAX: {:?}",
+        record.evidence
+    );
+}
+
+#[test]
+fn oversized_path_renders_capped_with_digest() {
+    // rm-2312: the entry cap bounds HOW MANY per-file paths the
+    // delivery-evidence line renders, but each stored `file` string
+    // is payload-controlled bytes of arbitrary length — one hostile
+    // or corrupt `summary_diffs` entry amplified whole into the
+    // report. Every rendered path now passes the shared render
+    // choke point (`capped_disclosure_value`: 96 rendered chars =
+    // 48 visible + `…#` + 12-hex digest), so the line is bounded by
+    // a constant regardless of payload byte size, while the counts
+    // line keeps the writer's truthful totals.
+    let sessions = loaded("opencode-summary-diffs/oversized.db");
+    let oversized = session_named(&sessions, "ses-diff-oversized");
+    assert_eq!(oversized.metrics.summary_diffs.as_ref().unwrap().len(), 2);
+    let report = delivery_evidence(&sessions);
+    let record = report
+        .sessions
+        .iter()
+        .find(|record| record.session.contains("oversized path"))
+        .expect("oversized record");
+    let paths_line = record
+        .evidence
+        .iter()
+        .find(|line| line.contains("writer-reported per-file paths:"))
+        .expect("writer-paths evidence line");
+    // 4096 payload chars must not survive into the render.
+    assert!(
+        !paths_line.contains(&"A".repeat(97)),
+        "oversized path rendered whole ({} chars)",
+        paths_line.len()
+    );
+    // The capped segment keeps a visible prefix plus the digest
+    // disclosure (rm-1571/rm-594 discipline).
+    assert!(
+        paths_line.contains(&format!("{}…#", "A".repeat(48))),
+        "48-visible prefix + digest marker missing: {paths_line:?}"
+    );
+    // A normal-length sibling segment still renders verbatim.
+    assert!(paths_line.contains("src/ok.rs (+2/-1)"));
+    // Hard constant bound: 32-char label + at most 20 segments of
+    // (96-char cap + ' (+{i64}/-{i64})' worst-case digits) + joins +
+    // the entry-elision tail — a payload of ANY size stays below it.
+    assert!(
+        paths_line.len() <= 3000,
+        "writer-paths line must be bounded by a constant: {}",
+        paths_line.len()
+    );
+    // The counts line stays the writer's truth, unamplified.
+    assert!(
+        record
+            .evidence
+            .iter()
+            .any(|line| line == "writer-reported per-file diff summary: 2 files (+3/-1)"),
+        "counts line missing or untruthful: {:?}",
         record.evidence
     );
 }
