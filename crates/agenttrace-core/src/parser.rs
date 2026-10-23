@@ -1575,6 +1575,12 @@ const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
     // bundled snapshot, so this stays an identity-only mapping like
     // its sibling.
     (1050, "gemini-3.1-flash-lite"),
+    // ccusage #1948 (2026-10-22) maps antigravity id 1402 to
+    // claude-opus-5-5 — same identity-only shape as its 1417/1050
+    // siblings: the bare key is already priced in the bundled
+    // snapshot (2026-10-08 bundle, input 4e-06), so the port is the
+    // table entry plus this comment, nothing else.
+    (1402, "claude-opus-5-5"),
 ];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
@@ -11236,6 +11242,53 @@ mod tests {
         assert!(
             session.metrics.cost_estimated > 0.0,
             "the bare gemini-3.1-flash-lite key is priced in the bundled snapshot"
+        );
+    }
+
+    #[test]
+    fn antigravity_numeric_1402_maps_to_opus_5_5() {
+        // rm-1533 (run e1fb8fc9 cycle 5, research 8f5e7497): ccusage
+        // #1948 (merged 2026-10-22) maps antigravity numeric
+        // modelConfigId 1402 to claude-opus-5-5 — the bare key is
+        // already priced in the bundled snapshot, so this stays an
+        // identity-only mapping like its 1417/1050 siblings and the
+        // spend prices instead of banking under a stringified "1402".
+        let raw = serde_json::json!({
+            "trajectoryId": "44444444-5555-6666-7777-888888888888",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-22T11:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Opus 5.5 generation.",
+                        "usageStats": {
+                            "inputTokens": 1000,
+                            "outputTokens": 500
+                        },
+                        "modelConfigId": 1402
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("numeric-1402", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "claude-opus-5-5",
+            "1402 maps through ANTIGRAVITY_NUMERIC_MODEL_MAP instead of stringifying"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+            "the mapped sighting still discloses its numeric origin"
+        );
+        assert!(
+            session.metrics.cost_estimated > 0.0,
+            "the bare claude-opus-5-5 key is priced in the bundled snapshot"
         );
     }
 

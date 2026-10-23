@@ -1,0 +1,3 @@
+{"type":"user","timestamp":"2026-10-19T10:00:00Z","message":{"role":"user","content":"plan the migration"}}
+{"type":"assistant","timestamp":"2026-10-19T10:00:05Z","message":{"id":"resp_3d2fbf9c8a1e4b7f9d0c","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"first pass"}],"usage":{"input_tokens":120,"output_tokens":40}}}
+{"type":"assistant","timestamp":"2026-10-19T10:00:07Z","message":{"id":"resp_3d2fbf9c8a1e4b7f9d0c","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"final pass"}],"usage":{"input_tokens":100,"output_tokens":90}}}

@@ -111,6 +111,46 @@
   1417 sibling and the spend prices instead of banking under a
   stringified "1050".
 
+- Antigravity numeric id 1402 maps to `claude-opus-5-5` (rm-1533
+  rider arm, run e1fb8fc9 cycle 5, research 8f5e7497): ccusage
+  #1948 (merged 2026-10-22) established the mapping for the numeric
+  model id Antigravity emits for opus-5-5 sessions; the target key is
+  priced in the bundled snapshot since 2026-10-08 (input $4e-06), so
+  the arm is identity-only like its 1417/1050 siblings and the spend
+  prices instead of banking under a stringified "1402". With this,
+  every antigravity numeric id observed in the wild — 1050, 1417,
+  1402 — maps through the table (and 1417's target `gemini-4-argon`
+  itself became priceable by the 2026-10-22 refresh below, closing
+  the last prices-as-None class on the antigravity lane).
+
+- The bundled LiteLLM snapshot refreshes 2026-10-17 → 2026-10-22
+  (rm-176 lane, run e1fb8fc9 cycle 5, research 8f5e7497; the run
+  landed onto a wall that had itself just refreshed to 10-17, so the
+  seed and the refresh both ran through the landing tree's script):
+  3,237 → 3,270 chat models, +33 new keys admitted (including
+  `gemini/gemini-4-argon` and its `*_priority` tiers, the last
+  blocker for antigravity-1417 costing), 2,330 rate mutations, 5
+  window-only changes, 466 keys retained by the never-drop union, 0
+  drops, no wildcard keys. This is the first bundled refresh through
+  the fixed script's preserve-absence arm: upstream LiteLLM stopped
+  publishing cache rates on a large cohort (2,722 of 4,245 live rows
+  lack a cache-read rate, 3,765 a cache-write rate), so the bundle
+  now carries genuinely-absent cache rates where prior bundles
+  zero-filled — the vendored census pins flipped consciously
+  (`cache_read_absent` 0 → 2,139, `cache_write_absent` 0 → 3,227 in
+  `pricing_snapshot_hygiene.rs`; the process-catalog pins in
+  `cache_rate_truth_contract.rs` moved with them, and the rm-1508
+  absent-vs-published-$0 contract holds end-to-end: absent cache
+  rates bill at the disclosed input-rate fallback (cache write at
+  input × 1.25) with the `cache_rate_fallback` disclosure counter
+  firing, never a silent $0 — the flip only widened the cohort of
+  rows that take that disclosed path). The 275-strong
+  bundled priority cohort from the rm-1556 landing moves to 279
+  keys. SVG card goldens re-pinned through the sanctioned channel
+  (`UPDATE_CARD_GOLDEN=1`; footer: snapshot 2026-10-22, 340 of
+  4,616 priced models past vendor deprecation, up from 215 of
+  4,443).
+
   Integration seam (2026-10-21, conflict case 524b2312e1b84f0592e6c153baca23da,
   landing onto a wall ≈7 runs past this run's base df7c2590): the
   run's rows land atop the Unreleased Added list as the newest
