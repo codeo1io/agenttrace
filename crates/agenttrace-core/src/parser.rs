@@ -6895,6 +6895,9 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             continue;
         }
         if let Some(rewind_to) = obj.get("$rewindTo").and_then(Value::as_str) {
+            // rm-715: the rewind target is the id the writer last
+            // used — a resume twin folds onto its original row.
+            let rewind_to = gemini_chats_fold_twin_id(rewind_to);
             match messages.iter().position(|(id, _)| id == rewind_to) {
                 Some(at) => messages.truncate(at),
                 None => messages.clear(),
@@ -6945,6 +6948,26 @@ fn gemini_chats_reindex(messages: &[(String, JsonObject)]) -> HashMap<String, us
         .enumerate()
         .map(|(slot, (id, _))| (id.clone(), slot))
         .collect()
+}
+
+/// rm-715 (run 675579b4 cycle 7): pre-0.65 gemini-cli resume
+/// re-recorded every message under BOTH its plain id and a
+/// `_response`-suffixed twin (upstream stopped the re-recording in
+/// 0.65), so keying the reader's map on raw ids doubles every turn
+/// in a resumed journal (the roadmap PoC: 10 sessions / 5 turns
+/// parsed as 20/10). One id-space instead: fold the twin suffix at
+/// KEY time — append, `$set`, `$rewindTo`, `$patch`, `removeIds` and
+/// `orderIds` all address ids through here, so a twin replaces its
+/// original row in place instead of owning a second one, and a
+/// structural record naming the twin still finds the folded row.
+/// Ids that never twin (0.65+ journals) fold to themselves; only a
+/// NON-EMPTY prefix folds, so an id that is exactly `_response`
+/// stays whole.
+fn gemini_chats_fold_twin_id(id: &str) -> &str {
+    match id.strip_suffix("_response") {
+        Some(prefix) if !prefix.is_empty() => prefix,
+        _ => id,
+    }
 }
 
 /// Claim rule: the 0.63 writer always leads with the metadata record
@@ -7007,7 +7030,9 @@ fn gemini_chats_message_id(record: &JsonObject) -> Option<String> {
     .iter()
     .any(|key| record.contains_key(*key));
     if carries_payload {
-        Some(id.to_string())
+        // rm-715: the map key is the FOLDED id — the re-recorded
+        // twin replaces its original row, never a second one.
+        Some(gemini_chats_fold_twin_id(id).to_string())
     } else {
         None
     }
@@ -7030,11 +7055,18 @@ fn gemini_chats_apply_patch(messages: &mut Vec<(String, JsonObject)>, patch: &Js
     }
     if let Some(remove_ids) = patch.get("removeIds").and_then(Value::as_array) {
         for id in remove_ids.iter().filter_map(Value::as_str) {
+            // rm-715: removal addresses the id the writer last used —
+            // fold the twin before matching stored (folded) keys.
+            let id = gemini_chats_fold_twin_id(id);
             messages.retain(|(existing, _)| existing != id);
         }
     }
     if let Some(order_ids) = patch.get("orderIds").and_then(Value::as_array) {
-        let ordered: Vec<&str> = order_ids.iter().filter_map(Value::as_str).collect();
+        // rm-715: same fold — order entries may name resume twins.
+        let ordered: Vec<&str> = order_ids
+            .iter()
+            .filter_map(|id| Value::as_str(id).map(gemini_chats_fold_twin_id))
+            .collect();
         let mut untouched: Vec<(String, JsonObject)> = Vec::new();
         let mut patched: Vec<(String, JsonObject)> = Vec::new();
         for entry in messages.drain(..) {
@@ -7056,6 +7088,9 @@ fn gemini_chats_apply_patch(messages: &mut Vec<(String, JsonObject)>, patch: &Js
 }
 
 fn gemini_chats_patch_one(messages: &mut [(String, JsonObject)], id: &str, patch: &JsonObject) {
+    // rm-715: a patch addresses the id the writer last used — fold
+    // the twin so it hits the row the append fold keyed.
+    let id = gemini_chats_fold_twin_id(id);
     let Some(slot) = messages.iter_mut().find(|(existing, _)| existing == id) else {
         return;
     };
@@ -13903,6 +13938,124 @@ const CHATS_METADATA: &str = concat!(
     r#"{"sessionId":"sess-a","projectHash":"h1","startTime":"2026-10-12T08:00:00.000Z","#,
     r#""lastUpdated":"2026-10-12T08:01:00.000Z","kind":"main"}"#
 );
+
+#[test]
+fn gemini_chats_resumed_journal_twin_ids_collapse() {
+    // A resumed pre-0.65 gemini-cli chats export re-records every
+    // message under both its plain id and a `_response`-suffixed twin
+    // (upstream #29618 stopped the re-recording in 0.65). The upsert
+    // dedupe key folds one trailing `_response`, so each twin replaces
+    // its original row in place instead of doubling every turn.
+    let twin = |id: &str, typ: &str, content: &str| {
+        format!(
+            r#"{{"id":"{id}","timestamp":"2026-10-12T08:00:05.000Z","type":"{typ}","content":"{content}"}}"#
+        )
+    };
+    let raw = format!(
+        "{CHATS_METADATA}\n{}\n{}\n{}\n{}\n",
+        twin("m-user-1", "user", "hello gemini"),
+        twin("m-gen-1", "gemini", "hi there"),
+        twin("m-user-1_response", "user", "hello gemini"),
+        twin("m-gen-1_response", "gemini", "hi there"),
+    );
+    let events =
+        parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("chats record stream claimed");
+    // Two logical messages, each twinned by the resume re-recording:
+    // the twins must collapse onto the original rows (replace in
+    // place), never a duplicate of either turn.
+    assert_eq!(events.len(), 2, "resumed twins must collapse");
+    assert_eq!(events[0].role, "user");
+    assert_eq!(events[0].content, "hello gemini");
+    assert_eq!(events[0].source_tool, "gemini_cli");
+    assert_eq!(events[1].role, "assistant");
+    assert_eq!(events[1].content, "hi there");
+}
+
+#[test]
+fn gemini_chats_lone_response_suffixed_id_owns_one_row() {
+    // 0.65+ corpora never twin. A lone `_response`-suffixed id (the
+    // fold maps it to its prefix) must still own exactly one row --
+    // the fold is idempotent for non-twining journals.
+    let raw = format!(
+        "{CHATS_METADATA}\n{}\n",
+        r#"{"id":"m-gen-1_response","timestamp":"2026-10-12T08:00:05.000Z","type":"gemini","content":"hi there","model":"gemini-2.5-pro"}"#
+    );
+    let events =
+        parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("chats record stream claimed");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].role, "assistant");
+    assert_eq!(events[0].model_used, "gemini-2.5-pro");
+}
+
+#[test]
+fn gemini_chats_patch_through_a_twin_id_hits_the_folded_row() {
+    // Structural records address the id the writer last used — in a
+    // pre-0.65 resumed journal that is the `_response` twin. The fold
+    // must key `$patch` the same way the append upsert does, or a
+    // patch aimed at the twin silently misses the row it targets.
+    let twin = |id: &str, typ: &str, content: &str| {
+        format!(
+            r#"{{"id":"{id}","timestamp":"2026-10-12T08:00:05.000Z","type":"{typ}","content":"{content}"}}"#
+        )
+    };
+    let raw = format!(
+        "{CHATS_METADATA}\n{}\n{}\n{}\n{}\n",
+        twin("m-user-1", "user", "hello gemini"),
+        twin("m-gen-1", "gemini", "draft"),
+        twin("m-gen-1_response", "gemini", "draft"),
+        r#"{"$patch":{"id":"m-gen-1_response","content":"patched via the twin"}}"#,
+    );
+    let events =
+        parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("chats record stream claimed");
+    // The twin replaced its original in place (2 rows, not 3) and the
+    // patch written against the twin id rewrote that same row.
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].role, "assistant");
+    assert_eq!(events[1].content, "patched via the twin");
+    assert_eq!(events[1].source_tool, "gemini_cli");
+}
+
+#[test]
+fn gemini_chats_rewind_and_order_remove_address_twin_ids_through_the_fold() {
+    // rm-715 structural arms: $rewindTo and $patch's removeIds/
+    // orderIds also address the `_response` twin in a resumed
+    // journal. Through the fold the rewind truncates at the twin's
+    // FOLDED row and the id lists hit the folded rows; without it
+    // the rewind target looks absent (it would clear the whole
+    // journal) and the id lists silently miss.
+    let twin = |id: &str, typ: &str, content: &str| {
+        format!(
+            r#"{{"id":"{id}","timestamp":"2026-10-12T08:00:05.000Z","type":"{typ}","content":"{content}"}}"#
+        )
+    };
+    let raw = format!(
+        "{CHATS_METADATA}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        twin("m-user-1", "user", "hello gemini"),
+        twin("m-gen-1", "gemini", "draft one"),
+        twin("m-gen-2", "gemini", "draft two"),
+        twin("m-gen-3", "gemini", "draft three"),
+        twin("m-gen-3_response", "gemini", "draft three"),
+        r#"{"$rewindTo":"m-gen-3_response"}"#,
+    );
+    let rewound =
+        parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("chats record stream claimed");
+    // The twin replaced its original row in place, so the rewind
+    // target sits at the folded m-gen-3 slot: everything from there
+    // drops, leaving the user row and the first two drafts.
+    let content: Vec<&str> = rewound.iter().map(|e| e.content.as_str()).collect();
+    assert_eq!(content, vec!["hello gemini", "draft one", "draft two"]);
+
+    let patched_raw = format!(
+        "{raw}{}\n",
+        r#"{"$patch":{"removeIds":["m-user-1_response"],"orderIds":["m-gen-2_response","m-gen-1_response"]}}"#
+    );
+    let events = parse_gemini_chats_jsonl(&chats_objs(patched_raw.as_str()))
+        .expect("chats record stream claimed");
+    // removeIds dropped the user row through its twin; orderIds put
+    // the second draft ahead of the first through theirs.
+    let content: Vec<&str> = events.iter().map(|e| e.content.as_str()).collect();
+    assert_eq!(content, vec!["draft two", "draft one"]);
+}
 
 #[test]
 fn gemini_chats_lane_claims_the_record_stream_and_replaces_reappends() {

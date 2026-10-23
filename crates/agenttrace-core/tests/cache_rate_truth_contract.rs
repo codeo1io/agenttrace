@@ -12,6 +12,19 @@
 //! catalog is a process-global `OnceLock` seeded from
 //! `AGENTTRACE_PRICING_FILE` on first use, so the override has to be
 //! in place before any lookup and must not race sibling tests.
+//!
+//! rm-1954 arm (run 675579b4 cycle 7): the catalog PREFERS a machine
+//! cache (`$AGENTTRACE_SESSION_CACHE_DIR/pricing.json`, else the
+//! default user-cache location) over the bundled snapshot, so the
+//! census used to answer whatever ambient host state the dispatch
+//! env carried (this run's assess: 2,230 absent rows served from the
+//! host cache vs the pinned 1; a one-row hostile fixture under a
+//! redirected session-cache dir flips the pin the same way). The
+//! body therefore runs inside `support::with_isolated_pricing_env`
+//! (scratch session cache, scratch HOME, cleared
+//! `AGENTTRACE_PRICING_FILE`), pinning bundled + override only.
+
+mod support;
 
 use agenttrace_core::{analyze, cache_rate_census, lookup_price, CacheRateCensus};
 use std::collections::BTreeMap;
@@ -39,13 +52,25 @@ fn usage_event(
     }
 }
 
-#[test]
-fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero() {
+/// rm-1954 arm: the override file's scratch dir lives under a Drop
+/// guard — a failing assert used to leak `/tmp/at-cache-rate-truth-*`
+/// on every red run. The env restore rides the pricing-env guard's
+/// own Drop; this one owns the scratch.
+struct OverrideScratch(std::path::PathBuf);
+
+impl Drop for OverrideScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero_body() {
     // The override catalog merges per-entry over the bundled one, so
     // three synthetic rows pin all three states without touching any
     // real model's rates. All three share input $10/M, output $30/M.
     let dir = std::env::temp_dir().join(format!("at-cache-rate-truth-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
+    let _scratch = OverrideScratch(dir.clone());
     let override_path = dir.join("pricing-override.json");
     std::fs::write(
         &override_path,
@@ -199,7 +224,9 @@ fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_publishe
     // pins those). What this binary pins: the classification itself —
     // exactly the absent rows it contributes (the 2026-10-08 bundle
     // zero-fills, so every bundled row classifies published), and the
-    // per-class sum invariant absent + zero + nonzero == total.
+    // per-class sum invariant absent + zero + nonzero == total. The
+    // isolation guard makes that population hermetic: bundled + this
+    // override only, never a host machine cache.
     let census: CacheRateCensus = cache_rate_census();
     assert_eq!(
         census.cache_read_absent, 1,
@@ -221,8 +248,15 @@ fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_publishe
         "write classes must partition the catalog"
     );
 
-    // --- hygiene: no scratch left behind --------------------------
-    std::env::remove_var("AGENTTRACE_PRICING_FILE");
-    std::fs::remove_file(&override_path).ok();
-    std::fs::remove_dir(&dir).ok();
+    // --- hygiene: guards own it -----------------------------------
+    // The scratch dir rides `OverrideScratch`'s Drop and
+    // AGENTTRACE_PRICING_FILE rides the pricing-env guard's restore,
+    // so both hold even when an assert above trips.
+}
+
+#[test]
+fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero() {
+    support::with_isolated_pricing_env(
+        absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero_body,
+    )
 }

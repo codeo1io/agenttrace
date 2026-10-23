@@ -613,17 +613,24 @@ impl App {
             }
 
             ExplorerView::Context => indices.sort_by(|a, b| {
+                // rm-1500 residual (run 675579b4 cycle 7): total_cmp
+                // keeps the comparator a total order when a session's
+                // utilization is NaN (window denominator
+                // unresolvable) — the old
+                // partial_cmp().unwrap_or(Equal) made NaN equal to
+                // everything, stranding the row mid-view. total_cmp
+                // orders NaN greatest, so it leads the descending
+                // view deterministically.
                 self.sessions[*b]
                     .diagnostics
                     .context_utilization
                     .utilization_pct
-                    .partial_cmp(
+                    .total_cmp(
                         &self.sessions[*a]
                             .diagnostics
                             .context_utilization
                             .utilization_pct,
                     )
-                    .unwrap_or(Ordering::Equal)
             }),
             ExplorerView::Storage => indices
                 .sort_by_key(|index| std::cmp::Reverse(session_file_size(&self.sessions[*index]))),
@@ -1349,7 +1356,11 @@ fn tools_preview(session: &Session, language: Language) -> String {
         .tool_latencies
         .iter()
         .collect::<Vec<_>>();
-    latency.sort_by(|a, b| b.p95_sec.partial_cmp(&a.p95_sec).unwrap_or(Ordering::Equal));
+    // rm-1500 residual (run 675579b4 cycle 7): a NaN p95 must order
+    // deterministically — total_cmp orders it greatest so it leads
+    // the descending ladder, instead of comparing equal to every
+    // peer and keeping whatever insertion slot it happened to hold.
+    latency.sort_by(|a, b| b.p95_sec.total_cmp(&a.p95_sec));
     let latency = latency
         .into_iter()
         .take(6)
@@ -2996,5 +3007,103 @@ mod interaction_tests {
         let summary = share_summary(app.explorer_session().unwrap());
         assert!(!summary.contains("beta"));
         assert!(!summary.contains(&app.explorer_session().unwrap().name));
+    }
+    fn explorer_test_session(name: &str, utilization_pct: f64) -> Session {
+        Session {
+            name: name.to_string(),
+            path: format!("/tmp/{name}.jsonl"),
+            cwd: "/tmp".to_string(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: agenttrace_core::Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics {
+                context_utilization: agenttrace_core::ContextUtilization {
+                    utilization_pct,
+                    ..agenttrace_core::ContextUtilization::default()
+                },
+                ..agenttrace_core::Diagnostics::default()
+            },
+        }
+    }
+
+    #[test]
+    fn explorer_context_view_orders_nan_utilization_deterministically() {
+        // rm-1500 residual (run 675579b4 cycle 7): a session whose
+        // context utilization is NaN (window denominator
+        // unresolvable) must sort by the total order — greatest, so
+        // it leads the descending view — not by whatever position it
+        // happened to occupy.
+        // Names a-< c- fix the session order App::new keeps, so the
+        // NaN row reaches the comparator wedged between the two
+        // finite values — the position where an equal-to-everything
+        // comparator strands it mid-view.
+        let mut app = App::new(
+            vec![
+                explorer_test_session("a-high", 90.0),
+                explorer_test_session("b-unresolvable", f64::NAN),
+                explorer_test_session("c-low", 10.0),
+            ],
+            "test",
+            None,
+        );
+        app.explorer_view = ExplorerView::Context;
+        app.refresh_filtered();
+        let ordered: Vec<f64> = app
+            .explorer_indices()
+            .iter()
+            .map(|index| {
+                app.sessions[*index]
+                    .diagnostics
+                    .context_utilization
+                    .utilization_pct
+            })
+            .collect();
+        assert_eq!(ordered.len(), 3);
+        assert!(
+            ordered[0].is_nan(),
+            "NaN utilization leads the descending view: {ordered:?}"
+        );
+        assert_eq!(ordered[1], 90.0);
+        assert_eq!(ordered[2], 10.0);
+    }
+
+    #[test]
+    fn tools_preview_orders_nan_latency_deterministically() {
+        // rm-1500 residual (run 675579b4 cycle 7): the p95 latency
+        // ladder sorts descending; a NaN p95 must order
+        // deterministically (greatest, leading the ladder) instead of
+        // comparing equal to every peer and keeping its insertion
+        // slot.
+        let mut session = explorer_test_session("latency", 50.0);
+        session.diagnostics.tool_latencies = vec![
+            tool_latency("alpha", 1.0),
+            tool_latency("beta", f64::NAN),
+            tool_latency("gamma", 5.0),
+        ];
+        let preview = tools_preview(&session, Language::En);
+        let beta = preview.find("beta").expect("beta row rendered");
+        let gamma = preview.find("gamma").expect("gamma row rendered");
+        let alpha = preview.find("alpha").expect("alpha row rendered");
+        assert!(
+            beta < gamma && gamma < alpha,
+            "NaN p95 leads the descending ladder: {preview}"
+        );
+    }
+
+    fn tool_latency(name: &str, p95_sec: f64) -> agenttrace_core::ToolLatency {
+        agenttrace_core::ToolLatency {
+            tool_name: name.to_string(),
+            count: 3,
+            avg_sec: p95_sec,
+            p95_sec,
+            max_sec: p95_sec,
+            min_sec: p95_sec,
+            unmatched: 0,
+            is_slow: false,
+        }
     }
 }
