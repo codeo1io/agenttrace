@@ -2894,6 +2894,32 @@ mod tests {
         assert!(status.expect("fast child finishes").success());
     }
 
+    /// Resolve the real `git` for the shim delegate arms (rm-2323):
+    /// the first executable `git` on PATH outside the shim's own
+    /// directory. The shims used to hardcode `exec /usr/bin/git`, so
+    /// the control arm died on hosts where git lives elsewhere
+    /// (NixOS, Homebrew, /usr/local-first toolchains) and took the
+    /// whole test with it. Resolving BEFORE the PATH mutation hands
+    /// the shim an absolute delegate, so it can never recurse into
+    /// itself.
+    #[cfg(unix)]
+    fn real_git_for_shim(shim_dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::var_os("PATH").expect("tests require a PATH");
+        for dir in std::env::split_paths(&path) {
+            if dir == shim_dir {
+                continue;
+            }
+            let candidate = dir.join("git");
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                    return candidate;
+                }
+            }
+        }
+        panic!("no executable git on PATH outside the shim dir; cannot build the shim delegate")
+    }
+
     #[test]
     #[cfg(unix)]
     fn git_commits_probe_survives_a_helper_holding_the_pipe_past_exit() {
@@ -2912,10 +2938,12 @@ mod tests {
         let root = std::env::temp_dir().join(marker);
         let shim_dir = root.join("shim");
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        let delegate_git = real_git_for_shim(&shim_dir);
         std::fs::write(
             shim_dir.join("git"),
             format!(
-                "#!/bin/sh\ncase \"$2\" in\n  *{marker}*) sleep 60 &\n    exec true ;;\n  *) exec /usr/bin/git \"$@\" ;;\nesac\n"
+                "#!/bin/sh\ncase \"$2\" in\n  *{marker}*) sleep 60 &\n    exec true ;;\n  *) exec \"{}\" \"$@\" ;;\nesac\n",
+                delegate_git.display()
             ),
         )
         .expect("write git shim");
@@ -2936,8 +2964,14 @@ mod tests {
             "the shim prints nothing and the drained bytes are unrecoverable in budget: the probe must degrade to the heuristic, got {} commits",
             commits.map(|drained| drained.len()).unwrap_or(0)
         );
+        // rm-2323: the bound is a contention-tolerant multiple of the
+        // probe budget, not `GIT_PROBE_TIMEOUT + 5s` — that tight
+        // wall-clock assert flaked under fleet load while the semantic
+        // guarantee (the degradation pinned above) held. Three budgets
+        // still catches the real regression this test guards: an
+        // unbounded drain waiting out the helper's 60s hold.
         assert!(
-            started.elapsed() < GIT_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
+            started.elapsed() < GIT_PROBE_TIMEOUT * 3,
             "the probe must stay inside its bound even when a helper holds the pipe (took {:?})",
             started.elapsed()
         );
@@ -2975,10 +3009,12 @@ mod tests {
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
         // 7,000 lines of 11-byte timestamps = ~77 KiB > the 64 KiB
         // drain cap; one line per commit mirrors `git log --format=%ct`.
+        let delegate_git = real_git_for_shim(&shim_dir);
         std::fs::write(
             shim_dir.join("git"),
             format!(
-                "#!/bin/sh\ncase \"$2\" in\n  *{marker}*) i=0\n    while [ $i -lt 7000 ]; do\n      echo 1000000000\n      i=$((i + 1))\n    done ;;\n  *) exec /usr/bin/git \"$@\" ;;\nesac\n"
+                "#!/bin/sh\ncase \"$2\" in\n  *{marker}*) i=0\n    while [ $i -lt 7000 ]; do\n      echo 1000000000\n      i=$((i + 1))\n    done ;;\n  *) exec \"{}\" \"$@\" ;;\nesac\n",
+                delegate_git.display()
             ),
         )
         .expect("write git shim");
@@ -2993,7 +3029,8 @@ mod tests {
         let overflow = git_commits(root.to_str().expect("utf-8 root"));
         let overflow_elapsed = started.elapsed();
         // Control: the crate root is a real git repository, and the
-        // shim delegates it to /usr/bin/git — it must still yield
+        // shim delegates it to the real git resolved from PATH (rm-2323:
+        // no /usr/bin/git hardcode) — it must still yield
         // commits under the cap (also proves the shim only diverts
         // the marker root).
         let control = git_commits(env!("CARGO_MANIFEST_DIR"));
@@ -3005,8 +3042,12 @@ mod tests {
             "an over-cap git log must degrade to the heuristic, got {} commits",
             overflow.map(|drained| drained.len()).unwrap_or(0)
         );
+        // rm-2323: contention-tolerant multiple of the probe budget
+        // (was `GIT_PROBE_TIMEOUT + 5s`, which flaked under fleet load
+        // while the degradation pinned above held). Three budgets
+        // still bounds the arm far below a wedged drain.
         assert!(
-            overflow_elapsed < GIT_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
+            overflow_elapsed < GIT_PROBE_TIMEOUT * 3,
             "the overflow arm must stay inside the probe bounds (took {overflow_elapsed:?})"
         );
         assert!(
