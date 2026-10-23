@@ -2,7 +2,7 @@
 set -eu
 
 # agenttrace — single binary install (Rust + ratatui)
-# Usage: curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
+# Usage: curl -sL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.sh | sh
 #
 # Environment contract (rm-2014) — all optional:
 #   AGENTTRACE_VERSION=TAG    install that release tag instead of the
@@ -16,7 +16,7 @@ set -eu
 #                             entirely (offline CI tests; wins over
 #                             AGENTTRACE_VERSION).
 
-REPO="luoyuctl/agenttrace"
+REPO="codeo1io/agenttrace"
 # Pinned ref for the build-from-source fallback (rm-051): the fallback
 # must never clone a moving default branch — whatever master holds at
 # clone time is not what this installer was tested against. Keep in

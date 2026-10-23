@@ -39,7 +39,7 @@ if ! grep -qE 'releases/download/v[0-9]+' "$example"; then
   fail=1
 fi
 
-if grep -qE 'curl[^|]*luoyuctl/agenttrace/(master|main|HEAD)/' "$example"; then
+if grep -qE 'curl[^|]*(luoyuctl|codeo1io)/agenttrace/(master|main|HEAD)/' "$example"; then
   echo "FAIL: install script fetched from a moving ref" >&2
   fail=1
 fi

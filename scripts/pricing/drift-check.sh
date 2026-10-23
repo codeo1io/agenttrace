@@ -28,6 +28,16 @@
 # bundled model that would drop out of the keep-filter basis is reported as `retired` and sets
 # removal_guard. The workflow refuses to auto-PR while removal_guard is set: a bundle model vanishing
 # without an upstream deprecation trail is exactly the silent-unpricing event this gate exists to stop.
+#   Retained-union exemption (2026-10-22, run 4fd837bd cycle 1, implement 92c14a0f): keys listed in
+# the bundle's `_snapshot.retained_from_previous` — the rm-588 never-drop union's sanctioned-retention
+# stamp, written by update-snapshot.sh at every refresh — do NOT count as `retired`: they stay priced
+# by the bundle by contract ("prefer letting the union retain a stale rate over dropping a price"),
+# so nothing was silently unpriced. Without the exemption, the first refresh after any upstream
+# retirement wave wedges this gate forever — the union re-retains exactly the retired keys, so
+# `retired` can never clear and the scheduled post-regeneration rc-0 verification fails permanently
+# (the same permanent-phantom-drift wedge class the rm-903 wildcard fix closed). The guard keeps its
+# teeth: a bundle key absent from live that the bundle does NOT stamp as retained still sets
+# removal_guard (selftest arm 9). A malformed stamp fails closed (rc 2), never silently disarmed.
 #
 # Exit contract: 0 = no actionable drift and no desync; 1 = actionable drift (any class) or desync or
 # removal guard; 2 = infra error (fetch/parse/missing input — including an unprovable desync pair:
@@ -39,7 +49,7 @@
 #   ... --bundle F.json --pricing-rs F.rs          # overrides for red-arm testing
 #   ... --json                                     # emit the machine report on stdout (summary goes to stderr
 #                                                  #   then — stdout is PURE JSON; review-2 fix F2)
-#   scripts/pricing/drift-check.sh --selftest      # eight embedded offline arms, rc 0 iff all pass
+#   scripts/pricing/drift-check.sh --selftest      # nine embedded offline arms, rc 0 iff all pass
 
 set -euo pipefail
 
@@ -129,8 +139,23 @@ try:
               "an absent stamp is never 'clean' — reconcile the bundle)", file=sys.stderr)
         sys.exit(2)
 
+    # rm-588 retained-union exemption (header note): keys stamped as sanctioned retention in
+    # `_snapshot.retained_from_previous` are priced-by-contract, never silently-unpriced, so they
+    # must not count as `retired`. Fail closed on a malformed stamp — a silently-dropped exemption
+    # would disarm the removal guard.
+    retained_raw = meta.get("retained_from_previous")
+    if retained_raw is None:
+        retained_union = set()
+    elif isinstance(retained_raw, list) and all(isinstance(k, str) for k in retained_raw):
+        retained_union = set(retained_raw)
+    else:
+        print("drift-check: infra error: bundle _snapshot.retained_from_previous must be a list of "
+              "model keys (fail-closed: a malformed stamp would disarm the removal guard)", file=sys.stderr)
+        sys.exit(2)
+
     new_costed = sorted(set(live_kept) - set(bundle_kept))
-    retired = sorted(set(bundle_kept) - set(live_kept))
+    retired = sorted((set(bundle_kept) - set(live_kept)) - retained_union)
+    retained_missing_live = sorted((retained_union & set(bundle_kept)) - set(live_kept))
     rate_changed, deprecation_new, context_changed, provider_changed = [], [], [], []
     for name in sorted(set(live_kept) & set(bundle_kept)):
         lrow, brow = live_kept[name], bundle_kept[name]
@@ -169,6 +194,8 @@ print(f"  bundled: {len(bundle_kept)} costed-chat models, _snapshot.date={bundle
 print(f"  live   : {len(live_kept)} costed-chat models", file=out)
 print(f"  new-costed: {len(new_costed)}{' — ' + sample(new_costed) if new_costed else ''}", file=out)
 print(f"  retired   : {len(retired)}{' — ' + sample(retired) if retired else ''} (removal_guard={'SET' if removal_guard else 'clear'})", file=out)
+if retained_missing_live:
+    print(f"  retained-union: {len(retained_missing_live)} keys carried by the rm-588 never-drop union (sanctioned retention, priced at their last live rate; exempt from removal_guard — header note)", file=out)
 print(f"  rate-changed: {len(rate_changed)}{' — ' + sample(rate_changed) if rate_changed else ''} (4 cost fields incl. cache)", file=out)
 print(f"  deprecation-new: {len(deprecation_new)}{' — ' + sample(deprecation_new) if deprecation_new else ''}", file=out)
 print(f"  context-window-changed (max_input only, informational): {len(context_changed)}{' — ' + sample(context_changed) if context_changed else ''}", file=out)
@@ -184,7 +211,7 @@ if emit_json:
         "counts": {
             "new_costed": len(new_costed), "retired": len(retired), "rate_changed": len(rate_changed),
             "deprecation_new": len(deprecation_new), "context_window_changed": len(context_changed),
-            "provider_changed": len(provider_changed),
+            "provider_changed": len(provider_changed), "retained_union": len(retained_missing_live),
         },
         "examples": {"new_costed": new_costed[:10], "retired": retired[:10], "rate_changed": rate_changed[:10],
                      "deprecation_new": deprecation_new[:10], "context_window_changed": context_changed[:10],
@@ -231,7 +258,7 @@ run_check() { # resolves inputs, fetches live if needed, dispatches analyze; ret
   return "$rc"
 }
 
-self_test() { # eight embedded offline arms; rc 0 iff all pass (fixtures never touch the repo)
+self_test() { # nine embedded offline arms; rc 0 iff all pass (fixtures never touch the repo)
   local t rc ok=0
   t="$(mktemp -d -t drift-selftest.XXXXXX)"
   trap 'rm -rf "$t"' RETURN
@@ -372,6 +399,27 @@ PY
     echo "  arm 8 rm-903 wildcard ..... PASS (glob row = parity rc 0; concrete commitment key still new-costed rc 1)"
   else echo "  arm 8 rm-903 wildcard ..... FAIL (parity sub-arm e=$e, commitment sub-arm f=$f)"; sed -n '1,8p' "$t/out8a.txt"; sed -n '1,12p' "$t/out8b.txt"; ok=1; fi
 
+  # Arm 9 — rm-588 retained-union exemption (2026-10-22, run 4fd837bd cycle 1): a bundle key
+  # stamped in `_snapshot.retained_from_previous` and absent from live is SANCTIONED RETENTION,
+  # not a removal — parity rc 0 with the retained-union informational count (without the
+  # exemption, the first refresh after an upstream retirement wave re-flags its own union
+  # forever: the union re-retains exactly the retired keys, so `retired` can never clear and
+  # the scheduled post-regeneration rc-0 verification fails permanently — the same wedge class
+  # rm-903 closed for wildcards). Arm 4 already pins the teeth half: an UNSTAMPED bundle key
+  # absent from live still sets removal_guard.
+  python3 - "$t" <<'PY'
+import json, sys
+t = sys.argv[1]
+bundle = json.load(open(f"{t}/base.json"))
+bundle["_snapshot"]["retained_from_previous"] = ["model-d"]
+json.dump(bundle, open(f"{t}/bundle-retained.json", "w"))
+PY
+  rc=0; "$0" --live "$t/live-removal.json" --bundle "$t/bundle-retained.json" --pricing-rs "$t/pricing.rs" --json > "$t/out9a.txt" 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ] && grep -q '"retired": 0' "$t/out9a.txt" && grep -q '"removal_guard": false' "$t/out9a.txt" \
+     && grep -q '"retained_union": 1' "$t/out9a.txt"; then
+    echo "  arm 9 rm-588 retention .... PASS (stamped key absent from live = parity rc 0, exempt count 1)"
+  else echo "  arm 9 rm-588 retention .... FAIL (rc $rc)"; sed -n '1,10p' "$t/out9a.txt"; ok=1; fi
+
   # Control — the keep-filter basis itself: non-chat and uncosted rows never count either side.
   if grep -q 'costed-chat models' "$t/out1.txt"; then
     echo "  control keep-filter ...... PASS (basis line present)"
@@ -381,7 +429,7 @@ PY
 }
 
 if [ "$selftest" -eq 1 ]; then
-  echo "drift-check --selftest (eight offline arms, no network)"
+  echo "drift-check --selftest (nine offline arms, no network)"
   self_test
   rc=$?
   [ "$rc" -eq 0 ] && echo "selftest: ALL ARMS PASS" || echo "selftest: FAILURES PRESENT"

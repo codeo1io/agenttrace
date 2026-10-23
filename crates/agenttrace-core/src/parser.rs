@@ -11281,12 +11281,8 @@ mod tests {
                 ]
             })
             .to_string();
-            let session = parse_raw_session(
-                "numeric-argon",
-                "conversation.trajectory.json",
-                &raw,
-            )
-            .unwrap();
+            let session =
+                parse_raw_session("numeric-argon", "conversation.trajectory.json", &raw).unwrap();
             assert_eq!(
                 session.metrics.model_used, "gemini-4-argon",
                 "{numeric_id} maps through ANTIGRAVITY_NUMERIC_MODEL_MAP instead of stringifying"

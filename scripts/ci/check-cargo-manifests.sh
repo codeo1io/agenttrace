@@ -49,8 +49,8 @@ const fs = require("fs");
 const metadata = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const required = {
   description: "Local-first TUI and reports for AI coding-agent session history, cost, tokens, time, and slow-run diagnosis.",
-  repository: "https://github.com/luoyuctl/agenttrace",
-  homepage: "https://github.com/luoyuctl/agenttrace",
+  repository: "https://github.com/codeo1io/agenttrace",
+  homepage: "https://github.com/codeo1io/agenttrace",
   license: "MIT",
   rust_version: "1.89",
 };

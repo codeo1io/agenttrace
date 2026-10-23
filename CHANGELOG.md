@@ -4,6 +4,42 @@
 
 ### Added
 
+- Pricing snapshot refreshed to 2026-10-22 (3,130 → 3,270 costed chat models:
+  +140 keys, 2,249 rate-field mutations, zero drops) and the drift gate's
+  retention wedge cured (rm-176, run 4fd837bd cycle 1, stewardship c960f7e9;
+  first implemented at salvage 9dbe4262): the refresh adopts the week's live
+  LiteLLM additions — including the first argon-family rows
+  (gemini/github_copilot/vertex_ai), which unblocked the antigravity 1418/1419
+  mapping below — and the 466 keys upstream retired since 2026-10-08 stay priced
+  via the rm-588 never-drop union (`_snapshot.retained_from_previous` now carries
+  them with their last live rates). `scripts/pricing/drift-check.sh` no longer
+  counts those stamped keys as `retired`: without the exemption the first refresh
+  after any upstream retirement wave re-flags its own union forever — the union
+  re-retains exactly the retired keys, so `retired` can never clear and the weekly
+  workflow's post-regeneration rc-0 verification fails permanently, the same
+  permanent-phantom-drift wedge class the rm-903 wildcard fix closed. A genuinely
+  new retirement (a bundle key absent from live that the bundle does NOT stamp as
+  retained) still sets `removal_guard`, a malformed stamp fails closed (rc 2), and
+  selftest arm 9 pins the exemption; the `PRICING_SNAPSHOT_DATE` const, the
+  snapshot-hygiene census pins, the cache-rate fixture corpus, and the SVG card
+  goldens (footers embed the snapshot date and priced counts) moved with the
+  bundle — goldens regenerated via `UPDATE_CARD_GOLDEN=1`. The corpus-anchor
+  contract test (`sparkline_is_anchored_to_the_corpus_clock_not_wall_clock`)
+  now scans corpus-derived lines only for wall-clock leaks: the footer
+  legitimately embeds the compile-time snapshot date, which equals `today` on
+  refresh day and false-positived the old whole-card scan — deterministically,
+  on the first same-UTC-day CI run after any future refresh.
+
+- Antigravity numeric session ids 1418/1419 now map to gemini-4-argon (rm-1533,
+  run 4fd837bd cycle 1; ccusage #1905 parity; first implemented at salvage
+  9dbe4262): the numeric-model map gains both arms beside 1417 and 1050, and a
+  red-first pin asserts both ids spend non-zero against the refreshed bundle
+  ($2/M in · $10/M out · 1e-7 cache read) — the assertion is unsatisfiable
+  against the 2026-10-08 bundle, which carried no argon rows at all, so it also
+  pins the refresh dependency. Unmapped numeric ids still attribute by column
+  with no substitution; the WARN + cost-exclusion semantics for genuinely
+  unmapped ids remain open on the row.
+
 - Zst stem twins count once, with disclosure (rm-2056, run 18f9b98a
   cycle 2, assess 9158ade7): codex 0.163's rollout migration leaves a
   journal present as BOTH `<stem>.jsonl` and `<stem>.jsonl.zst` — one
@@ -2195,6 +2231,22 @@
 - The codex multiagent reconcile re-scan no longer reads rollouts whole (rm-451 residual, run e40a66d301874cba8da57356d7efefe7 cycle 6): `scan_rollout` re-read each rollout with unbounded `std::fs::read` at reconcile time — a rollout over the parse lane's `FILE_READ_CAP_BYTES` was slurped into memory only to be refused later at parse. The scan now goes through the same bounded reader as the parse lane (`read_session_file_bounded`, metadata fast-path plus the stat/read re-guard), an over-cap rollout is refused before any read, and the skip is disclosed per-session as `codex_multiagent_reconcile_skipped_over_read_cap` plus the corpus `rollouts_over_cap` stat carried on the new stderr disclosure line (conservative as everywhere: the session keeps its inline turns, over-billed never erased). Pinned by `over_cap_rollout_discloses_reconcile_skip_without_reading_it` (sparse `set_len` past the cap).
 
 ### Changed
+
+- Install channels now fetch from the fork's repository (rm-550 rider, run
+  4fd837bd cycle 1, stewardship c960f7e9): every install-serving surface that
+  claims a repository now claims codeo1io/agenttrace — install.sh / install.ps1 /
+  install.cmd (usage comments, REPO constants, raw.githubusercontent download
+  hosts), Cargo.toml repository+homepage with their check-cargo-manifests.sh pins,
+  the check-install-runtime.sh receipt pin, the README badges and install
+  commands (one-liners, version-pinned variants, `cargo --git` ×2), and the
+  health-gate example workflow, whose pinned install moves to the fork's v0.10.1
+  release with that release's published checksums (the fork does not mirror
+  upstream's v0.9.0 assets; check-example-workflows.sh's moving-ref guard now
+  denies both origins). Homebrew and npm stay upstream-named and frozen — they
+  keep working but track the upstream project, which trails this fork — and the
+  README now says so in one place instead of leaving the split implicit. The
+  README also documents the MSRV (Rust 1.89, `rust-version` in `Cargo.toml`)
+  beside the source-build command.
 
 - One shared cache-directory resolver replaces the four byte-identical per-module copies (rm-1536, assess F4, run 79fe78c0 cycle 3; adoption of salvage 9b2a7a1 U2): doctor, pricing, session_cache, and statusline each carried their own `user_cache_dir` ladder for locating the `agenttrace` cache root (sessions.json, pricing.json, the statusline capture journal, the doctor cache report). The ladder now lives once in `agenttrace-core::cache_dir` — `resolve_user_cache_dir(home, xdg_cache_home, macos)` takes the platform arm as an injected boolean so the Linux CI legs can pin the macOS behavior that `cfg!` copies made compile-time dead code, and one 17-row decision table replaces the four per-module pin tests. Two order-of-precedence disclosures ride the consolidation: an ABSOLUTE, non-empty `$XDG_CACHE_HOME` now wins on EVERY OS — the old macOS arm returned `$HOME/Library/Caches` first, so the rm-596 doctor demo sandbox (HOME + absolute XDG override asserting no $HOME text in the report) was unsatisfiable on macOS — and the landed rm-248 rider stays on the home arms (a set-but-empty OR RELATIVE `HOME` is unset-equivalent on both arms; an unusable HOME never yields a per-cwd cache). No environment variable is read anywhere new — the `user_cache_dir()` wrapper reads exactly the same two variables through one code path.
 - `resolve_user_cache_dir` is defined exactly once (rm-1389, run 1a4cce3a cycle 3, batch "one truth on the money-and-cache path"; reliability 30.0): the user-cache base resolver existed as four hand-synced private copies (session_cache, doctor, pricing, statusline — byte-identical 29-line bodies at the consolidation base 3e90993, verified) that had already drifted twice in three days — the empty/relative-HOME fix (rm-248 rider, dade9cd) landed on three copies while statusline's lagged, and the relative-HOME review fix then landed on statusline alone. The session_cache copy — the module that owns the cache-root policy — is now the single `pub(crate)` definition, imported by the other three; it stays pure over `(HOME, XDG_CACHE_HOME)` so every call path remains test-injectable. No behavior change (the bodies were identical); the consolidation is pinned by `shared_user_cache_resolver_census_pins_one_definition` (session_cache unit test that walks every `crates/**/*.rs` and asserts exactly one `fn` definition — the needle is assembled at runtime so the test's own source cannot count itself) on top of the existing per-module parity tests (`user_cache_dir_treats_empty_and_relative_home_as_unset` in session_cache/doctor/pricing plus statusline's historical pins), which now exercise the one shared body from all four beds. (Integration, conflict case 4d82812f: this run's session_cache-hosted consolidation is superseded at the merge by the landed rm-1536 `cache_dir` consolidation above — same one-definition intent, mechanics rehomed: the shared resolver lives in `agenttrace-core::cache_dir` as `resolve_user_cache_dir(home, xdg_cache_home, macos)` with an injected macOS arm, so the Linux CI legs can pin it; the census pin `shared_user_cache_resolver_census_pins_one_definition` relocated to cache_dir.rs beside the one definition, and the per-module parity tests this entry cites were themselves folded into cache_dir's 17-row `user_cache_dir_decision_table`.)

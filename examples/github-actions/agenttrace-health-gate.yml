@@ -18,9 +18,11 @@ jobs:
           fetch-depth: 0
 
       # rm-405: install a PINNED release binary and verify it against the
-      # checksum published in that release (v0.9.0). Do not curl|sh from a
-      # moving branch head, and do not track `releases/latest`.
-      - name: Install agenttrace v0.9.0 (pinned, checksummed)
+      # checksum published in that release (v0.10.1, served from the fork's
+      # repository — the release channel installers pin; upstream's releases
+      # are frozen at the same tag). Do not curl|sh from a moving branch
+      # head, and do not track `releases/latest`.
+      - name: Install agenttrace v0.10.1 (pinned, checksummed)
         run: |
           set -euo pipefail
           OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -31,15 +33,15 @@ jobs:
           esac
           ASSET="agenttrace-${OS}-${ARCH}"
           case "${OS}-${ARCH}" in
-            linux-amd64)  SUM=ff26324f2114e1757babbbb9d7d0729f80d58073224dd20729c893e6d70a7ad8 ;;
-            linux-arm64)  SUM=253bd6c5e2f659477f057ff4ff28728823259eac9cf3e14328d75ba936f6f40f ;;
-            darwin-amd64) SUM=af84d9fe5770f2fc93c8125491e87ecea7fb93c7188c668347445341fa6f5a66 ;;
-            darwin-arm64) SUM=f29fe44bb5039f5441d79fe53c6893788685914f48910083c88ed7337141c2b3 ;;
+            linux-amd64)  SUM=3f0159f2eca56717cc5e76a317e495b464fbdc5c9f2610665ef574c6a6d311b6 ;;
+            linux-arm64)  SUM=e111e5b0a0bde25572b5f2cf335aca1b4bceffc845acdca1f638186a24b6cc41 ;;
+            darwin-amd64) SUM=fbee6c51aa0f022ad1cfc430fc9259a589e82d9505351bd1a22ee5971102b207 ;;
+            darwin-arm64) SUM=6f4657beb6dfe6978e5c13351ff9e31fbc7e174e00ee961949864b2d3832da85 ;;
             *) echo "unsupported platform: ${OS}-${ARCH}" >&2; exit 1 ;;
           esac
           ASSET_PATH="${RUNNER_TEMP}/${ASSET}"
           curl -fsSL --max-time 120 -o "${ASSET_PATH}" \
-            "https://github.com/luoyuctl/agenttrace/releases/download/v0.9.0/${ASSET}"
+            "https://github.com/codeo1io/agenttrace/releases/download/v0.10.1/${ASSET}"
           if command -v sha256sum >/dev/null 2>&1; then
             echo "${SUM}  ${ASSET_PATH}" | sha256sum -c -
           else

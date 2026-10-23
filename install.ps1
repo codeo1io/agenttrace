@@ -1,6 +1,6 @@
 # agenttrace Windows installer (PowerShell)
 # Usage: powershell -ExecutionPolicy Bypass -File install.ps1
-# Or:    iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+# Or:    iwr -useb https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.ps1 | iex
 #
 # Release pinning (rm-2014): an `iex` pipe cannot pass parameters, so
 # environment variables are the ONLY way to pin from the one-liner —
@@ -26,7 +26,7 @@ if (-not $Version) { $Version = "latest" }
 if (-not $InstallDir) { $InstallDir = "${env:AGENTTRACE_INSTALL_DIR}" }
 if (-not $InstallDir) { $InstallDir = "$env:LOCALAPPDATA\agenttrace" }
 
-$REPO = "luoyuctl/agenttrace"
+$REPO = "codeo1io/agenttrace"
 $BIN = "agenttrace.exe"
 
 # Detect architecture
