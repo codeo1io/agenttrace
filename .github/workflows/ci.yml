@@ -113,7 +113,10 @@ jobs:
       fail-fast: false
       matrix:
         # Linux tests run under the coverage job.
-        os: [macos-14, windows-latest]
+        # rm-1954 batch U3: macos-14 enters GitHub's staged brownout
+        # 2026-10-23T14:00Z (retirement window from 2026-11-02) — pin
+        # the newer image before the lane starts 404ing its runner.
+        os: [macos-15, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

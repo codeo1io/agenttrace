@@ -870,6 +870,13 @@ fn statusline_host_mode_never_fails_the_host() {
     let _ = std::fs::remove_dir_all(cache);
 }
 
+// rm-1954 batch U2: /dev/full exists only on Linux — macOS and
+// Windows hosts panic at the `.expect("open /dev/full")` below
+// (CI run 39768041639: macos-14 lane red). The host contract itself
+// (exit 0 for any stdout condition) stays pinned where the device
+// exists; non-Linux lanes keep their coverage through the closed-
+// pipe/fifo arms above.
+#[cfg(target_os = "linux")]
 #[test]
 fn statusline_host_mode_survives_stdout_write_failure() {
     // Review F2 (cycle 7): the host contract is exit 0 for any input —
@@ -2656,6 +2663,14 @@ fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// rm-1954 batch U2: the ENOSPC arm needs /dev/full (Linux-only), so
+// the full two-arm contract above is Linux-pinned byte-identical;
+// every other OS keeps the EISDIR arm exercising the same contract —
+// the underlying io cause must surface through the context site. On
+// Windows a directory `-o` target fails at open with
+// ERROR_ACCESS_DENIED, which is that platform's honest path-misuse
+// cause ("Is a directory" is the unix flavor).
+#[cfg(target_os = "linux")]
 #[test]
 fn error_stderr_carries_the_anyhow_cause_chain() {
     // rm-610: the top-level handler printed `Error: {err}`, and
@@ -2704,6 +2719,40 @@ fn error_stderr_carries_the_anyhow_cause_chain() {
     assert_ne!(
         enospc_err, eisdir_err,
         "a full disk and path misuse must be distinguishable in stderr"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn error_stderr_carries_the_anyhow_cause_chain_eisdir_arm() {
+    let dir = std::env::temp_dir().join(format!("at-rm610-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create -o directory target");
+    let eisdir = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o", dir.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace against a directory -o target");
+    let _ = std::fs::remove_dir(&dir);
+
+    let eisdir_err = String::from_utf8_lossy(&eisdir.stderr);
+    assert_eq!(
+        eisdir.status.code(),
+        Some(1),
+        "eisdir: exit code unchanged: {eisdir_err}"
+    );
+    assert!(
+        eisdir_err.contains("Error: writing report output file"),
+        "eisdir: context site still leads the chain: {eisdir_err}"
+    );
+    #[cfg(unix)]
+    assert!(
+        eisdir_err.contains("Is a directory"),
+        "EISDIR cause must be visible through the context site: {eisdir_err}"
+    );
+    #[cfg(not(unix))]
+    assert!(
+        eisdir_err.contains("denied"),
+        "the directory-target open cause must surface through the \
+         context site on this platform: {eisdir_err}"
     );
 }
 

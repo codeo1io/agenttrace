@@ -35,6 +35,10 @@ use agenttrace_core::{
 };
 use std::collections::BTreeMap;
 use std::fs;
+// rm-1954 batch U1: the windows test lane must compile this suite;
+// the sealed-journal chmod arm is unix-only, so the trait import and
+// its single consumer gate together (PR#30 shape, landed minimal).
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -475,6 +479,7 @@ fn explicit_dir_lane_keeps_duplicate_copies() {
     let _ = fs::remove_dir_all(&home);
 }
 
+#[cfg(unix)]
 #[test]
 fn unreadable_journal_is_kept_and_never_a_duplicate() {
     // A journal whose bytes cannot be read (permissions) has no

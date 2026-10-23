@@ -5040,6 +5040,11 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    // rm-1954 batch U1 (companion site): the windows test lane compiles
+    // this bin target too — mkfifo and FileTypeExt are unix-only, so the
+    // whole fifo-refusal arm gates with them (it was masked pre-tip by
+    // the fail-fast compile error in agenttrace-core's tests).
+    #[cfg(unix)]
     #[test]
     fn write_output_refuses_special_files_instead_of_materializing_them() {
         // rm-250 residual (cycle 1): a fifo destination is refused with

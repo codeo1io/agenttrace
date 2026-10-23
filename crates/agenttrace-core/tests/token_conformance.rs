@@ -28,6 +28,8 @@
 use agenttrace_core::{lookup_price, parse_file, round4};
 use serde_json::Value;
 use std::collections::HashSet;
+
+mod support;
 use std::fs;
 use std::path::PathBuf;
 
@@ -149,6 +151,15 @@ fn conformance_pack_manifest_is_internally_consistent() {
 
 #[test]
 fn conformance_pack_holds_against_parser_and_pricing() {
+    // rm-1954 (batch U4): every cost literal this harness re-derives
+    // through `lookup_price` must come from the bundled snapshot, not
+    // an ambient machine pricing cache (assess 5e462e30: this suite
+    // failed 1/2 under a populated ~/.cache/agenttrace). The manifest
+    // twin above reads JSON only and needs no guard.
+    support::with_isolated_pricing_env(conformance_pack_holds_body);
+}
+
+fn conformance_pack_holds_body() {
     let tolerance = manifest()["pricing_basis"]["formula_tolerance"]
         .as_f64()
         .expect("formula tolerance");

@@ -32,6 +32,14 @@ use agenttrace_core::{
 };
 use std::sync::OnceLock;
 
+// rm-1954 (batch U4): every test below resolves rates through the
+// process pricing catalog, which prefers a machine cache over the
+// bundled snapshot when one exists (assess 5e462e30: this suite
+// failed 2/9 under an ambient ~/.cache/agenttrace cache). All bodies
+// run inside `support::with_isolated_pricing_env` so the pinned
+// vendor list rates are deterministic on every host.
+mod support;
+
 /// The three dated ids the extract carries, with their published list
 /// rates in $/M (input, output, cache_read, cache_write) — the vendor
 /// list prices models.dev publishes, identical to what the reseller
@@ -69,6 +77,10 @@ fn expect_price(price: agenttrace_core::Price, input: f64, output: f64, cr: f64,
 
 #[test]
 fn extract_ids_bill_at_first_party_list_rates() {
+    support::with_isolated_pricing_env(extract_ids_bill_body);
+}
+
+fn extract_ids_bill_body() {
     for (id, input, output, cr, cw) in EXTRACT_ROWS {
         expect_price(lookup_price(id), *input, *output, *cr, *cw);
     }
@@ -76,6 +88,10 @@ fn extract_ids_bill_at_first_party_list_rates() {
 
 #[test]
 fn extract_ids_attribute_to_their_vendor() {
+    support::with_isolated_pricing_env(extract_ids_attribute_body);
+}
+
+fn extract_ids_attribute_body() {
     for (id, ..) in EXTRACT_ROWS {
         assert_eq!(
             provider_for(id).as_deref(),
@@ -87,6 +103,10 @@ fn extract_ids_attribute_to_their_vendor() {
 
 #[test]
 fn extract_service_is_disclosed_at_the_provenance_line() {
+    support::with_isolated_pricing_env(extract_service_disclosed_body);
+}
+
+fn extract_service_disclosed_body() {
     for (id, ..) in EXTRACT_ROWS {
         let source = pricing_source_for(id);
         assert!(
@@ -102,6 +122,10 @@ fn extract_service_is_disclosed_at_the_provenance_line() {
 
 #[test]
 fn extract_ids_are_specific_prices_not_fallbacks() {
+    support::with_isolated_pricing_env(specific_prices_body);
+}
+
+fn specific_prices_body() {
     for (id, ..) in EXTRACT_ROWS {
         assert!(
             has_specific_price(id),
@@ -112,6 +136,10 @@ fn extract_ids_are_specific_prices_not_fallbacks() {
 
 #[test]
 fn reseller_qualified_ids_keep_their_reseller_rows() {
+    support::with_isolated_pricing_env(reseller_rows_body);
+}
+
+fn reseller_rows_body() {
     // The session itself scoped these ids to a reseller lane: the
     // extract must NOT override an explicit qualification (it speaks
     // only for the bare first-party form).
@@ -134,6 +162,10 @@ fn reseller_qualified_ids_keep_their_reseller_rows() {
 
 #[test]
 fn first_party_ids_the_primary_catalog_carries_still_price_at_litellm() {
+    support::with_isolated_pricing_env(first_party_litellm_body);
+}
+
+fn first_party_litellm_body() {
     // The extract is a gap-filler: an id LiteLLM prices first-party
     // (a current dated sonnet) must be byte-identical to the
     // pre-extract behavior — LiteLLM rates, LiteLLM source.
@@ -155,6 +187,10 @@ fn first_party_ids_the_primary_catalog_carries_still_price_at_litellm() {
 
 #[test]
 fn unknown_ids_still_fall_through_to_the_default() {
+    support::with_isolated_pricing_env(unknown_ids_default_body);
+}
+
+fn unknown_ids_default_body() {
     let unknown = "totally-unknown-model-9000";
     assert!(
         !has_specific_price(unknown),
@@ -170,6 +206,10 @@ fn unknown_ids_still_fall_through_to_the_default() {
 
 #[test]
 fn catalog_identity_folds_the_extract_bytes() {
+    support::with_isolated_pricing_env(catalog_identity_folds_body);
+}
+
+fn catalog_identity_folds_body() {
     // rm-1532: the extract can reprice and re-attribute ids, so its
     // bytes must ride the identity the session cache freshness-key
     // consumes — a changed extract (new binary) invalidates cached
@@ -194,6 +234,10 @@ fn catalog_identity_folds_the_extract_bytes() {
 
 #[test]
 fn extract_json_carries_its_provenance_note() {
+    support::with_isolated_pricing_env(provenance_note_body);
+}
+
+fn provenance_note_body() {
     // The file documents WHERE its rates came from and the retirement
     // condition (LiteLLM shipping a first-party row ends the search).
     // If the note is gone the file was machine-edited blind — fail
