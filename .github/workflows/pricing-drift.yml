@@ -114,7 +114,7 @@ jobs:
           # refresh moves the pinned goldens. Regenerate them here, or the
           # merge ships a svg_card_contract red to master — this PR is
           # GITHUB_TOKEN-authored and runs no CI (see note above).
-          UPDATE_CARD_GOLDEN=1 cargo test -p agenttrace-core --test svg_card_contract
+          UPDATE_CARD_GOLDEN=1 cargo test --locked -p agenttrace-core --test svg_card_contract
 
           # Post-regeneration verification: the refreshed pair must pass the gate clean
           # (rc 0 on the keep-filter basis, desync cleared, removal guard still clear),
