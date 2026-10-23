@@ -29,11 +29,21 @@ if (-not $InstallDir) { $InstallDir = "$env:LOCALAPPDATA\agenttrace" }
 $REPO = "luoyuctl/agenttrace"
 $BIN = "agenttrace.exe"
 
-# Detect architecture
-$ARCH = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
-    "X64"   { "amd64" }
-    "Arm64" { "arm64" }
-    default { throw "Unsupported architecture: $_" }
+# Detect architecture. Ported from upstream #314 (run b58cd254
+# cycle 5): the bundled PSReadLine 2.0 in interactive Windows
+# PowerShell 5.1 can shadow RuntimeInformation with a copy whose arch
+# property is empty, so fall back to the environment
+# (PROCESSOR_ARCHITEW6432 is set for a 32-bit shell on a 64-bit OS;
+# PROCESSOR_ARCHITECTURE otherwise). Env values use the AMD64/ARM64
+# vocabulary, enum values X64/Arm64 — both map.
+$procArch = try { "$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)" } catch { "" }
+if (-not $procArch) {
+    $procArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+}
+$ARCH = switch ($procArch) {
+    { $_ -in "X64", "AMD64" }   { "amd64" }
+    { $_ -in "Arm64", "ARM64" } { "arm64" }
+    default                     { throw "Unsupported architecture: '$procArch'" }
 }
 
 $Pinned = $Version -ne "latest"

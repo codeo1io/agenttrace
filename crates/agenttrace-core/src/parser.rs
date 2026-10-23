@@ -6895,7 +6895,13 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             continue;
         }
         if let Some(rewind_to) = obj.get("$rewindTo").and_then(Value::as_str) {
-            match messages.iter().position(|(id, _)| id == rewind_to) {
+            // rm-715 twin-fold: resolve the rewind id through the
+            // fold so `$rewindTo: <id>_response` (or a raw id aimed at
+            // a folded slot) still finds its position.
+            match messages
+                .iter()
+                .position(|(id, _)| gemini_chats_key(id) == gemini_chats_key(rewind_to))
+            {
                 Some(at) => messages.truncate(at),
                 None => messages.clear(),
             }
@@ -6927,12 +6933,37 @@ fn gemini_chats_upsert(
     id: String,
     record: JsonObject,
 ) {
-    match index.get(&id) {
-        Some(slot) => messages[*slot].1 = record,
+    // rm-715 twin-fold: the slot AND its index entry live under the
+    // folded key, so a `<id>_response` twin replaces its base record
+    // in place instead of appending a second counted turn.
+    let key = gemini_chats_key(&id).to_string();
+    match index.get(&key) {
+        Some(slot) => messages[*slot] = (key, record),
         None => {
-            index.insert(id.clone(), messages.len());
-            messages.push((id, record));
+            index.insert(key.clone(), messages.len());
+            messages.push((key, record));
         }
+    }
+}
+
+/// rm-715 twin-fold (run b58cd254 cycle 5, batch "Gemini 0.65-stable
+/// boundary truth"): pre-0.65 gemini-cli resume paths synthesize a
+/// fallback response record under the id `<id>_response`
+/// (`sessionUtils.ts`; upstream #29618 "avoid duplicate tool response
+/// turns when resuming sessions", merged 2026-10-06, shipped 0.65.0
+/// stable 2026-10-20) and re-append the SAME turn under it, so a
+/// 0.64-era resumed journal carries `<id>` + `<id>_response` twins
+/// and the raw-id upsert counted both (fleet PoC 2026-10-16: 10
+/// sessions / 5 turns parsed as 20 / 10). The dedup key folds ONE
+/// trailing `_response` suffix; real writer ids never end in
+/// `_response` (only the synthesized fallback ids do), so the fold
+/// is inert on healthy and 0.65+ corpora. `$patch`/`$rewindTo` ids
+/// resolve through the same fold, keeping structural records working
+/// against folded slots.
+fn gemini_chats_key(id: &str) -> &str {
+    match id.strip_suffix("_response") {
+        Some(base) if !base.is_empty() => base,
+        _ => id,
     }
 }
 
@@ -6943,7 +6974,10 @@ fn gemini_chats_reindex(messages: &[(String, JsonObject)]) -> HashMap<String, us
     messages
         .iter()
         .enumerate()
-        .map(|(slot, (id, _))| (id.clone(), slot))
+        // rm-715 twin-fold: index under the folded key so a later
+        // append of the twin still finds the slot after a structural
+        // record rebuilt the vector.
+        .map(|(slot, (id, _))| (gemini_chats_key(id).to_string(), slot))
         .collect()
 }
 
@@ -7030,7 +7064,9 @@ fn gemini_chats_apply_patch(messages: &mut Vec<(String, JsonObject)>, patch: &Js
     }
     if let Some(remove_ids) = patch.get("removeIds").and_then(Value::as_array) {
         for id in remove_ids.iter().filter_map(Value::as_str) {
-            messages.retain(|(existing, _)| existing != id);
+            // rm-715 twin-fold: a remove of either twin id drops the
+            // folded slot.
+            messages.retain(|(existing, _)| gemini_chats_key(existing) != gemini_chats_key(id));
         }
     }
     if let Some(order_ids) = patch.get("orderIds").and_then(Value::as_array) {
@@ -7038,7 +7074,10 @@ fn gemini_chats_apply_patch(messages: &mut Vec<(String, JsonObject)>, patch: &Js
         let mut untouched: Vec<(String, JsonObject)> = Vec::new();
         let mut patched: Vec<(String, JsonObject)> = Vec::new();
         for entry in messages.drain(..) {
-            if ordered.contains(&entry.0.as_str()) {
+            if ordered
+                .iter()
+                .any(|ordered_id| gemini_chats_key(ordered_id) == gemini_chats_key(&entry.0))
+            {
                 patched.push(entry);
             } else {
                 untouched.push(entry);
@@ -7047,7 +7086,9 @@ fn gemini_chats_apply_patch(messages: &mut Vec<(String, JsonObject)>, patch: &Js
         patched.sort_by_key(|(id, _)| {
             ordered
                 .iter()
-                .position(|ordered_id| *ordered_id == id.as_str())
+                .position(|ordered_id| {
+                    gemini_chats_key(ordered_id) == gemini_chats_key(id.as_str())
+                })
                 .unwrap_or(usize::MAX)
         });
         messages.extend(untouched);
@@ -7056,7 +7097,12 @@ fn gemini_chats_apply_patch(messages: &mut Vec<(String, JsonObject)>, patch: &Js
 }
 
 fn gemini_chats_patch_one(messages: &mut [(String, JsonObject)], id: &str, patch: &JsonObject) {
-    let Some(slot) = messages.iter_mut().find(|(existing, _)| existing == id) else {
+    // rm-715 twin-fold: patch ids resolve through the fold so a patch
+    // aimed at either twin id reaches the folded slot.
+    let Some(slot) = messages
+        .iter_mut()
+        .find(|(existing, _)| gemini_chats_key(existing) == gemini_chats_key(id))
+    else {
         return;
     };
     if let Some(content) = patch.get("content") {
@@ -13903,6 +13949,20 @@ const CHATS_METADATA: &str = concat!(
     r#"{"sessionId":"sess-a","projectHash":"h1","startTime":"2026-10-12T08:00:00.000Z","#,
     r#""lastUpdated":"2026-10-12T08:01:00.000Z","kind":"main"}"#
 );
+
+#[test]
+fn gemini_chats_key_folds_one_trailing_response_suffix() {
+    // rm-715 twin-fold (run b58cd254 cycle 5): exactly ONE trailing
+    // `_response` folds — the synthesized fallback id shape from
+    // pre-0.65 gemini-cli resume paths — and anything else (no
+    // suffix, bare suffix, doubled suffix, empty) passes through
+    // untouched so the fold stays inert on healthy corpora.
+    assert_eq!(gemini_chats_key("m-g3"), "m-g3");
+    assert_eq!(gemini_chats_key("m-g3_response"), "m-g3");
+    assert_eq!(gemini_chats_key("m-g3_response_response"), "m-g3_response");
+    assert_eq!(gemini_chats_key("_response"), "_response");
+    assert_eq!(gemini_chats_key(""), "");
+}
 
 #[test]
 fn gemini_chats_lane_claims_the_record_stream_and_replaces_reappends() {

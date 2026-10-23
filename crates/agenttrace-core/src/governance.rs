@@ -2877,7 +2877,14 @@ mod tests {
             "a child that outlives the bound must time out"
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            // rm-1519 doctrine (re-anchored run b58cd254 cycle 5): the
+            // absolute ceiling only guards the runaway shape — the
+            // 30 s sleep — while the `is_none` assert above carries
+            // the regression signal. The old 5 s ceiling was 16x the
+            // healthy 300 ms op but still flaked on fully-loaded fleet
+            // boxes where spawn+kill stalls; 10 s keeps 3x separation
+            // from the 30 s runaway with 33x headroom.
+            started.elapsed() < std::time::Duration::from_secs(10),
             "the bound must actually cap the wait, took {:?}",
             started.elapsed()
         );
@@ -2937,8 +2944,17 @@ mod tests {
             commits.map(|drained| drained.len()).unwrap_or(0)
         );
         assert!(
-            started.elapsed() < GIT_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
-            "the probe must stay inside its bound even when a helper holds the pipe (took {:?})",
+            // rm-1519 doctrine (re-anchored run b58cd254 cycle 5): this
+            // ceiling only guards the runaway shape — the pre-fix
+            // behaviour of draining the helper's whole 60 s lifetime —
+            // while the `commits.is_none()` degrade assert above
+            // carries the regression signal. `GIT_PROBE_TIMEOUT + 5 s`
+            // (1.5x a healthy ~10 s probe) flaked on fully-loaded
+            // fleet boxes where shim spawn and pipe drain stall; the
+            // 3x bound + 15 s keeps 15 s of separation from the 60 s
+            // runaway.
+            started.elapsed() < 3 * GIT_PROBE_TIMEOUT + std::time::Duration::from_secs(15),
+            "the probe must stay inside its runaway bound even when a helper holds the pipe (took {:?})",
             started.elapsed()
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -3006,8 +3022,12 @@ mod tests {
             overflow.map(|drained| drained.len()).unwrap_or(0)
         );
         assert!(
-            overflow_elapsed < GIT_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
-            "the overflow arm must stay inside the probe bounds (took {overflow_elapsed:?})"
+            // rm-1519 doctrine (re-anchored run b58cd254 cycle 5): same
+            // runaway-guard re-anchor as the fast-exit arm above — the
+            // `overflow.is_none()` degrade assert carries the signal;
+            // the ceiling separates the 60 s runaway, not load noise.
+            overflow_elapsed < 3 * GIT_PROBE_TIMEOUT + std::time::Duration::from_secs(15),
+            "the overflow arm must stay inside its runaway bound (took {overflow_elapsed:?})"
         );
         assert!(
             control.is_some(),

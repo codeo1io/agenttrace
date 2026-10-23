@@ -1166,6 +1166,32 @@
 
 ### Fixed
 
+- Gemini chats: pre-0.65 resume twins collapse to one counted turn (rm-715,
+  run b58cd254 cycle 5, batch "Gemini 0.65-stable boundary truth +
+  test-clock determinism"): gemini-cli < 0.65 resume paths re-append a
+  turn under a synthesized `<id>_response` id (upstream #29618, "avoid
+  duplicate tool response turns when resuming sessions", merged
+  2026-10-06, fixed in 0.65.0 stable 2026-10-20), and the chats-lane
+  id-upsert keyed raw ids, so both twins were counted (fleet PoC
+  2026-10-16: 10 sessions / 5 turns parsed as 20 / 10). The dedup key
+  now folds ONE trailing `_response` suffix — the twin replaces its
+  base record in place — while `$patch`/`$rewindTo` ids resolve through
+  the same fold so structural records keep working; real writer ids
+  never end in `_response`, so healthy and 0.65+ journals parse
+  identically (v0.65.0 baselining: `chatRecordingTypes.ts` is
+  byte-identical to the pinned v0.64.0 capture — no new record shapes;
+  `chatRecordingService.ts` changes only resume-dedup + lifecycle).
+  Same batch: governance inline-test wall-clock asserts re-anchored as
+  runaway guards (3x the probe bound + 15s, and 10s for the 300 ms
+  child-cap arm) per the rm-1519 doctrine — the old `+5s` ceilings
+  flaked on fully-loaded fleet boxes; and `install.ps1` architecture
+  detection falls back to `PROCESSOR_ARCHITEW6432` /
+  `PROCESSOR_ARCHITECTURE` (AMD64/ARM64 vocabulary accepted) when the
+  bundled PSReadLine 2.0 shadows `RuntimeInformation` with an empty
+  arch property (ported from upstream #314). Pinned by
+  `resume_twin_response_records_collapse_to_one_turn` and
+  `gemini_chats_key_folds_one_trailing_response_suffix`.
+
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch

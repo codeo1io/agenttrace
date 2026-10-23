@@ -22,6 +22,14 @@
 //! - the `tokens` carrier counts, and the writer's full-record
 //!   re-append (tokens attach to the turn's own id) replaces in place
 //!   instead of double-billing;
+//! - 2026-10-22 baselining (rm-715 acceptance (a), run b58cd254 cycle
+//!   5): v0.65.0 stable (2026-10-20) `chatRecordingTypes.ts` is
+//!   byte-identical to the pinned v0.64.0 capture and
+//!   `chatRecordingService.ts` changes only resume-dedup and lifecycle
+//!   behavior (upstream #29618) — no new record shapes — so the claim
+//!   rule and fixture shapes above carry unchanged; the one
+//!   parse-relevant behavior change is the resume dedup, mirrored by
+//!   the `_response` twin-fold (`resume_twin_response_records_…`).
 //! - `{$set: {messages}}` clears and rebuilds — a warm pre-checkpoint
 //!   state must not survive the checkpoint;
 //! - `{$rewindTo}` truncates from the id;
@@ -198,6 +206,49 @@ fn patch_remove_ids_and_tool_calls_apply() {
         Some(&1),
         "the toolCalls array must drive tool_usage"
     );
+}
+
+/// rm-715 twin-fold (run b58cd254 cycle 5, batch "Gemini 0.65-stable
+/// boundary truth + test-clock determinism"): pre-0.65 gemini-cli
+/// resume paths re-record a turn under a synthesized `<id>_response`
+/// id (client fallback in `sessionUtils.ts`, upstream fix #29618 —
+/// "avoid duplicate tool response turns when resuming sessions" —
+/// shipped 0.65.0 stable 2026-10-20). The 0.64-shaped journal below
+/// carries the `m-g3` generation TWICE — the original record and a
+/// `m-g3_response` twin re-recording the same usage — and the raw-id
+/// upsert counted both (fleet PoC 2026-10-16: 10 sessions / 5 turns
+/// parsed as 20 / 10). The fold must collapse the twin to ONE counted
+/// turn billing its usage exactly once.
+#[test]
+fn resume_twin_response_records_collapse_to_one_turn() {
+    let raw = format!(
+        "{METADATA_LINE}\n{}",
+        concat!(
+            r#"{"id":"m-u1","timestamp":"2026-10-12T09:10:01.000Z","type":"user","content":"resume me"}"#,
+            "\n",
+            r#"{"id":"m-g3","timestamp":"2026-10-12T09:10:03.000Z","type":"gemini","content":"tool turn","model":"gemini-2.5-pro","toolCalls":[{"id":"tc-9","name":"read_file","args":{"path":"y.rs"},"status":"Completed","timestamp":"2026-10-12T09:10:02.000Z","displayName":"Read File"}],"tokens":{"input":300,"output":60,"cached":0,"thoughts":0,"tool":0,"total":360}}"#,
+            "\n",
+            r#"{"id":"m-g3_response","timestamp":"2026-10-12T09:10:03.000Z","type":"gemini","content":"tool turn","model":"gemini-2.5-pro","toolCalls":[{"id":"tc-9","name":"read_file","args":{"path":"y.rs"},"status":"Completed","timestamp":"2026-10-12T09:10:02.000Z","displayName":"Read File"}],"tokens":{"input":300,"output":60,"cached":0,"thoughts":0,"tool":0,"total":360}}"#,
+            "\n"
+        )
+    );
+    let session = parse_one("session-twin.jsonl", &raw);
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    assert_eq!(session.metrics.user_messages, 1);
+    // One logical generation: the twin must REPLACE the base record
+    // in place (the lane's re-append semantics), so the turn, its
+    // tools and its usage each count exactly once. Red before the
+    // fold: the raw-id upsert appended the twin as a SECOND counted
+    // generation — 2 tool_calls_total / 2 read_file usages (the
+    // fleet PoC's doubled counts).
+    assert_eq!(
+        session.metrics.tool_calls_total, 1,
+        "resume twin double-counted the generation's tools: {}",
+        session.metrics.tool_calls_total
+    );
+    assert_eq!(session.metrics.tool_usage.get("read_file"), Some(&1));
+    assert_eq!(session.metrics.tokens_input, 300);
+    assert_eq!(session.metrics.tokens_output, 60);
 }
 
 #[test]
