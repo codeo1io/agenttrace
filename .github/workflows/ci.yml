@@ -37,6 +37,9 @@ jobs:
           # version or the action installs a toolchain nothing runs).
           toolchain: "1.98.1"
           components: rustfmt, clippy
+          # rm-1375: the windows-target compile check below needs the
+          # windows-gnu std/rust-libs present on this linux runner.
+          targets: x86_64-pc-windows-gnu
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -55,6 +58,16 @@ jobs:
         # too. Clippy-on-lib-only let real errors rot in the lint lane
         # before; this mirrors the local gate.
         run: cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace --all-targets -- -D warnings
+
+      - name: Windows-target compile check
+        # rm-1375 anti-masking arm: the Test matrix compiles unix-gated
+        # test code only on unix runners, so an un-gated std::os::unix
+        # import (E0433/E0599) aborts the windows lane before later
+        # targets even compile, masking further reds (fork CI run
+        # 39768041639: the count_honesty reds hid the cli-bin red).
+        # cargo check for the windows-gnu target needs no windows
+        # linker, so the linux lane can carry this truth gate.
+        run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-gnu
 
       - name: Validate Cargo manifests
         run: scripts/ci/check-cargo-manifests.sh
@@ -113,7 +126,7 @@ jobs:
       fail-fast: false
       matrix:
         # Linux tests run under the coverage job.
-        os: [macos-14, windows-latest]
+        os: [macos-15, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
