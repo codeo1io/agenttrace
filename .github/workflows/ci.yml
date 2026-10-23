@@ -112,8 +112,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux tests run under the coverage job.
-        os: [macos-14, windows-latest]
+        # Linux tests run under the coverage job. macos-15 per the
+        # runner-images retirement schedule (macos-14 brownouts from
+        # 2026-10-23, fully unsupported 2026-11-02).
+        os: [macos-15, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -222,7 +224,11 @@ jobs:
 
   smoke:
     name: Release binary smoke
-    runs-on: ubuntu-latest
+    # Ubuntu 22.04 = the glibc 2.35 floor scripts/ci/check-install-runtime.sh
+    # guards (the release binary must RUN on the baseline host, not
+    # just link against it — ubuntu-latest ships 2.39 and hides
+    # symbol creep until a user on the floor hits it).
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
       AGENTTRACE_BIN: target/release/agenttrace

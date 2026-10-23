@@ -35,6 +35,7 @@ use agenttrace_core::{
 };
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -475,8 +476,15 @@ fn explicit_dir_lane_keeps_duplicate_copies() {
     let _ = fs::remove_dir_all(&home);
 }
 
+#[cfg(unix)]
 #[test]
 fn unreadable_journal_is_kept_and_never_a_duplicate() {
+    // Unix-only fixture: the 0o000 permission seal has no portable
+    // Windows spelling (`Permissions::from_mode` is unix-only), and
+    // the semantics under test — an unreadable journal stays admitted
+    // and is never claimed as a duplicate — are unix permission
+    // semantics (master-lane CI truth batch, run efe507262df9 cycle 5
+    // ungated this test's compile on the windows lane).
     // A journal whose bytes cannot be read (permissions) has no
     // content signature: it must stay ADMITTED (its parse failure is
     // disclosed downstream) and must not be counted as a duplicate of
@@ -676,6 +684,103 @@ fn doctor_and_audit_disclose_the_admission_ledger() {
         // `count_honesty_disclosures_in_cli_lanes` in
         // agenttrace-cli/tests/entrypoints.rs on this same fixture
         // shape.
+    });
+    let _ = fs::remove_dir_all(&home);
+}
+
+// ------------------------------------------------------------------
+// Discovery determinism — warm/cold survivor parity (master-lane CI
+// truth batch, run efe507262df9 cycle 5).
+//
+// The macOS-lane red this pins: `count_honesty_disclosures_in_cli_lanes`
+// (agenttrace-cli/tests/entrypoints.rs) failed on APFS because the
+// per-root mtime sort AHEAD of the rm-1886 content dedup let the
+// strictly NEWER byte-identical copy (beta, written second) steal
+// survival — the named pair flipped to "beta/b.jsonl <- alpha/a.jsonl".
+// Coarse-mtime filesystems (Linux jiffy timestamps) hid the same flip
+// behind equal keys and a stable sort, while the uncached walk's
+// subdirectories-inline shape could additionally pick a different
+// survivor than the cached walk's files-first shape. Admission now
+// dedups first-seen over the deterministic WALK order (sorted files,
+// then sorted subdirectories, depth-first; roots in registration
+// order) in BOTH lanes, and mtime ordering — mtime desc, path asc, a
+// total order — applies only to the OUTPUT.
+// ------------------------------------------------------------------
+
+#[test]
+fn content_dedup_survivor_is_walk_order_not_mtime_order() {
+    // Red-first on every filesystem: beta is written strictly LATER
+    // (the sleep clears any coarse-clock tick), so pre-fix the mtime
+    // sort made the newer copy the dedup survivor in every lane; the
+    // walk-order survivor is alpha (alpha/ sorts before beta/) on any
+    // filesystem whatever the mtime granularity.
+    let home = temp_home("walk-order");
+    let journal = pi_journal_with_cost("0.0038");
+    let alpha = write(&home.join(".pi/agent/sessions/alpha/a.jsonl"), &journal);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let beta = write(&home.join(".pi/agent/sessions/beta/b.jsonl"), &journal);
+    let alpha_time = fs::metadata(&alpha)
+        .and_then(|metadata| metadata.modified())
+        .expect("alpha metadata");
+    let beta_time = fs::metadata(&beta)
+        .and_then(|metadata| metadata.modified())
+        .expect("beta metadata");
+    assert!(
+        beta_time > alpha_time,
+        "fixture must reproduce the macOS shape: beta strictly newer (got {beta_time:?} vs {alpha_time:?})"
+    );
+    with_pinned_home(&home, || {
+        // Uncached lane: dedup first-seen over walk order.
+        let admitted = find_session_files(None);
+        assert_eq!(
+            admitted,
+            vec![alpha.clone()],
+            "uncached lane admits only the walk-first copy"
+        );
+        // Cached lane, fresh cache — the lane the CLI binaries serve.
+        let fresh = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(fresh.sessions.len(), 1, "one session survives admission");
+        assert_eq!(
+            Path::new(&fresh.sessions[0].path),
+            alpha.as_path(),
+            "cached lane (fresh cache) survivor is the walk-first copy, not the newer one"
+        );
+        assert_eq!(
+            fresh.duplicate_session_files, 1,
+            "the newer copy is the disclosed duplicate"
+        );
+        let (survivor, suppressed) = &fresh.duplicate_session_file_pairs[0];
+        assert_eq!(survivor, &alpha, "the pair names survivor <- suppressed");
+        assert_eq!(suppressed, &beta);
+        // Cached lane, warm cache (replayed directory listings — a
+        // third order source) must pick the SAME survivor.
+        let mut cache = load_session_cache();
+        let warm = load_sessions_with_progress_from_cache(
+            None,
+            &LoadOptions::default(),
+            &mut cache,
+            |_| {},
+        );
+        let _ = save_session_cache(&mut cache);
+        assert!(
+            warm.cache_hits >= 1,
+            "the warm leg actually served from cache: {} hits",
+            warm.cache_hits
+        );
+        assert_eq!(
+            Path::new(&warm.sessions[0].path),
+            alpha.as_path(),
+            "warm-cache replay keeps the same survivor"
+        );
+        assert_eq!(warm.duplicate_session_files, 1);
+        // Cross-lane parity: uncached admission equals the cached
+        // lanes' survivors.
+        assert_eq!(admitted.len(), warm.sessions.len());
+        assert_eq!(
+            Path::new(&warm.sessions[0].path),
+            Path::new(&fresh.sessions[0].path),
+            "warm and fresh cached lanes agree"
+        );
     });
     let _ = fs::remove_dir_all(&home);
 }

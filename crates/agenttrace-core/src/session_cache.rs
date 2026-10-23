@@ -3594,6 +3594,7 @@ fn cache_key(path: &Path) -> String {
 /// collide on one lossy key. Keys are absolute paths and therefore
 /// begin with the root separator, which is what keeps the prefix
 /// unambiguous against verbatim keys.
+#[cfg(any(unix, test))]
 const LOSSLESS_KEY_PREFIX: &str = "at-bytes:";
 
 #[cfg(unix)]
@@ -3620,12 +3621,12 @@ fn lossless_key_from_bytes(bytes: &[u8]) -> String {
 /// malformed escape — only reachable through hand-edited journals)
 /// fails safe: the key is returned as-is rather than guessed at.
 fn path_from_key(key: &str) -> PathBuf {
-    let Some(encoded) = key.strip_prefix(LOSSLESS_KEY_PREFIX) else {
-        return PathBuf::from(key);
-    };
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
+        let Some(encoded) = key.strip_prefix(LOSSLESS_KEY_PREFIX) else {
+            return PathBuf::from(key);
+        };
         decode_lossless_key(encoded)
             .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
             .unwrap_or_else(|| PathBuf::from(key))

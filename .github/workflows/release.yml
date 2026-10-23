@@ -56,10 +56,13 @@ jobs:
       matrix:
         include:
           # Linux targets cross-compile the arm64 build on ubuntu
-          - os: ubuntu-latest
+          # 22.04 = the glibc 2.35 runtime floor the smoke lane and
+          # scripts/ci/check-install-runtime.sh guard for the shipped
+          # binaries.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset: agenttrace-linux-amd64
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             asset: agenttrace-linux-arm64
           # Darwin targets need the Apple SDK — build natively on macOS runners

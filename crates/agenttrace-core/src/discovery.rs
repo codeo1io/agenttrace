@@ -7,7 +7,6 @@ use crate::{
     Session,
 };
 use chrono::{DateTime, Utc};
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -366,7 +365,11 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     let mut identities: HashSet<PathBuf> = HashSet::new();
     let mut all = Vec::new();
     for dir in dirs {
-        for path in collect_session_files(&dir) {
+        // Walk order, not mtime order: the dedup below is first-seen,
+        // so its survivor must come from the same deterministic order
+        // the cached lane dedups over (see
+        // `collect_session_files_in_walk_order`).
+        for path in collect_session_files_in_walk_order(&dir) {
             // rm-338: dedup across roots by canonical identity so roots
             // aliasing or nesting one canonical directory cannot
             // double-count a session file; listed paths are kept as-is.
@@ -851,6 +854,23 @@ fn matches_filter(value: &str, filter: &str) -> bool {
 }
 
 pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
+    sort_paths_by_mod_time(collect_session_files_in_walk_order(dir))
+}
+
+/// The raw deterministic walk order with no mtime ordering applied:
+/// per directory, sorted files first, then sorted subdirectories,
+/// depth-first (the exact shape of the cached walk in
+/// `collect_session_files_cached_in_walk_order`). Aggregation
+/// admission (`find_session_files`) dedups first-seen over THIS
+/// order — mirroring the cached lane — so a duplicate's survivor is
+/// decided by walk order, never by filesystem mtime granularity; the
+/// mtime ordering is an OUTPUT concern and is applied after the
+/// dedup (master-lane CI truth batch, run efe507262df9 cycle 5:
+/// a per-root mtime sort ahead of the dedup used to let a strictly
+/// newer byte-identical copy steal survival on fine-grained-mtime
+/// filesystems — the macOS-lane red — while coarse-mtime filesystems
+/// masked the same flip behind equal keys and a stable sort).
+fn collect_session_files_in_walk_order(dir: &Path) -> Vec<PathBuf> {
     if is_cline_task_dir(dir) {
         return vec![dir.to_path_buf()];
     }
@@ -866,8 +886,7 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
         &mut visited,
         &mut file_targets,
     );
-    items.sort_by_key(|item| Reverse(item.1));
-    items.into_iter().map(|item| item.0).collect()
+    items
 }
 
 /// rm-1887/rm-1886 (run 77ca5de0 cycle 5, "count-honesty ledger"):
@@ -1014,7 +1033,11 @@ pub(crate) fn find_session_files_cached(
         if skip_sqlite_backed && skip_sqlite_backed_file_dir(&dir) {
             continue;
         }
-        for path in collect_session_files_cached(&dir, cache) {
+        // Walk order, not mtime order: the dedup below is first-seen,
+        // so its survivor must come from the same deterministic order
+        // the uncached lane dedups over (see
+        // `collect_session_files_cached_in_walk_order`).
+        for path in collect_session_files_cached_in_walk_order(&dir, cache) {
             // rm-338: dedup across roots by canonical identity (see
             // canonical_identity); listed paths are kept as-is.
             let identity = if cross_root {
@@ -1090,11 +1113,15 @@ pub(crate) fn find_session_files_cached(
     // at a second path re-emits the same events and double-banks every
     // aggregate it feeds. First-seen survivor wins (deterministic: the
     // walk yields sorted per-directory files, roots in registration
-    // order); a file whose bytes cannot be read is KEPT — the parse
-    // lane owns unreadable files and discloses them, dedup must not
-    // silently drop what it cannot verify. Unreadable-file stance
-    // keeps this pass observable: suppressed copies are counted and
-    // the first pairs named.
+    // order — the SAME order the uncached lane dedups over, so warm
+    // and cold admission pick identical survivors on any filesystem;
+    // mtime ordering is output-only and never decides survival, which
+    // is what let a strictly newer copy steal survival on
+    // fine-grained-mtime filesystems); a file whose bytes cannot be
+    // read is KEPT — the parse lane owns unreadable files and
+    // discloses them, dedup must not silently drop what it cannot
+    // verify. Unreadable-file stance keeps this pass observable:
+    // suppressed copies are counted and the first pairs named.
     let mut deduped: Vec<PathBuf> = Vec::with_capacity(all.len());
     let mut signatures: HashMap<(i64, u64), PathBuf> = HashMap::new();
     for path in all {
@@ -1232,6 +1259,23 @@ pub(crate) fn opencode_session_fork_parent_cached(
 }
 
 fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<PathBuf> {
+    sort_paths_by_cache(
+        collect_session_files_cached_in_walk_order(dir, cache),
+        cache,
+    )
+}
+
+/// The cached-lane sibling of `collect_session_files_in_walk_order`:
+/// the cached walk's deterministic order (per directory: sorted files
+/// first, then sorted subdirectories, depth-first; cached listings
+/// replay that exact shape) with NO mtime ordering applied.
+/// `find_session_files_cached` dedups first-seen over THIS order so
+/// its survivors equal the uncached lane's on any filesystem
+/// (master-lane CI truth batch, run efe507262df9 cycle 5).
+fn collect_session_files_cached_in_walk_order(
+    dir: &Path,
+    cache: &mut SessionCache,
+) -> Vec<PathBuf> {
     if is_cline_task_dir(dir) {
         return vec![dir.to_path_buf()];
     }
@@ -1248,7 +1292,7 @@ fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<Pat
         &mut visited,
         &mut file_targets,
     );
-    sort_paths_by_cache(items, cache)
+    items
 }
 
 /// Loop guard for symlinked session directories (Codex `#42135`):
@@ -1500,7 +1544,7 @@ fn walk_session_files(
     dir: &Path,
     depth: usize,
     max_depth: usize,
-    items: &mut Vec<(PathBuf, SystemTime)>,
+    items: &mut Vec<PathBuf>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
 ) {
@@ -1515,7 +1559,16 @@ fn walk_session_files(
     // merge filter) so the alias survivor is the same path on a cold
     // uncached walk and a cached replay instead of whichever alias
     // readdir happened to yield first.
-    let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+    //
+    // Master-lane CI truth batch (run efe507262df9, cycle 5): the
+    // mirroring is now shape-exact — sorted files first, then sorted
+    // subdirectories, depth-first. The uncached walk used to recurse
+    // into subdirectories inline in raw readdir order and append the
+    // current directory's files afterwards, so its order (the dedup
+    // first-seen order) depended on the filesystem's readdir
+    // disposition and differed structurally from the cached walk's.
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
@@ -1529,13 +1582,13 @@ fn walk_session_files(
                 continue;
             }
             if is_cline_task_dir(&path) {
-                items.push((path, entry_mod_time(&entry)));
+                files.push(path);
                 continue;
             }
             if !visited.admit(&path) {
                 continue;
             }
-            walk_session_files(&path, depth + 1, max_depth, items, visited, file_targets);
+            dirs.push(path);
             continue;
         }
         let name = entry.file_name();
@@ -1569,14 +1622,14 @@ fn walk_session_files(
         // rm-597: same-file admission — a symlink or hardlink alias of an
         // already-collected transcript is not a second session; admitted
         // in sorted order below (see the comment above the loop).
-        files.push((path, entry_mod_time(&entry)));
+        files.push(path);
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    items.extend(
-        files
-            .into_iter()
-            .filter(|(path, _)| file_targets.admit(path)),
-    );
+    files.sort();
+    dirs.sort();
+    items.extend(files.into_iter().filter(|path| file_targets.admit(path)));
+    for child in dirs {
+        walk_session_files(&child, depth + 1, max_depth, items, visited, file_targets);
+    }
 }
 
 fn sort_paths_by_mod_time(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -1590,7 +1643,13 @@ fn sort_paths_by_mod_time(paths: Vec<PathBuf>) -> Vec<PathBuf> {
             (path, time)
         })
         .collect();
-    items.sort_by_key(|item| Reverse(item.1));
+    // Master-lane CI truth batch (run efe507262df9, cycle 5): total
+    // order — mtime desc, then path asc. A key on mtime alone leaves
+    // equal-mtime files in the input's order, so a stable sort could
+    // emit different orders from different walks (coarse Linux
+    // timestamps vs fine-grained APFS); the path tiebreak pins the
+    // output regardless of which lane produced the input.
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     items.into_iter().map(|item| item.0).collect()
 }
 
@@ -1609,7 +1668,10 @@ fn sort_paths_by_cache(paths: Vec<PathBuf>, cache: &mut SessionCache) -> Vec<Pat
             .unwrap_or_else(|| metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH));
         items.push((path, time));
     }
-    items.sort_by_key(|item| Reverse(item.1));
+    // Same total order as `sort_paths_by_mod_time` (mtime desc, path
+    // asc) so the cached lane's output ordering equals the uncached
+    // lane's on an identical corpus.
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     items.into_iter().map(|item| item.0).collect()
 }
 
@@ -1991,13 +2053,6 @@ fn user_config_dir(home: &Path) -> PathBuf {
         return home.join("Library").join("Application Support");
     }
     home.join(".config")
-}
-
-fn entry_mod_time(entry: &fs::DirEntry) -> SystemTime {
-    entry
-        .metadata()
-        .and_then(|metadata| metadata.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 #[allow(clippy::too_many_arguments)]
