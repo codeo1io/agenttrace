@@ -123,10 +123,25 @@ const META_SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 /// the first entry the client also declared, or falls back to `[0]`
 /// for unknown/absent client versions. The set mirrors the official
 /// revision ladder (modelcontextprotocol repository tags, fetched
-/// live 2026-10-08: 2026-07-28 > 2025-11-25 > 2025-06-18); adding a
-/// revision here is a deliberate, tested act — the cost the rm-455
-/// rmcp-adoption rider tracks.
-const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "2025-06-18"];
+/// live 2026-10-08): 2026-07-28, 2025-11-25, 2025-06-18, 2025-03-26,
+/// then 2024-11-05. Adding a revision here is a deliberate, tested
+/// act — the cost the rm-455 rmcp-adoption rider tracks. rm floor-widening
+/// (run de92ccb4 cycle 7, rider A): the two legacy rungs were
+/// initially left off, and the every-request `-32022` gate then
+/// refused every DECLARED pre-2025-06-18 client (live probes:
+/// `2025-03-26` and `2024-11-05` initializes both answered
+/// `-32022`) while the absent-version arm served anyone — a floor
+/// that punished exactly the honest declarers. Both rungs are
+/// spoken now: the server's wire is a subset of every revision in
+/// the ladder (read-only tools, no elicitation/sampling), so
+/// declaring a legacy revision negotiates it verbatim.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 5] = [
+    "2026-07-28",
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
 
 /// `tools/list` cache hint (rm-455, run e4209f0c cycle 5): the
 /// 2026-07-28 revision's CacheableResult rule (SEP-2549) makes
@@ -542,7 +557,15 @@ fn with_result_type(result: Value) -> Value {
 /// client echo is never returned: the old behavior told a
 /// 2026-07-28 host "supported" and then served it the older wire the
 /// server was actually built for (assess F5a PoC: `1999-99-99` was
-/// echoed back verbatim).
+/// echoed back verbatim). The legacy rungs (2025-03-26, 2024-11-05)
+/// are explicit members of the ladder since the cycle-7 floor
+/// widening, so a DECLARING legacy client negotiates its own
+/// revision through the normal arm above; the absent-version
+/// fallback below serves only hosts that skip the declaration —
+/// the pre-widening rationale ("the strict reading would lock out
+/// exactly the legacy clients the fallback serves") was stale the
+/// moment the gate refused those clients' declarations and is
+/// corrected here with the widening, not by re-loosening the gate.
 fn initialize_result(params: Value) -> Result<Value, (i64, String)> {
     let requested = requested_protocol_version(&params);
     let answered = match requested {
@@ -552,9 +575,13 @@ fn initialize_result(params: Value) -> Result<Value, (i64, String)> {
             // f62ee197 cycle 4): unsupported values — member or
             // `_meta` — are answered with the typed -32022 error at
             // the dispatch gate before this function runs. Absent
-            // stays permissive on purpose: the strict reading would
-            // lock out exactly the legacy clients the fallback
-            // serves. stdout is protocol-only; the disclosure rides
+            // stays permissive on purpose: hosts that never declare
+            // a revision still get a working handshake answered at
+            // the newest rung. Declaring legacy clients are NOT this
+            // arm's concern anymore — 2025-03-26 and 2024-11-05 are
+            // explicit ladder members since the cycle-7 floor
+            // widening, so they negotiate through the normal arm
+            // above. stdout is protocol-only; the disclosure rides
             // stderr.
             eprintln!(
                 "agenttrace mcp: client requested protocol version {}, which this \

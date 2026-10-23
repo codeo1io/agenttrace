@@ -4,6 +4,50 @@
 
 ### Added
 
+- Admission honesty on explicit-dir lanes (rm-2352, run de92ccb4
+  cycle 7, assess 5ea1eedc): a `<stem>.jsonl` + `<stem>.jsonl.zst`
+  pair pointed at with `-d` used to double-bank the session — every
+  explicit arm bypassed the rm-2056 twin pass (the uncached walk
+  early-returned `collect_session_files(dir)`, the cached loader arm
+  returned a zeroed `SuppressedSessions`, and the doctor's `--dir`
+  lane hardwired the same zero), so `--overview -d twin-dir`
+  admitted 2 sessions / $0.0084 — twice the $0.0042 plain-only
+  baseline — while `--doctor` on the same directory reported
+  `zst_stem_twin_pairs: []`. The twin now collapses on every `-d`
+  arm: `find_session_files(Some(_))` runs the rm-2056 pass (silent
+  parity with its auto-home arm), the loader's explicit arm populates
+  its ledger (the collapse discloses through the `LoadReport`), and
+  the doctor's `--dir` lane reads it through the new
+  `find_session_files_reported` — so `--overview -d` carries the same
+  `zst_stem_twins` / `zst_stem_twin_pairs` keys the `--audit` lane
+  uses, attached only when a disclosure actually fired (clean
+  corpora stay key-identical; the pinned-epoch demo corpus is
+  untouched). The rm-548 keep-everything stance for the AGGREGATION
+  families (fork copies, byte-identical duplicates, artifact
+  mirrors) is deliberately untouched and still pinned — this
+  supersedes only the twin sentence in the rm-2056 row below.
+  `--doctor`'s `zst_stem_twin_pairs` also gains the `skip_serializing_if`
+  its sibling field always had (absent = nothing happened).
+  Pinned by `explicit_dir_lane_admits_zst_twin_once_with_disclosure`,
+  `overview_discloses_admission_suppressions_on_the_dir_lane`, and
+  the clean key-set arms of `doctor_demo_contract`.
+
+- MCP floor widening to the full official revision ladder (rm-2352
+  rider A, run de92ccb4 cycle 7): `SUPPORTED_PROTOCOL_VERSIONS` now
+  speaks all five rungs — `2026-07-28`, `2025-11-25`, `2025-06-18`,
+  `2025-03-26`, `2024-11-05`. The two legacy rungs had been left
+  off while the every-request `-32022` gate refused every DECLARED
+  revision outside the set, so a client declaring `2025-03-26` (or
+  `2024-11-05`, member or `_meta`) was refused on every request
+  while a client declaring nothing was served — a floor punishing
+  exactly the honest declarers (assess F5b live probes). Declaring
+  legacy clients now negotiate their own revision through the normal
+  arm; the server's wire (read-only tools, no elicitation/sampling)
+  is a subset of every rung. `--help`, README, and
+  docs/guides/mcp-server.md updated to name the full ladder. Pinned
+  by `legacy_revisions_negotiate_instead_of_being_refused` and the
+  widened negotiation-list asserts.
+
 - The MCP server speaks the 2026-07-28 revision's wire truth
   end to end (rm-455, run f62ee197 cycle 4): `server/discover` — the
   revision's ONE mandatory server RPC, whose schema description reads

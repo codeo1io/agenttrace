@@ -219,8 +219,10 @@ locally discovered sessions the CLI reports on — `usage_overview` (the
 sessions per model) — through the same layered configuration the CLI
 resolves: a `--config` layer or `--pricing-file` override prices both
 lanes identically (rm-781). `initialize` negotiates the newest
-mutually supported protocol revision — `2026-07-28`, `2025-11-25`, or
-`2025-06-18` — never a blind echo (rm-780). The server opens no
+mutually supported protocol revision — the full official ladder:
+`2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26`, or
+`2024-11-05` — never a blind echo (rm-780; the two legacy rungs
+rejoined the set in the cycle-7 floor widening). The server opens no
 sockets, performs no network probes, and writes nothing outside the
 agenttrace session cache; it serves until stdin closes, answering a
 non-UTF-8 line with `-32700` and an over-cap line (past the 1 MiB

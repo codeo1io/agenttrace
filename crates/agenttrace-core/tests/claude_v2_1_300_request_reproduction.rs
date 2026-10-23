@@ -301,6 +301,74 @@ fn doctor_report_surfaces_the_unmatched_kind_counter() {
     );
 }
 
+/// rm-601 rider (run de92ccb4 cycle 7, "admission honesty on
+/// explicit-dir lanes", research RC8 / upstream ccusage #1935): a
+/// REQUESTLESS `resp_` assistant corpus — assistant rows keyed by
+/// Response-API ids with no request pairing to anchor them — folds by
+/// id, keeping the MAX per token class, never the sum. ccusage
+/// double-counted exactly this shape (streaming re-emissions of the
+/// same `resp_` id summed); the rm-601 fold keyed on ANY non-empty
+/// message id is the immunity. Pinned here in the v2.1.300 family
+/// because that era's journals are where requestless resp_ rows
+/// first appear in the wild. Behavior-neutral: parser code is
+/// untouched; this pin guards the fold against a future max→sum
+/// regression at the requestless seam.
+#[test]
+fn requestless_resp_rows_fold_by_id_keep_max_never_sum() {
+    // One message, id `resp_redacted01`, streamed twice with growing
+    // totals (output 200 then 500, input repeating 1200) — requestless:
+    // no user turn or request record precedes it.
+    let resp_row = |id: &str, input: u64, output: u64, seq: u8| {
+        format!(
+            concat!(
+                r#"{{"type":"assistant","message":{{"id":"{}","role":"assistant","model":"claude-sonnet-4-5-20250929","#,
+                r#""content":[{{"type":"text","text":"block {}"}}],"#,
+                r#""usage":{{"input_tokens":{},"output_tokens":{},"#,
+                r#""cache_read_input_tokens":800,"cache_creation_input_tokens":100}}}},"#,
+                r#""uuid":"a{}","parentUuid":null,"sessionId":"rr-2-1-300","#,
+                r#""timestamp":"2026-10-15T10:00:0{}Z","version":"2.1.300"}}"#,
+                "\n"
+            ),
+            id, seq, input, output, seq, seq
+        )
+    };
+    // A second, DISTINCT resp_ id: any-non-empty-id keying admits it
+    // as its own message (distinct sessions never collapse). The lone
+    // user turn carries no usage and no request record — the assistant
+    // rows stay REQUESTLESS (nothing pairs them), which is the ccusage
+    // #1935 shape the rm-601 fold must survive.
+    let body = format!(
+        "{}{}{}{}",
+        KNOWN_USER,
+        resp_row("resp_redacted01", 1200, 200, 1),
+        resp_row("resp_redacted01", 1200, 500, 2),
+        resp_row("resp_redacted02", 300, 50, 3),
+    );
+    let session = parse_corpus("requestless-resp", &body);
+    assert_eq!(
+        session.metrics.tokens_input,
+        1200 + 300,
+        "keep-max per id: re-emission of resp_redacted01 must not re-add its 1200"
+    );
+    assert_eq!(
+        session.metrics.tokens_output, 500 + 50,
+        "keep-max per id: 200→500 climb keeps 500, never sums to 700 (the ccusage #1935 double-count)"
+    );
+    assert_eq!(
+        session.metrics.tokens_cache_r,
+        800 + 800,
+        "cache reads fold the same way (max per emission, then the distinct id adds its own)"
+    );
+    assert_eq!(
+        session.metrics.assistant_turns, 2,
+        "ONE meta event per id: 2 distinct resp_ ids, never 3 emissions"
+    );
+    assert_eq!(
+        session.metrics.events_total, 6,
+        "decomposition: 1 user turn + 3 streamed text blocks (per emission,\n        by design — content renders each block) + 2 usage-meta events (one\n        per DISTINCT id — a sum-folded ledger would bank a 4th emission)"
+    );
+}
+
 /// Provenance: the fixture and the inline corpora describe the SAME
 /// known-shape lines (the byte-identical arm above compares across
 /// them, so they must not drift).

@@ -96,6 +96,25 @@ fn doctor_demo_dir_arg_gates_the_directory_lane() {
             control_json.contains(&marker_path),
             "control must disclose the probed directory: {control_json}"
         );
+        // rm-2352 (run de92ccb4 cycle 7): clean key-set pin — a custom
+        // directory with no twins OMITS `zst_stem_twin_pairs` entirely
+        // (the `skip_serializing_if` the rm-2056 field was missing while
+        // its sibling `duplicate_session_file_pairs` already had it), so
+        // a clean corpus renders no phantom empty-array rows and the
+        // disclosure convention stays "absent = nothing happened".
+        let control_value: serde_json::Value =
+            serde_json::from_str(&control_json).expect("parse control json");
+        assert!(
+            control_value.get("zst_stem_twin_pairs").is_none(),
+            "clean --dir JSON must omit the twin-pairs key: {control_json}"
+        );
+        assert!(
+            control_value
+                .get("disclosures")
+                .and_then(|d| d.get("zst_stem_twins"))
+                .is_none(),
+            "clean --dir JSON carries no twin disclosure: {control_json}"
+        );
         fs::remove_dir_all(&root).ok();
     });
 }
@@ -121,6 +140,12 @@ fn doctor_demo_auto_discovery_is_fast_and_deterministic() {
             value["directories"].as_array().map(Vec::len),
             Some(0),
             "demo must not enumerate the operator's discovery roots"
+        );
+        // rm-2352 clean key-set pin, demo arm: zero files walked means
+        // zero twins — the key must be ABSENT, not an empty array.
+        assert!(
+            value.get("zst_stem_twin_pairs").is_none(),
+            "demo JSON must omit the twin-pairs key: {first}"
         );
         assert!(
             elapsed.as_secs() < 5,
