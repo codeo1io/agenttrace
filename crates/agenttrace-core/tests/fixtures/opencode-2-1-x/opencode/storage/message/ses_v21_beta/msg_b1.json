@@ -1,0 +1,17 @@
+{
+  "id": "msg_b1",
+  "sessionID": "ses_v21_beta",
+  "role": "assistant",
+  "modelID": "anthropic/claude-sonnet-4-5",
+  "time": {
+    "created": 1792576800000,
+    "start": 1792576800000
+  },
+  "tokens": {
+    "input": 500,
+    "output": 150
+  },
+  "native": {
+    "context": "v2.1 renamed from providerState"
+  }
+}

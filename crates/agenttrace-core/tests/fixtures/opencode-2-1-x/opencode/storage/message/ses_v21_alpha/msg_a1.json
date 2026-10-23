@@ -1,0 +1,9 @@
+{
+  "id": "msg_a1",
+  "sessionID": "ses_v21_alpha",
+  "role": "user",
+  "time": {
+    "created": 1792573200000,
+    "start": 1792573200000
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": "ses_v21_alpha",
+  "projectID": "proj_orbit",
+  "directory": "/work/demo/orbit",
+  "title": "Orbit budget review",
+  "slug": "orbit-budget-review",
+  "time": {
+    "created": 1792573200000,
+    "updated": 1792573440000
+  }
+}

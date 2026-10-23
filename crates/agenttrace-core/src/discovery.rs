@@ -163,6 +163,36 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
             name: "Codex CLI archived".to_string(),
             path: env_home("CODEX_HOME", home.join(".codex")).join("archived_sessions"),
         },
+        // rm-2360 (cycle 7): Orca runs Codex behind per-account homes
+        // nested under its macOS app-support data dir (ccusage #1930,
+        // first-hand layout report; upstream closed the issue excluded,
+        // so this lane is agenttrace's own bank, not a ccusage mirror).
+        // Every Orca Codex home is a full `~/.codex`-shaped tree, so the
+        // sessions/archived_sessions pair mirrors the rows above and the
+        // existing rollout parser lane is reused unchanged. The shared
+        // runtime home is static here; per-account homes are enumerated
+        // structurally in `orca_known_session_dirs` below (account ids
+        // are user-specific, like pi-family fork dirs).
+        KnownSessionDir {
+            name: "Orca".to_string(),
+            path: home
+                .join("Library")
+                .join("Application Support")
+                .join("orca")
+                .join("codex-runtime-home")
+                .join("home")
+                .join("sessions"),
+        },
+        KnownSessionDir {
+            name: "Orca archived".to_string(),
+            path: home
+                .join("Library")
+                .join("Application Support")
+                .join("orca")
+                .join("codex-runtime-home")
+                .join("home")
+                .join("archived_sessions"),
+        },
         KnownSessionDir {
             name: "Gemini CLI".to_string(),
             path: home.join(".gemini").join("tmp"),
@@ -275,6 +305,7 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
     dirs.extend(open_code_known_session_dirs(&home));
     dirs.extend(cline_known_session_dirs(&home));
     dirs.extend(pi_family_known_session_dirs(&home));
+    dirs.extend(orca_known_session_dirs(&home));
     dirs
 }
 
@@ -1918,6 +1949,51 @@ fn open_code_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
             .join("opencode")
             .join("storage"),
     );
+    dirs
+}
+
+/// Orca account homes (rm-2360): every
+/// `codex-accounts/<account-id>/home` child of the Orca data dir is a
+/// full Codex home with its own `sessions/` (and possibly
+/// `archived_sessions/`) — ccusage #1930 reports multiple accounts per
+/// machine, and the account ids are user-specific, so the children are
+/// enumerated structurally the way pi-family fork dirs are, with the
+/// same existence gate: a `codex-accounts` child that is not a Codex
+/// home registers nothing at all.
+fn orca_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
+    let accounts = home
+        .join("Library")
+        .join("Application Support")
+        .join("orca")
+        .join("codex-accounts");
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    let Ok(children) = fs::read_dir(&accounts) else {
+        return dirs;
+    };
+    let mut children: Vec<PathBuf> = children.flatten().map(|entry| entry.path()).collect();
+    children.sort();
+    for child in children {
+        let Some(account) = child.file_name().and_then(std::ffi::OsStr::to_str) else {
+            continue;
+        };
+        let codex_home = child.join("home");
+        let mut candidates = Vec::new();
+        candidates.push((
+            format!("Orca ({account})"),
+            codex_home.join("sessions"),
+        ));
+        candidates.push((
+            format!("Orca ({account}) archived"),
+            codex_home.join("archived_sessions"),
+        ));
+        for (name, path) in candidates {
+            if !seen.contains(&path) && path.is_dir() {
+                seen.insert(path.clone());
+                dirs.push(KnownSessionDir { name, path });
+            }
+        }
+    }
     dirs
 }
 

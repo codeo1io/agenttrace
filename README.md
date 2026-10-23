@@ -29,7 +29,7 @@
 
 ---
 
-**agenttrace** is a local-first terminal TUI and report generator for AI coding-agent session history. It reads Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Hermes Agent, OpenCode, OpenClaw, Pi and its forks (Senpi, Omo — cancelled-run markers on the pi ≥1.1.0 wire, `agent_settled.aborted` and the terminal `stopReason:"aborted"`, are consumed and disclosed as `pi_run_aborted`) plus agent-dir variants like `~/.pi/agent-cliproxy-only`, Oh My Pi, Kimi CLI, Copilot-style logs, and generic JSON/JSONL traces, then helps with two daily jobs: see what multiple agents spent across cost, tokens, and time; and diagnose why a task ran slowly.
+**agenttrace** is a local-first terminal TUI and report generator for AI coding-agent session history. It reads Claude Code, Codex CLI (including Orca-managed homes on macOS), Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Hermes Agent, OpenCode, OpenClaw, Pi and its forks (Senpi, Omo — cancelled-run markers on the pi ≥1.1.0 wire, `agent_settled.aborted` and the terminal `stopReason:"aborted"`, are consumed and disclosed as `pi_run_aborted`) plus agent-dir variants like `~/.pi/agent-cliproxy-only`, Oh My Pi, Kimi CLI, Copilot-style logs, and generic JSON/JSONL traces, then helps with two daily jobs: see what multiple agents spent across cost, tokens, and time; and diagnose why a task ran slowly.
 
 One `agenttrace` binary provides both interfaces: run it without a report action to open the TUI, or pass flags such as `--sessions` and `--overview` for CLI output.
 
@@ -618,6 +618,8 @@ directory; missing directories are simply skipped.
 | Hermes Agent | `~/.hermes/sessions` |
 | Codex CLI | `~/.codex/sessions` |
 | Codex CLI (archived) | `~/.codex/archived_sessions` |
+| Orca | `~/Library/Application Support/orca/codex-runtime-home/home/sessions` |
+| Orca (archived) | `~/Library/Application Support/orca/codex-runtime-home/home/archived_sessions` |
 | Gemini CLI | `~/.gemini/tmp` |
 | Antigravity CLI | `~/.gemini/antigravity-cli/brain` |
 | Antigravity CLI (conversations) | `~/.gemini/antigravity-cli/conversations` |
@@ -650,6 +652,10 @@ Pi-family homes are
 enumerated structurally (every `~/.pi`, `~/.omp`, `~/.senpi`, `~/.omo`,
 `~/.config/pi` root child carrying a `sessions/` directory registers —
 including fork-relocated agent dirs), so they have no fixed rows here.
+Orca account homes are enumerated structurally too (every
+`~/Library/Application Support/orca/codex-accounts/<account>/home`
+child's `sessions/` and `archived_sessions/` registers), so only the
+shared runtime home has fixed rows above.
 Anything outside these roots is reachable only through the explicit
 `-d/--dir` escape.
 

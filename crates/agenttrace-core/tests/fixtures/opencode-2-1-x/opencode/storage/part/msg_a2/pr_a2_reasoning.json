@@ -1,0 +1,11 @@
+{
+  "id": "pr_a2_reasoning",
+  "type": "reasoning",
+  "text": "Recheck the delta table before summarizing.",
+  "time": {
+    "start": 1792573260000
+  },
+  "native": {
+    "durationMs": 900
+  }
+}

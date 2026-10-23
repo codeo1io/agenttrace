@@ -1,0 +1,16 @@
+{
+  "id": "msg_a4",
+  "sessionID": "ses_v21_alpha",
+  "role": "assistant",
+  "modelID": "anthropic/claude-haiku-4-5",
+  "time": {
+    "created": 1792573380000,
+    "start": 1792573380000
+  },
+  "tokens": {
+    "reasoning": 48
+  },
+  "native": {
+    "note": "reasoning-only fold must not suppress the step rescue"
+  }
+}

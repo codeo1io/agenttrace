@@ -4,6 +4,32 @@
 
 ### Added
 
+- Default discovery now reaches Orca-managed Codex homes on macOS
+  (rm-2360, run ceac8b96 cycle 7): Orca runs Codex behind whole
+  `~/.codex`-shaped homes nested under
+  `~/Library/Application Support/orca` — the shared
+  `codex-runtime-home/home` (sessions and archived sessions) plus one
+  `codex-accounts/<account>/home` per account, enumerated structurally
+  the way pi-family fork dirs are, so a non-home `codex-accounts`
+  child registers nothing. The layout is banked from ccusage issue
+  #1930's first-hand report (upstream closed it excluded); rollouts
+  found there parse through the existing Codex CLI lane unchanged and
+  surface in the README roots table (EN and zh-CN) per the rm-1022
+  transparency contract.
+- The OpenCode storage lane is pinned to the v2.1.x field shapes
+  (rm-507/rm-1021, run ceac8b96 cycle 7): a v2.1.2-shaped fixture
+  bank under `tests/fixtures/opencode-2-1-x/` (provenance in-tree)
+  locks full attribution — project directory through both arms
+  (session `directory` and `storage/project/<projectID>`), model
+  ownership via message `modelID`s, message bodies under the renamed
+  shapes, and every token class including the two rm-619 folds —
+  through `opencode_v2_1_x`, a dedicated companion to the existing
+  opencode suites. The v2.1 renames (`state`/`providerState` →
+  `native` on provider-replay surfaces, tool execution `state`
+  unchanged; compaction `recent` → `metadata.keepID`; provider
+  compaction windows in `native.messages`; `session.compacted`
+  removed) touch no field the storage parser reads, and the fixture
+  proves that per revision rather than assuming it.
 - The MCP server speaks the 2026-07-28 revision's wire truth
   end to end (rm-455, run f62ee197 cycle 4): `server/discover` — the
   revision's ONE mandatory server RPC, whose schema description reads

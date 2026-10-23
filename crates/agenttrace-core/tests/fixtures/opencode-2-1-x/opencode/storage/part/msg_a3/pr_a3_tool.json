@@ -1,0 +1,20 @@
+{
+  "id": "pr_a3_tool",
+  "type": "tool",
+  "tool": "read",
+  "callID": "toolu_v21_orbit",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "orbit.csv"
+    },
+    "output": "42 rows, 3 columns",
+    "time": {
+      "start": 1792573320000,
+      "end": 1792573324000
+    }
+  },
+  "native": {
+    "tool": "read"
+  }
+}

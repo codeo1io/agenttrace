@@ -1,0 +1,11 @@
+{
+  "id": "pr_b1_text",
+  "type": "text",
+  "text": "Northgate release notes drafted.",
+  "time": {
+    "start": 1792576800000
+  },
+  "native": {
+    "stopReason": "end_turn"
+  }
+}

@@ -29,7 +29,7 @@
 
 ---
 
-**agenttrace** 是一个本地优先的终端 TUI 和报告生成工具，用来分析 AI 编程 Agent 的会话历史。它会读取 Claude Code、Codex CLI、Qwen Code、Cline、Aider、Cursor exports、Hermes Agent、OpenCode、OpenClaw、Pi、Oh My Pi、Kimi CLI、Copilot-style logs 和通用 JSON/JSONL traces，主要帮你做两件事：汇总多个 Agent 历史会话的成本、Token 和耗时；定位某次任务为什么跑得慢。
+**agenttrace** 是一个本地优先的终端 TUI 和报告生成工具，用来分析 AI 编程 Agent 的会话历史。它会读取 Claude Code、Codex CLI（含 macOS 上 Orca 托管的主目录）、Qwen Code、Cline、Aider、Cursor exports、Hermes Agent、OpenCode、OpenClaw、Pi、Oh My Pi、Kimi CLI、Copilot-style logs 和通用 JSON/JSONL traces，主要帮你做两件事：汇总多个 Agent 历史会话的成本、Token 和耗时；定位某次任务为什么跑得慢。
 
 CLI 和 TUI 来自同一个 `agenttrace` 二进制：不带报告动作时进入 TUI，传入 `--sessions`、`--overview` 等参数时输出 CLI 报告。
 
@@ -203,6 +203,8 @@ discovery 声明的根目录上，新注册的根目录无法绕过文档落地�
 | Hermes Agent | `~/.hermes/sessions` |
 | Codex CLI | `~/.codex/sessions` |
 | Codex CLI（归档） | `~/.codex/archived_sessions` |
+| Orca | `~/Library/Application Support/orca/codex-runtime-home/home/sessions` |
+| Orca（归档） | `~/Library/Application Support/orca/codex-runtime-home/home/archived_sessions` |
 | Gemini CLI | `~/.gemini/tmp` |
 | Antigravity CLI | `~/.gemini/antigravity-cli/brain` |
 | Antigravity CLI（对话） | `~/.gemini/antigravity-cli/conversations` |
@@ -232,7 +234,10 @@ discovery 声明的根目录上，新注册的根目录无法绕过文档落地�
 根目录不可迁移）、`CLINE_SESSION_DATA_DIR`（Cline CLI 的
 `~/.cline/data/sessions` 存储）。Pi 家族主目录按结构枚举（`~/.pi`、`~/.omp`、`~/.senpi`、
 `~/.omo`、`~/.config/pi` 下任何携带 `sessions/` 目录的子目录都会注册，
-包括 fork 迁移过的 agent 目录），因此这里没有固定行。表外的任何
+包括 fork 迁移过的 agent 目录），因此这里没有固定行。Orca 各账号主目录同样按
+结构枚举（`~/Library/Application Support/orca/codex-accounts/<account>/home`
+下的 `sessions/` 与 `archived_sessions/` 都会注册），因此上表只固定列出共享的
+runtime 主目录。表外的任何
 位置只能通过显式的 `-d/--dir` 逃生口扫描。
 
 ## 你会得到什么

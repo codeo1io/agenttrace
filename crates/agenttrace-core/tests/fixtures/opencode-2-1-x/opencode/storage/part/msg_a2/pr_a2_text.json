@@ -1,0 +1,11 @@
+{
+  "id": "pr_a2_text",
+  "type": "text",
+  "text": "Orbit spent 12.4M tokens in October, 8.1M of them cached reads.",
+  "time": {
+    "start": 1792573262000
+  },
+  "native": {
+    "stopReason": "end_turn"
+  }
+}

@@ -1,7 +1,7 @@
 use agenttrace_core::SESSION_CACHE_SCHEMA_VERSION;
 use agenttrace_core::{
     build_doctor_report, collect_session_files, data_health, data_health_scoped,
-    find_session_files, load_sessions_from_dir, load_sessions_with_options,
+    find_session_files, known_session_dirs, load_sessions_from_dir, load_sessions_with_options,
     load_sessions_with_progress, parse_file, render_waste_report, search_sessions,
     session_cache_path, session_capability, total_tokens, LoadOptions,
 };
@@ -2709,6 +2709,116 @@ fn rust_discovers_antigravity_conversation_sidecars_but_not_the_store() {
             "VIEW_FILE must surface as a tool event"
         );
         assert_eq!(sidecar_session.metrics.events_total, 3);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_discovers_orca_codex_homes_runtime_and_accounts() {
+    // rm-2360: Orca runs Codex behind whole Codex homes nested under
+    // its macOS app-support dir — a shared runtime home plus one home
+    // per account (ccusage #1930 first-hand layout; upstream closed
+    // the issue excluded, so the lane is agenttrace's own). Both homes'
+    // rollouts must surface through DEFAULT discovery and attribute to
+    // the codex_cli parser lane, and the account enumeration must stay
+    // structural: a `codex-accounts` child that is not a Codex home
+    // registers nothing.
+    let root = temp_root("agenttrace-rust-orca-codex-homes");
+    let home = root.join("home");
+    let orca = home
+        .join("Library")
+        .join("Application Support")
+        .join("orca");
+    let runtime_sessions = orca
+        .join("codex-runtime-home")
+        .join("home")
+        .join("sessions");
+    let runtime_archived = orca
+        .join("codex-runtime-home")
+        .join("home")
+        .join("archived_sessions");
+    let account_home = orca.join("codex-accounts").join("acct-alpha").join("home");
+    let account_sessions = account_home.join("sessions");
+    fs::create_dir_all(&runtime_sessions).expect("create orca runtime sessions");
+    fs::create_dir_all(&runtime_archived).expect("create orca runtime archived");
+    fs::create_dir_all(&account_sessions).expect("create orca account sessions");
+    // Codex homes "may also contain archived_sessions" (ccusage
+    // #1930) — give the account one so both rows register.
+    fs::create_dir_all(account_home.join("archived_sessions"))
+        .expect("create orca account archived");
+    fs::create_dir_all(orca.join("codex-accounts").join("attachments"))
+        .expect("create non-home codex-accounts child");
+    let rollout = r#"{"timestamp":"2026-10-18T09:00:00Z","type":"session_meta","payload":{"model_provider":"openai"}}
+{"timestamp":"2026-10-18T09:00:01Z","type":"turn_context","payload":{"model":"gpt-5.4"}}
+{"timestamp":"2026-10-18T09:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":20,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":20,"total_tokens":1100}}}}
+{"timestamp":"2026-10-18T09:00:03Z","type":"response_item","payload":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}}
+{"timestamp":"2026-10-18T09:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"ok"}}
+"#;
+    // NB: the two corpora differ on purpose — discovery dedups
+    // byte-identical copies across roots (rm-1886 content signature),
+    // and this test pins that BOTH homes are walked, not that a
+    // mirrored pair survives.
+    let runtime_rollout = runtime_sessions.join("rollout-2026-10-18-09-00-00-aaa.jsonl");
+    fs::write(&runtime_rollout, rollout).expect("write runtime rollout");
+    let account_rollout = account_sessions.join("rollout-2026-10-18-10-00-00-bbb.jsonl");
+    fs::write(
+        &account_rollout,
+        rollout.replace("2026-10-18T09:00:0", "2026-10-18T10:00:0"),
+    )
+    .expect("write account rollout");
+
+    with_home(&home, || {
+        let registry: Vec<(String, std::path::PathBuf)> = known_session_dirs()
+            .into_iter()
+            .map(|dir| (dir.name, dir.path))
+            .collect();
+        for (name, path) in [
+            ("Orca", runtime_sessions.clone()),
+            ("Orca archived", runtime_archived.clone()),
+            ("Orca (acct-alpha)", account_sessions.clone()),
+            (
+                "Orca (acct-alpha) archived",
+                account_home.join("archived_sessions"),
+            ),
+        ] {
+            assert!(
+                registry.iter().any(|(n, p)| n == name && *p == path),
+                "registry must carry {name} at {}: {registry:?}",
+                path.display()
+            );
+        }
+        assert!(
+            !registry
+                .iter()
+                .any(|(_, p)| p.to_string_lossy().contains("attachments")),
+            "a codex-accounts child that is not a Codex home must register \
+             nothing: {registry:?}"
+        );
+        assert!(
+            !registry.iter().any(|(n, _)| n == "Orca (attachments)"),
+            "no phantom registry row for a non-home child: {registry:?}"
+        );
+
+        let found = find_session_files(None);
+        assert_eq!(
+            found.len(),
+            2,
+            "default discovery must find both Orca-hosted rollouts and \
+             nothing else under the scratch home: {found:?}"
+        );
+        assert!(
+            found.contains(&runtime_rollout),
+            "the runtime-home rollout must be discovered"
+        );
+        assert!(
+            found.contains(&account_rollout),
+            "the account-home rollout must be discovered"
+        );
+
+        let parsed = parse_file(&runtime_rollout).expect("parse orca-hosted rollout");
+        assert_eq!(parsed.metrics.source_tool, "codex_cli");
+        assert_eq!(parsed.metrics.tokens_input, 600);
     });
 
     let _ = fs::remove_dir_all(root);

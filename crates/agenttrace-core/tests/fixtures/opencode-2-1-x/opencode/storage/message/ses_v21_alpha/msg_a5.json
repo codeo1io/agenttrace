@@ -1,0 +1,17 @@
+{
+  "id": "msg_a5",
+  "sessionID": "ses_v21_alpha",
+  "type": "compaction",
+  "summary": "Kept the budget table turn; earlier turns dropped.",
+  "metadata": {
+    "keepID": "msg_a2"
+  },
+  "time": {
+    "created": 1792573440000
+  },
+  "native": {
+    "messages": [
+      "compacted replay list (v2.1 renamed from providerContext)"
+    ]
+  }
+}

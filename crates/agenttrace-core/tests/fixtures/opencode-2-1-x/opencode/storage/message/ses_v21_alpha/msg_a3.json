@@ -1,0 +1,13 @@
+{
+  "id": "msg_a3",
+  "sessionID": "ses_v21_alpha",
+  "role": "assistant",
+  "modelID": "anthropic/claude-haiku-4-5",
+  "time": {
+    "created": 1792573320000,
+    "start": 1792573320000
+  },
+  "native": {
+    "mode": "tool"
+  }
+}

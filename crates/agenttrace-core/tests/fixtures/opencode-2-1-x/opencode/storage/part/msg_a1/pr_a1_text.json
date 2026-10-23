@@ -1,0 +1,11 @@
+{
+  "id": "pr_a1_text",
+  "type": "text",
+  "text": "Summarize the orbit token budget for October.",
+  "time": {
+    "start": 1792573200000
+  },
+  "native": {
+    "replay": "opaque v2.1 provider replay (renamed from state)"
+  }
+}
