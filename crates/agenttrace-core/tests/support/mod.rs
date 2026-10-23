@@ -124,7 +124,9 @@ pub fn assert_poison_proof_standing(probe_filter: &str, poisoned_cache_json: &st
     let guarded = run_probe(Some(&clean_session));
     assert!(
         guarded.status.success(),
-        "guarded catalog must ignore a poisoned default machine cache:\n{}",
+        "guarded catalog must ignore a poisoned default machine cache \
+         (child stdout then stderr):\n{}\n{}",
+        String::from_utf8_lossy(&guarded.stdout),
         String::from_utf8_lossy(&guarded.stderr)
     );
 

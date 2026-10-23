@@ -302,10 +302,15 @@ fn first_party_extract_poison_probe() {
         serde_json::from_str(include_str!("../src/pricing_snapshot.json")).unwrap();
     let row = &bundled["claude-sonnet-4-5-20250929"];
     let p = lookup_price("claude-sonnet-4-5-20250929");
+    // `Price` is USD per MILLION tokens; the snapshot literal is USD
+    // per token — the same *1e6 scaling the regional suite applies.
     assert_eq!(
         p.input,
-        row["input_cost_per_token"].as_f64().unwrap(),
+        row["input_cost_per_token"].as_f64().unwrap() * 1e6,
         "a primary-catalog id must price at the bundled LiteLLM rate"
     );
-    assert_eq!(p.output, row["output_cost_per_token"].as_f64().unwrap());
+    assert_eq!(
+        p.output,
+        row["output_cost_per_token"].as_f64().unwrap() * 1e6
+    );
 }
