@@ -93,4 +93,32 @@ if grep -q '^## Unreleased' "$changelog"; then
 		fail "Unreleased section is present but carries no entries (rm-1390): a header over zero bullets claims a landing lane that does not exist — land the entries, date the section, or drop the header"
 fi
 
-echo "check-changelog-structure: no merge-conflict fences; no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous)"
+# Pass 4 (rm-2319, run e8b4dd3f cycle 4): duplicate-entry gate. The
+# Unreleased Added list carried a 37-entry run TWICE — 66 duplicate
+# entry lines, largest byte-identical block 28 lines long — from a
+# merge, and every earlier arm stayed rc0-green: Pass 1 arms duplicate
+# SECTION headings, Pass 2 a first-per-kind lens, and the duplicated
+# entries sat inside the SAME section, invisible to both. Keep-a-
+# changelog consumers and human readers see inflated release notes.
+# This arm fails the moment any `##` section carries two byte-identical
+# `- ` entry lines. Identical entry lines across DIFFERENT sections
+# stay legal — a re-listed fix under a later version is a different
+# fact.
+if ! dupes="$(awk '
+	/^## / { section++ }
+	/^- / {
+		key = section SUBSEP $0
+		if (key in seen) {
+			printf("  section %d: entry line first at %d, again at %d: %.80s...\n", section, seen[key], NR, substr($0, 1, 80))
+			bad = 1
+		} else {
+			seen[key] = NR
+		}
+		entries++
+	}
+	END { exit bad ? 1 : 0 }
+' "$changelog")"; then
+	fail "duplicate entry lines within one section of CHANGELOG.md (keep exactly one copy per entry):"$'\n'"$dupes"
+fi
+
+echo "check-changelog-structure: no merge-conflict fences; no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous); no duplicate entry lines in any section"
