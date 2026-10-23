@@ -1688,7 +1688,13 @@ fn sort_paths_by_mod_time(paths: Vec<PathBuf>) -> Vec<PathBuf> {
             (path, time)
         })
         .collect();
-    items.sort_by_key(|item| Reverse(item.1));
+    // rm-2378 (run 8a5372ee cycle 7): `sort_by_key(Reverse(mtime))` left
+    // equal-mtime sessions in INPUT order — same-second directory copies
+    // (CI fixtures, restored stores) ordered by readdir luck. Equal
+    // mtimes now tiebreak on ascending path, the survivor convention
+    // 58227d21 landed for the content-dedup pass: lexicographically
+    // first path wins.
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     items.into_iter().map(|item| item.0).collect()
 }
 
@@ -1707,8 +1713,80 @@ fn sort_paths_by_cache(paths: Vec<PathBuf>, cache: &mut SessionCache) -> Vec<Pat
             .unwrap_or_else(|| metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH));
         items.push((path, time));
     }
-    items.sort_by_key(|item| Reverse(item.1));
+    // rm-2378: same tiebreak as sort_paths_by_mod_time — equal cached
+    // mtimes order by ascending path so scan order never depends on the
+    // input path order.
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     items.into_iter().map(|item| item.0).collect()
+}
+
+#[cfg(test)]
+mod sort_determinism_tests {
+    use super::{sort_paths_by_cache, sort_paths_by_mod_time};
+    use crate::session_cache::SessionCache;
+    use std::fs::{self, FileTimes};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    fn write_with_mtime(root: &Path, name: &str, mtime: SystemTime) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, b"x").expect("fixture write");
+        let file = fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("reopen for set_times");
+        file.set_times(FileTimes::new().set_modified(mtime))
+            .expect("set_times");
+        path
+    }
+
+    // rm-2378 red-first: two files whose mtimes are EXACTLY equal (a
+    // same-second copy — CI fixtures, restored stores) sorted by input
+    // order under `sort_by_key(Reverse(mtime))`, so shuffling the input
+    // shuffled the output. The tiebreak pins equal-mtime order to
+    // ascending path, and the older file still sorts last from either
+    // input order.
+    #[test]
+    fn equal_mtime_files_order_by_path_from_any_input_order() {
+        let root = std::env::temp_dir().join(format!("rm2378-modtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp dir");
+        let same = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let a = write_with_mtime(&root, "a-same.jsonl", same);
+        let b = write_with_mtime(&root, "b-same.jsonl", same);
+        let c = write_with_mtime(&root, "c-older.jsonl", same - Duration::from_secs(10));
+        for order in [
+            vec![c.clone(), b.clone(), a.clone()],
+            vec![a.clone(), c.clone(), b.clone()],
+        ] {
+            let sorted = sort_paths_by_mod_time(order);
+            assert_eq!(sorted, vec![a.clone(), b.clone(), c.clone()]);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The cached lane carries the same guarantee — an empty cache (all
+    // misses fall back to fs metadata) with equal mtimes must produce
+    // the identical, path-tiebroken order from shuffled inputs.
+    #[test]
+    fn equal_mtime_files_order_by_path_in_the_cached_lane_too() {
+        let root = std::env::temp_dir().join(format!("rm2378-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp dir");
+        let same = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let a = write_with_mtime(&root, "a-same.jsonl", same);
+        let b = write_with_mtime(&root, "b-same.jsonl", same);
+        let c = write_with_mtime(&root, "c-older.jsonl", same - Duration::from_secs(10));
+        let mut cache = SessionCache::default();
+        for order in [
+            vec![b.clone(), a.clone(), c.clone()],
+            vec![c.clone(), b.clone(), a.clone()],
+        ] {
+            let sorted = sort_paths_by_cache(order, &mut cache);
+            assert_eq!(sorted, vec![a.clone(), b.clone(), c.clone()]);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 fn time_from_unix_nanos(nanos: i64) -> SystemTime {

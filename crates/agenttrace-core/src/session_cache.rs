@@ -8,7 +8,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 74;
+// Bumped 72 -> 74 (integration of run 8a5372eeebc6417c9c2072e6f8cf444c
+// cycle 7 "antigravity model-identity truth + scan-order determinism",
+// rm-1533 completion): the numeric id table now carries ccusage #1948 /
+// v20.0.41 in full (1402 → claude-opus-5-5 among them), unmapped ≥1000
+// ids spell the `model_placeholder_m<id-1000>` form the string lane
+// uses, and string sightings normalize through the alias table — cached
+// rows written by a pre-bump build hold pre-completion antigravity
+// spellings ("1402", "1277", raw display names), so the bump forces
+// those rows to regenerate rather than ever serving an identity a
+// re-parse would remap. The rm-2378 scan-order tiebreak is order-only
+// and rides the same bump for a clean regeneration point. SEAM: 73 is
+// not skipped by accident — run 96287e10's usage-accounting landing
+// minted 73 at tip 828ddb49 while this run's wall stood at 72; per the
+// landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c, the rm-230
+// convention) this landing takes 74, the lowest rung unique above the
+// live ceiling 73. Entries regenerate once on next scan.
 // Bumped 71 -> 72 (integration of run 4eeea89188b245068a569ba76f8caa71
 // cycle 2 "truth of the default surfaces", rm-1553: the claude identity
 // capture (orgIdentifier/loginEmail) is now capped at capture
