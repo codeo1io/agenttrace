@@ -870,6 +870,8 @@ fn statusline_host_mode_never_fails_the_host() {
     let _ = std::fs::remove_dir_all(cache);
 }
 
+#[cfg(target_os = "linux")] // /dev/full is a Linux special file; macOS and
+// Windows have no ENOSPC-on-write device node.
 #[test]
 fn statusline_host_mode_survives_stdout_write_failure() {
     // Review F2 (cycle 7): the host contract is exit 0 for any input —
@@ -2656,6 +2658,10 @@ fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(target_os = "linux")]
+// the ENOSPC leg needs /dev/full; the EISDIR
+// leg it shares this test with is pinned by
+// sibling directory-target tests on other OSes.
 #[test]
 fn error_stderr_carries_the_anyhow_cause_chain() {
     // rm-610: the top-level handler printed `Error: {err}`, and
@@ -2977,8 +2983,12 @@ fn output_flag_refusal_names_the_directory_and_target() {
         stderr.contains(target.to_str().expect("path is UTF-8")),
         "error must name the requested -o target: {stderr}"
     );
+    // The OS cause stays disclosed (rm-610) — spelled differently per
+    // platform: Linux mkdir(2) under a file parent reports EEXIST ("File
+    // exists"); Windows CreateDirectoryW reports ERROR_ALREADY_EXISTS
+    // ("Cannot create a file when that file already exists").
     assert!(
-        stderr.contains("File exists"),
+        stderr.contains("File exists") || (cfg!(windows) && stderr.contains("file already exists")),
         "the OS cause stays disclosed (rm-610): {stderr}"
     );
 

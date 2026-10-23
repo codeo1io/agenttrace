@@ -292,6 +292,19 @@ fn default_text_lane_guards_spreadsheet_formulas_like_csv() {
         // Bare stem: the session NAME is the file stem, and a formula
         // only executes when an introducer leads the CELL — the
         // interesting case is the stem itself leading.
+        // Windows: `-2+5|cmd` is not a legal filename there (the pipe is
+        // a reserved separator) — the formula-guard contract is about the
+        // CELL rendering of session names, so skip stems the host
+        // filesystem cannot even hold (Linux covers the full set).
+        #[cfg(windows)]
+        {
+            // '|' is a reserved separator; ':' in the middle of a name
+            // silently creates an NTFS alternate data stream instead of a
+            // plain file, so neither stem can back a session on Windows.
+            if stem.contains('|') || stem.contains(':') {
+                continue;
+            }
+        }
         let file = corpus.join(format!("{stem}.jsonl"));
         fs::write(
             &file,
@@ -336,7 +349,19 @@ fn default_text_lane_guards_spreadsheet_formulas_like_csv() {
     );
     // And the guard actually fired: every hostile stem shows up
     // apostrophe-prefixed in the name column, never row-leading raw.
+    // (Windows cannot hold pipe-bearing filenames, so stems skipped in
+    // the fixture loop above are skipped here too — the guard contract
+    // is asserted over every stem the host filesystem could hold.)
     for stem in &hostile_stems {
+        #[cfg(windows)]
+        {
+            // '|' is a reserved separator; ':' in the middle of a name
+            // silently creates an NTFS alternate data stream instead of a
+            // plain file, so neither stem can back a session on Windows.
+            if stem.contains('|') || stem.contains(':') {
+                continue;
+            }
+        }
         assert!(
             text.contains(&format!("'{stem}")),
             "hostile stem {stem:?} missing its formula guard in the TSV lane"

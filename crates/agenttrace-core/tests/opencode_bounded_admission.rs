@@ -247,7 +247,13 @@ fn absolute_session_id_is_rejected_with_disclosure_and_no_escape() {
     // The escape target lives entirely OUTSIDE the scan root.
     let leak = parent.join("leak-abs");
     fs::create_dir_all(&leak).unwrap();
-    let session_file = write_containment_session(&root, "abs", &leak.to_string_lossy());
+    // JSON-escape the id: on Windows the leak target is a `C:\Users\...`
+    // path whose raw backslashes are invalid JSON escape sequences, which
+    // made the whole doc unparseable ("unsupported session format") before
+    // the containment rule could even be exercised. Escaping keeps the
+    // hostile id byte-faithful INSIDE the JSON string on every platform.
+    let session_file =
+        write_containment_session(&root, "abs", &leak.to_string_lossy().replace('\\', "\\\\"));
     fs::write(
         leak.join("m1.json"),
         r#"{"id": "m1", "sessionID": "whatever", "role": "user", "content": "SECRET-PAYLOAD-ABS-LANE", "tokens": {"input": 777777, "output": 777}, "time": {"created": 1764750001000}}"#,

@@ -576,7 +576,17 @@ pub fn append_statusline_capture(payload: &Value) -> io::Result<()> {
     // vanished. The whole write-and-maybe-compact critical section now
     // runs under an exclusive cross-process lock
     // (`open_locked_journal`).
-    let journal = open_locked_journal(&path)?;
+    #[allow(unused_mut)]
+    let mut journal = open_locked_journal(&path)?;
+    // Windows: the journal opens read+write (not O_APPEND — an
+    // append-only handle cannot LockFileEx), so position at end; the
+    // rm-166 lock serializes writers, making the seek-then-write pair
+    // atomic. Unix O_APPEND needs no seek (writes always land at end).
+    #[cfg(not(unix))]
+    {
+        use std::io::Seek as _;
+        journal.seek(std::io::SeekFrom::End(0))?;
+    }
     let size_after_append = journal.metadata()?.len() + line.len() as u64 + 1;
     let mut writer = &journal;
     let appended = writeln!(writer, "{line}").and_then(|()| writer.flush());
@@ -671,6 +681,19 @@ fn lock_journal_with_deadline(journal: &fs::File, deadline: std::time::Instant) 
                 let error: io::Error = error.into();
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue;
+                }
+                // Windows: LockFileEx reports ERROR_ACCESS_DENIED (os
+                // error 5) transiently when a scanner/AV or the shell
+                // briefly holds a newly created journal — the same
+                // "try again shortly" contract as WouldBlock, not a
+                // permanent refusal. Retry inside the deadline instead
+                // of failing the host status line on first contact.
+                #[cfg(windows)]
+                {
+                    if error.raw_os_error() == Some(5) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
                 }
                 if error.kind() != io::ErrorKind::WouldBlock {
                     return Err(error);

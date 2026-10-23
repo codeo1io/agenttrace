@@ -379,8 +379,17 @@ fn doctor_json_lane_escapes_spoofing_controls_in_failure_samples() {
     );
     // Fast path: the clean sample rides verbatim — escaping never
     // touches clean strings, so clean output stays byte-identical.
+    // JSON-encode the expected path for the substring probe: backslashes
+    // (Windows paths) double inside JSON string literals, so a raw
+    // contains() on the on-disk spelling could never match there — the
+    // escape guarantee is about Cf controls, not JSON's own escaping.
+    let clean_json = serde_json::to_string(&clean_path).expect("encode clean path");
+    let clean_json_inner = clean_json
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(&clean_json);
     assert!(
-        stdout.contains(clean_path.as_str()),
+        stdout.contains(clean_json_inner),
         "clean names must ride the json lane verbatim: {stdout}"
     );
 
