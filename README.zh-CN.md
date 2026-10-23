@@ -13,13 +13,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/luoyuctl/agenttrace/actions/workflows/ci.yml"><img src="https://github.com/luoyuctl/agenttrace/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://codecov.io/gh/luoyuctl/agenttrace"><img src="https://codecov.io/gh/luoyuctl/agenttrace/graph/badge.svg" alt="Coverage"></a>
-  <a href="https://scorecard.dev/viewer/?uri=github.com/luoyuctl/agenttrace"><img src="https://api.scorecard.dev/projects/github.com/luoyuctl/agenttrace/badge" alt="OpenSSF Scorecard"></a>
-  <a href="https://github.com/luoyuctl/agenttrace/releases/latest"><img src="https://img.shields.io/github/v/release/luoyuctl/agenttrace?color=00ADD8" alt="Release"></a>
+  <a href="https://github.com/codeo1io/agenttrace/actions/workflows/ci.yml"><img src="https://github.com/codeo1io/agenttrace/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/codeo1io/agenttrace"><img src="https://codecov.io/gh/codeo1io/agenttrace/graph/badge.svg" alt="Coverage"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/codeo1io/agenttrace"><img src="https://api.scorecard.dev/projects/github.com/codeo1io/agenttrace/badge" alt="OpenSSF Scorecard"></a>
+  <a href="https://github.com/codeo1io/agenttrace/releases/latest"><img src="https://img.shields.io/github/v/release/codeo1io/agenttrace?color=00ADD8" alt="Release"></a>
   <img src="https://img.shields.io/badge/Rust-stable-f74c00.svg" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
-  <a href="https://github.com/luoyuctl/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-tap-2bbc8a.svg" alt="Homebrew tap"></a>
+  <a href="https://github.com/codeo1io/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-tap-2bbc8a.svg" alt="Homebrew tap"></a>
   <a href="https://www.npmjs.com/package/@zack78/agenttrace"><img src="https://img.shields.io/npm/v/@zack78/agenttrace?label=npm" alt="npm"></a>
 </p>
 
@@ -73,19 +73,19 @@ agenttrace
 macOS 和 Linux：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.sh | sh
 ```
 
 Windows PowerShell：
 
 ```powershell
-irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.ps1 | iex
 ```
 
 Windows CMD：
 
 ```bat
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
+curl -fsSL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
 安装脚本会下载对应平台的发布版程序，并在安装前按发布的校验和验证
@@ -105,26 +105,26 @@ SHA-256。脚本从不修改你的 shell 配置文件——只会打印加入 PA
 | `AGENTTRACE_DOWNLOAD_URL` | 完全覆盖二进制下载地址（离线 CI 测试用）。 |
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh \
+curl -fsSL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.sh \
   | AGENTTRACE_VERSION=v0.10.1 sh
 ```
 
 ```powershell
 $env:AGENTTRACE_VERSION = "v0.10.1"
-irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.ps1 | iex
 ```
 
 包管理器：
 
 ```bash
 # macOS 和 Linux
-brew install luoyuctl/tap/agenttrace
+brew install codeo1io/tap/agenttrace
 
 # macOS、Linux 和 Windows（需要 Node.js 18+）
 npm install -g @zack78/agenttrace
 
 # 从源码安装
-cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
+cargo install --git https://github.com/codeo1io/agenttrace agenttrace
 ```
 
 可用 `agenttrace --version` 检查实际版本。
@@ -133,9 +133,9 @@ cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
 
 | 安装方式 | 更新命令 |
 | --- | --- |
-| Homebrew | `brew upgrade luoyuctl/tap/agenttrace` |
+| Homebrew | `brew upgrade codeo1io/tap/agenttrace` |
 | npm | `npm install -g @zack78/agenttrace@latest` |
-| cargo | `cargo install --git https://github.com/luoyuctl/agenttrace agenttrace --force` |
+| cargo | `cargo install --git https://github.com/codeo1io/agenttrace agenttrace --force` |
 
 
 预编译二进制与当前主机不兼容时（例如基于更新版本 libc 构建）不会

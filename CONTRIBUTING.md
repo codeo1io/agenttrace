@@ -7,7 +7,7 @@ agenttrace is intentionally small: one Rust binary, local-first analysis, no hos
 ## Development Setup
 
 ```bash
-git clone https://github.com/luoyuctl/agenttrace.git
+git clone https://github.com/codeo1io/agenttrace.git
 cd agenttrace
 cargo test
 cargo build --release -p agenttrace

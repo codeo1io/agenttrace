@@ -42,14 +42,14 @@ It parses logs from Claude Code, Codex CLI, Qwen Code, Cline, Aider, Cursor expo
 Install:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
+curl -sL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.sh | sh
 agenttrace
 ```
 
 Or:
 
 ```bash
-brew install luoyuctl/tap/agenttrace
+brew install codeo1io/tap/agenttrace
 ```
 
 No local agent logs yet?
@@ -60,7 +60,7 @@ agenttrace --demo
 
 The pain point: when an agent gets stuck, retries a tool loop, or silently burns context, the output alone does not tell you what happened. agenttrace gives a quick local view before you dig through raw JSONL logs.
 
-Repo: https://github.com/luoyuctl/agenttrace
+Repo: https://github.com/codeo1io/agenttrace
 
 ## Short Posts
 
@@ -72,7 +72,7 @@ I built agenttrace: a fast terminal dashboard for local agent sessions.
 
 It shows what multiple agents spent across cost, tokens, and time, then helps explain why a task was slow: hanging gaps, slow tools, retry loops, large params, context pressure, health score, details, diffs, JSON output, and CI gates.
 
-https://github.com/luoyuctl/agenttrace
+https://github.com/codeo1io/agenttrace
 
 **Reddit / V2EX**
 
@@ -82,7 +82,7 @@ The goal is not another chat UI. It is closer to `htop`/`lazygit` for AI agent r
 
 Would love feedback from anyone using Claude Code, Codex CLI, Qwen Code, Cline, Aider, Cursor exports, Hermes Agent, OpenCode, OpenClaw, Pi, Oh My Pi, Kimi CLI, Copilot-style logs, JSON/JSONL traces, or similar local agent histories.
 
-Repo: https://github.com/luoyuctl/agenttrace
+Repo: https://github.com/codeo1io/agenttrace
 
 Feedback thread: https://github.com/luoyuctl/agenttrace/discussions/2
 
@@ -330,7 +330,7 @@ Manual-only / blocked / stale follow-up:
 Terminal Trove draft:
 
 - Name: `agenttrace`
-- URL: `github.com/luoyuctl/agenttrace`
+- URL: `github.com/codeo1io/agenttrace`
 - Tagline: `Local-first TUI for AI coding agent cost, tokens, time, and slow-run diagnosis.`
 - Description: `agenttrace parses local Claude Code, Codex CLI, Qwen Code, Cline, Aider, Cursor exports, Hermes Agent, OpenCode, OpenClaw, Pi, Oh My Pi, Kimi CLI, Copilot-style logs, and JSON/JSONL traces into a fast terminal dashboard for comparing historical session cost, token usage, and elapsed time, then diagnosing slow tasks.`
 - Standout features: `Overview, session list, detail, diagnostics, and diff views; incremental local cache; slow-run evidence for long gaps, hanging sessions, slow tools, large params, and context pressure; JSON, Markdown, and self-contained HTML reports.`
@@ -338,10 +338,10 @@ Terminal Trove draft:
 - Primary language: `rust`
 - License: `mit`
 - Install:
-  - macOS/Linux: `curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh`
-  - Homebrew: `brew install luoyuctl/tap/agenttrace`
-  - Cargo: `cargo install --git https://github.com/luoyuctl/agenttrace agenttrace`
-  - Windows PowerShell: `iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex`
+  - macOS/Linux: `curl -sL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.sh | sh`
+  - Homebrew: `brew install codeo1io/tap/agenttrace`
+  - Cargo: `cargo install --git https://github.com/codeo1io/agenttrace agenttrace`
+  - Windows PowerShell: `iwr -useb https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.ps1 | iex`
 
 ## Demo Checklist
 
@@ -384,7 +384,7 @@ override only for a deliberate A/B against a pinned build.
 
 ## Release Consistency Checklist
 
-Before sharing a release publicly, compare these surfaces against `gh release list --repo luoyuctl/agenttrace --limit 1`:
+Before sharing a release publicly, compare these surfaces against `gh release list --repo codeo1io/agenttrace --limit 1`:
 
 - README release links point at the latest public release, while the Homebrew
   badge remains version-neutral until the tap is verified separately.

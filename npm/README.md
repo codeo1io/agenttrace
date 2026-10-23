@@ -11,4 +11,4 @@ agenttrace
 
 The npm package is a small launcher. During installation it downloads the matching signed-by-checksum native binary from the matching GitHub Release for macOS, Linux, or Windows on x64 and arm64.
 
-See the [project README](https://github.com/luoyuctl/agenttrace#readme) for usage, manual installation, and checksum/provenance details.
+See the [project README](https://github.com/codeo1io/agenttrace#readme) for usage, manual installation, and checksum/provenance details.

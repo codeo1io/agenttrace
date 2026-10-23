@@ -36,7 +36,7 @@ grep -q "cargo install" README.md ||
 	fail "README install paths must include cargo install"
 grep -q "cargo install" README.zh-CN.md ||
 	fail "README.zh-CN install paths must include cargo install"
-grep -q "brew install luoyuctl/tap/agenttrace" README.md ||
+grep -q "brew install codeo1io/tap/agenttrace" README.md ||
 	fail "README must document Homebrew installation"
 # WinGet is no longer a release channel (adopted upstream v0.10.1 #301/#312
 # channel decision): install.ps1 / install.cmd serve Windows instead.
@@ -93,7 +93,7 @@ grep -q "dtolnay/rust-toolchain" .github/workflows/release.yml ||
 grep -q "gh release create" .github/workflows/release.yml ||
 	fail "release workflow must publish GitHub releases"
 
-if grep -R -Eqi "go install github.com/luoyuctl/agenttrace|go build .*cmd/agenttrace|setup-go|go-version-file" \
+if grep -R -Eqi "go install github.com/(luoyuctl|codeo1io)/agenttrace|go build .*cmd/agenttrace|setup-go|go-version-file" \
 	README.md README.zh-CN.md CONTRIBUTING.md docs/maintainers/launch-kit.md docs/maintainers/demo-playbook.md docs/guides/parser-guide.md docs/maintainers/agentops-prompt-rules.md install.sh install.ps1 .github homebrew skills; then
 	fail "public release surfaces must not advertise Go build/install paths"
 fi

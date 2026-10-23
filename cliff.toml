@@ -31,7 +31,7 @@ tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
 topo_order = false
 sort_commits = "oldest"
 commit_preprocessors = [
-  { pattern = "\\(#([0-9]+)\\)", replace = "([#${1}](https://github.com/luoyuctl/agenttrace/pull/${1}))" },
+  { pattern = "\\(#([0-9]+)\\)", replace = "([#${1}](https://github.com/codeo1io/agenttrace/pull/${1}))" },
 ]
 commit_parsers = [
   { message = "^feat", group = "<!-- 0 -->Added" },

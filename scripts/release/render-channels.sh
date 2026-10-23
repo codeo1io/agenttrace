@@ -22,7 +22,7 @@ fail() {
 version="${1#v}"
 checksums_file="$2"
 output_dir="$3"
-repo="luoyuctl/agenttrace"
+repo="codeo1io/agenttrace"
 
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "invalid version: $version"
 [[ -f "$checksums_file" ]] || fail "checksums file does not exist: $checksums_file"

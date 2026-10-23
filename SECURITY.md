@@ -12,7 +12,7 @@ Security fixes target the latest released version of agenttrace.
 
 Please report sensitive issues privately through GitHub Security Advisories:
 
-https://github.com/luoyuctl/agenttrace/security/advisories/new
+https://github.com/codeo1io/agenttrace/security/advisories/new
 
 If a private advisory is not available, contact the repository owner through
 their GitHub profile and include only a high-level description first.

@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Try doctor mode first
-    url: https://github.com/luoyuctl/agenttrace#usage
+    url: https://github.com/codeo1io/agenttrace#usage
     about: Run `agenttrace --doctor` before opening setup or discovery issues.
   - name: Ask a question or share feedback
-    url: https://github.com/luoyuctl/agenttrace/discussions
+    url: https://github.com/codeo1io/agenttrace/discussions
     about: Use Discussions for usage questions, screenshots, parser ideas, and workflow feedback.

@@ -6,8 +6,8 @@
     "name": "luoyuctl",
     "url": "https://github.com/luoyuctl"
   },
-  "homepage": "https://github.com/luoyuctl/agenttrace",
-  "repository": "https://github.com/luoyuctl/agenttrace",
+  "homepage": "https://github.com/codeo1io/agenttrace",
+  "repository": "https://github.com/codeo1io/agenttrace",
   "license": "MIT",
   "keywords": [
     "codex",
@@ -29,9 +29,9 @@
       "Interactive",
       "Read"
     ],
-    "websiteURL": "https://github.com/luoyuctl/agenttrace",
-    "privacyPolicyURL": "https://github.com/luoyuctl/agenttrace/blob/master/PRIVACY.md",
-    "termsOfServiceURL": "https://github.com/luoyuctl/agenttrace/blob/master/LICENSE",
+    "websiteURL": "https://github.com/codeo1io/agenttrace",
+    "privacyPolicyURL": "https://github.com/codeo1io/agenttrace/blob/master/PRIVACY.md",
+    "termsOfServiceURL": "https://github.com/codeo1io/agenttrace/blob/master/LICENSE",
     "defaultPrompt": [
       "Audit my latest AI coding-agent session with agenttrace.",
       "Summarize local agent session health and token waste.",

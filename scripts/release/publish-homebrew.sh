@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Push a rendered Homebrew Formula to luoyuctl/homebrew-tap.
+# Push a rendered Homebrew Formula to codeo1io/homebrew-tap.
 # Usage: publish-homebrew.sh <tag> <rendered-formula>
 set -euo pipefail
 
@@ -7,7 +7,7 @@ tag="${1:?usage: publish-homebrew.sh <tag> <rendered-formula>}"
 formula="${2:?usage: publish-homebrew.sh <tag> <rendered-formula>}"
 
 [[ -n "${HOMEBREW_TAP_TOKEN:-}" ]] || {
-	echo "HOMEBREW_TAP_TOKEN is required to update luoyuctl/homebrew-tap." >&2
+	echo "HOMEBREW_TAP_TOKEN is required to update codeo1io/homebrew-tap." >&2
 	exit 1
 }
 [[ -f "$formula" ]] || {
@@ -18,7 +18,7 @@ formula="${2:?usage: publish-homebrew.sh <tag> <rendered-formula>}"
 tap_dir="$(mktemp -d "${TMPDIR:-/tmp}/homebrew-tap.XXXXXX")"
 trap 'rm -rf "$tap_dir"' EXIT
 
-git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/luoyuctl/homebrew-tap.git" "$tap_dir"
+git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/codeo1io/homebrew-tap.git" "$tap_dir"
 install -Dm644 "$formula" "$tap_dir/Formula/agenttrace.rb"
 cd "$tap_dir"
 git config user.name "github-actions[bot]"

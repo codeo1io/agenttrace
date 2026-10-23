@@ -17,7 +17,7 @@ const { createHash } = require("node:crypto");
 const { verifyRuntime } = require("./verify-runtime");
 
 const PACKAGE_VERSION = require("../package.json").version;
-const REPOSITORY = "luoyuctl/agenttrace";
+const REPOSITORY = "codeo1io/agenttrace";
 const ARCHITECTURES = { x64: "amd64", arm64: "arm64" };
 const PLATFORMS = { darwin: "darwin", linux: "linux", win32: "windows" };
 

@@ -226,7 +226,7 @@ grep -q "pinned ref $default_ref" "$out" ||
 	fail "test E: fallback must echo the pinned ref to the user"
 grep -q '^source=source-build$' "$tmp/e-receipt" ||
 	fail "test E: install receipt must record the source-build lane"
-grep -q '^repo=luoyuctl/agenttrace$' "$tmp/e-receipt" ||
+grep -q '^repo=codeo1io/agenttrace$' "$tmp/e-receipt" ||
 	fail "test E: install receipt must record the repository"
 
 # — test F: an unresolvable pin aborts with a clear, actionable message —

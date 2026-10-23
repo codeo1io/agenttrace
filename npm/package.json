@@ -3,13 +3,13 @@
   "version": "0.0.0-release",
   "description": "Local-first TUI and reports for AI coding-agent session history, cost, tokens, time, and slow-run diagnosis.",
   "license": "MIT",
-  "homepage": "https://github.com/luoyuctl/agenttrace#readme",
+  "homepage": "https://github.com/codeo1io/agenttrace#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/luoyuctl/agenttrace.git"
+    "url": "git+https://github.com/codeo1io/agenttrace.git"
   },
   "bugs": {
-    "url": "https://github.com/luoyuctl/agenttrace/issues"
+    "url": "https://github.com/codeo1io/agenttrace/issues"
   },
   "author": "Luoyuctl",
   "publishConfig": {
