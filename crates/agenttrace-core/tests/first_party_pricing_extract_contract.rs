@@ -32,6 +32,8 @@ use agenttrace_core::{
 };
 use std::sync::OnceLock;
 
+mod support;
+
 /// The three dated ids the extract carries, with their published list
 /// rates in $/M (input, output, cache_read, cache_write) — the vendor
 /// list prices models.dev publishes, identical to what the reseller
@@ -69,6 +71,14 @@ fn expect_price(price: agenttrace_core::Price, input: f64, output: f64, cr: f64,
 
 #[test]
 fn extract_ids_bill_at_first_party_list_rates() {
+    // rm-1954 (run 79881d21 cycle 7): the whole binary prices over the
+    // loaded catalog — a warm host machine-cache lane shadows rows and
+    // re-prices ids it carries. Every lookup-priced test runs inside
+    // the isolation guard (assess-observed false reds at :123/:150).
+    support::with_isolated_pricing_env(extract_ids_bill_at_first_party_list_rates_body);
+}
+
+fn extract_ids_bill_at_first_party_list_rates_body() {
     for (id, input, output, cr, cw) in EXTRACT_ROWS {
         expect_price(lookup_price(id), *input, *output, *cr, *cw);
     }
@@ -102,6 +112,10 @@ fn extract_service_is_disclosed_at_the_provenance_line() {
 
 #[test]
 fn extract_ids_are_specific_prices_not_fallbacks() {
+    support::with_isolated_pricing_env(extract_ids_are_specific_prices_not_fallbacks_body);
+}
+
+fn extract_ids_are_specific_prices_not_fallbacks_body() {
     for (id, ..) in EXTRACT_ROWS {
         assert!(
             has_specific_price(id),
@@ -112,6 +126,10 @@ fn extract_ids_are_specific_prices_not_fallbacks() {
 
 #[test]
 fn reseller_qualified_ids_keep_their_reseller_rows() {
+    support::with_isolated_pricing_env(reseller_qualified_ids_keep_their_reseller_rows_body);
+}
+
+fn reseller_qualified_ids_keep_their_reseller_rows_body() {
     // The session itself scoped these ids to a reseller lane: the
     // extract must NOT override an explicit qualification (it speaks
     // only for the bare first-party form).
@@ -134,6 +152,12 @@ fn reseller_qualified_ids_keep_their_reseller_rows() {
 
 #[test]
 fn first_party_ids_the_primary_catalog_carries_still_price_at_litellm() {
+    support::with_isolated_pricing_env(
+        first_party_ids_the_primary_catalog_carries_still_price_at_litellm_body,
+    );
+}
+
+fn first_party_ids_the_primary_catalog_carries_still_price_at_litellm_body() {
     // The extract is a gap-filler: an id LiteLLM prices first-party
     // (a current dated sonnet) must be byte-identical to the
     // pre-extract behavior — LiteLLM rates, LiteLLM source.

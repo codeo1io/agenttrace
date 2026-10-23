@@ -16,6 +16,8 @@
 use agenttrace_core::{analyze, cache_rate_census, lookup_price, CacheRateCensus};
 use std::collections::BTreeMap;
 
+mod support;
+
 /// A pi-shaped usage event: role `meta` (or `session_meta`) carries
 /// usage and model attribution, the shape the per-block arm prices.
 fn usage_event(
@@ -41,6 +43,18 @@ fn usage_event(
 
 #[test]
 fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero() {
+    // rm-1954 (run 79881d21 cycle 7): the census asserts over the full
+    // loaded catalog, so the host machine-cache lane (user_cache_dir
+    // pricing.json, pricing.rs:969) must be absent — on a warm host its
+    // absent-rate rows break `cache_read_absent == 1` (assess-observed
+    // false red). The body still sets its own AGENTTRACE_PRICING_FILE
+    // override; the guard only pins the machine lane underneath it.
+    support::with_isolated_pricing_env(
+        absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero_body,
+    );
+}
+
+fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero_body() {
     // The override catalog merges per-entry over the bundled one, so
     // three synthetic rows pin all three states without touching any
     // real model's rates. All three share input $10/M, output $30/M.

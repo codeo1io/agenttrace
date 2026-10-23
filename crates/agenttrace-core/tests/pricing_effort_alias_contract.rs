@@ -232,6 +232,61 @@ fn antigravity_lane_prices_effort_alias_at_base() {
     assert!(health.fallback_with_base_available.is_empty());
 }
 
+/// rm-1533 (cycle 7, run 79881d21) — ccusage PR #1948 / issue #1947,
+/// ported 2026-10-22: a numeric Antigravity `modelConfigId` attributes
+/// (and prices) at the model it names, and a mapped-but-unpriced id
+/// discloses the miss instead of silently billing $0.00. Before the
+/// table, 1402 attributed the raw numeral and rode the undisclosed
+/// default — the exact public regression shape ccusage fixed same-day.
+#[test]
+fn antigravity_lane_prices_numeric_id_at_named_model() {
+    let dir = fixture_dir("antigravity-numeric");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("conversations.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    use std::io::Write as _;
+    file.write_all(
+        br#"{"type":"USER_INPUT","step_index":0,"created_at":"2026-10-14T11:00:00Z","content":"plan"}"#,
+    )
+    .unwrap();
+    file.write_all(b"\n").unwrap();
+    file.write_all(
+        br#"{"type":"PLANNER_RESPONSE","step_index":1,"created_at":"2026-10-14T11:00:05Z","content":"done","modelConfigId":1402,"usageStats":{"inputTokens":1000,"outputTokens":500}}"#,
+    )
+    .unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let session = parse_raw_session("conversations.jsonl", path.to_str().unwrap(), &raw)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(session.metrics.source_tool, "antigravity_cli");
+    // 1402 -> claude-opus-5-5 (ccusage PR #1948), billed at its catalog
+    // rate — not the raw numeral, not a silent $0.00.
+    assert_eq!(session.metrics.model_used, "claude-opus-5-5");
+    assert!(has_specific_price(&session.metrics.model_used));
+    let expected = 1000.0 * 4.0e-6 + 500.0 * 2.0e-5; // $0.014
+    assert_eq!(session.metrics.cost_estimated, expected);
+    let health = data_health(std::slice::from_ref(&session), 1, 0);
+    assert_eq!(health.fallback_pricing, 0);
+
+    // The mapped-but-unpriced arm (1417 -> gemini-4-argon): attribution
+    // lands on the named model and the miss is disclosed — never a
+    // silent $0.00 (#1947's other face).
+    let path2 = dir.join("conversations-1417.jsonl");
+    std::fs::write(
+        &path2,
+        b"{\"type\":\"USER_INPUT\",\"step_index\":0,\"created_at\":\"2026-10-14T12:00:00Z\",\"content\":\"plan\"}\n{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"created_at\":\"2026-10-14T12:00:05Z\",\"content\":\"done\",\"modelConfigId\":1417,\"usageStats\":{\"inputTokens\":1000,\"outputTokens\":500}}\n",
+    )
+    .unwrap();
+    let raw2 = std::fs::read_to_string(&path2).unwrap();
+    let session2 = parse_raw_session("conversations-1417.jsonl", path2.to_str().unwrap(), &raw2)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(session2.metrics.model_used, "gemini-4-argon");
+    assert!(!has_specific_price(&session2.metrics.model_used));
+    let health2 = data_health(std::slice::from_ref(&session2), 1, 0);
+    assert_eq!(health2.fallback_pricing, 1);
+}
+
 /// Review 1a615b64 F4 — pin the second-order expansion (variants of
 /// variants) so the catalog loop in `lookup_price_in` is a contract, not an
 /// accident: `claude-sonnet-5-5-pro-high`'s first-order candidate list is

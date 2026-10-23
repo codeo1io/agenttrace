@@ -8,7 +8,29 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 73;
+// Bumped 72 -> 73 (integration of run 79881d21c3ee4a23a00925fc46c5656b
+// cycle 7 "antigravity attribution truth", rm-1533 extension: the
+// antigravity identity table now follows ccusage main @ 2026-10-22 —
+// 26 numeric arms (incl. 1402 -> claude-opus-5-5, ccusage #1948's
+// same-day fix for their public #1947 $0.00 regression), the
+// model_placeholder_m* string family, display-spelling folds, and
+// the m{id - 1000} arithmetic for unmapped ids >= 1000, in
+// parser.rs). Cached rows written before this rung may hold STALE
+// ATTRIBUTION for unchanged source files — a raw numeral ("1402") or
+// placeholder spelling ("MODEL_PLACEHOLDER_M16") where a re-parse
+// attributes the mapped model — the same warm-replay class as the 71
+// rung's derived-cost move (rm-196 gate keys an unchanged catalog
+// digest because pricing_snapshot.json is byte-identical: mapping is
+// identity-only). SEAM: sibling run b58cd254's unlanded cycle-6 band
+// pairs its own 24-id scope with a 72 -> 73 mint — per the
+// landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c, and the 72
+// rung's own conflict note above) this integration lands 73 and the
+// sibling re-bases to 74 when it lands. No SQLite snapshot rung rode
+// the batch; the landed 14 remains the snapshot ceiling (the 67 rung
+// set the same precedent for antigravity numeric ids: snapshot schema
+// gates its own shape, this change alters derived session values
+// only). Entries regenerate once on next scan.
 // Bumped 71 -> 72 (integration of run 4eeea89188b245068a569ba76f8caa71
 // cycle 2 "truth of the default surfaces", rm-1553: the claude identity
 // capture (orgIdentifier/loginEmail) is now capped at capture

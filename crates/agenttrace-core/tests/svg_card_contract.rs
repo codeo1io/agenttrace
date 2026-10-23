@@ -17,6 +17,8 @@ use agenttrace_core::{
     SvgCardTheme,
 };
 
+mod support;
+
 const GOLDEN_DIR: &str = "tests/fixtures/svg-card";
 
 fn card_of(theme: SvgCardTheme) -> String {
@@ -27,6 +29,15 @@ fn card_of(theme: SvgCardTheme) -> String {
 
 #[test]
 fn golden_bytes_are_pinned_for_the_demo_corpus() {
+    // rm-1954 (run 79881d21 cycle 7): the golden footer embeds the
+    // catalog lane ("bundled snapshot" vs "cached catalog") and the
+    // priced-model census, both of which the host machine-cache lane
+    // mutates — pinned bytes need the isolated guard (assess-observed
+    // false red on warm hosts).
+    support::with_isolated_pricing_env(golden_bytes_are_pinned_for_the_demo_corpus_body);
+}
+
+fn golden_bytes_are_pinned_for_the_demo_corpus_body() {
     for (name, theme) in [
         ("demo-auto.svg", SvgCardTheme::Auto),
         ("demo-dark.svg", SvgCardTheme::Dark),

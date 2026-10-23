@@ -29,6 +29,8 @@ use agenttrace_core::{lookup_price, parse_file, round4};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
+
+mod support;
 use std::path::PathBuf;
 
 /// The five audited AgentMeasure classes rm-053 must cover; the last two
@@ -149,6 +151,15 @@ fn conformance_pack_manifest_is_internally_consistent() {
 
 #[test]
 fn conformance_pack_holds_against_parser_and_pricing() {
+    // rm-1954 (run 79881d21 cycle 7): per-case costs come from
+    // lookup_price over the loaded catalog; a warm host machine-cache
+    // lane re-prices cases whose ids it carries (assess-observed cost
+    // 0 vs 0.0001 false red). The pack must hold against the bundled
+    // catalog, deterministically.
+    support::with_isolated_pricing_env(conformance_pack_holds_against_parser_and_pricing_body);
+}
+
+fn conformance_pack_holds_against_parser_and_pricing_body() {
     let tolerance = manifest()["pricing_basis"]["formula_tolerance"]
         .as_f64()
         .expect("formula tolerance");

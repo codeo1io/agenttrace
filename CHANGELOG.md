@@ -1166,6 +1166,48 @@
 
 ### Fixed
 
+- Antigravity attribution truth + hermetic proof (rm-1533 extension +
+  rm-1954 extension, run 79881d21 cycle 7, batch "Antigravity
+  attribution truth + hermetic proof"): the antigravity identity table
+  now follows ccusage main @ 2026-10-22 — 26 numeric arms (adding 246,
+  281|282, 290|291, 312, 313|329, 330, 333|334, 340|341, 342, 1071-1073,
+  1298-1300, 1318-1320, 1402, 1418|1419 to the landed 1050/1417), most
+  urgently 1402 → claude-opus-5-5 (ccusage v20.0.40 PR #1948, the
+  same-day fix for their public #1947 $0.00 regression: sessions that
+  ran Opus 5.5 misattributed to the raw numeral "1402" and priced
+  through the disclosed-unknown fallback). Identity-only law unchanged
+  (attribution maps, pricing rides the catalog; unmapped numerals below
+  1000 keep the landed raw-spelling disclosure — 1277 precedent).
+  Stored string spellings now canonicalize per ccusage's
+  `normalize_antigravity_model` ported in full: the `model_placeholder_m*`
+  family (m26→claude-opus-4-6, m35→claude-sonnet-4-6, m402→claude-opus-5-5,
+  m50→gemini-3.1-flash-lite, m71-73/m298-300/m318-320 effort tiers,
+  m417-419→gemini-4-argon, m16/m36/m37→gemini-3.1-pro,
+  m18/m47/m84→gemini-3-flash-preview, m132/m133/m187/m20→3.5-flash tiers),
+  display folds (the 3.8/3.7/3.6 paren effort tiers,
+  "gemini 3 flash"→gemini-3.6-flash, thinking strips,
+  "gemini-pro-default"/"gemini-pro-agent"→gemini-3.1-pro, the
+  gemini-3-flash-* agent aliases, the dashed gemini-3.5-flash-low→medium
+  quirk, dotted Claude 3.x→dashed ids,
+  "model_openai_gpt_oss_120b_medium"→gpt-oss-120b-medium — and the
+  numeric decode composes the same fold over the mapped name like
+  ccusage, so numeric 342 attributes identically), and unmapped
+  ids ≥ 1000 decode the client's own placeholder arithmetic
+  m{id − 1000}. The session-cache schema rung rises 72 → 73 (warm rows
+  may hold stale raw-numeral/placeholder attribution; sibling run
+  b58cd254's unlanded band re-bases to 74 per the
+  landed-rung-keeps-numeral convention). Pinned by
+  `antigravity_identity_table_matches_ccusage_main_2026_10_22` plus the
+  three updated antigravity-lane pins (1050 backfill shipped with none).
+  Hermetic proof: the four catalog-coupled test binaries
+  (`cache_rate_truth_contract`, `first_party_pricing_extract_contract`,
+  `svg_card_contract`, `token_conformance`) now run inside the landed
+  `with_isolated_pricing_env` guard — they read the host machine-cache
+  pricing lane (`pricing.rs:969`) and false-red on any warm host
+  (assess-observed at tip: 4 suites red, all green under empty HOME /
+  XDG_CACHE_HOME); the guard also pins the catalog lane underneath the
+  golden footer's "bundled snapshot" bytes.
+
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch

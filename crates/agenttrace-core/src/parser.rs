@@ -1568,13 +1568,48 @@ struct AntigravityModelId {
 /// model is absent from the catalog degrades through the disclosed
 /// unknown-model path rather than this table inventing a price.
 const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
-    (1417, "gemini-4-argon"),
+    // rm-1864 (2026-10-15): ccusage v20.0.34 PR #1894.
+    (246, "gemini-2.5-pro"),
+    (281, "claude-4-sonnet"),
+    (282, "claude-4-sonnet"),
+    (290, "claude-4-opus"),
+    (291, "claude-4-opus"),
+    (312, "gemini-2.5-flash"),
+    (313, "gemini-2.5-flash-thinking"),
+    (329, "gemini-2.5-flash-thinking"),
+    (330, "gemini-2.5-flash-lite"),
+    (333, "claude-4.5-sonnet"),
+    (334, "claude-4.5-sonnet"),
+    (340, "claude-4.5-haiku"),
+    (341, "claude-4.5-haiku"),
+    // The value is ccusage's table entry verbatim; the decode composes
+    // the string fold over it (342 -> gpt-oss-120b-medium, their parser
+    // :519-520) like every string sighting of the same model.
+    (342, "model_openai_gpt_oss_120b_medium"),
     // rm-1533 (run 18f9b98a cycle 2, research 0418480c): ccusage
     // v20.0.36 (2026-10-18, #1902) maps antigravity id 1050 to
     // gemini-3.1-flash-lite — the bare key is already priced in the
     // bundled snapshot, so this stays an identity-only mapping like
     // its sibling.
     (1050, "gemini-3.1-flash-lite"),
+    (1071, "gemini-3.6-flash-high"),
+    (1072, "gemini-3.6-flash-medium"),
+    (1073, "gemini-3.6-flash-low"),
+    (1298, "gemini-3.7-flash-high"),
+    (1299, "gemini-3.7-flash-medium"),
+    (1300, "gemini-3.7-flash-low"),
+    (1318, "gemini-3.8-flash-high"),
+    (1319, "gemini-3.8-flash-medium"),
+    (1320, "gemini-3.8-flash-low"),
+    // rm-1533 (cycle 7, run 79881d21): 1402 → claude-opus-5-5 is
+    // ccusage v20.0.40 (PR #1948, 2026-10-22) — the same-day fix for
+    // their public #1947 $0.00 regression for Opus 5.5. The bare key
+    // is priced in the bundled snapshot. 1417's proven family extends
+    // to 1418/1419.
+    (1402, "claude-opus-5-5"),
+    (1417, "gemini-4-argon"),
+    (1418, "gemini-4-argon"),
+    (1419, "gemini-4-argon"),
 ];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
@@ -1597,6 +1632,120 @@ fn canonical_antigravity_number_id(number: &serde_json::Number) -> String {
     number.to_string()
 }
 
+/// rm-1533 (cycle 7, run 79881d21): string-spelling canonicalization
+/// ported from ccusage main @ 2026-10-22 (`normalize_antigravity_model`,
+/// PRs #1902/#1948 and their model_map). Identity-only, same law as the
+/// numeric table: a placeholder or display spelling attributes to the
+/// model it actually ran; pricing still rides the catalog (effort
+/// suffixes strip at lookup), and unknown spellings pass through
+/// untouched — the normalizer never invents an id it cannot prove.
+fn canonical_antigravity_model_string(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    // Effort-tiered display spellings fold to their tiered catalog ids
+    // (the bare base also prices via strip_effort_suffix).
+    match lower.as_str() {
+        "gemini 3.8 flash (high)" => return "gemini-3.8-flash-high".to_string(),
+        "gemini 3.8 flash (medium)" => return "gemini-3.8-flash-medium".to_string(),
+        "gemini 3.8 flash (low)" => return "gemini-3.8-flash-low".to_string(),
+        "gemini 3.7 flash (high)" => return "gemini-3.7-flash-high".to_string(),
+        "gemini 3.7 flash (medium)" => return "gemini-3.7-flash-medium".to_string(),
+        "gemini 3.7 flash (low)" => return "gemini-3.7-flash-low".to_string(),
+        "gemini 3.6 flash (high)" => return "gemini-3.6-flash-high".to_string(),
+        "gemini 3.6 flash (medium)" => return "gemini-3.6-flash-medium".to_string(),
+        "gemini 3.6 flash (low)" => return "gemini-3.6-flash-low".to_string(),
+        _ => {}
+    }
+    // ccusage strips any parenthetical before matching, so an unknown
+    // paren suffix (e.g. "(preview)") cannot fork the spelling.
+    let base = match lower.find('(') {
+        Some(index) => lower[..index].trim(),
+        None => lower.as_str(),
+    };
+    match base {
+        // Base display spellings (and their thinking variants) fold to
+        // the dashed catalog id; "gemini 3 flash" runs gemini 3.6.
+        "gemini 3.8 flash" | "gemini 3.8 flash thinking" => "gemini-3.8-flash",
+        "gemini 3.7 flash" | "gemini 3.7 flash thinking" => "gemini-3.7-flash",
+        "gemini 3.7 pro" | "gemini 3.7 pro thinking" => "gemini-3.7-pro",
+        "gemini 3.6 flash" | "gemini 3 flash" => "gemini-3.6-flash",
+        "gemini 3.6 pro" => "gemini-3.6-pro",
+        "gemini 3 pro" | "gemini 3 pro thinking" => "gemini-3-pro",
+        "gemini 2.5 flash" => "gemini-2.5-flash",
+        "gemini 2.5 pro" => "gemini-2.5-pro",
+        "gemini 2.0 flash" | "gemini 2 flash" => "gemini-2.0-flash",
+        "gemini 2.0 pro" => "gemini-2.0-pro",
+        "gemini 1.5 flash" => "gemini-1.5-flash",
+        "gemini 1.5 pro" => "gemini-1.5-pro",
+        // Placeholder spellings attribute to the model they encode
+        // (the m = modelConfigId - 1000 client encoding).
+        "model_placeholder_m318" => "gemini-3.8-flash-high",
+        "model_placeholder_m319" => "gemini-3.8-flash-medium",
+        "model_placeholder_m320" => "gemini-3.8-flash-low",
+        "model_placeholder_m298" => "gemini-3.7-flash-high",
+        "model_placeholder_m299" => "gemini-3.7-flash-medium",
+        "model_placeholder_m300" => "gemini-3.7-flash-low",
+        "model_placeholder_m71" => "gemini-3.6-flash-high",
+        "model_placeholder_m72" => "gemini-3.6-flash-medium",
+        "model_placeholder_m73" => "gemini-3.6-flash-low",
+        "model_placeholder_m417" | "model_placeholder_m418" | "model_placeholder_m419" => {
+            "gemini-4-argon"
+        }
+        "model_placeholder_m402" => "claude-opus-5-5",
+        "model_placeholder_m50" => "gemini-3.1-flash-lite",
+        "model_placeholder_m26" => "claude-opus-4-6",
+        "model_placeholder_m35" => "claude-sonnet-4-6",
+        "model_placeholder_m36" | "model_placeholder_m37" | "model_placeholder_m16" => {
+            "gemini-3.1-pro"
+        }
+        "model_placeholder_m18" | "model_placeholder_m84" | "model_placeholder_m47" => {
+            "gemini-3-flash-preview"
+        }
+        "model_placeholder_m132" | "model_placeholder_m133" => "gemini-3.5-flash-high",
+        "model_placeholder_m187" => "gemini-3.5-flash-extra-low",
+        "model_placeholder_m20" => "gemini-3.5-flash-medium",
+        "model_openai_gpt_oss_120b_medium" => "gpt-oss-120b-medium",
+        "gemini-pro-default" | "gemini-pro-agent" => "gemini-3.1-pro",
+        "gemini-3-flash-agent"
+        | "gemini-3-flash-agent-a"
+        | "gemini-3-flash-agent-b"
+        | "gemini-3-flash-a"
+        | "gemini-3-flash-b" => "gemini-3.5-flash-high",
+        "gemini-3-flash-c" | "gemini-3-flash" => "gemini-3-flash-preview",
+        // ccusage quirk, ported as-is: the dashed low tier of 3.5
+        // prices as medium (the tier that SKU actually bills).
+        "gemini-3.5-flash-low" => "gemini-3.5-flash-medium",
+        "gemini-3.1-pro-high" | "gemini-3.1-pro-low" => "gemini-3.1-pro",
+        "gemini-3-pro-high" | "gemini-3-pro-low" => "gemini-3-pro",
+        "claude 3.7 sonnet" | "claude 3.7 sonnet thinking" => "claude-3-7-sonnet",
+        "claude 3.5 sonnet" => "claude-3-5-sonnet",
+        "claude 3.5 haiku" => "claude-3-5-haiku",
+        "claude 3 opus" => "claude-3-opus",
+        // Fork extensions beyond ccusage's table: human display names of
+        // the 4.6/5.5 Claude family. The proven arms (m26/m35/m402,
+        // numeric 1402) pin the dashed id as the family's catalog
+        // identity; ccusage's generic dash would leave an unpriced
+        // dotted spelling ("claude-sonnet-4.6") — the #1947 class.
+        "claude sonnet 4.6" => "claude-sonnet-4-6",
+        "claude opus 4.6" => "claude-opus-4-6",
+        "claude opus 5.5" => "claude-opus-5-5",
+        _ => {
+            // Generic fallback, ccusage order: fold spaces to dashes on
+            // the lowercased spelling so the result is a catalog-shaped
+            // id; anything else passes through in its original case.
+            let converted = base.replace(' ', "-");
+            if converted.starts_with("gemini-")
+                || converted.starts_with("claude-")
+                || converted.starts_with("gpt-")
+            {
+                return converted;
+            }
+            return trimmed.to_string();
+        }
+    }
+    .to_string()
+}
+
 fn antigravity_model_id(obj: &Map<String, Value>) -> Option<AntigravityModelId> {
     ANTIGRAVITY_MODEL_KEYS.iter().find_map(|key| {
         // rm-1864: antigravity ALSO emits numeric model ids (JSON numbers —
@@ -1616,17 +1765,34 @@ fn antigravity_model_id(obj: &Map<String, Value>) -> Option<AntigravityModelId> 
             return None;
         }
         let display = if numeric {
-            raw.parse::<i64>()
-                .ok()
-                .and_then(|int| {
-                    ANTIGRAVITY_NUMERIC_MODEL_MAP
-                        .iter()
-                        .find(|(id, _)| *id == int)
-                        .map(|(_, mapped)| (*mapped).to_string())
-                })
-                .unwrap_or(raw)
+            match raw.parse::<i64>() {
+                Ok(int) => ANTIGRAVITY_NUMERIC_MODEL_MAP
+                    .iter()
+                    .find(|(id, _)| *id == int)
+                    // ccusage composes the string fold over the mapped
+                    // name (their parser :180-181/:519-520), so a numeric
+                    // id and its string spelling attribute identically —
+                    // today only 342 folds (model_openai_gpt_oss_120b_
+                    // medium -> gpt-oss-120b-medium); every other arm is
+                    // already canonical.
+                    .map(|(_, mapped)| canonical_antigravity_model_string(mapped))
+                    // rm-1533 (cycle 7): ids >= 1000 without a proven arm
+                    // are the client's own placeholder encoding
+                    // m{id - 1000} (ccusage `model_name_from_id` fallback).
+                    // Below 1000 the landed raw-spelling disclosure
+                    // behavior stands (1277 precedent) — the table never
+                    // invents an id.
+                    .unwrap_or_else(|| {
+                        if int >= 1000 {
+                            format!("model_placeholder_m{}", int - 1000)
+                        } else {
+                            raw.clone()
+                        }
+                    }),
+                Err(_) => raw.clone(),
+            }
         } else {
-            raw
+            canonical_antigravity_model_string(&raw)
         };
         Some(AntigravityModelId { display, numeric })
     })
@@ -11179,8 +11345,10 @@ mod tests {
             "cacheReadInputTokens and cachedContentTokenCount are one basis"
         );
         assert_eq!(
-            session.metrics.model_used, "gemini-pro-default",
-            "config id passes through verbatim"
+            session.metrics.model_used, "gemini-3.1-pro",
+            "config id passes through verbatim unless a proven fold exists —
+            rm-1533 (cycle 7): gemini-pro-default is ccusage's documented
+            alias for gemini-3.1-pro"
         );
         assert_eq!(
             session
@@ -11280,8 +11448,10 @@ mod tests {
         let session =
             parse_raw_session("numeric-model-ids", "conversation.trajectory.json", &raw).unwrap();
         assert_eq!(
-            session.metrics.model_used, "1277",
-            "last numeric id wins and an unmapped numeric attributes to its stringified id"
+            session.metrics.model_used, "model_placeholder_m277",
+            "last numeric id wins; an unmapped id >= 1000 attributes to the
+            client's own placeholder spelling m{{id - 1000}} (rm-1533 cycle 7,
+            ccusage parity), still disclosed via antigravity_model:numeric_id"
         );
         assert_eq!(
             session
@@ -11463,6 +11633,193 @@ mod tests {
         );
     }
 
+    /// rm-1533 (cycle 7, run 79881d21): the identity table follows
+    /// ccusage main @ 2026-10-22 (`model_name_from_id` — PRs #1894/#1902/
+    /// #1948 — plus `normalize_antigravity_model` in full for string
+    /// spellings: effort tiers, thinking strips, version aliases, the
+    /// dashed 3.5-low→medium quirk, dotted Claude 3.x families, and
+    /// the numeric decode composing the fold like their parser does).
+    /// Identity-only law unchanged: mapping fixes attribution, pricing
+    /// still rides the catalog (bare keys price; absent keys degrade
+    /// through the disclosed unknown path). Unmapped ids keep their raw
+    /// spelling below 1000 (the table never invents); ids >= 1000 decode
+    /// the client's own placeholder arithmetic m{id - 1000}.
+    #[test]
+    fn antigravity_identity_table_matches_ccusage_main_2026_10_22() {
+        let one_step = |model: serde_json::Value| {
+            serde_json::json!({
+                "trajectoryId": "33333333-3333-4444-5555-666666666666",
+                "steps": [
+                    {
+                        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                        "status": "COMPLETED",
+                        "metadata": {"createdAt": "2026-10-22T10:00:05Z"},
+                        "plannerResponse": {
+                            "response": "Identity table case.",
+                            "usageStats": {"inputTokens": 3, "outputTokens": 1},
+                            "modelConfigId": model
+                        }
+                    }
+                ]
+            })
+            .to_string()
+        };
+        let model_used = |model: serde_json::Value| {
+            let raw = one_step(model);
+            parse_raw_session("id-table", "conversation.trajectory.json", &raw)
+                .unwrap()
+                .metrics
+                .model_used
+        };
+
+        // Numeric arms added after ccusage #1948 (2026-10-22, v20.0.40 —
+        // the same-day fix for their public #1947 $0.00 regression).
+        assert_eq!(model_used(serde_json::json!(1402)), "claude-opus-5-5");
+        assert_eq!(model_used(serde_json::json!(246)), "gemini-2.5-pro");
+        assert_eq!(model_used(serde_json::json!(312)), "gemini-2.5-flash");
+        assert_eq!(model_used(serde_json::json!(330)), "gemini-2.5-flash-lite");
+        assert_eq!(model_used(serde_json::json!(281)), "claude-4-sonnet");
+        // The numeric decode composes the string fold over the mapped
+        // name (their parser :180-181/:519-520): 342 attributes to the
+        // same id a literal "model_openai_gpt_oss_120b_medium" string
+        // sighting folds to.
+        assert_eq!(model_used(serde_json::json!(342)), "gpt-oss-120b-medium");
+        // 1417's proven family extends to 1418/1419.
+        assert_eq!(model_used(serde_json::json!(1418)), "gemini-4-argon");
+        // Effort-tiered families map to their full display spelling —
+        // pricing strips the suffix at lookup (strip_effort_suffix).
+        assert_eq!(model_used(serde_json::json!(1298)), "gemini-3.7-flash-high");
+        assert_eq!(
+            model_used(serde_json::json!(1319)),
+            "gemini-3.8-flash-medium"
+        );
+        assert_eq!(model_used(serde_json::json!(1073)), "gemini-3.6-flash-low");
+        // Placeholder arithmetic: ids >= 1000 without an explicit arm
+        // are the client's own m{id - 1000} placeholder encoding.
+        assert_eq!(
+            model_used(serde_json::json!(1500)),
+            "model_placeholder_m500"
+        );
+        // Backfill regression: the 1050 arm (rm-1533 run 18f9b98a)
+        // shipped with no pin of its own — ccusage #1902's mapping.
+        assert_eq!(model_used(serde_json::json!(1050)), "gemini-3.1-flash-lite");
+
+        // String spellings canonicalize per ccusage's
+        // `normalize_antigravity_model` — placeholder names attribute
+        // to the real model, display strings fold to catalog ids.
+        assert_eq!(
+            model_used(serde_json::json!("model_placeholder_m402")),
+            "claude-opus-5-5"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("MODEL_PLACEHOLDER_M50")),
+            "gemini-3.1-flash-lite"
+        );
+        // Later placeholder arms from the same table.
+        assert_eq!(
+            model_used(serde_json::json!("model_placeholder_m18")),
+            "gemini-3-flash-preview"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("model_placeholder_m132")),
+            "gemini-3.5-flash-high"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("model_placeholder_m187")),
+            "gemini-3.5-flash-extra-low"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("model_placeholder_m20")),
+            "gemini-3.5-flash-medium"
+        );
+        // Effort-tiered display families across 3.8/3.7/3.6.
+        assert_eq!(
+            model_used(serde_json::json!("gemini 3.8 flash (high)")),
+            "gemini-3.8-flash-high"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("gemini 3.7 flash (low)")),
+            "gemini-3.7-flash-low"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("gemini 3.6 flash (medium)")),
+            "gemini-3.6-flash-medium"
+        );
+        // Base display spellings, thinking variants, and version
+        // aliases ("gemini 3 flash" runs gemini 3.6) — ccusage strips
+        // any parenthetical before matching, so "(preview)" cannot
+        // fork the spelling.
+        assert_eq!(
+            model_used(serde_json::json!("gemini 3 flash")),
+            "gemini-3.6-flash"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("gemini 3.8 flash thinking")),
+            "gemini-3.8-flash"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("gemini 2.5 pro (preview)")),
+            "gemini-2.5-pro"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("gemini-pro-default")),
+            "gemini-3.1-pro"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("gemini-pro-agent")),
+            "gemini-3.1-pro"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("gemini-3-flash-agent")),
+            "gemini-3.5-flash-high"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("model_openai_gpt_oss_120b_medium")),
+            "gpt-oss-120b-medium"
+        );
+        // ccusage quirk, ported as-is: the dashed low tier of 3.5
+        // prices as medium.
+        assert_eq!(
+            model_used(serde_json::json!("gemini-3.5-flash-low")),
+            "gemini-3.5-flash-medium"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("gemini-3.1-pro-high")),
+            "gemini-3.1-pro"
+        );
+        // Dotted Claude 3.x displays fold to their dashed catalog ids
+        // (identity-only today — none of the 3.x keys are priced).
+        assert_eq!(
+            model_used(serde_json::json!("claude 3.7 sonnet")),
+            "claude-3-7-sonnet"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("claude 3.5 haiku")),
+            "claude-3-5-haiku"
+        );
+        // Fork extension beyond ccusage's table: human display names of
+        // the 4.6/5.5 family fold to the priced dashed ids their proven
+        // arms pin (m35/m402, numeric 1402), not the unpriced dotted
+        // spellings the generic dash would leave.
+        assert_eq!(
+            model_used(serde_json::json!("claude sonnet 4.6")),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            model_used(serde_json::json!("claude opus 5.5")),
+            "claude-opus-5-5"
+        );
+        // Unknown spellings pass through untouched — the normalizer
+        // never invents an id it cannot prove.
+        assert_eq!(
+            model_used(serde_json::json!("custom-antigravity-model")),
+            "custom-antigravity-model"
+        );
+        // Unmapped numerals below 1000 keep the landed raw-spelling
+        // disclosure behavior (pinned by the 1277 case above).
+        assert_eq!(model_used(serde_json::json!(999)), "999");
+    }
+
     #[test]
     fn antigravity_jsonl_folds_usage_blocks() {
         // rm-720: the jsonl lane folds PLANNER_RESPONSE usage blocks the
@@ -11477,7 +11834,7 @@ mod tests {
         assert_eq!(session.metrics.tokens_input, 40);
         assert_eq!(session.metrics.tokens_output, 10);
         assert_eq!(session.metrics.tokens_cache_r, 7);
-        assert_eq!(session.metrics.model_used, "MODEL_PLACEHOLDER_M16");
+        assert_eq!(session.metrics.model_used, "gemini-3.1-pro");
         assert_eq!(
             session.metrics.source_tool, "antigravity_cli",
             "the lane still claims the file"
