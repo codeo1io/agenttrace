@@ -216,6 +216,7 @@ fn stale_schema_22_cache_cannot_mask_the_disclosure() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
 fn with_session_cache_dir(cache: &std::path::Path, f: impl FnOnce()) {
     let key = "AGENTTRACE_SESSION_CACHE_DIR";
     let previous = std::env::var_os(key);

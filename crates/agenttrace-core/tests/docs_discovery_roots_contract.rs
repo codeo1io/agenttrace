@@ -19,10 +19,14 @@
 //! platform-dependent, so the pin runs where the README's row is
 //! written: Linux.
 
+#[cfg(target_os = "linux")]
 use agenttrace_core::known_session_dirs;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
 fn readme_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../")
@@ -31,6 +35,7 @@ fn readme_path(relative: &str) -> PathBuf {
 
 /// `~`-relative form of a root path under the scratch home, matching
 /// the README table's rendering (forward slashes, `~` for the home).
+#[cfg(target_os = "linux")]
 fn tilde_form(home: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(home).ok()?;
     Some(format!(
@@ -39,6 +44,7 @@ fn tilde_form(home: &Path, path: &Path) -> Option<String> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn scratch_enumeration() -> Vec<(String, String)> {
     let scratch =
         std::env::temp_dir().join(format!("agenttrace-docs-roots-{}", std::process::id()));

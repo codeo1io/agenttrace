@@ -93,4 +93,27 @@ if grep -q '^## Unreleased' "$changelog"; then
 		fail "Unreleased section is present but carries no entries (rm-1390): a header over zero bullets claims a landing lane that does not exist — land the entries, date the section, or drop the header"
 fi
 
-echo "check-changelog-structure: no merge-conflict fences; no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous)"
+# Pass 4 (rm-2338, run 252064e2 cycle 4): verbatim-duplicated ENTRY lines.
+# Pass 1 catches duplicated `###` headings; the same re-doubling landing can
+# also duplicate whole entry bullets inside one section (2026-10-22: 39
+# duplicated entry blocks / 132 duplicated long lines in Unreleased). The
+# significance floor (40 chars) keeps short generic bullets and repeated
+# `Integration seam (...)` continuation annotations inside different
+# entries legal — only verbatim re-doubled entry text fails.
+dup_entries="$(awk '
+	BEGIN { FS = "\n" }
+	/^## / { section = $0 }
+	/^- / {
+		if (length($0) > 40) {
+			key = section SUBSEP $0
+			seen[key]++
+			if (seen[key] == 2) { printf "    %s: %s\n", section, $0; bad = 1 }
+		}
+	}
+	END { exit bad ? 1 : 0 }
+' "$changelog")" || true
+if grep -q . <<<"$dup_entries"; then
+	fail "verbatim duplicate entry line in CHANGELOG.md (rm-2338 class — a re-doubled landing pasted the same entry twice):"$'\n'"$dup_entries"
+fi
+
+echo "check-changelog-structure: no merge-conflict fences; no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous); no duplicated entry lines"

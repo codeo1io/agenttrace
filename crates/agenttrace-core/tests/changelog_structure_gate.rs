@@ -169,3 +169,46 @@ fn setext_underline_stays_legal() {
         "3-'=' setext underline must not trip the fence check: {err}"
     );
 }
+
+/// Verbatim-duplicated entry lines inside one section are re-doubled
+/// landings (rm-2338 class: 39 duplicated entry blocks / 132 duplicated
+/// long lines found in the live [Unreleased] on 2026-10-22, deduplicated
+/// by run 252064e2 cycle 4): the gate must fail and name the class.
+#[test]
+fn duplicate_entry_line_reds_the_gate() {
+    let entry =
+        "- SQLite snapshot cache: failed database reads never bank a stale snapshot into the cache.";
+    let doubled = HEALTHY.replace(
+        "### Fixed\n\n- another thing\n",
+        format!("### Fixed\n\n{entry}\n\n{entry}\n").as_str(),
+    );
+    let root = temp_repo("entry-dup", &doubled);
+    let (ok, _out, err) = run_gate(&root);
+    std::fs::remove_dir_all(&root).ok();
+    assert!(!ok, "verbatim-duplicated entry line must fail the gate");
+    assert!(
+        err.contains("duplicate entry line"),
+        "failure must name the entry-duplication class, got: {err}"
+    );
+}
+
+/// Class boundary: short bullets under the significance floor and repeated
+/// `Integration seam (...)` continuation annotations inside DIFFERENT entries
+/// are legitimate shapes (the live CHANGELOG carries two of the latter after
+/// the 2026-10-22 dedup) and must NOT trip the arm.
+#[test]
+fn short_bullets_and_seam_annotations_stay_legal() {
+    let legal = HEALTHY.replace(
+        "### Fixed\n\n- another thing\n",
+        "### Fixed\n\n- fixed.\n\n- fixed.\n\n\
+- parser: keeps transcript replay stable across cold caches (2026-10-21, fleet merge).\n  Integration seam (2026-10-21, conflict case 0f0f0f0f): seam annotation repeated.\n\n\
+- discovery: keeps the roots census stable across cold caches (2026-10-21, fleet merge).\n  Integration seam (2026-10-21, conflict case 0f0f0f0f): seam annotation repeated.\n",
+    );
+    let root = temp_repo("entry-dup-boundary", &legal);
+    let (ok, _out, err) = run_gate(&root);
+    std::fs::remove_dir_all(&root).ok();
+    assert!(
+        ok,
+        "short bullets and repeated seam annotations must not trip the arm: {err}"
+    );
+}

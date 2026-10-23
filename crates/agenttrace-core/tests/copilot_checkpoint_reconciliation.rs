@@ -23,6 +23,7 @@ use std::path::PathBuf;
 /// binary (cargo runs `#[test]` fns on parallel threads; each pin points
 /// `AGENTTRACE_SESSION_CACHE_DIR` at its own isolated root and must not
 /// observe a sibling's).
+#[cfg(unix)]
 static STALE_CACHE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn fixture(name: &str) -> PathBuf {
