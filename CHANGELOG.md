@@ -1026,6 +1026,43 @@
 
 ### Fixed
 
+- OpenCode v2 session-ingest truth (rm-2290, run e9021a4b cycle 7, batch
+  "opencode v2 session-ingest truth" — promote `unhandled_v2_stores` to
+  counted sessions): opencode shipped v2.1.2 (2026-10-21) with a same-day
+  V1→V2 migration hotfix (c3b613ca), so migrated homes are the common case
+  and their post-migration sessions live ONLY in `session_v2` — which the
+  reader disclosed as a named unhandled format (rm-1927) but never counted:
+  every session started after the migration was invisible in every total,
+  and a fresh v2 install counted nothing at all. The sqlite lane now READS
+  v2-shaped tables (matched by the column signature, not the table name)
+  beside the v1 `session` lane, session-level aggregates only: stored
+  cost/token columns, guarded lenient reads — an upstream-dropped or
+  renamed column reads as NULL and is named per read (`absent_columns`),
+  never a failed pass — the JSON `model` column parsed leniently for
+  attribution, and TWIN accounting: upstream's migration copies every v1
+  row into `session_v2` and leaves the v1 rows in place, so a migrated
+  home double-carries each legacy session; a v2 row whose id the v1 lane
+  already counted is counted ONCE (through the richer, message-enriched
+  v1 aggregate) and disclosed as a skipped twin (`v2_reads` on the ingest
+  report; `--latest` prints one note per read that has twins or absent
+  columns and stays silent on a clean fresh install). The residual
+  `unhandled_v2_stores` class is now exactly shape-without-readability —
+  the shape probe matched but the guarded SELECT itself failed — and the
+  `--doctor` census counts healthy v2 stores as parsed sessions instead
+  of a named failure class. The sqlite snapshot rung moves 14 -> 15 (the
+  session cache rung stays 72): a v14 snapshot banked from a migrated
+  home replays without the post-migration sessions on an unchanged
+  (size, mtime) fingerprint — a silent undercount of exactly the sessions
+  this change counts — so every older snapshot regenerates once, carrying
+  the v2 read accounting for warm replay. Pinned red-first by
+  `opencode_v2_read.rs` (migrated twins kept singular against
+  poisoned-totals twin copies, warm replay of the twin accounting,
+  drifted-schema absent columns), the rewritten `opencode_v2_store.rs`
+  (fresh v2 store counted with zero twins, warm-path replay, doctor
+  census, and the shape-without-readability residual class), and
+  `agenttrace-cli/tests/opencode_v2_disclosure.rs` (the stderr
+  note/warning/silence lanes).
+
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch

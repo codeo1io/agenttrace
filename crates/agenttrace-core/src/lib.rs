@@ -671,7 +671,7 @@ pub struct Metrics {
     /// are present but unreadable on a row that DOES carry a decoded
     /// `summary_diffs` payload (no payload, no cross-check, no
     /// disclosure). Serialized so warm sqlite snapshots keep
-    /// disclosing (snapshot schema 14).
+    /// disclosing (snapshot schema 15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_cross_check_unreadable: Option<Vec<SummaryColumnUnreadable>>,
     pub source_tool: String,

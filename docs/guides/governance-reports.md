@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 72 and the SQLite snapshot is schema 14; the
+The session cache is schema 72 and the SQLite snapshot is schema 15; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -554,7 +554,16 @@ named unhandled format instead of classifying it session-less — a v13
 snapshot banked before either change replays the same database with no
 unreadable disclosure on an unchanged (size, mtime) fingerprint, so one
 regeneration per database retires the stale entry (rm-1926/rm-1927, run
-9d3b927c cycle 1; rm-230 convention). Older versions are discarded and
+9d3b927c cycle 1; rm-230 convention), and to 15 when the sqlite lane began
+READING v2-shaped `session_v2` tables into counted sessions beside the v1
+`session` lane — upstream's V1→V2 migration copies every v1 row and leaves
+the originals, so a migrated home double-carries each legacy session: twins
+are counted once through the richer v1 aggregate, post-migration sessions
+count through the v2 arm, and the twin/column-drift accounting (`v2_reads`)
+rides the entry — a v14 snapshot banked from a migrated home replays without
+the post-migration sessions on an unchanged fingerprint, so one
+regeneration per database retires the stale entry (rm-2290, run e9021a4b
+cycle 7; rm-230 convention). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
 pruned the next time the cache loads, and the JSONL-backed session cache is

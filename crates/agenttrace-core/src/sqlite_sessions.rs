@@ -1461,14 +1461,13 @@ fn opencode_v2_session_rows(
     };
     for row in rows {
         match row {
-            Ok((id, agg)) => {
-                if aggs.contains_key(&id) {
-                    read.twin_rows += 1;
-                } else {
-                    aggs.insert(id, agg);
+            Ok((id, agg)) => match aggs.entry(id) {
+                std::collections::hash_map::Entry::Occupied(_) => read.twin_rows += 1,
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(agg);
                     read.rows_ingested += 1;
                 }
-            }
+            },
             Err(error) => failures.record_dropped(&error),
         }
     }
@@ -2047,7 +2046,7 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     // rm-1926: the unreadable cross-check is a disclosure-counter
     // event like `opencode_summary_dropped` — the doctor census and
     // diagnostics fold read it off the counters, so warm and cold
-    // paths disclose identically (snapshot schema 14 round-trips it).
+    // paths disclose identically (snapshot schema 15 round-trips it).
     if summary_cross_check_unreadable_count > 0 {
         metrics
             .disclosure_counters
