@@ -16,6 +16,20 @@
 use agenttrace_core::{analyze, cache_rate_census, lookup_price, CacheRateCensus};
 use std::collections::BTreeMap;
 
+mod support;
+
+// rm-1954 extension (run 2cdd052c cycle 7): the census below partitions
+// the pricing catalog, but the catalog PREFERS a machine cache
+// (`~/.cache/agenttrace/pricing.json`, pricing.rs load_pricing_cache)
+// over this repository's bundled snapshot — on a fleet host with a
+// machine cache the whole partition shifts (observed live: cache-read
+// absent 1 → 2230, models 3130 → 3941) and the census pins fail for
+// reasons the repository cannot control. The body runs under
+// `support::with_isolated_pricing_env`; its `AGENTTRACE_PRICING_FILE`
+// override is set INSIDE the body, after the guard's ambient clear, so
+// the override-before-first-lookup sequencing the header documents is
+// preserved.
+
 /// A pi-shaped usage event: role `meta` (or `session_meta`) carries
 /// usage and model attribution, the shape the per-block arm prices.
 fn usage_event(
@@ -41,6 +55,12 @@ fn usage_event(
 
 #[test]
 fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero() {
+    support::with_isolated_pricing_env(
+        absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero_body,
+    );
+}
+
+fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero_body() {
     // The override catalog merges per-entry over the bundled one, so
     // three synthetic rows pin all three states without touching any
     // real model's rates. All three share input $10/M, output $30/M.

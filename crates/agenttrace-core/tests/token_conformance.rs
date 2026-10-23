@@ -31,6 +31,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
+mod support;
+
 /// The five audited AgentMeasure classes rm-053 must cover; the last two
 /// entries are the pack's own extensions (unprovable totals rendered
 /// honestly, hostile journals failing loudly).
@@ -149,6 +151,19 @@ fn conformance_pack_manifest_is_internally_consistent() {
 
 #[test]
 fn conformance_pack_holds_against_parser_and_pricing() {
+    support::with_isolated_pricing_env(conformance_pack_holds_against_parser_and_pricing_body);
+}
+
+// rm-1954 extension (run 2cdd052c cycle 7): the pack re-derives every
+// cost literal from the pricing catalog via `lookup_price`, but the
+// catalog PREFERS a machine cache (`~/.cache/agenttrace/pricing.json`,
+// pricing.rs load_pricing_cache) over this repository's bundled
+// snapshot — on a fleet host with a machine cache the re-derived costs
+// drift from the checked-in pack literals and the drift guard fails
+// for reasons the repository cannot control. The pricing consumer runs
+// under `support::with_isolated_pricing_env`; the manifest-consistency
+// test reads files only and stays bare.
+fn conformance_pack_holds_against_parser_and_pricing_body() {
     let tolerance = manifest()["pricing_basis"]["formula_tolerance"]
         .as_f64()
         .expect("formula tolerance");
