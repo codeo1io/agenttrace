@@ -1025,34 +1025,6 @@
 
 - The session cache entry bound is configurable and disclosed (rm-298 residual capacity arm, run 3e6e5de0 cycle 1): `session_cache_entries` in the config file outranks `AGENTTRACE_SESSION_CACHE_ENTRIES` (parse-fail ignored, best-effort like every AGENTTRACE_*), both clamp to the 1..=1,000,000 band (default 20,000 unchanged; no schema bump rides this arm — the cache shape is untouched and SESSION_CACHE_SCHEMA_VERSION stays at its landed ceiling, 41 after this integration's rm-520 rebase), and `--doctor` reports the effective bound, where it came from (`default|config file|env`), and how many sessions the last scan re-parsed (release probe on the 25,889-file corpus: 20000/default/19414). The `--config` disclosure shows the same clamped effective value and annotates `clamped from <raw>` when the configured value was out of band.
 
-- Local read-only MCP server: `agenttrace mcp` speaks newline-delimited JSON-RPC 2.0 over stdio (initialize, ping, tools/list, tools/call; notifications stay silent; malformed JSON, unknown methods, bad tool params, and batch requests answer the spec error arms -32700/-32600/-32601/-32602, and the wire stays disciplined — non-UTF-8 lines answer -32700 without dying, over-cap lines are refused with -32600 naming the 1 MiB transport cap per the landed rm-923 contract (this run's -32700 draft was superseded at integration), request ids outside String/Number/Null answer -32600 with `id: null` instead of being echoed back, and non-object `params`/`arguments` answer -32602 instead of behaving like absent values) so a coding agent can ask about its own token usage from inside the session that burned it. `initialize` negotiates the newest mutually supported protocol revision of 2026-07-28/2025-11-25/2025-06-18 — never a blind echo of an unknown client version (rm-780). Two read-only tools render the SAME locally discovered sessions the CLI reports on — `usage_overview` (the `--overview -f json` document) and `by_model_breakdown` (the `by_model` rollup) — through the same layered configuration the CLI resolves: config layers, `--pricing-file`, and `--history-dir` price both lanes identically (a pricing override used to move the CLI's answer and leave the MCP tools on snapshot pricing under the same override; rm-781), with the CLI's full `--range` alias set (`today|day|1d|7d|week|weekly|30d|month|monthly|all|""`, published verbatim in the tool schema so schema-validating hosts can call every alias the parser accepts); a discovered-but-empty corpus is a tool-level `isError` result — a discovery miss when no session files exist at all, a filter miss naming the discovery count when files exist outside the window — the twin of the CLI's rc1 bail, and the server keeps serving. Flags placed BEFORE the `mcp` keyword are honored (`-d/--dir` plus the config family `--config`/`--history-dir`/`--pricing-file`) or refused at rc2 — previously they were accepted by clap and silently dropped, so an explicit `-d` corpus answered the auto-discovery remedy and a report flag vanished (rm-781). The server opens no sockets, performs no network probes, and writes nothing outside the agenttrace session cache; it serves until stdin closes (host disconnect is a clean exit 0). Hand-rolled JSON-RPC — no new dependencies (the SDK-vs-hand-rolled decision is recorded in the rm-455 lane). Keyword host-command wiring lands with the rm-505 help/guard routes; guide at docs/guides/mcp-server.md with registration snippets and a tool-call transcript; e2e wire contract pinned by tests/mcp_server.rs (rm-455, run 90f54faf cycle 3; hardened rm-780/rm-781/rm-782, run 749cd298 cycle 1 — the assess PoCs behind the hardening: CLI 0.003 vs MCP 0.0 under the same pricing override, `1999-99-99` echoed as supported, a non-UTF-8 line killing the server rc1, `-d` silently dropped, and the tool schema under-declaring the parser's range aliases).
-
-- `--overview` gained a `by_branch` attribution dimension: the spend-by-branch rollup every governance surface already gave providers and task types (rm-585, run 4c3ca863 cycle 3, honest attribution). The branch is captured from the claude-code lane's `gitBranch` envelope onto the session-meta event — the first cut, and the only lane that records a branch today — and every session lands in exactly one bucket: its named branch, or one explicit `unknown` bucket covering branchless claude journals, detached-HEAD sessions (the literal `HEAD`), and every codex/qwen/copilot lane (the gap is disclosed in the governance guide and the code; extending capture to those lanes is future work as their journals grow the field). Sessions and cost only, like `by_provider`; rendered in JSON, text, markdown, HTML and CSV with the same GroupOverview shape, and the session cache was bumped to 40 at this integration (landed at the run’s base e9e8fd9 as 32 → 33, re-based onto the advanced ceiling) so warm corpora regenerate with the new field (serde-default keeps older caches decodable; the bump is the regeneration trigger, not a decode gate). Pinned by `tests/attribution_dimensions.rs` (json surface, unknown-bucket coverage, cost parity with the `by_model` baseline, every-surface rendering), a parser pin for `gitBranch`/`HEAD`/branchless journals, and live-proven on a real `~/.claude/projects` corpus (`conductor/run-6956132c5089` attributing its sessions beside a detached-HEAD `unknown`).
-
-- **rm-576: shareable usage card (`--overview -f svg`, `--card-theme
-  auto|dark|light`).** A deterministic, offline SVG renderer in the
-  `--overview` family: headline stats (cost, sessions, tool calls, tokens),
-  top models/projects by cost, a 14-day daily-spend sparkline anchored to
-  the corpus's own clock (never `Utc::now()` — this is what makes rerenders
-  byte-identical), and the same honesty footer as the other renderers
-  (covered window, pricing source, data-health confidence) so a shareable
-  artifact cannot hide an incomplete corpus. Auto theme ships the light
-  palette as presentation attributes plus a `prefers-color-scheme: dark`
-  override block — the card adapts where SVG media queries are honored and
-  degrades to a correct light card where they are not or a sanitizer strips
-  `<style>`. Session-derived strings pass `sanitize_line_segment` (raw
-  control bytes are illegal XML 1.0) and the family entity escaper, so a
-  model or project named like markup renders inert. `-f svg` requires
-  `--overview` (integration-review fix, rm-576 F1: the governance actions
-  have no svg arm, so svg outside the overview lane is a loud error rather
-  than the silent plain-text fallthrough the first cut admitted — the
-  rm-409 discipline). Contract pinned by `tests/svg_card_contract.rs` (golden bytes
-  for all three themes, rerender byte-equality, hostile-name inertness,
-  empty-corpus validity, corpus-clock anchoring) and
-  `scripts/ci/check-output-contract.sh` (saved-vs-stdout behavior,
-  cross-run `cmp` determinism). Docs: `docs/guides/usage-card.md`, README
-  section. Minted by the 7eae74ea cycle-1 roadmap (rm-576); codeburn #1640
-  parity research recorded in that run's ledger.
 
 - `-f otel` output format (rm-599 CLI half): OpenTelemetry GenAI OTLP-JSON export on the
   `--overview` lane (`--overview` required; `-o` supported); stdout text/json/csv output
@@ -1166,6 +1138,37 @@
 
 ### Fixed
 
+- Explicit `-d` directories collapse zst stem twins to one admission per
+  stem (rm-2056 rider, run c870ab5a cycle 2): the default scan already treats
+  a plain `.jsonl` + `.jsonl.zst` pair as ONE session under two names (the
+  codex 0.163 migration transient, rm-992), but the explicit-directory lane
+  kept both, so a `-d` probe double-counted the session the scan had already
+  collapsed. The identity carve-out now applies to `-d` too — plain twin
+  wins, precedence by name not walk order — while the other duplicate classes
+  (byte-identical copies, content dups, artifact mirrors) keep every name
+  there, as before. Unlike the uncached probe, the cached `-d` lane names
+  the suppressed pair through the load report's disclosure ledger
+  (zst_stem_twins count + capped pair samples) instead of letting it vanish.
+- doctor JSON omits empty suppression classes it used to name (rm-2056
+  rider, run c870ab5a cycle 2): `zst_stem_twin_pairs` promised
+  absent-when-nothing-happened (the disclosure convention its sibling
+  `duplicate_session_file_pairs` already carries) but shipped without the
+  `skip_serializing_if` attribute, so every clean report carried a named
+  empty class. The attribute is restored; a real suppression stays present
+  and named.
+- `--baseline` comparison files are read under a 64 MiB cap (rm-2345,
+  run c870ab5a cycle 2): the baseline gate read the operator-supplied
+  operand whole into memory before any validation ran — the last
+  operator-supplied whole-file read in the report lane without the
+  read-cap discipline the parser lane already enforces. Oversized
+  operands (checked by stat BEFORE the read, with a bounded-take backstop
+  for files that grow between stat and read) now fail with the flag, the
+  path, and the observed size; the unreadable/non-UTF-8/non-JSON
+  rejection classes are unchanged.
+- CHANGELOG hygiene: 28 entries duplicated byte-for-byte into the
+  v0.8.0 section were removed (rm-2302, run c870ab5a cycle 2) — a
+  copy-paste residue that made every one of those entries appear twice
+  in the rendered changelog.
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch
@@ -2248,6 +2251,16 @@
 
 ### Changed
 
+- Session cache schema 72->73 (rm-2354, run c870ab5a cycle 2, batch
+  "warm-cache truth restoration + admission-honesty riders"): the antigravity numeric-model map
+  (ANTIGRAVITY_NUMERIC_MODEL_MAP, landed in 6f76dbdd without a rung of its
+  own) changed parser output for unchanged source files — numeric
+  modelConfigIds like 1050 now map to their model names (gemini-3.1-flash-lite)
+  and price from the bundled catalog — but every warm cache built before that
+  landing kept replaying the stale raw "1050" string with banked-unknown
+  pricing. The rung drops parsed entries once; they regenerate under the
+  mapping on the next scan, the discard is disclosed through the
+  schema_invalidations journal, and doctor summarizes it.
 - One shared cache-directory resolver replaces the four byte-identical per-module copies (rm-1536, assess F4, run 79fe78c0 cycle 3; adoption of salvage 9b2a7a1 U2): doctor, pricing, session_cache, and statusline each carried their own `user_cache_dir` ladder for locating the `agenttrace` cache root (sessions.json, pricing.json, the statusline capture journal, the doctor cache report). The ladder now lives once in `agenttrace-core::cache_dir` — `resolve_user_cache_dir(home, xdg_cache_home, macos)` takes the platform arm as an injected boolean so the Linux CI legs can pin the macOS behavior that `cfg!` copies made compile-time dead code, and one 17-row decision table replaces the four per-module pin tests. Two order-of-precedence disclosures ride the consolidation: an ABSOLUTE, non-empty `$XDG_CACHE_HOME` now wins on EVERY OS — the old macOS arm returned `$HOME/Library/Caches` first, so the rm-596 doctor demo sandbox (HOME + absolute XDG override asserting no $HOME text in the report) was unsatisfiable on macOS — and the landed rm-248 rider stays on the home arms (a set-but-empty OR RELATIVE `HOME` is unset-equivalent on both arms; an unusable HOME never yields a per-cwd cache). No environment variable is read anywhere new — the `user_cache_dir()` wrapper reads exactly the same two variables through one code path.
 - `resolve_user_cache_dir` is defined exactly once (rm-1389, run 1a4cce3a cycle 3, batch "one truth on the money-and-cache path"; reliability 30.0): the user-cache base resolver existed as four hand-synced private copies (session_cache, doctor, pricing, statusline — byte-identical 29-line bodies at the consolidation base 3e90993, verified) that had already drifted twice in three days — the empty/relative-HOME fix (rm-248 rider, dade9cd) landed on three copies while statusline's lagged, and the relative-HOME review fix then landed on statusline alone. The session_cache copy — the module that owns the cache-root policy — is now the single `pub(crate)` definition, imported by the other three; it stays pure over `(HOME, XDG_CACHE_HOME)` so every call path remains test-injectable. No behavior change (the bodies were identical); the consolidation is pinned by `shared_user_cache_resolver_census_pins_one_definition` (session_cache unit test that walks every `crates/**/*.rs` and asserts exactly one `fn` definition — the needle is assembled at runtime so the test's own source cannot count itself) on top of the existing per-module parity tests (`user_cache_dir_treats_empty_and_relative_home_as_unset` in session_cache/doctor/pricing plus statusline's historical pins), which now exercise the one shared body from all four beds. (Integration, conflict case 4d82812f: this run's session_cache-hosted consolidation is superseded at the merge by the landed rm-1536 `cache_dir` consolidation above — same one-definition intent, mechanics rehomed: the shared resolver lives in `agenttrace-core::cache_dir` as `resolve_user_cache_dir(home, xdg_cache_home, macos)` with an injected macOS arm, so the Linux CI legs can pin it; the census pin `shared_user_cache_resolver_census_pins_one_definition` relocated to cache_dir.rs beside the one definition, and the per-module parity tests this entry cites were themselves folded into cache_dir's 17-row `user_cache_dir_decision_table`.)
 

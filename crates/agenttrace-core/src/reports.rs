@@ -1378,27 +1378,80 @@ fn render_recommendations_markdown(out: &mut String, items: &[crate::Recommendat
     }
 }
 
+/// rm-2345 (run c870ab5a cycle 2): read cap for the `--baseline`
+/// comparison file — 64 MiB, the journal read-cap discipline the
+/// parser lane already enforces, applied to the one remaining
+/// operator-supplied whole-file read in the report lane. A comparison
+/// file is untrusted by the same standard as a journal: without the
+/// cap a multi-gigabyte `--baseline` operand buffers whole before the
+/// JSON class check ever runs. Checked BEFORE the read (stat
+/// fast-path) with a bounded-take backstop for files that grow
+/// between the stat and the read.
+pub const BASELINE_READ_CAP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// rm-2345: the failure classes of [`read_baseline_capped`] — the
+/// rm-569 classes (io error, non-UTF-8) stay attributed exactly as
+/// before; the cap adds the oversized class.
+enum ReadBaselineError {
+    InvalidUtf8(std::io::Error),
+    Io(std::io::Error),
+    TooLarge(u64),
+}
+
+/// rm-2345: `--baseline` read under [`BASELINE_READ_CAP_BYTES`].
+fn read_baseline_capped(baseline_path: &str) -> Result<String, ReadBaselineError> {
+    use std::io::Read;
+    let file = fs::File::open(baseline_path).map_err(ReadBaselineError::Io)?;
+    // Stat fast-path: reject before buffering anything.
+    let stat_len = file.metadata().map_err(ReadBaselineError::Io)?.len();
+    if stat_len > BASELINE_READ_CAP_BYTES {
+        return Err(ReadBaselineError::TooLarge(stat_len));
+    }
+    // Bounded-take backstop: a file that grew between the stat and
+    // the read still cannot exceed the cap by more than one byte.
+    let mut bytes = Vec::new();
+    file.take(BASELINE_READ_CAP_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ReadBaselineError::Io)?;
+    if bytes.len() as u64 > BASELINE_READ_CAP_BYTES {
+        return Err(ReadBaselineError::TooLarge(bytes.len() as u64));
+    }
+    String::from_utf8(bytes).map_err(|err| {
+        ReadBaselineError::InvalidUtf8(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+    })
+}
+
 /// rm-569: load a `--baseline` file with truthful, attributed errors.
 ///
 /// The baseline gate is the CI flagship (docs/guides/ci-integration.md): a
 /// wrong file must fail loudly instead of zero-filling into a fabricated
 /// +100% regression. Input classes covered: unreadable (io error attributed
-/// to the path), non-UTF-8, non-JSON, and valid JSON that is not an overview
-/// report (missing `summary` object). The version cross-check against
-/// the current report lives in `add_baseline_comparison`.
+/// to the path), non-UTF-8, non-JSON, valid JSON that is not an overview
+/// report (missing `summary` object), and — rm-2345 — oversized past
+/// [`BASELINE_READ_CAP_BYTES`] (checked before the read). The version
+/// cross-check against the current report lives in `add_baseline_comparison`.
 ///
 /// Review fix (2026-10-06): the `version` string and the summary's compared
 /// numeric fields (`total_duration_seconds`, `total_cost`, `total_tokens`) are
 /// required up front, so an empty or partial summary cannot zero-fill its way
 /// into a fabricated +100% regression.
 fn load_baseline_report(baseline_path: &str) -> anyhow::Result<Value> {
-    let baseline_text = match fs::read_to_string(baseline_path) {
+    let baseline_text = match read_baseline_capped(baseline_path) {
         Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+        Err(ReadBaselineError::InvalidUtf8(err)) => {
             anyhow::bail!("--baseline: {baseline_path} is not valid UTF-8: {err}");
         }
-        Err(err) => {
+        Err(ReadBaselineError::Io(err)) => {
             anyhow::bail!("--baseline: failed to read baseline file {baseline_path}: {err}");
+        }
+        Err(ReadBaselineError::TooLarge(len)) => {
+            anyhow::bail!(
+                "--baseline: {baseline_path} is {len} bytes, larger than the {} MiB baseline \
+                 read cap — a comparison file that size cannot be an overview report; check \
+                 the flag's operand, or regenerate the baseline with \
+                 `agenttrace --overview -f json -o <baseline>`",
+                BASELINE_READ_CAP_BYTES / (1024 * 1024)
+            );
         }
     };
     let baseline: Value = serde_json::from_str(&baseline_text)

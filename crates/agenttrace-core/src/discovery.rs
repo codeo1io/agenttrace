@@ -370,7 +370,17 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
         if is_cline_task_dir(dir) {
             return vec![dir.to_path_buf()];
         }
-        return collect_session_files(dir);
+        // rm-2056 (run c870ab5a cycle 2): the explicit `-d` walk keeps
+        // every FILE it walks (rm-548 forked copies, rm-1886 content
+        // duplicates, rm-1887 artifact mirrors — real files with real
+        // names), but a zst stem twin is not two files claiming two
+        // sessions: it is ONE session under two names, exactly the
+        // default-scan admission rule. Collapsing the pair here admits
+        // the session once with parity across both lanes; this
+        // Vec-returning arm has no disclosure channel, so the cached
+        // twin in find_session_files_cached names the pair.
+        let mut suppressed = SuppressedSessions::default();
+        return suppress_zst_stem_twins(collect_session_files(dir), &mut suppressed);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
@@ -1092,14 +1102,19 @@ pub(crate) fn find_session_files_cached(
         // a forked copy loaded by explicit path still renders (the
         // exclusion is an aggregation rule, not a parse block). Same
         // stance for rm-1886 content duplicates and rm-1887 artifact
-        // mirrors: `-d` is the inspection lane. rm-451 keeps the
+        // mirrors: `-d` is the inspection lane. rm-2056 (run c870ab5a
+        // cycle 2) carves out the one identity class: a zst stem twin
+        // is ONE session under two names, not two files claiming two
+        // sessions, so it collapses here exactly as in the default
+        // scan — and unlike the content/artifact classes this arm HAS
+        // a disclosure carrier, so the suppressed pair is named through
+        // SuppressedSessions instead of vanishing. rm-451 keeps the
         // over-cap counter zero here too — an explicit `-d` probe reads
         // the doc through the parse lane, which owns its own read caps.
-        return (
-            collect_session_files_cached(dir, cache),
-            SuppressedSessions::default(),
-            0,
-        );
+        let mut suppressed = SuppressedSessions::default();
+        let paths =
+            suppress_zst_stem_twins(collect_session_files_cached(dir, cache), &mut suppressed);
+        return (paths, suppressed, 0);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;

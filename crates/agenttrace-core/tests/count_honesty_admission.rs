@@ -832,11 +832,16 @@ fn zst_only_name_still_admits_without_a_plain_twin() {
 }
 
 #[test]
-fn explicit_dir_lane_keeps_zst_stem_twin() {
-    // rm-548 stance guard for rm-2056: `-d` is the inspection lane —
-    // an explicitly requested directory keeps every admitted file
-    // (same stance the byte-identical duplicate class carries), so the
-    // twin policy must not leak into it.
+fn explicit_dir_lane_collapses_zst_stem_twin() {
+    // rm-2056 rider (run c870ab5a cycle 2): a zst stem twin is ONE
+    // session under two names — the identity class — so the `-d`
+    // inspection lane collapses it exactly as the default scan does.
+    // The OTHER duplicate classes (byte-identical copies, content
+    // dups, artifact mirrors — rm-548/rm-1886/rm-1887) still keep
+    // every name here: those are two FILES claiming two sessions; a
+    // zst twin is one session wearing a migration transient's second
+    // name (rm-992). Precedence rides the name (plain wins), not walk
+    // order, so the explicit probe is deterministic.
     let home = temp_home("zst-twin-explicit");
     let sessions = home.join(".codex/sessions");
     fs::create_dir_all(sessions.join("2026/10/15")).expect("mkdir date tree");
@@ -858,8 +863,69 @@ fn explicit_dir_lane_keeps_zst_stem_twin() {
     let found = find_session_files(Some(&sessions));
     assert_eq!(
         found.len(),
-        2,
-        "the -d inspection lane keeps both names (rm-548 stance): {found:?}"
+        1,
+        "the -d lane admits one session per stem (rm-2056 identity class): {found:?}"
     );
+    let kept = found[0]
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("utf-8 name");
+    assert_eq!(
+        kept, "rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl",
+        "the plain twin wins — the decompressed lane is complete (rm-992)"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn cached_explicit_lane_discloses_zst_stem_twin() {
+    // rm-2056 rider (run c870ab5a cycle 2): the cached `-d` lane is
+    // the arm with a disclosure carrier — unlike the uncached probe
+    // above, find_session_files_cached names the suppressed pair
+    // through SuppressedSessions, so the collapse is counted and
+    // named in the LoadReport (and summarized by doctor) instead of
+    // vanishing. Cold and warm passes both disclose: the suppression
+    // is admission-time, not cache-time.
+    let home = temp_home("zst-twin-explicit-cached");
+    let sessions = home.join(".codex/sessions/2026/10/15");
+    fs::create_dir_all(&sessions).expect("mkdir date tree");
+    fs::write(
+        sessions.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"),
+        include_str!(
+            "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl"
+        ),
+    )
+    .expect("write plain rollout");
+    fs::write(
+        sessions.join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"),
+        include_bytes!(
+            "fixtures/codex-compressed-rollout/rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst"
+        ),
+    )
+    .expect("write compressed twin");
+
+    with_pinned_home(&home, || {
+        for pass in 0..2 {
+            let report =
+                load_sessions_with_progress(Some(&sessions), &LoadOptions::default(), |_| {});
+            assert_eq!(
+                report.sessions.len(),
+                1,
+                "pass {pass}: one admission per stem in the cached -d lane"
+            );
+            assert_eq!(
+                report.zst_stem_twins, 1,
+                "pass {pass}: the suppressed twin discloses on every pass"
+            );
+            let kept = std::path::Path::new(&report.sessions[0].path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("utf-8 name");
+            assert_eq!(
+                kept, "rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl",
+                "pass {pass}: the plain twin survives, the zst twin collapses"
+            );
+        }
+    });
     let _ = fs::remove_dir_all(&home);
 }

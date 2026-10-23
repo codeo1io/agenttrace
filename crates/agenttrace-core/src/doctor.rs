@@ -224,6 +224,11 @@ pub struct DoctorReport {
     /// capped at five, the exact count rides
     /// `disclosures["zst_stem_twins"]`. Empty when no twin pairs were
     /// found (absent = nothing happened, the disclosure convention).
+    // rm-2056 rider (run c870ab5a cycle 2): the field's own contract
+    // above says absent-when-empty, but the attr was missing, so every
+    // clean report carried a named empty class — this restores it,
+    // mirroring the sibling `duplicate_session_file_pairs` attr.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub zst_stem_twin_pairs: Vec<String>,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
@@ -2050,6 +2055,41 @@ mod tests {
     /// rm-512 dedup/budget/surface semantics under test are unchanged.
     fn unresolved_session(encoded_dir: &str) -> Session {
         session_at("", &format!("/nowhere/projects/-{encoded_dir}/s.jsonl"))
+    }
+
+    #[test]
+    fn zst_stem_twin_pairs_absent_when_empty_present_when_set() {
+        // rm-2056 rider (run c870ab5a cycle 2): the doc comment on the
+        // field promises "absent = nothing happened" (the disclosure
+        // convention the sibling duplicate-pairs field already
+        // carries), but without skip_serializing_if every clean doctor
+        // JSON named an empty class instead. The attr restores the
+        // contract: absent on a clean report, present with its pairs
+        // when a suppression actually happened.
+        let _env = crate::test_env::lock_env();
+        let clean = serde_json::to_value(DoctorReport::default()).expect("serialize clean report");
+        assert!(
+            clean.get("zst_stem_twin_pairs").is_none(),
+            "clean report must not name an empty suppression class: {clean}"
+        );
+        assert!(
+            clean.get("duplicate_session_file_pairs").is_none(),
+            "sibling convention holds for the byte-identical class too: {clean}"
+        );
+
+        let report = DoctorReport {
+            zst_stem_twin_pairs: vec!["a.jsonl <- a.jsonl.zst".to_string()],
+            ..DoctorReport::default()
+        };
+        let disclosed = serde_json::to_value(&report).expect("serialize disclosed report");
+        assert_eq!(
+            disclosed
+                .get("zst_stem_twin_pairs")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(1),
+            "a real suppression stays present and named: {disclosed}"
+        );
     }
 
     #[test]

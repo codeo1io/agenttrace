@@ -308,6 +308,59 @@ fn baseline_invalid_utf8_is_reported_as_such() {
 }
 
 #[test]
+fn baseline_oversized_file_is_rejected_before_the_read() {
+    // rm-2345 (run c870ab5a cycle 2): a `--baseline` operand larger
+    // than the 64 MiB read cap must fail with the flag, the path, and
+    // the size — checked BEFORE the read (the stat fast-path), so a
+    // multi-gigabyte operand never buffers. The fixture is a SPARSE
+    // file (set_len, no bytes written): the rejection must fire on
+    // metadata alone.
+    let sessions = demo_sessions().expect("demo sessions parse");
+    let overview = compute_overview(&sessions);
+    let report = report_overview_json(&overview, &sessions);
+    let path = std::env::temp_dir().join(format!(
+        "agenttrace-oversized-baseline-{}.json",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&path);
+    let file = fs::File::create(&path).expect("create oversized baseline");
+    file.set_len(agenttrace_core::BASELINE_READ_CAP_BYTES + 1)
+        .expect("set sparse length past the cap");
+    drop(file);
+    let err = add_baseline_comparison(
+        &report,
+        path.to_str().unwrap(),
+        BaselineThresholds {
+            max_duration_delta_pct: 1.5,
+            max_cost_delta_pct: 2.5,
+            max_token_delta_pct: 3.5,
+        },
+    )
+    .expect_err("oversized baseline must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("--baseline"),
+        "flag attribution missing: {message}"
+    );
+    assert!(
+        message.contains("larger than the 64 MiB baseline read cap"),
+        "cap class missing: {message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "{} bytes",
+            agenttrace_core::BASELINE_READ_CAP_BYTES + 1
+        )),
+        "observed size missing: {message}"
+    );
+    assert!(
+        message.contains(path.to_str().unwrap()),
+        "baseline path missing: {message}"
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn baseline_version_mismatch_is_rejected() {
     // rm-569/rm-504: a structurally-valid overview from a different report
     // version must be rejected instead of comparing across versions.
