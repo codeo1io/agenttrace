@@ -498,6 +498,33 @@ loudly, and pairing `--quota` with any other report action is a usage
 error (every discovered session bills the window — view filters would
 distort it).
 
+### Billing blocks
+
+`--blocks` answers "what did the provider's 5-hour billing windows actually
+cost?" from the local corpus alone (rm-042). Where `--quota` renders
+ROLLING windows (deliberately, because provider anchors are not knowable
+without credentials), `--blocks` replays the provider's own first-use
+alignment from the transcript: a session's first parsable event timestamp
+opens a block `[t0, t0+5h)`, later events extend it, and the first event at
+or past the end opens the next block at its own timestamp. Concurrent
+sessions whose blocks overlap merge into one billing block — they shared
+the provider window they opened together — and the active block carries a
+burn rate over the elapsed part of the window only.
+
+Attribution follows the quota census discipline: sessions with per-event
+stamps split their tokens and cost pro rata across the blocks their stamps
+land in (event basis); warm-cache sessions without stamps anchor at their
+session start (span basis, counted in the census, never silently
+blended); unplaceable rows are counted, not guessed. One thing the view
+cannot claim: the provider resets the window early after inactivity, and
+that reset is not derivable from transcripts — the report discloses this
+instead of inventing reset points.
+
+`-f json` emits the stable `agenttrace.blocks/1` schema; the default is a
+text summary, and every other format is refused loudly. The view is
+corpus-scope under the same guards as `--quota`, and pairing it with any
+other report action is a usage error.
+
 ### Statusline capture
 
 Subscription limit windows (`5h`/`7d` usage and reset times) and Claude
@@ -566,6 +593,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--update-pricing` |  | Refresh the vendored pricing-catalog snapshots from their upstream sources, then report the drift |
 | `--test-match` |  | Print the catalog-resolution table for a probe set of model identifiers (alias and rate-match verification) |
 | `--quota` |  | Show the plan-window quota view (rm-201): current 5h and 7d ROLLING spend windows over the discovered corpus, TTL-correct (a session's cost enters a window pro rata by its event timestamps; warm-cache sessions by their start-to-end span), with `resets_at` full-decay horizons and a corpus-cutoff disclosure. The cutoff clamps at the newest at-or-before-now instant — future-dated timestamps are discarded at a disclosed clock-skew guard (rm-1402) so a hostile or skewed journal line cannot hide the real spend. `-f json` emits the stable `agenttrace.quota/1` schema, the default a text summary; every other format is rejected loudly. Limits are disclosed-unknown — agenttrace reads no credentials and no plan data. Corpus-scope: `--range`, `--project`, `--source`, `--model-filter`, and the sample/history flags do not apply to it and are refused loudly |
+| `--blocks` |  | Show the transcript-derived 5-hour billing-block view (rm-042): FIRST-USE-ALIGNED provider billing windows replayed from event timestamps (the same alignment the provider applies), rolled when an event lands at or past the previous window's end, merged across concurrent sessions, with an active-block burn rate and the same attribution census as `--quota` (event-basis / span-basis / unplaced, pro-rata by stamp membership). The provider's early inactivity reset is disclosed as underivable from transcripts — never invented. `-f json` emits the stable `agenttrace.blocks/1` schema, the default a text summary; every other format is rejected loudly. Corpus-scope under the same guards as `--quota` |
 | `--statusline-report` |  | Report on the Claude Code statusline capture journal (candidate 53, cycle 7): limit-pressure windows, reset crossings, and per-session prompt-cache miss causes recorded by `agenttrace statusline` |
 | `--fetch` |  | `agenttrace upstream`: refresh the remote-tracking refs from the network via `git fetch` (and probe the npm registry) before reporting fork-vs-upstream drift. Without it, `agenttrace upstream` is fully offline (rm-024) |
 | `--config <PATH>` |  | Explicit configuration file (rm-384). Layered above the project and user config files; a missing file is an error |
