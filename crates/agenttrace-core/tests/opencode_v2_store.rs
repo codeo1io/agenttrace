@@ -195,3 +195,104 @@ fn doctor_census_counts_the_v2_store_as_its_own_class() {
         "census sample names the unhandled format: {samples}"
     );
 }
+
+// ============================================================
+// rm-2320 (run e8b4dd3f cycle 4, batch "truth discharge"): the v2
+// shape probe runs on EVERY candidate store, not only the
+// prepare-Err arm. A MIXED store — the v1 `session` table present
+// AND the dev `session_v2` table beside it — is the state the
+// upstream v1-migration creates mid-flight (`INSERT OR IGNORE INTO
+// session_v2` while v1 keeps serving). Before rm-2320 the v1 read
+// succeeded, the probe never ran, and the v2 rows were silently
+// invisible: the store reported only its v1 half with no disclosure
+// that anything was uncounted — the partial-totals twin of rm-1927's
+// silent zero.
+// Fixture `opencode-summary-diffs/opencode-mixed-v1-v2-store.db` is
+// the committed v2-only fixture plus a minimal v1 `session` table
+// carrying one row.
+// ============================================================
+
+fn plant_mixed(home: &Path) -> PathBuf {
+    let target = home.join(".local/share/opencode/opencode.db");
+    std::fs::create_dir_all(target.parent().unwrap()).expect("mkdir opencode home");
+    std::fs::copy(
+        format!(
+            "{}/tests/fixtures/opencode-summary-diffs/opencode-mixed-v1-v2-store.db",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+        &target,
+    )
+    .expect("copy mixed fixture db");
+    target
+}
+
+/// Red-first lineage: on the prepare-Err-only probe this asserted a
+/// disclosure and failed — one v1 session, zero unreadable, zero
+/// dropped, zero disclosures: the v2 half of the store invisible.
+#[test]
+fn mixed_store_discloses_coresident_v2_rows() {
+    let home = temp_home("mixed");
+    let outcome = with_home(&home, || {
+        plant_mixed(&home);
+        let (sessions, report) = load_sqlite_backed_sessions_reported(None);
+        (
+            sessions.len(),
+            report.unreadable.len(),
+            report.dropped_rows.len(),
+            report
+                .unhandled_v2_stores
+                .iter()
+                .map(|store| (store.table.clone(), store.reason.clone()))
+                .collect::<Vec<_>>(),
+        )
+    });
+    std::fs::remove_dir_all(&home).ok();
+    let (sessions, unreadable, dropped, unhandled) = outcome;
+    assert_eq!(sessions, 1, "the v1 row must keep loading");
+    assert_eq!(unreadable, 0, "a mixed store is not corruption");
+    assert_eq!(dropped, 0, "the v1 half decoded cleanly");
+    assert_eq!(
+        unhandled.len(),
+        1,
+        "the v2 half must be disclosed, not silent"
+    );
+    let (table, reason) = &unhandled[0];
+    assert_eq!(table, "session_v2", "shape probe matched by columns");
+    assert!(
+        reason.contains("alongside the v1 `session` table")
+            && reason.contains("ingest not implemented"),
+        "reason names the partial-totals state: {reason}"
+    );
+}
+
+/// A store whose v1 half READ is exactly the store most at risk of
+/// banking a clean snapshot that masks the disclosure on the warm
+/// read — the disclosure must survive the second load verbatim
+/// (`is_clean` stays false, so no snapshot banks over a partial
+/// store).
+#[test]
+fn mixed_disclosure_survives_a_second_load() {
+    let home = temp_home("mixed-warm");
+    let outcome = with_home(&home, || {
+        plant_mixed(&home);
+        let (first, report_first) = load_sqlite_backed_sessions_reported(None);
+        let (second, report_second) = load_sqlite_backed_sessions_reported(None);
+        (
+            first.len(),
+            second.len(),
+            report_first.unhandled_v2_stores.len(),
+            report_second.unhandled_v2_stores.len(),
+            report_second.unreadable.len(),
+        )
+    });
+    std::fs::remove_dir_all(&home).ok();
+    let (first, second, unhandled_first, unhandled_second, unreadable_second) = outcome;
+    assert_eq!(first, 1);
+    assert_eq!(second, 1, "the v1 row survives the warm read");
+    assert_eq!(unhandled_first, 1, "cold read discloses the v2 half");
+    assert_eq!(
+        unhandled_second, 1,
+        "warm read discloses identically — no clean snapshot may bank over a partial store"
+    );
+    assert_eq!(unreadable_second, 0);
+}

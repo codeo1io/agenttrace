@@ -584,7 +584,7 @@ fn transcript_evidence(
     // string discloses THIS number, never the on-disk size a compressed
     // frame hides behind (rm-1872).
     let charged: u64;
-    if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+    if zstd_stream_head(&bytes) {
         match crate::parser::decode_zstd_rollout_bounded(bytes, path) {
             Ok(decoded) => {
                 let decoded_len = decoded.len() as u64;
@@ -613,6 +613,24 @@ fn transcript_evidence(
                 );
             }
         }
+    } else if path_zstd_named(path) {
+        // rm-2321 (run e8b4dd3f cycle 4): the NAME promises a zstd
+        // stream but the head carries no zstd magic — a mis-named
+        // plain journal or a truncated/garbage frame. rm-1872's
+        // contract ("Refused frames are skipped loudly, never scanned
+        // as raw bytes behind a false `scanned` verdict") extends to
+        // the name/content mismatch: the raw arm below would report
+        // `scanned (N bytes)` over bytes the name said were
+        // compressed — a false verdict. Refuse loudly instead. The
+        // refusal keys on the name, so identical content under a
+        // plain `.jsonl` name still raw-scans (in-place compression
+        // keeps the plain name for magic-carrying files).
+        scan.skipped_zstd += 1;
+        return (
+            Vec::new(),
+            "skipped: zstd name/content mismatch (`.zst` name but no zstd magic at head; not scanned as raw text)"
+                .to_string(),
+        );
     } else {
         // growth race: the file may have grown past the stat length the
         // budget was pre-checked against, so the charge saturates and
@@ -635,6 +653,36 @@ fn transcript_evidence(
         }
     }
     (out, format!("scanned ({charged} bytes)"))
+}
+
+/// rm-2321 (run e8b4dd3f cycle 4): does the file NAME promise a zstd
+/// stream? Codex flips rollout names to `.jsonl.zst` when it
+/// compresses cold rollouts, so the suffix is the caller-side
+/// half of the name/content contract `transcript_evidence` enforces.
+fn path_zstd_named(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zst"))
+}
+
+/// rm-2321 (run e8b4dd3f cycle 4): does this head open a zstd
+/// stream? Either the standard frame magic (28 B5 2F FD) or a
+/// skippable-frame magic (184D2A50..=184D2A5F little-endian — first
+/// byte 0x50..=0x5F, then 2A 4D 18). A producer may legitimately
+/// prefix metadata as a skippable frame, and the shared decoder
+/// steps over it exactly like `zstd -d`, so the gate routes BOTH to
+/// the decode lane; the old frame-magic-only check left
+/// skippable-prefixed streams in the raw arm behind a false
+/// `scanned` verdict.
+fn zstd_stream_head(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return true;
+    }
+    bytes.len() >= 4
+        && (0x50..=0x5F).contains(&bytes[0])
+        && bytes[1] == 0x2A
+        && bytes[2] == 0x4D
+        && bytes[3] == 0x18
 }
 
 /// A `…window…` snippet centered on the first case-insensitive hit of

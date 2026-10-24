@@ -93,17 +93,18 @@ if grep -q '^## Unreleased' "$changelog"; then
 		fail "Unreleased section is present but carries no entries (rm-1390): a header over zero bullets claims a landing lane that does not exist — land the entries, date the section, or drop the header"
 fi
 
-# Pass 4 (rm-2319, run e8b4dd3f cycle 4): duplicate-entry gate. The
-# Unreleased Added list carried a 37-entry run TWICE — 66 duplicate
-# entry lines, largest byte-identical block 28 lines long — from a
-# merge, and every earlier arm stayed rc0-green: Pass 1 arms duplicate
-# SECTION headings, Pass 2 a first-per-kind lens, and the duplicated
-# entries sat inside the SAME section, invisible to both. Keep-a-
-# changelog consumers and human readers see inflated release notes.
-# This arm fails the moment any `##` section carries two byte-identical
-# `- ` entry lines. Identical entry lines across DIFFERENT sections
-# stay legal — a re-listed fix under a later version is a different
-# fact.
+# Pass 4 (rm-2319, run e8b4dd3f cycle 4): duplicate-entry gate. A
+# merge landed the same Unreleased entries TWICE — a 33-entry block,
+# a 5-entry block, and a single entry each duplicated byte-for-byte
+# (39 duplicated entry lines inside one section; the largest
+# contiguous duplicate 33 entries long) — and every earlier arm stayed
+# rc0-green: Pass 1 arms duplicate SECTION headings, Pass 2 a
+# first-per-kind lens, and the duplicated entries sat inside the SAME
+# section, invisible to both. Keep-a-changelog consumers and human
+# readers see inflated release notes. This arm fails the moment any
+# `##` section carries two byte-identical `- ` entry lines. Identical
+# entry lines across DIFFERENT sections stay legal — a re-listed fix
+# under a later version is a different fact.
 if ! dupes="$(awk '
 	/^## / { section++ }
 	/^- / {

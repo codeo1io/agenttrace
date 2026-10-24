@@ -287,6 +287,114 @@ fn refused_zstd_content_is_skipped_loudly() {
 }
 
 #[test]
+fn zst_named_plain_content_is_refused_not_scanned() {
+    // rm-2321 (run e8b4dd3f cycle 4, batch "truth discharge"): the
+    // rm-1872 gate keys on CONTENT (zstd frame magic). A
+    // `.jsonl.zst`-named file whose head carries no magic — a
+    // mis-named plain journal, or a truncated/garbage frame — fell
+    // to the raw arm and reported `scanned (N bytes)`: a FALSE
+    // verdict over bytes the name promised were compressed.
+    // rm-1872's own contract comment ("Refused frames are skipped
+    // loudly, never scanned as raw bytes behind a false `scanned`
+    // verdict") extends to the name/content mismatch: refuse loudly.
+    // The same content under a `.jsonl` name must still scan — the
+    // refusal is driven by the NAME promising zstd, not by the bytes
+    // being unscannable.
+    let body = b"plain journal body, no zstd magic anywhere\n";
+    let dir = std::env::temp_dir().join(format!("agenttrace-zst-named-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let zst_named = dir.join("rollout-2026-09-26T20-29-31-00000000.jsonl.zst");
+    let jsonl_named = dir.join("rollout-2026-09-26T20-29-32-00000001.jsonl");
+    std::fs::write(&zst_named, body).unwrap();
+    std::fs::write(&jsonl_named, body).unwrap();
+
+    let mk = |path: &std::path::Path, name: &str| {
+        let mut session = parse_file(&fixture("body-only.jsonl")).unwrap();
+        session.name = name.to_string();
+        session.path = path.to_string_lossy().to_string();
+        session
+    };
+    let report = search_sessions_detailed(
+        &[mk(&zst_named, "a-named"), mk(&jsonl_named, "b-named")],
+        "a-named",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        1 << 20,
+    );
+    assert_eq!(report.results.len(), 1, "the name match must keep the row");
+    assert_eq!(
+        report.results[0].transcript_scan,
+        "skipped: zstd name/content mismatch (`.zst` name but no zstd magic at head; not scanned as raw text)",
+        "a zstd-named file without magic must disclose the mismatch"
+    );
+    assert_eq!(report.scan.skipped_zstd, 1, "counted in the summary");
+
+    // The twin: identical bytes under a plain `.jsonl` name scan raw.
+    let report = search_sessions_detailed(
+        &[mk(&jsonl_named, "c-named")],
+        "c-named",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        1 << 20,
+    );
+    assert_eq!(report.results.len(), 1);
+    assert!(
+        report.results[0].transcript_scan.starts_with("scanned ("),
+        "plain content under a plain name is raw-scanned: {}",
+        report.results[0].transcript_scan
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn skippable_prefixed_zstd_stream_decodes_and_matches() {
+    // rm-2321 second half: a stream may legitimately open with a
+    // skippable frame (magic 184D2A50..=184D2A5F little-endian) —
+    // the decoder steps over it exactly like `zstd -d` — but the
+    // content gate only recognized the standard frame magic, so such
+    // a stream fell to the raw arm behind a false `scanned` verdict
+    // with zero matches. Prepend an empty skippable frame (8 header
+    // bytes) to the golden compressed fixture and pin that the scan
+    // still decodes, charges the DEcompressed size, and matches.
+    let mut stream = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex-zstd/rollout.jsonl.zst"),
+    )
+    .unwrap();
+    assert_eq!(stream.len(), 2833, "golden fixture drift: re-derive sizes");
+    let mut prefixed = vec![0x50, 0x2A, 0x4D, 0x18, 0x00, 0x00, 0x00, 0x00];
+    prefixed.append(&mut stream);
+    let dir = std::env::temp_dir().join(format!("agenttrace-zst-skip-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rollout-2026-10-18T09-00-00-4f1c9d21.jsonl.zst");
+    std::fs::write(&path, prefixed).unwrap();
+    let mut session = parse_file(&fixture("body-only.jsonl")).unwrap();
+    session.name = "turn_context-twin".to_string();
+    session.path = path.to_string_lossy().to_string();
+    let report = search_sessions_detailed(
+        &[session],
+        "turn_context",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        1 << 20,
+    );
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|r| r.transcript_scan == "scanned (22652 bytes)"
+                && r.matches.iter().any(|m| m.contains("turn_context"))),
+        "a skippable-prefixed stream must decode, charge decompressed bytes, and match: {:?}",
+        report
+            .results
+            .iter()
+            .map(|r| r.transcript_scan.clone())
+            .collect::<Vec<_>>()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn scan_charge_saturates_when_a_file_reads_past_its_stat_length() {
     // rm-1872 seam (rm-1993 cession): the budget pre-check runs on the
     // stat length; the charge uses the ACTUAL read. /proc/self/status is

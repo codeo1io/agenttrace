@@ -1084,6 +1084,25 @@ fn opencode_sqlite_session_rows(
             return (HashMap::new(), failures, 0);
         }
     };
+    // rm-2320 (run e8b4dd3f cycle 4, batch "truth discharge"): probe
+    // EVERY candidate, not only the prepare-Err arm above. A MIXED
+    // store — the v1 `session` table present AND a v2-shaped table
+    // beside it (the upstream v1-migration's mid-flight state:
+    // `INSERT OR IGNORE INTO session_v2` while v1 keeps serving) —
+    // used to read its v1 rows and stay silent about the v2 rows:
+    // the prepare succeeded, the probe never ran, and the store's
+    // totals read as complete while they were partial. The v1 read
+    // below is unchanged; the co-resident v2 store is disclosed
+    // through the same rm-1927 channel, and `is_clean` stays false so
+    // no clean snapshot banks over the partial read.
+    if let Some(table) = opencode_v2_shaped_table(db) {
+        failures.unhandled_format = Some(format!(
+            "opencode v2 store: ingest not implemented (found `{table}` \
+             alongside the v1 `session` table; the v2 rows are not read — \
+             this store's totals are partial)"
+        ));
+        failures.unhandled_table = Some(table);
+    }
     let since_millis = since.map(|value| value.timestamp_millis());
     let rows = match stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
@@ -1902,9 +1921,14 @@ fn sqlite_i64_unreadable_reason(
 /// the dev-branch `session_v2` DDL
 /// (anomalyco/opencode@dev packages/core/src/database/schema.gen.ts)
 /// — not on the table name (rm-507 discipline), so an upstream rename
-/// keeps the disclosure truthful. Reached only on the
-/// no-`session`-table path, so the pragma walk costs nothing on
-/// healthy v1 stores.
+/// keeps the disclosure truthful. Reached on both read paths since
+/// rm-2320 (run e8b4dd3f cycle 4): the no-`session`-table arm above
+/// and every candidate's successful v1 read (a co-resident v2 store
+/// must be disclosed even when the v1 half reads — a mixed store's
+/// totals are partial, not complete). The v1 `session` table itself
+/// carries the shared column signature, so it is skipped by name: a
+/// hit means a SECOND v2-shaped table beside the v1 store (or, on
+/// the no-v1 path, the v2 store itself).
 fn opencode_v2_shaped_table(db: &Connection) -> Option<String> {
     let names = db
         .prepare("select name from sqlite_master where type = 'table' and name not like 'sqlite_%'")
@@ -1916,6 +1940,12 @@ fn opencode_v2_shaped_table(db: &Connection) -> Option<String> {
         })
         .ok()?;
     for name in names {
+        // rm-2320: the v1 `session` table carries the same column
+        // signature and must not match itself on the every-candidate
+        // path — a hit means a v2-shaped table BESIDE the v1 store.
+        if name == "session" {
+            continue;
+        }
         let quoted = format!("\"{}\"", name.replace('"', "\"\""));
         let columns = db
             .prepare(&format!("pragma table_info({quoted})"))

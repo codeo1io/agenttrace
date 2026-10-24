@@ -923,6 +923,59 @@
 
 ### Fixed
 
+- CHANGELOG duplicate-entry dedup plus a duplicate-entry gate arm
+  (rm-2319, run e8b4dd3f cycle 4, batch "truth discharge"): a merge
+  landed the same Unreleased entries twice — a 33-entry block, a
+  5-entry block, and a single entry each present in two byte-identical
+  copies (39 duplicated entry lines inside one subsection) — and every
+  arm of `scripts/ci/check-changelog-structure.sh` stayed rc0-green on
+  the duplicated tree: Pass 1 arms duplicate `###` section headings and
+  Pass 2 is a first-per-kind lens, both blind to duplication INSIDE one
+  subsection, so keep-a-changelog consumers and human readers saw
+  inflated release notes. The duplicate copies are gone (exactly one
+  copy per entry kept; the duplicated text was already byte-identical,
+  so no provenance is lost), and the gate gains a Pass 4 duplicate-entry
+  arm: any `##` section carrying two byte-identical `- ` entry lines
+  fails naming the first and repeat line numbers, while identical lines
+  across DIFFERENT sections stay legal (a re-listed fix under a later
+  version is a different fact). Red-first proven: the new arm returns
+  rc1 against the pre-fix tree naming all 39 pairs and rc0 on the
+  deduplicated tree.
+
+- OpenCode mixed v1+v2 stores disclose their unread v2 half (rm-2320,
+  run e8b4dd3f cycle 4, batch "truth discharge"): the rm-1927 v2 shape
+  probe ran only when the v1 `session` table was absent (the
+  prepare-Err arm), so a store carrying BOTH tables — the upstream
+  v1-migration's mid-flight state, `INSERT OR IGNORE INTO session_v2`
+  while v1 keeps serving — read its v1 rows and stayed silent about
+  the v2 rows: the store's totals read as complete while they were
+  partial. The probe now runs on every candidate store (the v1
+  `session` table itself matches the shared column signature and is
+  skipped by name), and a co-resident v2-shaped table is disclosed
+  through the same `unhandled_v2_stores` channel with a
+  partial-totals reason — never folded into `unreadable`, never
+  banked under a clean snapshot (`is_clean` stays false, so the warm
+  read discloses identically). Red-first contract:
+  `tests/opencode_v2_store.rs` against the new committed mixed
+  fixture `tests/fixtures/opencode-summary-diffs/opencode-mixed-v1-v2-store.db`.
+
+- `.jsonl.zst`-named rollouts with no zstd magic are refused loudly,
+  not scanned behind a false verdict (rm-2321, run e8b4dd3f cycle 4,
+  batch "truth discharge"): the rm-1872 transcript-scan gate keyed on
+  content alone (the zstd frame magic), so a `.zst`-named file whose
+  head carried no magic fell to the raw-text arm and reported
+  `scanned (N bytes)` over bytes the name promised were compressed —
+  exactly the false verdict rm-1872's contract forbids for refused
+  frames. Such files now skip with `skipped: zstd name/content
+  mismatch (…)` (counted in `skipped_zstd`), while identical content
+  under a plain `.jsonl` name still raw-scans. The head check now
+  also recognizes a leading skippable frame (magic
+  `184D2A50..=184D2A5F`, which the shared decoder steps over exactly
+  like `zstd -d`), so skippable-prefixed streams decode, charge their
+  DEcompressed size, and match instead of raw-scanning behind a
+  false `scanned` verdict. Red-first contract:
+  `tests/search_transcript_contract.rs`.
+
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch
