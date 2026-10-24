@@ -2,11 +2,14 @@
 //!
 //! Golden assertions pin the OTLP wire shape and the `gen_ai.*` attribute
 //! names against the semantic-convention snapshot recorded in
-//! [`agenttrace_core::SEMCONV_SNAPSHOT_DATE`]. If the semconv attribute
+//! [`agenttrace_core::SEMCONV_SNAPSHOT_DATE`] /
+//! [`agenttrace_core::SEMCONV_SNAPSHOT_COMMIT`]. If the semconv attribute
 //! names drift, these tests are the tripwire — update the constant and
 //! the attribute spellings together, deliberately.
 
-use agenttrace_core::{parse_file, report_otel_export, SEMCONV_SNAPSHOT_DATE};
+use agenttrace_core::{
+    parse_file, report_otel_export, SEMCONV_SNAPSHOT_COMMIT, SEMCONV_SNAPSHOT_DATE,
+};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
@@ -148,9 +151,10 @@ fn otel_export_shape_and_genai_attributes() {
         50
     );
 
-    // rm-599: the Recommended cache/reasoning subset counters of the
-    // GenAI token-metrics set — cache buckets always emit (honest
-    // zeros), reasoning only when the session recorded any.
+    // rm-599/rm-493: the Recommended cache/reasoning subset counters
+    // of the GenAI token-metrics set — all three emit only when the
+    // session recorded a non-zero value (#548 "when available and
+    // non-zero"); the agenttrace.session.* mirrors keep honest zeros.
     assert_eq!(
         attr(claude_span, "gen_ai.usage.cache_read.input_tokens")["intValue"],
         40
@@ -163,14 +167,11 @@ fn otel_export_shape_and_genai_attributes() {
         attr(claude_span, "gen_ai.usage.reasoning.output_tokens")["intValue"],
         12
     );
-    assert_eq!(
-        attr(codex_span, "gen_ai.usage.cache_read.input_tokens")["intValue"],
-        0
-    );
-    assert_eq!(
-        attr(codex_span, "gen_ai.usage.cache_write.input_tokens")["intValue"],
-        0
-    );
+    // rm-493: upstream #548 — the optional breakdown attributes
+    // record only when non-zero; a codex session that reported no
+    // cache activity carries no zero-valued cache attrs.
+    assert!(opt_attr(codex_span, "gen_ai.usage.cache_read.input_tokens").is_none());
+    assert!(opt_attr(codex_span, "gen_ai.usage.cache_write.input_tokens").is_none());
     assert!(
         opt_attr(codex_span, "gen_ai.usage.reasoning.output_tokens").is_none(),
         "reasoning attr only when recorded"
@@ -179,6 +180,10 @@ fn otel_export_shape_and_genai_attributes() {
     // wb7 shape: 150 cached reported against 100 input clamps to
     // input 0 + cache_read 100 — the exported total (input + cache)
     // never exceeds the source-recorded input.
+    // rm-493: the clamp keeps the honest input total at zero, and the
+    // REQUIRED total still reports that zero on the wire (#548: "The
+    // totals ... are unchanged and still report 0") — the omit-at-zero
+    // rule is the breakdown counters' only.
     assert_eq!(
         attr(workbuddy_span, "gen_ai.usage.input_tokens")["intValue"],
         0
@@ -265,10 +270,15 @@ fn otel_export_shape_and_genai_attributes() {
             >= claude_span["startTimeUnixNano"].as_u64().unwrap()
     );
 
-    // The semconv snapshot date travels with the export.
+    // The semconv snapshot date (and its verification commit) travel with
+    // the export.
     assert_eq!(
         attr(claude_span, "agenttrace.export.semconv_snapshot_date")["stringValue"],
         SEMCONV_SNAPSHOT_DATE
+    );
+    assert_eq!(
+        attr(claude_span, "agenttrace.export.semconv_snapshot_commit")["stringValue"],
+        SEMCONV_SNAPSHOT_COMMIT
     );
 }
 
@@ -425,4 +435,53 @@ fn prompt_id_joins_statusline_captures_to_otel_export() {
     // never an error.
     let bare: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert!(correlated_prompt_ids(&captures, &bare).is_empty());
+}
+
+// rm-493: the #548 rule on a session with REAL usage where individual
+// counters settle at zero — the workbuddy basis clamp drives the input
+// total to 0 (100 - 150) and the source reports no cache_write, while
+// cache_read (100) and output (10) stay positive. The zero BREAKDOWN
+// (cache_write) is omitted from gen_ai.usage.* (the fork-side mirror
+// keeps it observable); the required input total keeps its honest zero
+// ON the wire; positive fields keep their exact values (NUMBERS
+// UNCHANGED).
+#[test]
+fn zero_breakdown_omitted_while_required_total_keeps_honest_zero() {
+    let path = write_session("zero-fields.jsonl", WORKBUDDY_BODY);
+    let sessions = vec![parse_file(&path).unwrap()];
+    let doc: serde_json::Value = serde_json::from_str(&report_otel_export(&sessions)).unwrap();
+    let spans = &doc["resourceSpans"][0]["scopeSpans"][0]["spans"];
+    assert_eq!(spans.as_array().map(Vec::len), Some(1), "one span");
+    let attrs = spans[0]["attributes"].as_array().unwrap();
+    let get = |k: &str| {
+        attrs
+            .iter()
+            .find(|kv| kv["key"] == k)
+            .and_then(|kv| kv["value"]["intValue"].as_i64())
+    };
+    assert_eq!(
+        get("gen_ai.usage.input_tokens"),
+        Some(0),
+        "clamp-zero input stays on the wire — required total (#548)"
+    );
+    assert_eq!(
+        get("gen_ai.usage.cache_write.input_tokens"),
+        None,
+        "unreported breakdown omitted (#548)"
+    );
+    assert_eq!(
+        get("agenttrace.session.cache_write_tokens"),
+        Some(0),
+        "fork-side mirror keeps the honest zero observable"
+    );
+    assert_eq!(
+        get("gen_ai.usage.cache_read.input_tokens"),
+        Some(100),
+        "positive cache_read keeps its exact value (basis-capped)"
+    );
+    assert_eq!(
+        get("gen_ai.usage.output_tokens"),
+        Some(10),
+        "positive output keeps its exact value"
+    );
 }

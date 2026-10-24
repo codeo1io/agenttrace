@@ -2,7 +2,7 @@
 //!
 //! Emits an OTLP/HTTP-JSON `ExportTraceServiceRequest` document with one
 //! INTERNAL span per session carrying `gen_ai.*` attributes per the GenAI
-//! semantic conventions (open-telemetry/semantic-conventions docs/gen-ai,
+//! semantic conventions (open-telemetry/semantic-conventions-genai,
 //! attribute names verified on [`SEMCONV_SNAPSHOT_DATE`]). The render is a
 //! file/stdout write only — there is no network transport in this module,
 //! honoring PRIVACY.md's offline-first posture.
@@ -26,16 +26,39 @@
 //! The deviation is disclosed on every span as
 //! `agenttrace.export.input_token_basis` so consumers never have to
 //! guess which basis the numbers are on.
+//!
+//! rm-493 (re-pinned at [`SEMCONV_SNAPSHOT_COMMIT`]): the optional
+//! usage BREAKDOWN attributes (`gen_ai.usage.cache_read.input_tokens`,
+//! `cache_write.input_tokens`, `reasoning.output_tokens`) record only
+//! non-zero contributions, per upstream #548 ("when available and
+//! non-zero" — the standing reasoning rule generalized to the cache
+//! buckets). The required totals
+//! `gen_ai.usage.input_tokens`/`output_tokens` keep their honest
+//! zeros: #548 — "The totals ... are unchanged and still report 0".
+//! Upstream #602's positive-only rule governs the
+//! `gen_ai.client.inference.usage.*` METRIC counters, which this
+//! span-only export does not emit. The `agenttrace.session.*` cache
+//! mirrors keep the fork-internal honest-zero disclosure.
 
 use crate::Session;
 use serde::Serialize;
 use std::path::Path;
 
-/// Date the GenAI semantic-convention attribute names used below were
-/// verified against the `docs/gen-ai` tree. Golden tests pin this constant
-/// so a future semconv drift forces a conscious refresh of the attribute
-/// names rather than silent staleness.
-pub const SEMCONV_SNAPSHOT_DATE: &str = "2026-10-05";
+/// Date of the `semantic-conventions-genai` tree state the attribute
+/// names and emission policy below were verified against — the
+/// committer date of [`SEMCONV_SNAPSHOT_COMMIT`]. The pre-move
+/// `open-telemetry/semantic-conventions` `docs/gen-ai` path froze on
+/// 2026-05-05 when #3696 moved development; it is no longer a
+/// verification basis. Golden tests pin this constant (and the commit
+/// below) so a future semconv drift forces a conscious refresh of the
+/// attribute names rather than silent staleness.
+pub const SEMCONV_SNAPSHOT_DATE: &str = "2026-10-21";
+
+/// Commit of the `semantic-conventions-genai` tree the names/policy
+/// were verified against (live check 2026-10-23; the repo still has no
+/// release tags, so the sha is the pin). At verification this was
+/// HEAD — the #602 merge commit, whose tree also carries #548.
+pub const SEMCONV_SNAPSHOT_COMMIT: &str = "9ffc7e00c639be7712e544e3e54331e885dccf84";
 
 /// Recorded input-token basis of the emitted `gen_ai.usage.*` counters —
 /// see the module docs for the rationale. Emitted on every span so
@@ -306,21 +329,19 @@ fn session_span(session: &Session, ordinal: u64) -> Span {
         attr_str("gen_ai.request.model", metrics.model_used.clone()),
         // Delta basis — see the module docs and the basis disclosure
         // attribute below.
+        // GenAI semconv snapshot 2026-10-21: cache_read/cache_write are
+        // input-subset counters and reasoning is an output-subset
+        // counter. rm-493: per upstream #548 the BREAKDOWN counters
+        // (cache_read/cache_write, like the standing reasoning rule)
+        // are recommended only "when available and non-zero" — a zero
+        // cannot distinguish "none" from "source does not report", so
+        // a zero omits the attribute (the pushes live below). The
+        // required totals stay here, zeros included (#548: "The
+        // totals ... are unchanged and still report 0"); the
+        // agenttrace.session.* cache mirrors below keep the
+        // fork-internal honest-zero disclosure.
         attr_int("gen_ai.usage.input_tokens", metrics.tokens_input),
         attr_int("gen_ai.usage.output_tokens", metrics.tokens_output),
-        // GenAI semconv snapshot 2026-10-05: cache_read/cache_write are
-        // input-subset counters and reasoning is an output-subset
-        // counter. The cache buckets always emit (honest zeros);
-        // reasoning emits only when the session recorded any — a zero
-        // cannot distinguish "none" from "source does not report".
-        attr_int(
-            "gen_ai.usage.cache_read.input_tokens",
-            metrics.tokens_cache_r,
-        ),
-        attr_int(
-            "gen_ai.usage.cache_write.input_tokens",
-            metrics.tokens_cache_w,
-        ),
         attr_int(
             "agenttrace.session.cache_read_tokens",
             metrics.tokens_cache_r,
@@ -346,8 +367,28 @@ fn session_span(session: &Session, ordinal: u64) -> Span {
             "agenttrace.export.semconv_snapshot_date",
             SEMCONV_SNAPSHOT_DATE,
         ),
+        attr_str(
+            "agenttrace.export.semconv_snapshot_commit",
+            SEMCONV_SNAPSHOT_COMMIT,
+        ),
         attr_str("agenttrace.export.input_token_basis", INPUT_TOKEN_BASIS),
     ];
+    // rm-493: #548 — the optional breakdown counters emit only when
+    // non-zero (the standing reasoning rule, generalized to the cache
+    // buckets). #602's positive-only rule is the metric-counter arm
+    // and does not apply to this span-only export.
+    if metrics.tokens_cache_r != 0 {
+        attributes.push(attr_int(
+            "gen_ai.usage.cache_read.input_tokens",
+            metrics.tokens_cache_r,
+        ));
+    }
+    if metrics.tokens_cache_w != 0 {
+        attributes.push(attr_int(
+            "gen_ai.usage.cache_write.input_tokens",
+            metrics.tokens_cache_w,
+        ));
+    }
     if metrics.tokens_reasoning != 0 {
         attributes.push(attr_int(
             "gen_ai.usage.reasoning.output_tokens",
@@ -468,7 +509,19 @@ mod tests {
 
     #[test]
     fn semconv_snapshot_date_is_pinned() {
-        assert_eq!(SEMCONV_SNAPSHOT_DATE, "2026-10-05");
+        // rm-493: pinned to semantic-conventions-genai HEAD — the
+        // #602 merge commit (verified live 2026-10-23; the repo still
+        // has no release tags, so the sha is the pin and the date is
+        // that commit's committer date).
+        assert_eq!(SEMCONV_SNAPSHOT_DATE, "2026-10-21");
+        assert_eq!(SEMCONV_SNAPSHOT_COMMIT.len(), 40);
+        assert!(SEMCONV_SNAPSHOT_COMMIT
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            SEMCONV_SNAPSHOT_COMMIT,
+            "9ffc7e00c639be7712e544e3e54331e885dccf84"
+        );
     }
 
     #[test]
