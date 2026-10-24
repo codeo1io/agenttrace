@@ -18,7 +18,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-22";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
@@ -228,8 +228,10 @@ pub fn lookup_price(model: &str) -> Price {
 }
 
 /// rm-1532: the embedded models.dev pricing extract — the SECOND
-/// catalog. Live LiteLLM (checked 2026-10-16, research run b1e8b617)
-/// carries no row in ANY form for the dated first-party Anthropic ids
+/// catalog. Live LiteLLM (checked 2026-10-16, research run b1e8b617;
+/// re-checked 2026-10-22, run 2bc715252343 — still no first-party row,
+/// only bedrock-qualified twins at identical list rates) carries no row
+/// in ANY form for the dated first-party Anthropic ids
 /// Claude Code actually records (`claude-sonnet-4-20250514`,
 /// `claude-3-7-sonnet-20250219`, `claude-opus-4-1-20250805`); the only
 /// rows ending in those ids are reseller-qualified, so the raw-first
@@ -244,7 +246,7 @@ pub fn lookup_price(model: &str) -> Price {
 /// (new binary) reprices cached sessions. Rows self-retire the day
 /// LiteLLM ships a first-party row (see `_snapshot.source`).
 const MODELS_DEV_SNAPSHOT_JSON: &str = include_str!("models_dev_snapshot.json");
-const MODELS_DEV_SNAPSHOT_DATE: &str = "2026-10-16";
+const MODELS_DEV_SNAPSHOT_DATE: &str = "2026-10-22";
 
 /// Providers that are the model's own vendor (rm-1532): a catalog row
 /// attributed to one of these ends the search — that IS the
@@ -3365,6 +3367,50 @@ mod tests {
     }
 
     #[test]
+    fn bundled_snapshot_prices_gemini_4_argon_exactly() {
+        // rm-176 truth refresh (run 2bc715252343, cycle 1): the whole
+        // gemini-4 family shipped after the 2026-10-08 bundle, so a
+        // 1000-in/500-out gemini-4-argon session fell back to default
+        // pricing — $0.0105 instead of the true $0.007, the disclosed
+        // 1.5x overestimate. Rates pinned from LiteLLM
+        // model_prices_and_context_window.json @159b5b2f (2026-10-21):
+        // 2e-06 in / 1e-05 out per token, corroborated by models.dev
+        // api.json ($2/$10 per M, 1,048,576-token context). The pin is
+        // the session-shaped bare id — the same ladder a real journal
+        // resolves through. A future refresh that loses or corrupts
+        // the row goes red here instead of silently re-enabling the
+        // fallback.
+        assert!(
+            has_specific_price("gemini-4-argon"),
+            "gemini-4-argon must be priced by the bundled catalog, not the default"
+        );
+        let price = lookup_price("gemini-4-argon");
+        // 2e-06 in / 1e-05 out per token; cache READ is published at
+        // 1e-07 ($0.10/M) and cache WRITE is genuinely absent (the
+        // generator omits it — disclosed fallback, not a pinned zero).
+        let eps = 1e-12;
+        assert!((price.input - 2.0).abs() < eps, "input {}", price.input);
+        assert!((price.output - 10.0).abs() < eps, "output {}", price.output);
+        let cr = price
+            .cr
+            .expect("gemini-4-argon publishes a cache-read rate");
+        assert!((cr - 0.10).abs() < eps, "cache-read {}", cr);
+        assert!(
+            price.cw.is_none(),
+            "cache-write is absent from the live row; the generator must omit it"
+        );
+        // 1000 input + 500 output tokens: $0.007 in exact arithmetic,
+        // disclosed as $0.007 by token_cost's 4-decimal rounding.
+        // (Tier argument `None`: the tier-less world is byte-identical.)
+        assert_eq!(token_cost(1000, 500, 0, 0, "gemini-4-argon", None), 0.007);
+        // The fallback this replaces charged 1.5x more on this workload.
+        assert_eq!(
+            token_cost(1000, 500, 0, 0, "nonexistent-model-xyz", None),
+            0.0105
+        );
+    }
+
+    #[test]
     fn bundled_snapshot_union_header_stays_honest() {
         // rm-588 never-drop contract, artifact side: the refresh writes
         // the keys that survived only through the union (upstream no
@@ -3990,10 +4036,20 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // The 1M-window default class (rm-231's motivating case),
+        // re-anchored 2026-10-22 to the batch's headline model: the
+        // upstream snapshot corrected the claude-sonnet-4-5 family's
+        // window from 1,000,000 to 200,000 (input-token semantics),
+        // so the 1M-class pin rides gemini-4-argon — the
+        // models.dev-published 1,048,576 window — and sonnet-4-5 pins
+        // the corrected value instead.
+        assert_eq!(
+            catalog.entries["gemini-4-argon"].max_input_tokens,
+            Some(1_048_576)
+        );
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 

@@ -12,9 +12,24 @@
 //! catalog is a process-global `OnceLock` seeded from
 //! `AGENTTRACE_PRICING_FILE` on first use, so the override has to be
 //! in place before any lookup and must not race sibling tests.
+//!
+//! rm-1954 continuation (run ce9309d9 wired the first two census
+//! suites; this is the third): the catalog lane PREFERS a machine
+//! pricing cache — `$AGENTTRACE_SESSION_CACHE_DIR/pricing.json` or
+//! the default user-cache location — over the bundled snapshot, and
+//! the catalog initializes once per process, so ambient host cache
+//! state silently re-points every assertion below (observed on the
+//! shared conductor host 2026-10-23: a sibling's default-lane
+//! `pricing.json` replaced the 2026-10-22 bundle wholesale and
+//! collapsed the census absence mass to 1). The whole contract runs
+//! inside `support::with_isolated_pricing_env`, so the only catalog
+//! inputs are the guard's scratch lanes plus this test's own
+//! `AGENTTRACE_PRICING_FILE` override.
 
 use agenttrace_core::{analyze, cache_rate_census, lookup_price, CacheRateCensus};
 use std::collections::BTreeMap;
+
+mod support;
 
 /// A pi-shaped usage event: role `meta` (or `session_meta`) carries
 /// usage and model attribution, the shape the per-block arm prices.
@@ -41,6 +56,10 @@ fn usage_event(
 
 #[test]
 fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_published_zero() {
+    support::with_isolated_pricing_env(absent_cache_rates_body);
+}
+
+fn absent_cache_rates_body() {
     // The override catalog merges per-entry over the bundled one, so
     // three synthetic rows pin all three states without touching any
     // real model's rates. All three share input $10/M, output $30/M.
@@ -196,20 +215,26 @@ fn absent_cache_rates_bill_at_disclosed_fallback_and_stay_distinct_from_publishe
     // --- census: the population is answerable without code -------
     // The override rows merged into the bundled catalog, so absolute
     // totals are bundle-vintage-dependent (pricing_snapshot_hygiene.rs
-    // pins those). What this binary pins: the classification itself —
-    // exactly the absent rows it contributes (the 2026-10-08 bundle
-    // zero-fills, so every bundled row classifies published), and the
-    // per-class sum invariant absent + zero + nonzero == total.
+    // pins those). What this binary pins: the classification itself
+    // — the absent row this test contributes classifies absent, and
+    // the per-class sum invariant absent + zero + nonzero == total.
+    // Since the 2026-10-22 refresh the bundle itself carries the
+    // upstream rm-1508 absence mass (live rows omit unwritten cache
+    // fields instead of zero-filling: 2,140 read-absent / 3,228
+    // write-absent at that vintage), so the absolute counts below
+    // are asserted as masses, not scalars — the exact vintage census
+    // lives in pricing_snapshot_hygiene.rs.
     let census: CacheRateCensus = cache_rate_census();
-    assert_eq!(
-        census.cache_read_absent, 1,
+    assert!(
+        census.cache_read_absent >= 1,
         "the absent-rate row must classify as absent: {census:?}"
     );
-    // rm-1508: the only absent rates in this process's catalog are
-    // the ones this test's override contributes — the 2026-10-08
-    // bundle zero-fills and upstream even publishes an explicit $0 on
-    // the gpt-5.3-codex rows, so the vend row is Some(0.0) too.
-    assert_eq!(census.cache_write_absent, 1);
+    assert!(census.cache_write_absent >= 1);
+    assert!(
+        census.cache_read_absent > 1_000,
+        "the 2026-10-22 vintage must carry the upstream absence mass \
+         (a collapse back to 1 means zero-fill regressed): {census:?}"
+    );
     assert_eq!(
         census.cache_read_absent + census.cache_read_zero + census.cache_read_published,
         census.models,

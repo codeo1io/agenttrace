@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read as _;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BaselineThresholds {
@@ -1392,13 +1393,52 @@ fn render_recommendations_markdown(out: &mut String, items: &[crate::Recommendat
 /// required up front, so an empty or partial summary cannot zero-fill its way
 /// into a fabricated +100% regression.
 fn load_baseline_report(baseline_path: &str) -> anyhow::Result<Value> {
-    let baseline_text = match fs::read_to_string(baseline_path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
-            anyhow::bail!("--baseline: {baseline_path} is not valid UTF-8: {err}");
+    // rm-2345: the read is bounded by the same file-read budget the
+    // session parse lane enforces (FILE_READ_CAP_BYTES via
+    // `file_read_cap_bytes`, knob AGENTTRACE_FILE_CAP_BYTES) — this
+    // used to be the one file lane outside the budget: an unbounded
+    // `fs::read_to_string` a planted multi-gigabyte baseline could
+    // OOM-kill the process through. Metadata fast path first, then a
+    // take(cap + 1) read so a file that GROWS between the two steps
+    // still cannot allocate more than one byte over the cap; the
+    // refusal names the path, the size, the cap, and the knob.
+    let cap = crate::parser::file_read_cap_bytes();
+    let path = std::path::Path::new(baseline_path);
+    let bytes = {
+        let metadata_len = fs::metadata(path)
+            .map_err(|err| {
+                anyhow::anyhow!("--baseline: failed to read baseline file {baseline_path}: {err}")
+            })?
+            .len();
+        if metadata_len > cap {
+            anyhow::bail!(
+                "--baseline: {baseline_path} is {metadata_len} bytes and exceeds the {cap}-byte \
+                 read cap; refusing the unbounded read (set AGENTTRACE_FILE_CAP_BYTES to raise or \
+                 lower the cap, or regenerate the baseline from a smaller corpus)"
+            );
         }
+        let file = fs::File::open(path).map_err(|err| {
+            anyhow::anyhow!("--baseline: failed to read baseline file {baseline_path}: {err}")
+        })?;
+        let mut bytes = Vec::with_capacity(metadata_len.min(1024 * 1024) as usize);
+        file.take(cap.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|err| {
+                anyhow::anyhow!("--baseline: failed to read baseline file {baseline_path}: {err}")
+            })?;
+        bytes
+    };
+    if bytes.len() as u64 > cap {
+        anyhow::bail!(
+            "--baseline: {baseline_path} exceeds the {cap}-byte read cap (it grew past \
+             the cap between the size check and the read); refusing the unbounded read \
+             (set AGENTTRACE_FILE_CAP_BYTES to raise or lower the cap)"
+        );
+    }
+    let baseline_text = match String::from_utf8(bytes) {
+        Ok(text) => text,
         Err(err) => {
-            anyhow::bail!("--baseline: failed to read baseline file {baseline_path}: {err}");
+            anyhow::bail!("--baseline: {baseline_path} is not valid UTF-8: {err}");
         }
     };
     let baseline: Value = serde_json::from_str(&baseline_text)

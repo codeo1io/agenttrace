@@ -558,6 +558,69 @@ fn protocol_version_is_negotiated_never_echoed() {
 }
 
 #[test]
+fn legacy_protocol_floor_versions_negotiate_instead_of_erroring() {
+    // rm-2344: the revision ladder's LEGACY floor (2025-03-26 and
+    // 2024-11-05 — modelcontextprotocol specification tags, ladder
+    // re-verified 2026-10-22, run 2bc715252343) is a served dialect,
+    // not a refusal: pre-2025-06-18 hosts initialize successfully and
+    // their requested version is echoed back (the rm-780
+    // requested-version-wins semantics, unchanged), per-request
+    // `_meta` negotiation honors the floor on any method, and an
+    // unknown version still answers the typed -32022 with the newest
+    // revision first in the recovery list. Pre-fix this test was RED:
+    // both floor versions were answered -32022 because the served
+    // set stopped at 2025-06-18.
+    let (home, cache) = seed_home("legacyfloor", false);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2024-11-05"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"1999-99-99","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(4, responses.len());
+    assert_eq!(
+        Some("2024-11-05"),
+        responses[0]["result"]["protocolVersion"].as_str(),
+        "the oldest floor revision negotiates and is echoed, not refused"
+    );
+    assert_eq!(
+        Some("2025-03-26"),
+        responses[1]["result"]["protocolVersion"].as_str(),
+        "the 2025-03-26 floor revision negotiates too"
+    );
+    assert!(
+        responses[2]["result"].is_object(),
+        "per-request _meta floor negotiation serves tools/list: {}",
+        responses[2]
+    );
+    assert_eq!(
+        Some(-32022),
+        responses[3]["error"]["code"].as_i64(),
+        "an unknown version is still the typed error — the floor widens the \
+         served dialects, it does not open the gate"
+    );
+    let supported = responses[3]["error"]["data"]["supported"]
+        .as_array()
+        .expect("supported list");
+    assert_eq!(
+        supported.first().and_then(|v| v.as_str()),
+        Some("2026-07-28"),
+        "the recovery list stays newest-first: {supported:?}"
+    );
+    assert!(
+        supported.iter().any(|v| v.as_str() == Some("2024-11-05")),
+        "the recovery list carries the floor so a legacy host can pick it: {supported:?}"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
 fn server_discover_answers_the_mandatory_rpc_statelessly() {
     // rm-455 (run f62ee197 cycle 4, A1): the 2026-07-28 revision
     // makes `server/discover` the ONE mandatory server RPC — its
@@ -592,8 +655,10 @@ fn server_discover_answers_the_mandatory_rpc_statelessly() {
     assert!(
         versions.iter().any(|v| v.as_str() == Some("2026-07-28"))
             && versions.iter().any(|v| v.as_str() == Some("2025-11-25"))
-            && versions.iter().any(|v| v.as_str() == Some("2025-06-18")),
-        "the negotiation list matches initialize: {versions:?}"
+            && versions.iter().any(|v| v.as_str() == Some("2025-06-18"))
+            && versions.iter().any(|v| v.as_str() == Some("2025-03-26"))
+            && versions.iter().any(|v| v.as_str() == Some("2024-11-05")),
+        "the negotiation list matches initialize, legacy floor included (rm-2344): {versions:?}"
     );
     assert_eq!(
         Some(false),

@@ -1166,6 +1166,48 @@
 
 ### Fixed
 
+- Legacy MCP hosts negotiate a floor dialect instead of the typed
+  refusal (rm-2344, run 2bc715252343 cycle 1, batch "pricing-truth +
+  compat-floor + read-cap"): `SUPPORTED_PROTOCOL_VERSIONS` stopped at
+  2025-06-18 while the official revision ladder
+  (modelcontextprotocol specification tags, fetched 2026-10-08,
+  re-verified 2026-10-22: 2026-07-28 still newest) publishes
+  2025-03-26 and 2024-11-05 below it — a host that honestly declared
+  a pre-2025-06-18 dialect was answered
+  `UnsupportedProtocolVersionError` (-32022) at `initialize`, the
+  served-set/ladder divergence the compat-floor item existed to
+  close. Both floor revisions are now served: `initialize` echoes a
+  requested floor version (rm-780 requested-version-wins semantics
+  unchanged), per-request `_meta` negotiation honors the floor on
+  any method, and `server/discover` advertises all five entries
+  newest-first. The floor only WIDENS the served dialects — an
+  unknown version still answers the typed -32022 with the newest
+  revision first in the recovery list. Pinned red-first by
+  `legacy_protocol_floor_versions_negotiate_instead_of_erroring`
+  (both floor versions were answered -32022 at the three-entry base)
+  and the floor assertions in
+  `server_discover_answers_the_mandatory_rpc_statelessly`.
+
+- `--baseline` reads through the shared file-read budget instead of
+  an unbounded slurp (rm-2345, run 2bc715252343 cycle 1):
+  `load_baseline_report` was the one file lane outside
+  `FILE_READ_CAP_BYTES` — a bare `fs::read_to_string` on the
+  operator-named baseline path — so a planted (or accidentally
+  pointed) multi-gigabyte baseline OOM-killed the process instead of
+  failing with attribution while every session-parse lane beside it
+  already refused over-cap files. The read now enforces the same cap
+  the parse lane does (`file_read_cap_bytes`, knob
+  `AGENTTRACE_FILE_CAP_BYTES`): a metadata fast-path refusal first,
+  then a `take(cap + 1)` read that still guards a file growing
+  between the two steps, with the refusal naming the path, the size,
+  the cap, and the knob. The rm-569 error taxonomy is untouched —
+  unreadable, non-UTF-8, non-JSON, and not-an-overview-report
+  failures keep their exact messages. Pinned red-first by
+  `baseline_over_cap_fails_with_the_named_cap_error_instead_of_reading_it_all`
+  (the over-cap run exited 0 at the base — unbounded read, comparison
+  green) with a within-cap control arm proving the same padded
+  baseline still round-trips under a raised cap.
+
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch
@@ -2247,6 +2289,38 @@
 - The codex multiagent reconcile re-scan no longer reads rollouts whole (rm-451 residual, run e40a66d301874cba8da57356d7efefe7 cycle 6): `scan_rollout` re-read each rollout with unbounded `std::fs::read` at reconcile time — a rollout over the parse lane's `FILE_READ_CAP_BYTES` was slurped into memory only to be refused later at parse. The scan now goes through the same bounded reader as the parse lane (`read_session_file_bounded`, metadata fast-path plus the stat/read re-guard), an over-cap rollout is refused before any read, and the skip is disclosed per-session as `codex_multiagent_reconcile_skipped_over_read_cap` plus the corpus `rollouts_over_cap` stat carried on the new stderr disclosure line (conservative as everywhere: the session keeps its inline turns, over-billed never erased). Pinned by `over_cap_rollout_discloses_reconcile_skip_without_reading_it` (sparse `set_len` past the cap).
 
 ### Changed
+
+- The bundled offline pricing catalog is refreshed to the 2026-10-22
+  LiteLLM snapshot (rm-176 slice, run 2bc715252343 cycle 1, batch
+  "pricing-truth + compat-floor + read-cap"; PRICING_SNAPSHOT_DATE
+  synced): 3,130 → 3,270 chat models through the rm-588 never-drop
+  union — 140 new keys admitted on the keep-filter basis (the gemini-4
+  family foremost: `gemini/gemini-4-argon` at the published
+  $2e-06 in / $1e-05 out per token / $1e-07 cache read, plus its
+  `vertex_ai/` and `github_copilot/` twins and
+  `vertex_ai/gemini-4-argon-cyber-permissive`; previously a gemini-4
+  session costed through the 3.0/15.0 fallback, the exact silent
+  mispricing the refresh exists to cure), 18 real rate changes on
+  previously bundled keys (e.g. `azure/gpt-4-turbo` $1e-05→$1.1e-05
+  in / $3e-05→$3.3e-05 out, `amazon.titan-text-express-v1`
+  $1.3e-06→$2e-07 in), 2,231 rows migrating a published-as-zero
+  cache rate to the rm-1508 absence contract (live-side rows only;
+  union-retained rows age out as upstream drops them), 466 keys
+  retained by the union, and ZERO priced keys lost (0 manual drops).
+  Determinism proven: an offline re-run from the same captured
+  catalog byte-identical. The models.dev first-party extract's date
+  rode along to 2026-10-22 (re-verified: LiteLLM still ships NO
+  first-party row for the three dated Anthropic ids — only
+  bedrock-qualified twins — and models.dev's anthropic list has
+  moved past the dated legacy ids, so every extract rate was
+  cross-checked against the live twins at identical list pricing).
+  Pinned by `bundled_snapshot_prices_gemini_4_argon_exactly`
+  (red-first at the 2026-10-08 base: the key was absent and a lookup
+  fell through to the fallback) plus the re-pinned census arms in
+  `pricing_snapshot_hygiene`; the drift gate (offline) now reports
+  0 new-costed / 0 rate-changed / no desync against the same
+  capture, with the standing `retired: 466` removal-guard ledger
+  unchanged (the never-drop union's by-design posture).
 
 - One shared cache-directory resolver replaces the four byte-identical per-module copies (rm-1536, assess F4, run 79fe78c0 cycle 3; adoption of salvage 9b2a7a1 U2): doctor, pricing, session_cache, and statusline each carried their own `user_cache_dir` ladder for locating the `agenttrace` cache root (sessions.json, pricing.json, the statusline capture journal, the doctor cache report). The ladder now lives once in `agenttrace-core::cache_dir` — `resolve_user_cache_dir(home, xdg_cache_home, macos)` takes the platform arm as an injected boolean so the Linux CI legs can pin the macOS behavior that `cfg!` copies made compile-time dead code, and one 17-row decision table replaces the four per-module pin tests. Two order-of-precedence disclosures ride the consolidation: an ABSOLUTE, non-empty `$XDG_CACHE_HOME` now wins on EVERY OS — the old macOS arm returned `$HOME/Library/Caches` first, so the rm-596 doctor demo sandbox (HOME + absolute XDG override asserting no $HOME text in the report) was unsatisfiable on macOS — and the landed rm-248 rider stays on the home arms (a set-but-empty OR RELATIVE `HOME` is unset-equivalent on both arms; an unusable HOME never yields a per-cwd cache). No environment variable is read anywhere new — the `user_cache_dir()` wrapper reads exactly the same two variables through one code path.
 - `resolve_user_cache_dir` is defined exactly once (rm-1389, run 1a4cce3a cycle 3, batch "one truth on the money-and-cache path"; reliability 30.0): the user-cache base resolver existed as four hand-synced private copies (session_cache, doctor, pricing, statusline — byte-identical 29-line bodies at the consolidation base 3e90993, verified) that had already drifted twice in three days — the empty/relative-HOME fix (rm-248 rider, dade9cd) landed on three copies while statusline's lagged, and the relative-HOME review fix then landed on statusline alone. The session_cache copy — the module that owns the cache-root policy — is now the single `pub(crate)` definition, imported by the other three; it stays pure over `(HOME, XDG_CACHE_HOME)` so every call path remains test-injectable. No behavior change (the bodies were identical); the consolidation is pinned by `shared_user_cache_resolver_census_pins_one_definition` (session_cache unit test that walks every `crates/**/*.rs` and asserts exactly one `fn` definition — the needle is assembled at runtime so the test's own source cannot count itself) on top of the existing per-module parity tests (`user_cache_dir_treats_empty_and_relative_home_as_unset` in session_cache/doctor/pricing plus statusline's historical pins), which now exercise the one shared body from all four beds. (Integration, conflict case 4d82812f: this run's session_cache-hosted consolidation is superseded at the merge by the landed rm-1536 `cache_dir` consolidation above — same one-definition intent, mechanics rehomed: the shared resolver lives in `agenttrace-core::cache_dir` as `resolve_user_cache_dir(home, xdg_cache_home, macos)` with an injected macOS arm, so the Linux CI legs can pin it; the census pin `shared_user_cache_resolver_census_pins_one_definition` relocated to cache_dir.rs beside the one definition, and the per-module parity tests this entry cites were themselves folded into cache_dir's 17-row `user_cache_dir_decision_table`.)

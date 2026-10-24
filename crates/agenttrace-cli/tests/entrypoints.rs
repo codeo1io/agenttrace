@@ -381,6 +381,126 @@ fn baseline_regression_gates_the_exit_code_and_opt_out_flags_work() {
 }
 
 #[test]
+fn baseline_over_cap_fails_with_the_named_cap_error_instead_of_reading_it_all() {
+    // rm-2345: `--baseline` used to read the baseline through an
+    // UNBOUNDED fs::read_to_string — the one file lane outside the
+    // FILE_READ_CAP_BYTES budget the session parse lane enforces. A
+    // planted multi-gigabyte baseline OOM-killed the process instead
+    // of failing with attribution. The read is now bounded by the
+    // same cap (AGENTTRACE_FILE_CAP_BYTES knob), the refusal names
+    // the path, the size, the cap, and the knob, and a within-cap
+    // baseline still round-trips untouched. Pre-fix this test was
+    // RED: the over-cap run read the whole file and exited 0.
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-baseline-cap-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&work).expect("create temp dir");
+    let report = work.join("report.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--demo",
+            "--overview",
+            "-f",
+            "json",
+            "-o",
+            report.to_str().expect("report path is valid UTF-8"),
+        ])
+        .output()
+        .expect("generate demo report");
+    assert!(output.status.success(), "demo report failed: {output:?}");
+    // Pad the (valid, version-matching) baseline past the cap with a
+    // JSON-legal member so the refusal can only come from the SIZE,
+    // never from parse validity — padding zeroes keep summary totals
+    // identical, so a within-cap run compares green.
+    let mut baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).expect("read report"))
+            .expect("report json");
+    baseline["rm2345_pad"] = serde_json::json!("x".repeat(8192));
+    let baseline_path = work.join("baseline.json");
+    std::fs::write(
+        &baseline_path,
+        serde_json::to_string(&baseline).expect("serialize baseline"),
+    )
+    .expect("write baseline");
+    assert!(
+        std::fs::metadata(&baseline_path)
+            .expect("baseline metadata")
+            .len()
+            > 8192,
+        "planted baseline must be comfortably over the lowered cap"
+    );
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--demo",
+            "--overview",
+            "-f",
+            "json",
+            "--baseline",
+            baseline_path
+                .to_str()
+                .expect("baseline path is valid UTF-8"),
+        ])
+        .env("AGENTTRACE_FILE_CAP_BYTES", "1024")
+        .output()
+        .expect("run over-cap compare");
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "an over-cap baseline must fail with attribution, got {:?}",
+        refused.status
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("--baseline"),
+        "stderr must attribute the refusal to the flag, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("baseline.json"),
+        "stderr must name the baseline path, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("read cap") && stderr.contains("1024"),
+        "stderr must name the cap it refused against, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("AGENTTRACE_FILE_CAP_BYTES"),
+        "stderr must name the knob, got: {stderr}"
+    );
+    // Control arm: the SAME padded baseline under a raised cap reads
+    // and compares fine — the cap is the only gate, the lane is
+    // otherwise untouched (rm-569 error taxonomy preserved).
+    let within = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--demo",
+            "--overview",
+            "-f",
+            "json",
+            "--baseline",
+            baseline_path
+                .to_str()
+                .expect("baseline path is valid UTF-8"),
+        ])
+        .env("AGENTTRACE_FILE_CAP_BYTES", "1048576")
+        .output()
+        .expect("run within-cap compare");
+    assert!(
+        within.status.success(),
+        "a within-cap baseline must still compare green, got {:?}\n{}",
+        within.status,
+        String::from_utf8_lossy(&within.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&within.stdout);
+    assert!(
+        stdout.contains("\"baseline_comparison\""),
+        "the comparison still lands in the report, got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(work);
+}
+
+#[test]
 fn output_parent_creation_failure_names_the_dash_o_target() {
     // rm-704: `-o` under an uncreatable parent directory used to die
     // with a contextless raw io::Error ("Permission denied (os error

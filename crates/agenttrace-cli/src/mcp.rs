@@ -123,10 +123,24 @@ const META_SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 /// the first entry the client also declared, or falls back to `[0]`
 /// for unknown/absent client versions. The set mirrors the official
 /// revision ladder (modelcontextprotocol repository tags, fetched
-/// live 2026-10-08: 2026-07-28 > 2025-11-25 > 2025-06-18); adding a
+/// live 2026-10-08; ladder re-verified 2026-10-22, run 2bc715252343:
+/// 2026-07-28 is still the newest tag). rm-2344 appended the legacy
+/// floor revisions 2025-03-26 and 2024-11-05 (both real ladder tags
+/// below 2025-06-18) so a pre-2025-06-18 host negotiates a dialect
+/// it actually speaks instead of receiving the typed -32022 the
+/// three-entry set answered it; the floor only WIDENS the served
+/// set — unknown versions still gate, and `initialize`/`server/discover`
+/// advertise the whole list newest-first. Adding or removing a
 /// revision here is a deliberate, tested act — the cost the rm-455
-/// rmcp-adoption rider tracks.
-const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "2025-06-18"];
+/// rmcp-adoption rider tracks, pinned by
+/// `legacy_protocol_floor_versions_negotiate_instead_of_erroring`.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 5] = [
+    "2026-07-28",
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
 
 /// `tools/list` cache hint (rm-455, run e4209f0c cycle 5): the
 /// 2026-07-28 revision's CacheableResult rule (SEP-2549) makes

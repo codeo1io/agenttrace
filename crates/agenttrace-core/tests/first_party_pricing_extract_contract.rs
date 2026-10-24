@@ -204,7 +204,7 @@ fn extract_json_carries_its_provenance_note() {
     ))
     .expect("models_dev_snapshot.json readable from the test");
     assert!(
-        raw.contains("self-retire") && raw.contains("\"date\": \"2026-10-16\""),
+        raw.contains("self-retire") && raw.contains("\"date\": \"2026-10-22\""),
         "the extract must carry its source note and pinned date"
     );
     for (id, ..) in EXTRACT_ROWS {

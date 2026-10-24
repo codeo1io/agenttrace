@@ -75,15 +75,23 @@ fn cache_rate_census_body() {
         census.models
     );
     assert_eq!(
-        census.cache_read_absent, 0,
-        "the 2026-10-08 bundle zero-fills: absent cache-read rows can only appear via a \
-         sanctioned refresh (rm-176 lane), which must move this pin consciously"
+        census.cache_read_absent, 2139,
+        "2026-10-22 sanctioned refresh (run 2bc715252343 cycle 1, rm-176 lane): \
+         LiteLLM now publishes rows with no cache-read field at all; the \
+         post-rm-1508 generator omits absent rates instead of zero-filling, \
+         so absent = disclosed fallback, never a pinned silent zero. The \
+         2026-10-08 bundle zero-filled (0 absent); any future refresh must \
+         move this pin consciously"
     );
     assert_eq!(
-        census.cache_write_absent, 0,
-        "the 2026-10-08 bundle zero-fills (upstream even publishes an explicit $0 on the \
-         gpt-5.3-codex rows, so the vend row is Some(0.0)): absent rows can only appear \
-         via a sanctioned refresh (rm-176 lane), which must move this pin consciously"
+        census.cache_write_absent, 3227,
+        "2026-10-22 sanctioned refresh (rm-176 lane): cache-write fields are \
+         absent far more often than cache-read; the generator omits them \
+         (billed at the disclosed 1.25x-input fallback). Upstream still \
+         publishes an explicit $0 on some rows (gpt-5.3-codex family), which \
+         parse as Some(0.0) and stay in the zero class. The 2026-10-08 bundle \
+         zero-filled (0 absent); any future refresh must move this pin \
+         consciously"
     );
     assert_eq!(
         census.cache_read_absent + census.cache_read_zero + census.cache_read_published,

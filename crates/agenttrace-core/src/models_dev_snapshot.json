@@ -1,7 +1,7 @@
 {
   "_snapshot": {
-    "source": "models.dev first-party pricing extract — the second catalog (rm-1532). Rows are the dated Anthropic model ids the LiteLLM snapshot carries NO first-party row for in any form (verified against live LiteLLM 2026-10-16, research run b1e8b617): only reseller-qualified rows (openrouter/, vercel_ai_gateway/, github_copilot/) end in these ids, so the base-model collapse attributed first-party sessions to a reseller. Rates are the vendor's list prices as published by models.dev, cross-checked against the reseller rows (identical, since resellers forward list pricing). Each row self-retires the day LiteLLM ships a first-party row: serving_catalog consults the LiteLLM ladder first and a first-party winner ends the search.",
-    "date": "2026-10-16",
+    "source": "models.dev first-party pricing extract — the second catalog (rm-1532). Rows are the dated Anthropic model ids the LiteLLM snapshot carries NO first-party row for in any form (verified against live LiteLLM 2026-10-16, research run b1e8b617; re-verified 2026-10-22, run 2bc715252343: only bedrock-qualified twins remain): only reseller-qualified rows (openrouter/, vercel_ai_gateway/, github_copilot/, bedrock) end in these ids, so the base-model collapse attributed first-party sessions to a reseller. Rates are the vendor's list prices, originally published by models.dev, whose anthropic list has since moved past the dated legacy ids — the 2026-10-22 re-verification cross-checked every rate against the live bedrock twins (identical: resellers forward list pricing). Each row self-retires the day LiteLLM ships a first-party row: serving_catalog consults the LiteLLM ladder first and a first-party winner ends the search.",
+    "date": "2026-10-22",
     "rates_basis": "USD per million tokens (input, output, cache_read, cache_write)"
   },
   "anthropic/claude-3-7-sonnet-20250219": {
