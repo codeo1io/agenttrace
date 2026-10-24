@@ -356,3 +356,117 @@ fn decompressed_budget_charge_saturates() {
         text
     );
 }
+
+// ============================================================
+// rm-1872 completion (run 0a89c44a cycle 1): decode-before-budget
+// honesty. The scan's admission checks run on the STAT length, so a
+// tiny compressed frame used to fully decompress (up to the 64 MiB
+// per-file cap) before the decompressed-budget admission refused it —
+// and the session loop kept stat-ing every remaining candidate after
+// the budget was gone, classifying files it could no longer read by
+// per-file probes instead of by the budget line that stopped the scan.
+// ============================================================
+
+#[test]
+fn budget_line_stops_per_file_io_and_discloses_remaining_as_budget_skipped() {
+    // The documented budget contract (TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET)
+    // says the canonical order is scanned "until the budget is
+    // exhausted; every file past the line is skipped and disclosed".
+    // The reason a past-the-line file is not read is the BUDGET, not a
+    // per-file probe outcome — so a file that does not exist must be
+    // disclosed budget-skipped, never re-probed into a `skipped_missing`
+    // classification the scan could only reach by spending I/O it had
+    // already declared exhausted.
+    let mut first = parse_file(&fixture("body-only.jsonl")).unwrap();
+    first.name = "a-exhausts-the-budget".to_string();
+    let mut gone = parse_file(&fixture("body-only.jsonl")).unwrap();
+    gone.name = "b-missing-past-the-line".to_string();
+    gone.path = "/nonexistent-rm-1872/no-such-session.jsonl".to_string();
+    // canonical_sessions orders same-instant parses by name, so
+    // `a-...` is scanned first and consumes exactly the whole budget
+    // (the fixture is 431 bytes on disk) and `b-...` falls past the
+    // line.
+    let report = search_sessions_detailed(
+        &[first, gone],
+        "zygomorphic",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        431,
+    );
+    assert_eq!(report.scan.files_considered, 2);
+    assert_eq!(report.scan.scanned_files, 1);
+    assert_eq!(
+        report.scan.skipped_missing, 0,
+        "past the budget line the scan must not re-probe files: the budget, not a missing-file stat, is why the file was not read"
+    );
+    assert_eq!(report.scan.skipped_budget, 1);
+    let text = agenttrace_core::report_search_text_detailed(&report, "zygomorphic");
+    assert!(
+        text.contains("1 skipped: read budget exhausted"),
+        "the past-the-line disclosure must name the budget, got: {text}"
+    );
+}
+
+#[test]
+fn tiny_compressed_frames_stop_at_the_remaining_budget() {
+    // The stat-length admission cannot see decompressed size: the
+    // 2,833-byte compressed frame admits through any budget above
+    // 2,833 while its 22,652 decompressed bytes bust a 100-byte budget.
+    // The decode itself must stop at the budget line — classified
+    // budget-skipped without ever fully decompressing the frame, and
+    // never relabeled as a decode refusal.
+    let session = parse_file(&codex_compressed_fixture()).unwrap();
+    let report = search_sessions_detailed(
+        &[session],
+        "turn_context",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        100,
+    );
+    assert_eq!(report.scan.scanned_files, 0);
+    assert_eq!(report.scan.skipped_zstd, 0);
+    assert_eq!(report.scan.skipped_budget, 1);
+    let text = agenttrace_core::report_search_text_detailed(&report, "turn_context");
+    assert!(
+        text.contains("1 skipped: read budget exhausted"),
+        "the over-budget frame must be disclosed as budget-exhausted, got: {text}"
+    );
+}
+
+#[test]
+fn over_cap_frames_keep_their_cap_verdict_at_large_budgets() {
+    // Bounding the decode by the REMAINING budget must not relabel the
+    // per-file cap's refusals: a frame stream that decompresses past the
+    // 64 MiB cap under a budget at or above the cap is refused BY THE
+    // CAP — it was `skipped_zstd` before the decode became budget-bounded
+    // and stays `skipped_zstd` after. The reused codex-zstd bomb
+    // (rollout-bomb-multiframe.jsonl, 2,618 compressed bytes of 68 MiB
+    // decompressed) exists to pin exactly that per-file cap; this test
+    // pins that the budget bound never swallows its verdict.
+    let mut session = parse_file(&fixture("body-only.jsonl")).unwrap();
+    session.name = "innocuous-session".to_string();
+    session.path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-zstd/rollout-bomb-multiframe.jsonl")
+        .to_string_lossy()
+        .to_string();
+    let report = search_sessions_detailed(
+        &[session],
+        "innocuous",
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+    );
+    assert_eq!(report.results.len(), 1, "the name match must keep the row");
+    assert!(
+        report.results[0]
+            .transcript_scan
+            .starts_with("skipped: zstd decode refused"),
+        "the cap refusal keeps its pre-budget-bounding verdict, got {:?}",
+        report.results[0].transcript_scan
+    );
+    assert_eq!(report.scan.skipped_budget, 0);
+    assert_eq!(
+        report.scan.skipped_zstd, 1,
+        "the 64 MiB cap refusal is a decode refusal, not a budget skip"
+    );
+}

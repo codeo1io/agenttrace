@@ -1812,16 +1812,33 @@ fn lock_token_pid(text: &str) -> Option<u32> {
     }
 }
 
-#[cfg(unix)]
+// rm-2034: liveness probe for a lock token's pid, platform-honest
+// per unix family. `/proc` is the std-only probe on Linux; on the
+// rest of the unix family (darwin, the BSDs) `/proc` does not exist,
+// so the old unix-wide probe read EVERY pid as dead and the dead-pid
+// arm of `lock_decision` stole a LIVE writer's fresh lock at any age
+// — the age lane never saw it, because the dead-pid arm fires first.
+// There `kill(pid, 0)` performs the kernel's existence/permission
+// check without sending a signal: `0` and `EPERM` (a live process we
+// may not signal) both mean alive; `ESRCH` alone means dead.
+#[cfg(target_os = "linux")]
 fn lock_pid_is_alive(pid: u32) -> bool {
-    // /proc is the std-only liveness probe on the unix family this
-    // tool ships on; where it is absent the age lane still catches
-    // the crash.
     Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn lock_pid_is_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 performs no action on the target —
+    // it is the POSIX-documented existence check — and errno is
+    // sampled immediately after the call, before any allocation.
+    let probe = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    probe == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]
 fn lock_pid_is_alive(_pid: u32) -> bool {
+    // No std liveness probe exists on Windows; the age lane alone
+    // governs there, as before.
     true
 }
 
@@ -5830,6 +5847,46 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lock_decision_respects_a_live_foreign_owner_at_any_age() {
+        // rm-2034: a live pid that is NOT this process must keep its
+        // fresh lock unstealable through the liveness probe itself,
+        // not the age lane. On darwin the old `/proc`-only probe read
+        // every pid as dead, so this pin was red there (the dead-pid
+        // arm stole at age zero) while staying green on Linux; a real
+        // child is the only truthful witness because the probe must
+        // observe a pid the kernel agrees is alive and foreign to us.
+        #[cfg(unix)]
+        {
+            use std::process::Command;
+            let mut witness = Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn live witness");
+            let foreign_token = format!("{}-witness", witness.id());
+            assert!(
+                lock_pid_is_alive(witness.id()),
+                "probe must read a live foreign pid as alive"
+            );
+            assert!(
+                !lock_decision(&foreign_token, std::time::Duration::ZERO),
+                "a live foreign owner's fresh lock is not stealable"
+            );
+            witness.kill().expect("kill witness");
+            let _ = witness.wait();
+            // Reaped now: the dead-pid arm steals at any age — but a
+            // reaped pid may be recycled by the OS at any moment, so
+            // the dead pin only asserts when the probe still reads
+            // the recycled pid as dead.
+            if !lock_pid_is_alive(witness.id()) {
+                assert!(
+                    lock_decision(&foreign_token, std::time::Duration::ZERO),
+                    "a dead owner's lock is stealable at age zero"
+                );
+            }
+        }
     }
 
     #[test]

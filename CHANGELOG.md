@@ -1026,6 +1026,52 @@
 
 ### Fixed
 
+- Cross-platform truth core: darwin lock liveness, bounded-scan honesty,
+  fork install surface (rm-2034 + rm-1872 + rm-1876, run 0a89c44a cycle 1,
+  batch "Cross-platform truth core: darwin lock liveness, bounded-scan
+  honesty, fork install surface"): (a) rm-2034 — the session-cache lock
+  liveness probe `lock_pid_is_alive` read `/proc/<pid>` under plain
+  `cfg(unix)`, so on darwin every owner pid — including a live foreign
+  one — read dead, and `lock_decision`'s dead-pid arm could steal a
+  LIVE fresh lock at any age (the probe's comment claiming no std
+  liveness probe existed on macOS was false). The probe is now split:
+  linux keeps `/proc`; every other unix uses `kill(pid, 0)` — the
+  POSIX existence check — where 0 and EPERM (a live process owned by
+  another user) both read alive; `libc` joins as a unix-gated
+  dependency (already in Cargo.lock — zero new packages). Pinned by
+  `lock_decision_respects_a_live_foreign_owner_at_any_age`
+  (session_cache.rs), which spawns a real foreign witness child: red on
+  darwin before the split, green on Linux where the `/proc` arm already
+  worked; the shipped probe was typechecked verbatim for
+  aarch64-apple-darwin and x86_64-pc-windows-gnu. (b) rm-1872
+  completion — the transcript search scan now bounds its zstd decode
+  by the REMAINING budget (at most budget+1 decompressed bytes)
+  instead of always paying the full 64 MiB per-file cap on a frame the
+  budget could never admit: a typed `ZstdDecodeOverCap` refusal at the
+  caller-supplied bound discloses as a budget skip, a refusal that
+  fired at the 64 MiB cap itself keeps its decode-refusal verdict
+  (bounding the decode by the remaining budget must not relabel the
+  cap's own refusals), and a file whose probe fails while the budget
+  is exhausted discloses past-the-line budget skip instead of a
+  `missing` verdict the scan could only reach by spending I/O it had
+  already declared exhausted — the stat-0 `/proc` seam keeps its read
+  (it admits at a zero budget for free). Pinned by
+  `budget_line_stops_per_file_io_and_discloses_remaining_as_budget_skipped`,
+  `tiny_compressed_frames_stop_at_the_remaining_budget` and
+  `over_cap_frames_keep_their_cap_verdict_at_large_budgets`
+  (tests/search_transcript_contract.rs) plus
+  `decode_with_cap_stops_at_an_arbitrary_cap_typed` (parser.rs).
+  (c) rm-1876 — an EXACT cost-and-duration tie is no longer labeled
+  `faster_cheaper` (false on both axes); it is its own `unchanged`
+  verdict, and the never-consumed public re-export of
+  `compare_session_outcome` is gone (the fn is now crate-visible under
+  test only). Pinned by `session_comparison_labels_an_exact_tie_unchanged`
+  (insights.rs). Alongside: the README/README.zh-CN install one-liners
+  now pull `install.sh`/`install.ps1`/`install.cmd` from the codeo1io
+  fork's raw URLs (the luoyuctl upstream is frozen at 15ed07f2, day
+  15 — its raw URLs serve a stale install surface for a binary this
+  fork ships), and Cargo.lock rides serde_json 1.0.151 → 1.0.154 (no
+  source change).
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch

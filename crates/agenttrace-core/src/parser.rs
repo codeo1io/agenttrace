@@ -278,15 +278,38 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
 /// rollout cannot smuggle past it a frame at a time (rm-1516). A rollout
 /// past the cap is refused loudly; the operator can always decompress
 /// manually and re-run.
-const ZSTD_ROLLOUT_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const ZSTD_ROLLOUT_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// rm-1025: the over-cap refusal numeral is DERIVED from
 /// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`], never hand-written — a cap change
 /// must not leave the user-facing message stating a stale size (same
 /// discipline as `MCP_INPUT_MAX_BYTES` in the CLI transport lane).
 fn zstd_decode_cap_label() -> String {
+    // rm-1025: the refusal numeral stays DERIVED from the cap constant,
+    // never hand-written, so a cap retune can never ship a stale message.
     format!("{} MiB", ZSTD_ROLLOUT_DECODE_MAX_BYTES / (1024 * 1024))
 }
+
+fn zstd_cap_label_for(cap: usize) -> String {
+    // rm-1872: the budget-bounded decode lane refuses at an arbitrary
+    // caller-supplied cap, so its numeral must be derived from THAT cap
+    // — the 64 MiB default keeps the rm-1025 MiB wording byte-identical,
+    // any other cap names its exact byte count.
+    if cap == ZSTD_ROLLOUT_DECODE_MAX_BYTES {
+        zstd_decode_cap_label()
+    } else {
+        format!("{}-byte", cap)
+    }
+}
+
+/// rm-1872: typed over-cap refusal for the budget-bounded decode lane
+/// (`decode_zstd_rollout_with_cap`) — the caller's contract is
+/// `err.downcast_ref::<ZstdDecodeOverCap>()`; the human wording lives
+/// in the error's context, so disclosure text never becomes a match
+/// target.
+#[derive(Debug, thiserror::Error)]
+#[error("zstd decode would decompress past the caller-supplied cap")]
+pub(crate) struct ZstdDecodeOverCap;
 
 /// Decode one zstd-compressed Codex rollout, bounded by
 /// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`] of TOTAL decompressed output.
@@ -314,6 +337,21 @@ fn zstd_decode_cap_label() -> String {
 /// multi-frame truth: a concatenated rollout parses and fingerprints as
 /// the whole journal on both lanes).
 pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
+    decode_zstd_rollout_with_cap(raw, label, ZSTD_ROLLOUT_DECODE_MAX_BYTES)
+}
+
+/// rm-1872 completion (search budget honesty): the transcript-search
+/// scan charges its byte budget in DEcompressed bytes, so its decode
+/// must stop at the REMAINING budget instead of the 64 MiB per-file
+/// cap — a tiny compressed frame must not fully decompress just to be
+/// refused by the budget admission afterwards. An over-`cap` refusal
+/// returns the typed `ZstdDecodeOverCap` marker; every other behavior
+/// and wording of the bounded lane is unchanged.
+pub(crate) fn decode_zstd_rollout_with_cap(
+    raw: Vec<u8>,
+    label: &str,
+    cap: usize,
+) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
     let total_len = raw.len();
     // `rest` always points at the next not-yet-decoded frame; each
@@ -393,14 +431,14 @@ pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::
             if n == 0 {
                 break;
             }
-            if decoded.len() + n > ZSTD_ROLLOUT_DECODE_MAX_BYTES {
-                bail!(
+            if decoded.len() + n > cap {
+                return Err(anyhow::Error::new(ZstdDecodeOverCap).context(format!(
                     "session file {} is zstd-compressed (Codex rollout format) and would decompress past the {} cap ({} bytes decoded so far, still in frame {}); refusing the unbounded decode — decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
                     label,
-                    zstd_decode_cap_label(),
+                    zstd_cap_label_for(cap),
                     decoded.len(),
                     frame_no
-                );
+                )));
             }
             decoded.extend_from_slice(&chunk[..n]);
         }
@@ -14071,5 +14109,50 @@ mod zstd_cap_label_tests {
         // can take (the derivation must not silently produce "0 MiB" or
         // a fraction if the cap is ever retuned).
         assert_eq!(ZSTD_ROLLOUT_DECODE_MAX_BYTES % (1024 * 1024), 0);
+    }
+
+    #[test]
+    fn decode_with_cap_stops_at_an_arbitrary_cap_typed() {
+        // rm-1872 completion: the budget-bounded decode refuses at the
+        // CALLER's cap, checked DURING the stream — the golden compressed
+        // fixture (2,833 bytes on disk, 22,652 decompressed) must fail a
+        // 100-byte cap mid-decode with the typed marker, succeed at
+        // exactly its decompressed size, and fail again one byte under.
+        // The default-capped twin must agree with a MAX-bytes cap so the
+        // two lanes can never drift.
+        let raw = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-zstd/rollout.jsonl"
+        ))
+        .expect("the golden compressed fixture ships with the crate");
+        let over = decode_zstd_rollout_with_cap(raw.clone(), "rollout.jsonl", 100).unwrap_err();
+        assert!(
+            over.downcast_ref::<ZstdDecodeOverCap>().is_some(),
+            "a caller-cap refusal must downcast to the typed marker, got {over:?}"
+        );
+        let wording = format!("{over:#}");
+        assert!(
+            wording.contains("past the 100-byte cap"),
+            "the caller cap is named in its own bytes, got: {wording}"
+        );
+        let exact = decode_zstd_rollout_with_cap(raw.clone(), "rollout.jsonl", 22_652).unwrap();
+        assert_eq!(exact.len(), 22_652);
+        assert!(decode_zstd_rollout_with_cap(raw.clone(), "rollout.jsonl", 22_651).is_err());
+        let twin = decode_zstd_rollout_with_cap(
+            raw.clone(),
+            "rollout.jsonl",
+            ZSTD_ROLLOUT_DECODE_MAX_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            twin,
+            decode_zstd_rollout_bounded(raw, "rollout.jsonl").unwrap(),
+            "the default lane IS the caller-capped lane at MAX bytes"
+        );
+        assert_eq!(
+            zstd_cap_label_for(ZSTD_ROLLOUT_DECODE_MAX_BYTES),
+            zstd_decode_cap_label(),
+            "the MAX cap keeps the rm-1025 MiB wording verbatim"
+        );
     }
 }

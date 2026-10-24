@@ -66,19 +66,19 @@ agenttrace
 macOS and Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.ps1 | iex
 ```
 
 Windows CMD:
 
 ```bat
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
+curl -fsSL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
 The install scripts download the release binary for your platform and verify its
@@ -100,13 +100,13 @@ there):
 | `AGENTTRACE_DOWNLOAD_URL` | Override the binary URL entirely (offline CI tests). |
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh \
+curl -fsSL https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.sh \
   | AGENTTRACE_VERSION=v0.10.1 sh
 ```
 
 ```powershell
 $env:AGENTTRACE_VERSION = "v0.10.1"
-irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/codeo1io/agenttrace/master/install.ps1 | iex
 ```
 
 Package managers:
@@ -119,7 +119,7 @@ brew install luoyuctl/tap/agenttrace
 npm install -g @zack78/agenttrace
 
 # From source
-cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
+cargo install --git https://github.com/codeo1io/agenttrace agenttrace
 ```
 
 Check the installed version with `agenttrace --version`.
@@ -130,7 +130,7 @@ Check the installed version with `agenttrace --version`.
 | --- | --- |
 | Homebrew | `brew upgrade luoyuctl/tap/agenttrace` |
 | npm | `npm install -g @zack78/agenttrace@latest` |
-| cargo | `cargo install --git https://github.com/luoyuctl/agenttrace agenttrace --force` |
+| cargo | `cargo install --git https://github.com/codeo1io/agenttrace agenttrace --force` |
 
 and points package-manager installs back to their manager.
 

@@ -58,11 +58,11 @@ pub use governance::{
 };
 pub use history::{history_path, merge_preserved_history, preserve_derived_history};
 pub use insights::{
-    compare_session_outcome, data_health, data_health_scoped, filter_sessions,
-    future_admission_bound, project_decode_status, project_name, report_scope, resolve_project,
-    session_admitted_since, session_beyond_future_grace, session_capability,
-    session_matches_time_range, DataHealth, ProjectDecodeStatus, ProjectIdentity, ReportScope,
-    SessionComparison, SourceScope, TimeRange, FUTURE_ADMISSION_GRACE_SECS,
+    data_health, data_health_scoped, filter_sessions, future_admission_bound,
+    project_decode_status, project_name, report_scope, resolve_project, session_admitted_since,
+    session_beyond_future_grace, session_capability, session_matches_time_range, DataHealth,
+    ProjectDecodeStatus, ProjectIdentity, ReportScope, SessionComparison, SourceScope, TimeRange,
+    FUTURE_ADMISSION_GRACE_SECS,
 };
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 pub use parser::{
@@ -4976,9 +4976,25 @@ mod tests {
         previous.metrics.duration_sec = 10.0;
         previous.metrics.cost_estimated = 2.0;
         previous.metrics.tool_calls_fail = 2;
-        let comparison = compare_session_outcome(&current, &previous);
+        let comparison = crate::insights::compare_session_outcome(&current, &previous);
         assert_eq!(comparison.outcome, "faster_cheaper");
         assert_eq!(comparison.reasons, vec!["fewer_failures"]);
+    }
+
+    #[test]
+    fn session_comparison_labels_an_exact_tie_unchanged() {
+        // rm-1876: equal duration AND equal cost is not "faster_cheaper"
+        // — it is false on both axes. The exact tie is its own verdict;
+        // every strictly-better arm keeps the old label.
+        let mut current = test_session();
+        current.metrics.duration_sec = 7.0;
+        current.metrics.cost_estimated = 2.0;
+        let mut previous = test_session();
+        previous.metrics.duration_sec = 7.0;
+        previous.metrics.cost_estimated = 2.0;
+        let comparison = crate::insights::compare_session_outcome(&current, &previous);
+        assert_eq!(comparison.outcome, "unchanged");
+        assert_eq!(comparison.reasons, vec!["review_metric_changes"]);
     }
 
     #[test]

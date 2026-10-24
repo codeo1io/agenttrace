@@ -539,6 +539,21 @@ fn transcript_evidence(
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => {
+            // rm-1872 (run 0a89c44a cycle 1): a probe that fails while
+            // the read budget is exhausted discloses past the budget
+            // line, not as `missing`. The stat itself is not
+            // budget-governed I/O (every candidate is probed — see the
+            // `len > budget_left` admission below), but once the budget
+            // is gone a real file of any nonzero length would be
+            // budget-skipped anyway, so the only way to keep calling
+            // this file missing is to spend read I/O the scan has
+            // already declared exhausted to confirm a shape nobody
+            // asked for. The stat-0 `/proc` seam keeps its read: it
+            // probes successfully and admits at a zero budget for free.
+            if *budget_left == 0 {
+                scan.skipped_budget += 1;
+                return (Vec::new(), "skipped: read budget exhausted".to_string());
+            }
             scan.skipped_missing += 1;
             return (Vec::new(), "skipped: file missing".to_string());
         }
@@ -585,7 +600,19 @@ fn transcript_evidence(
     // frame hides behind (rm-1872).
     let charged: u64;
     if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        match crate::parser::decode_zstd_rollout_bounded(bytes, path) {
+        // rm-1872 completion: the decode is bounded by the REMAINING
+        // budget (never more), so a tiny compressed frame that would
+        // blow past the budget is refused after at most budget+1 bytes
+        // of decompression instead of the full 64 MiB per-file cap —
+        // the budget admission below then only ever fires at the exact
+        // budget+1 boundary, and an over-budget frame lands in the
+        // typed `ZstdDecodeOverCap` arm, where the refusal fired at
+        // the caller-supplied cap (below the per-file cap) and so is
+        // disclosed as a budget skip.
+        let decode_cap = (*budget_left as usize)
+            .saturating_add(1)
+            .min(crate::parser::ZSTD_ROLLOUT_DECODE_MAX_BYTES);
+        match crate::parser::decode_zstd_rollout_with_cap(bytes, path, decode_cap) {
             Ok(decoded) => {
                 let decoded_len = decoded.len() as u64;
                 if decoded_len > *budget_left {
@@ -606,6 +633,24 @@ fn transcript_evidence(
                 content = std::borrow::Cow::Owned(String::from_utf8_lossy(&decoded).into_owned());
             }
             Err(reason) => {
+                let over_budget = reason
+                    .downcast_ref::<crate::parser::ZstdDecodeOverCap>()
+                    .is_some()
+                    && decode_cap < crate::parser::ZSTD_ROLLOUT_DECODE_MAX_BYTES;
+                if over_budget {
+                    scan.skipped_budget += 1;
+                    return (
+                        Vec::new(),
+                        "skipped: read budget exhausted (decompressed body over remaining budget)"
+                            .to_string(),
+                    );
+                }
+                // A refusal that fired at the per-file 64 MiB cap itself
+                // (the budget never bound the decode tighter) keeps the
+                // decode-refusal verdict the cap lane always had:
+                // bounding the decode by the REMAINING budget must not
+                // relabel the cap's own refusals (rm-1872, run 0a89c44a
+                // cycle 1).
                 scan.skipped_zstd += 1;
                 return (
                     Vec::new(),

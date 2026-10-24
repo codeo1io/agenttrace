@@ -21,3 +21,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+
+# rm-2034: darwin/BSD lock-liveness probe (`kill(pid, 0)`); libc is
+# already in the workspace lock via transitive deps — zero new packages.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

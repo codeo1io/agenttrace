@@ -10,15 +10,32 @@ pub struct SessionComparison {
     pub reasons: Vec<&'static str>,
 }
 
-pub fn compare_session_outcome(current: &Session, previous: &Session) -> SessionComparison {
-    let outcome = match (
-        current.metrics.duration_sec <= previous.metrics.duration_sec,
-        current.metrics.cost_estimated <= previous.metrics.cost_estimated,
-    ) {
-        (true, true) => "faster_cheaper",
-        (true, false) => "faster_costlier",
-        (false, true) => "slower_cheaper",
-        (false, false) => "slower_costlier",
+// Zero production callers pin this verdict — the public re-export is
+// gone and the function itself is compiled only under test, where the
+// outcome-rule contracts live.
+#[cfg(test)]
+pub(crate) fn compare_session_outcome(current: &Session, previous: &Session) -> SessionComparison {
+    // rm-1876: the (<=, <=) arm used to label an EXACT tie — equal
+    // duration AND equal cost — as "faster_cheaper", false on both
+    // axes. An exact tie is its own verdict; every other arm stays
+    // honest under its <= reading (strictly better on at least one
+    // axis, never worse on either). Zero production callers ever
+    // consumed this off the public lib surface — the re-export is
+    // gone, so the verdict is now crate-visible only.
+    let duration_tied = current.metrics.duration_sec == previous.metrics.duration_sec;
+    let cost_tied = current.metrics.cost_estimated == previous.metrics.cost_estimated;
+    let outcome = if duration_tied && cost_tied {
+        "unchanged"
+    } else {
+        match (
+            current.metrics.duration_sec <= previous.metrics.duration_sec,
+            current.metrics.cost_estimated <= previous.metrics.cost_estimated,
+        ) {
+            (true, true) => "faster_cheaper",
+            (true, false) => "faster_costlier",
+            (false, true) => "slower_cheaper",
+            (false, false) => "slower_costlier",
+        }
     };
     let mut reasons = Vec::new();
     if current.metrics.tool_calls_fail < previous.metrics.tool_calls_fail {
