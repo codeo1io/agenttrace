@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 72 and the SQLite snapshot is schema 14; the
+The session cache is schema 73 and the SQLite snapshot is schema 14; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -514,6 +514,22 @@ with an `org_identity_truncated` counter beside the per-field
 `org_truncated:*` counters and an idempotent materialization cap in
 `GoSession::into_session`, so no further rung is required — rung 72
 already regenerates every pre-cap row)
+— so cached sessions regenerate under the corrected totals, and to 73
+when the claude streaming folds gained their id-class split (run
+db0a9afba6ee cycle 2, rm-601 residual arm: usage max-merge, the
+assistant snapshot fold, tool_result dedup and advisor-iterations
+mining key on `ClaudeMessageKey` — real `msg_…` ids fold on the id
+alone while a gateway/local placeholder id folds per
+(id, whole-second timestamp — same-second re-emissions of one response
+keep folding at the max, and usage a gateway stamps on user-typed rows
+folds through the same scope map), with each usage-bearing reuse beyond
+the first scope disclosed via `claude_placeholder_id_reuse:{id}` — so a
+gateway reusing one
+placeholder across DISTINCT responses stops max-merging them into a
+single undercounting event, and a warm v72 entry regenerates rather
+than replaying the merged undercount; minted 72 → 73 straight at the
+landed ceiling 72, one invalidation either way; the SQLite snapshot
+stays 14)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

@@ -44,6 +44,14 @@
 //!   (the qwen arm's rule).
 //! - rm-602 extension: the qwen stats/modelUsage arms take the first
 //!   PRESENT alias per class (never the sum), like `qwen_usage`.
+//!
+//! Residual arm (run db0a9afb cycle 2, rm-601 id-class split per ccusage
+//! #1838): only `msg_…` ids are unique across a session — every other
+//! non-empty id is a gateway/local placeholder folding per
+//! (id, whole-second timestamp), with each usage-bearing scope beyond
+//! the first disclosed via `claude_placeholder_id_reuse:{id}`; usage on
+//! USER-typed rows folds through the same map (gateways replay a
+//! response's usage across both row types).
 
 use agenttrace_core::parse_file;
 use std::path::PathBuf;
@@ -461,5 +469,131 @@ fn codex_event_msg_rate_limit_snapshots_without_usage_are_ignored() {
     assert_eq!(
         session.metrics.wire_metadata.get("codex_plan_type"),
         Some(&"pro".to_string())
+    );
+}
+
+#[test]
+fn gateway_placeholder_id_reuse_folds_per_response_not_per_id() {
+    // rm-601 residual arm (run db0a9afb cycle 2, ccusage #1838's id-class
+    // split): only `msg_…` ids are unique across a session. A gateway
+    // reusing its `gateway-1` placeholder across DISTINCT responses used
+    // to max-merge them into ONE event — two responses reported 1x
+    // (pre-fix: 1000 in / 120 out). Placeholder ids now fold per
+    // (id, timestamp): the two same-second emissions of the FIRST
+    // response still fold at the max (1000/120, never the 170 sum), the
+    // :09 response owns its own event (400/40), and the reuse is
+    // disclosed instead of silently undercounting.
+    let session = fixture("claude-gateway-placeholder-reuse.jsonl");
+    assert_eq!(session.metrics.source_tool, "claude_code");
+    assert_eq!(session.metrics.tokens_input, 1400);
+    assert_eq!(session.metrics.tokens_output, 160);
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("claude_placeholder_id_reuse:gateway-1"),
+        Some(&1),
+        "a placeholder id reused across responses must disclose the reuse"
+    );
+}
+
+#[test]
+fn gateway_placeholder_tool_results_never_cross_merge_across_responses() {
+    // rm-601 residual arm on the rm-834 tool_result fold: both responses
+    // reuse the placeholder `gateway-9` AND the tool_use_id `call_1`.
+    // Pre-fix the (id, tool_use_id) key made the :09 response's result a
+    // "re-emission" — dropped behind a `tool_result_refold` disclosure
+    // (tool_results 1, turns 1, 150 in / 20 out). Per-response scoping
+    // keeps every response's own result, turn and tokens: the two
+    // same-second :08 rows still fold at the max (out 20, never 30).
+    let session = fixture("claude-gateway-placeholder-toolresult.jsonl");
+    assert_eq!(session.metrics.tokens_input, 450);
+    assert_eq!(session.metrics.tokens_output, 55);
+    assert_eq!(session.metrics.assistant_turns, 2);
+    assert_eq!(session.metrics.tool_results, 2);
+    assert!(
+        !session
+            .metrics
+            .disclosure_counters
+            .contains_key("tool_result_refold:call_1"),
+        "distinct responses' results must not be disclosed as re-emissions"
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("claude_placeholder_id_reuse:gateway-9"),
+        Some(&3),
+        "four distinct (id, timestamp) scopes = three reuses disclosed"
+    );
+}
+
+#[test]
+fn gateway_placeholder_iterations_mine_each_response() {
+    // rm-601 residual arm on the rm-406 advisor fold: the mine set used
+    // to key on the id alone, so a placeholder id reused across DISTINCT
+    // responses attributed only the FIRST response's advisor spend
+    // (pre-fix totals 150 in / 15 out — one main event plus one advisor
+    // event). Both responses' main usage and both responses' advisor
+    // arrays now count: 2x(100/10) + 2x(50/5) = 300 in / 30 out.
+    let session = fixture("claude-gateway-placeholder-iterations.jsonl");
+    assert_eq!(session.metrics.tokens_input, 300);
+    assert_eq!(session.metrics.tokens_output, 30);
+    assert!(
+        session
+            .metrics
+            .model_attribution
+            .contains_key("gpt-5.1-codex"),
+        "both responses' advisor spend must be attributed to the advisor model"
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("claude_placeholder_id_reuse:gateway-7"),
+        Some(&1)
+    );
+}
+
+#[test]
+fn gateway_placeholder_same_second_reemissions_still_fold_at_max() {
+    // rm-601 residual arm, sub-second pin: claude-code timestamps carry
+    // milliseconds, and the placeholder scope must be the whole SECOND —
+    // the two :05 rows below differ (:05.100 vs :05.900) but are ONE
+    // response's re-emissions. Pre-fix (id, full-timestamp) keying made
+    // them distinct scopes: 1200 in / 120 out and TWO reuse disclosures.
+    // Correct: fold :05 at the max (500/50), then the distinct-second
+    // :08 response counts its own scope (400/40) = 900 in / 90 out, one
+    // disclosed reuse.
+    let session = fixture("claude-gateway-placeholder-same-second.jsonl");
+    assert_eq!(session.metrics.tokens_input, 900);
+    assert_eq!(session.metrics.tokens_output, 90);
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("claude_placeholder_id_reuse:gw-ss"),
+        Some(&1),
+        "same-second re-emissions are one scope; only the :08 response mints a second"
+    );
+}
+
+#[test]
+fn user_row_usage_folds_into_the_same_second_scope() {
+    // rm-601 residual arm, user-row pin: a gateway replaying a response's
+    // usage (ccusage #1838's shape) can stamp it on a user-typed row.
+    // Pre-fix the user arm never folded message.usage — this fixture's
+    // 999-token output silently vanished (reported 120). The user row
+    // folds through the SAME per-scope map: one (id, second) scope,
+    // max per token class, and no reuse disclosure (nothing was reused).
+    let session = fixture("claude-user-row-usage-folds-same-scope.jsonl");
+    assert_eq!(session.metrics.tokens_input, 1000);
+    assert_eq!(session.metrics.tokens_output, 999);
+    assert!(
+        !session
+            .metrics
+            .disclosure_counters
+            .contains_key("claude_placeholder_id_reuse:gw-ux"),
+        "user + same-second assistant rows are ONE response scope, not a reuse"
     );
 }

@@ -5685,6 +5685,116 @@ fn claude_org_identity(obj: &JsonObject) -> Option<(String, String)> {
     Some((org.to_string(), email.to_string()))
 }
 
+/// rm-601 residual arm (run db0a9afb cycle 2, ccusage #1838's id-class
+/// split): the streaming folds in `parse_claude_code_jsonl` used to key
+/// EVERY non-empty message id by the id alone, but only Anthropic's
+/// `msg_…` ids are unique across a whole session. Any other non-empty id
+/// is a gateway/local placeholder — unique at best within one response —
+/// so a gateway reusing one placeholder across DISTINCT messages
+/// max-merged them into a single event (an undercount: two responses
+/// reported 1x, the wall's `gateway-1` red). The fold scope is now the
+/// id CLASS: real `msg_` ids keep the fold on the id alone (growing
+/// re-emissions at :05/:06/:07 still fold to the max per token class),
+/// while placeholder ids fold per (id, whole-second timestamp) —
+/// same-second re-emissions of one response keep folding at the max,
+/// distinct responses never cross-merge, and every usage-bearing scope
+/// beyond the first for that id is disclosed via
+/// `claude_placeholder_id_reuse:{id}` instead of silently
+/// undercounting.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ClaudeMessageKey {
+    Anthropic(String),
+    Placeholder { id: String, ts: String },
+}
+
+impl ClaudeMessageKey {
+    fn for_fold(id: &str, ts: &str) -> Self {
+        if id.starts_with("msg_") {
+            ClaudeMessageKey::Anthropic(id.to_string())
+        } else {
+            // Re-emissions of one response land within the same second
+            // but carry distinct sub-second stamps (:05.123 vs :05.456 in
+            // the fixtures); scope on the whole SECOND so same-second
+            // re-emissions keep folding at the max while DISTINCT
+            // responses (distinct seconds) never cross-merge.
+            let second = ts.split('.').next().unwrap_or(ts);
+            ClaudeMessageKey::Placeholder {
+                id: id.to_string(),
+                ts: second.to_string(),
+            }
+        }
+    }
+}
+
+/// rm-601 residual arm: fold ONE claude-code row's `message.usage` into
+/// the per-scope usage map shared by the user and assistant arms of
+/// `parse_claude_code_jsonl`. `msg_…` ids fold on the id alone (growing
+/// re-emissions across distinct timestamps still fold to the max); any
+/// other non-empty id is a placeholder folding per
+/// (id, whole-second timestamp), with each usage-bearing scope beyond
+/// the first for that id disclosed via
+/// `claude_placeholder_id_reuse:{id}`. An empty id has no key: every
+/// emission counts (pinned legacy).
+fn fold_claude_usage_row(
+    usage_by_message: &mut BTreeMap<ClaudeMessageKey, usize>,
+    placeholder_scopes: &mut BTreeMap<String, i64>,
+    reuse_disclosures: &mut BTreeMap<String, i64>,
+    events: &mut Vec<Event>,
+    message: &JsonObject,
+    ts: &str,
+    model: &str,
+) {
+    let Some(usage) = message.get("usage").and_then(usage_from_value) else {
+        return;
+    };
+    let message_id = string(message.get("id")).unwrap_or("");
+    let fold_key = if message_id.is_empty() {
+        None
+    } else {
+        Some(ClaudeMessageKey::for_fold(message_id, ts))
+    };
+    match fold_key
+        .as_ref()
+        .and_then(|key| usage_by_message.get(key).copied())
+    {
+        Some(index) => {
+            for (key, value) in usage {
+                let slot = events[index].usage.entry(key).or_insert(0);
+                *slot = (*slot).max(value);
+            }
+            // rm-834: the running total's last emission is the message's
+            // last activity — keep the meta slot at the final timestamp
+            // so session_end and duration cover the whole stream, not the
+            // first block.
+            if !ts.is_empty() {
+                events[index].timestamp = ts.to_string();
+            }
+        }
+        None => {
+            if let Some(key) = fold_key {
+                if let ClaudeMessageKey::Placeholder { id, .. } = &key {
+                    let scopes = placeholder_scopes.entry(id.clone()).or_insert(0);
+                    *scopes += 1;
+                    if *scopes > 1 {
+                        *reuse_disclosures
+                            .entry(disclosure_key("claude_placeholder_id_reuse", id))
+                            .or_insert(0) += 1;
+                    }
+                }
+                usage_by_message.insert(key, events.len());
+            }
+            events.push(Event {
+                role: "meta".to_string(),
+                timestamp: ts.to_string(),
+                usage,
+                model_used: model.to_string(),
+                source_tool: "claude_code".to_string(),
+                ..Event::default()
+            });
+        }
+    }
+}
+
 fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
@@ -5702,26 +5812,44 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // timestamp advances to the last emission. Turns, tool calls and
     // session_end/duration therefore describe the message once, at its
     // final state — instead of once per streamed block.
-    let mut usage_by_message: BTreeMap<String, usize> = BTreeMap::new();
-    let mut assistant_by_message: BTreeMap<String, usize> = BTreeMap::new();
+    // rm-601 residual arm: both folds key on `ClaudeMessageKey` — real
+    // `msg_…` ids fold on the id alone while gateway/local placeholder
+    // ids fold per (id, whole-second timestamp), so a gateway reusing one placeholder
+    // across DISTINCT messages stops max-merging them into a single
+    // undercounting event (see the enum's doc above).
+    let mut usage_by_message: BTreeMap<ClaudeMessageKey, usize> = BTreeMap::new();
+    let mut assistant_by_message: BTreeMap<ClaudeMessageKey, usize> = BTreeMap::new();
     // rm-300 reserved-namespace arm (run 57c491338818): the fold keys for
     // journal-supplied tool_use_ids and for synthesized id-less rows are
     // structurally disjoint enum variants — a hostile wire id literally
     // "#2" can never alias the id-less row at ordinal 2, and a true
     // re-fold is disclosed via `tool_result_refold:*` counters instead of
     // silently dropping the row.
+    // rm-601 residual arm: the message part of every entry keys on
+    // `ClaudeMessageKey`, so two DISTINCT responses reusing a gateway
+    // placeholder id never treat each other's tool_results as
+    // re-emissions (that used to drop the second response's result
+    // behind only a `tool_result_refold` disclosure).
     #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
     enum ToolResultFoldKey {
         Wire(String),
         Idless(usize),
     }
-    let mut tool_results_by_message: BTreeSet<(String, ToolResultFoldKey)> = BTreeSet::new();
+    let mut tool_results_by_message: BTreeSet<(ClaudeMessageKey, ToolResultFoldKey)> =
+        BTreeSet::new();
     let mut tool_result_refolds: BTreeMap<String, i64> = BTreeMap::new();
+    // rm-601 residual arm: distinct (id, second) scopes minted per
+    // placeholder id — a second scope for the same id is exactly the
+    // reuse the `claude_placeholder_id_reuse:{id}` disclosure names.
+    let mut placeholder_scopes: BTreeMap<String, i64> = BTreeMap::new();
     // rm-406 (dated 2026-10-07 arm): message ids whose usage.iterations[]
     // array was already mined — the streaming re-emission problem rm-601
     // solved for top-level usage applies to the iterations array verbatim
-    // (every re-emission repeats it in full).
-    let mut iterations_mined: BTreeSet<String> = BTreeSet::new();
+    // (every re-emission repeats it in full). rm-601 residual arm: the
+    // mine set keys on `ClaudeMessageKey` like the streaming folds, so a
+    // placeholder id reused across DISTINCT responses mines each
+    // response's own advisor array.
+    let mut iterations_mined: BTreeSet<ClaudeMessageKey> = BTreeSet::new();
     let mut cwd = String::new();
     // rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
     // org identity capture — `$.session.identity` rides any line
@@ -5825,6 +5953,23 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     continue;
                 };
                 claude_user_content_events(message.get("content"), &ts, &model, &mut events);
+                // rm-601 residual arm (ccusage #1838's gateway shape): a
+                // gateway replaying a response's usage can stamp it on a
+                // user-typed row too — dropping it silently undercounts
+                // that response's own scope, so the user arm folds usage
+                // through the SAME per-scope map the assistant arm uses
+                // (same id class, same max-fold, same disclosure
+                // channel). A user row whose usage no other row repeats
+                // simply mints its own scope.
+                fold_claude_usage_row(
+                    &mut usage_by_message,
+                    &mut placeholder_scopes,
+                    &mut tool_result_refolds,
+                    &mut events,
+                    message,
+                    &ts,
+                    &model,
+                );
             }
             "assistant" => {
                 saw_claude = true;
@@ -5838,38 +5983,20 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         model = next_model.to_string();
                     }
                 }
-                if let Some(usage) = message.get("usage").and_then(usage_from_value) {
-                    let message_id = string(message.get("id")).unwrap_or("");
-                    match usage_by_message.get(message_id).copied() {
-                        Some(index) => {
-                            for (key, value) in usage {
-                                let slot = events[index].usage.entry(key).or_insert(0);
-                                *slot = (*slot).max(value);
-                            }
-                            // rm-834: the running total's last emission is
-                            // the message's last activity — keep the meta
-                            // slot at the final timestamp so session_end and
-                            // duration cover the whole stream, not the first
-                            // block.
-                            if !ts.is_empty() {
-                                events[index].timestamp = ts.clone();
-                            }
-                        }
-                        None => {
-                            if !message_id.is_empty() {
-                                usage_by_message.insert(message_id.to_string(), events.len());
-                            }
-                            events.push(Event {
-                                role: "meta".to_string(),
-                                timestamp: ts.clone(),
-                                usage,
-                                model_used: model.clone(),
-                                source_tool: "claude_code".to_string(),
-                                ..Event::default()
-                            });
-                        }
-                    }
-                }
+                // rm-601 residual arm: usage folding is shared with the
+                // user arm above — gateway journals replay one response's
+                // usage across user- and assistant-typed rows (ccusage
+                // #1838's gateway shape), so both ride the same per-scope
+                // fold.
+                fold_claude_usage_row(
+                    &mut usage_by_message,
+                    &mut placeholder_scopes,
+                    &mut tool_result_refolds,
+                    &mut events,
+                    message,
+                    &ts,
+                    &model,
+                );
                 // rm-406 (dated 2026-10-07 arm): Claude Code advisor-model
                 // usage rides message.usage.iterations[] (tokscale #1386):
                 // advisor turns report their own model and their own usage
@@ -5928,6 +6055,14 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             let tool_use_id =
                                 string(block.get("tool_use_id")).unwrap_or("").to_string();
                             let message_id = string(message.get("id")).unwrap_or("");
+                            // rm-601 residual arm: the dedup key's message
+                            // part mirrors the usage fold's id class — see
+                            // the comment at the map's declaration.
+                            let message_key = if message_id.is_empty() {
+                                None
+                            } else {
+                                Some(ClaudeMessageKey::for_fold(message_id, &ts))
+                            };
                             tool_result_ordinal += 1;
                             let idless = tool_use_id.is_empty();
                             let ordinal = tool_result_ordinal;
@@ -5936,9 +6071,9 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             } else {
                                 ToolResultFoldKey::Wire(tool_use_id.clone())
                             };
-                            if !message_id.is_empty()
-                                && !tool_results_by_message
-                                    .insert((message_id.to_string(), dedup_key))
+                            if message_key
+                                .map(|key| !tool_results_by_message.insert((key, dedup_key)))
+                                .unwrap_or(false)
                             {
                                 let label = if idless {
                                     format!("#{ordinal}")
@@ -5970,6 +6105,15 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     || !reasoning_parts.is_empty()
                     || !tool_calls.is_empty()
                 {
+                    let message_id = string(message.get("id")).unwrap_or("");
+                    // rm-601 residual arm: the fold key mirrors the usage
+                    // fold's id class (built before the event literal
+                    // because the literal moves `ts`).
+                    let assistant_key = if message_id.is_empty() {
+                        None
+                    } else {
+                        Some(ClaudeMessageKey::for_fold(message_id, &ts))
+                    };
                     let assistant_event = Event {
                         role: "assistant".to_string(),
                         content: assistant_parts.join("\n"),
@@ -5980,43 +6124,46 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         source_tool: "claude_code".to_string(),
                         ..Event::default()
                     };
-                    // rm-834: fold the snapshot per message id — the last
+                    // rm-834: fold the snapshot per message key — the last
                     // re-emission (the complete one) replaces the earlier
                     // partial snapshot in place, so turns, tool calls,
                     // anomalies and spans see the message once. Id-less
-                    // rows keep one event per row (pinned legacy).
-                    let message_id = string(message.get("id")).unwrap_or("");
-                    if message_id.is_empty() {
-                        events.push(assistant_event);
-                    } else {
-                        match assistant_by_message.get_mut(message_id) {
-                            Some(index) => {
-                                // rm-891: the fold is keep-max for usage
-                                // but used to be last-wins for content — a
-                                // final re-emission that omits the thinking
-                                // block an earlier snapshot carried
-                                // silently deleted it (reasoning collapsed
-                                // to empty). Per-field union: an empty
-                                // field on the latest snapshot keeps the
-                                // previous non-empty one; a non-empty
-                                // field still replaces, so monotonic
-                                // growth stays byte-identical.
-                                let previous =
-                                    std::mem::replace(&mut events[*index], assistant_event);
-                                let merged = &mut events[*index];
-                                if merged.content.is_empty() {
-                                    merged.content = previous.content;
+                    // rows keep one event per row (pinned legacy);
+                    // placeholder ids fold per (id, whole-second timestamp) so a reused
+                    // gateway placeholder never merges DISTINCT messages'
+                    // snapshots (rm-601 residual arm).
+                    match assistant_key {
+                        None => events.push(assistant_event),
+                        Some(assistant_key) => {
+                            match assistant_by_message.get_mut(&assistant_key) {
+                                Some(index) => {
+                                    // rm-891: the fold is keep-max for usage
+                                    // but used to be last-wins for content — a
+                                    // final re-emission that omits the thinking
+                                    // block an earlier snapshot carried
+                                    // silently deleted it (reasoning collapsed
+                                    // to empty). Per-field union: an empty
+                                    // field on the latest snapshot keeps the
+                                    // previous non-empty one; a non-empty
+                                    // field still replaces, so monotonic
+                                    // growth stays byte-identical.
+                                    let previous =
+                                        std::mem::replace(&mut events[*index], assistant_event);
+                                    let merged = &mut events[*index];
+                                    if merged.content.is_empty() {
+                                        merged.content = previous.content;
+                                    }
+                                    if merged.reasoning.is_empty() {
+                                        merged.reasoning = previous.reasoning;
+                                    }
+                                    if merged.tool_calls.is_empty() {
+                                        merged.tool_calls = previous.tool_calls;
+                                    }
                                 }
-                                if merged.reasoning.is_empty() {
-                                    merged.reasoning = previous.reasoning;
+                                None => {
+                                    assistant_by_message.insert(assistant_key, events.len());
+                                    events.push(assistant_event);
                                 }
-                                if merged.tool_calls.is_empty() {
-                                    merged.tool_calls = previous.tool_calls;
-                                }
-                            }
-                            None => {
-                                assistant_by_message.insert(message_id.to_string(), events.len());
-                                events.push(assistant_event);
                             }
                         }
                     }
@@ -6163,14 +6310,19 @@ fn claude_iterations_events(
     message: &JsonObject,
     ts: &str,
     model: &str,
-    mined: &mut BTreeSet<String>,
+    mined: &mut BTreeSet<ClaudeMessageKey>,
     events: &mut Vec<Event>,
 ) {
     let message_id = string(message.get("id")).unwrap_or("");
     // Id-less messages mirror the legacy rm-601 behavior for top-level
     // usage (every emission counts); an id-bearing message is mined
     // exactly once no matter how many streaming rows repeat the array.
-    if !message_id.is_empty() && !mined.insert(message_id.to_string()) {
+    // rm-601 residual arm: the mine key follows the streaming folds' id
+    // class — real `msg_…` ids mine once per id while a gateway
+    // placeholder reused across DISTINCT responses mines each
+    // response's own advisor array instead of attributing only the
+    // first response's advisor spend.
+    if !message_id.is_empty() && !mined.insert(ClaudeMessageKey::for_fold(message_id, ts)) {
         return;
     }
     let Some(iterations) = message

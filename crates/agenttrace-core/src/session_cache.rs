@@ -8,7 +8,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 72;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 73;
+// Bumped 72 -> 73 (run db0a9afba6ee4a168537838967b80b38 cycle 2
+// "claude-lane cost truth + quarantine truthfulness", rm-601 residual
+// arm): the claude streaming folds (usage max-merge, rm-834 assistant
+// snapshot fold, rm-834 tool_result dedup, rm-406 advisor-iterations
+// mining) key on the message id CLASS — real `msg_…` ids fold on the id
+// alone while any other non-empty id is a gateway/local placeholder
+// that folds per (id, timestamp), with each usage-bearing reuse beyond
+// the first scope disclosed via `claude_placeholder_id_reuse:{id}`
+// (parser.rs ClaudeMessageKey). Cached rows written before this rung
+// folded placeholder-reuse journals into a single undercounting event;
+// the bump regenerates them so a warm row can never serve the merged
+// undercount a re-parse would split. No SQLite snapshot rung rides the
+// batch; the landed 14 (run 9d3b927c, below) remains the snapshot
+// ceiling. Entries regenerate once on next scan.
 // Bumped 71 -> 72 (integration of run 4eeea89188b245068a569ba76f8caa71
 // cycle 2 "truth of the default surfaces", rm-1553: the claude identity
 // capture (orgIdentifier/loginEmail) is now capped at capture
