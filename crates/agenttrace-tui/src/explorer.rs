@@ -613,17 +613,24 @@ impl App {
             }
 
             ExplorerView::Context => indices.sort_by(|a, b| {
-                self.sessions[*b]
-                    .diagnostics
-                    .context_utilization
-                    .utilization_pct
-                    .partial_cmp(
-                        &self.sessions[*a]
-                            .diagnostics
-                            .context_utilization
-                            .utilization_pct,
-                    )
-                    .unwrap_or(Ordering::Equal)
+                // rm-1500 family (run 575b0a78 U1): gate NaN/inf to 0.0
+                // and total_cmp — utilization_pct is NaN whenever the
+                // context window total is 0 (diagnostics), and the old
+                // partial_cmp().unwrap_or(Equal) made it tie with
+                // everything, an inconsistent order a sort is allowed
+                // to reject.
+                shared::finite_cost(
+                    self.sessions[*b]
+                        .diagnostics
+                        .context_utilization
+                        .utilization_pct,
+                )
+                .total_cmp(&shared::finite_cost(
+                    self.sessions[*a]
+                        .diagnostics
+                        .context_utilization
+                        .utilization_pct,
+                ))
             }),
             ExplorerView::Storage => indices
                 .sort_by_key(|index| std::cmp::Reverse(session_file_size(&self.sessions[*index]))),
@@ -1349,7 +1356,11 @@ fn tools_preview(session: &Session, language: Language) -> String {
         .tool_latencies
         .iter()
         .collect::<Vec<_>>();
-    latency.sort_by(|a, b| b.p95_sec.partial_cmp(&a.p95_sec).unwrap_or(Ordering::Equal));
+    // rm-1500 family (run 575b0a78 U2): gate NaN/inf p95 to 0.0 and
+    // total_cmp so the descending order stays a total order — a NaN
+    // p95 sorts to the bottom instead of tying with everything.
+    latency
+        .sort_by(|a, b| shared::finite_cost(b.p95_sec).total_cmp(&shared::finite_cost(a.p95_sec)));
     let latency = latency
         .into_iter()
         .take(6)
@@ -2996,5 +3007,42 @@ mod interaction_tests {
         let summary = share_summary(app.explorer_session().unwrap());
         assert!(!summary.contains("beta"));
         assert!(!summary.contains(&app.explorer_session().unwrap().name));
+    }
+}
+
+// run 575b0a78 U2 (rm-1500 family): NaN p95_sec must sort
+// deterministically (gated to 0.0 + total_cmp), not tie with
+// everything via partial_cmp().unwrap_or(Equal). Lives in this module
+// for private-fn access to tools_preview; the session fixture helper
+// is pub(crate) in crate::app::tests.
+#[cfg(test)]
+mod run575_latency {
+    use super::*;
+    use crate::app::tests::session;
+
+    #[test]
+    fn nan_p95_latency_sorts_to_the_bottom() {
+        let tl = |name: &str, p95: f64| agenttrace_core::ToolLatency {
+            tool_name: name.to_string(),
+            p95_sec: p95,
+            count: 0,
+            avg_sec: 0.0,
+            max_sec: 0.0,
+            min_sec: 0.0,
+            unmatched: 0,
+            is_slow: false,
+        };
+        let mut s = session("nanlat", "claude_code", "gpt-5", 100, 0.0, "bash");
+        s.diagnostics.tool_latencies =
+            vec![tl("zz-nan", f64::NAN), tl("aa-hi", 3.0), tl("mm-lo", 1.0)];
+        let app = App::new(Vec::new(), "test", None);
+        let out = tools_preview(&s, app.language);
+        let p_nan = out.find("zz-nan").expect("nan tool rendered");
+        let p_hi = out.find("aa-hi").expect("hi tool rendered");
+        let p_lo = out.find("mm-lo").expect("lo tool rendered");
+        assert!(
+            p_hi < p_lo && p_lo < p_nan,
+            "descending p95 with NaN at the bottom; got hi={p_hi} lo={p_lo} nan={p_nan}"
+        );
     }
 }

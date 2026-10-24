@@ -1391,8 +1391,30 @@ fn render_recommendations_markdown(out: &mut String, items: &[crate::Recommendat
 /// numeric fields (`total_duration_seconds`, `total_cost`, `total_tokens`) are
 /// required up front, so an empty or partial summary cannot zero-fill its way
 /// into a fabricated +100% regression.
+/// Baseline reads are bounded (run 575b0a78 U4, rm-212 family): a
+/// user-supplied --baseline file used to load fully into memory before
+/// JSON parsing; past the cap the lane refuses with a disclosed error.
+const BASELINE_READ_CAP_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_baseline_capped(path: &str) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    fs::File::open(path)?
+        .take(BASELINE_READ_CAP_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > BASELINE_READ_CAP_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!(
+                "baseline file exceeds the {BASELINE_READ_CAP_BYTES}-byte read cap; refusing the unbounded read"
+            ),
+        ));
+    }
+    Ok(text)
+}
+
 fn load_baseline_report(baseline_path: &str) -> anyhow::Result<Value> {
-    let baseline_text = match fs::read_to_string(baseline_path) {
+    let baseline_text = match read_baseline_capped(baseline_path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
             anyhow::bail!("--baseline: {baseline_path} is not valid UTF-8: {err}");
@@ -4628,5 +4650,32 @@ mod tests {
         // HTML lane carries the same marker.
         let html = report_overview_html(&overview, &sessions);
         assert!(html.contains("(fallback pricing)"));
+    }
+}
+
+// run 575b0a78 U4 (rm-212 family): --baseline reads are capped — an
+// oversized baseline is refused with a disclosed error.
+#[cfg(test)]
+mod run575_baseline_cap {
+    use super::*;
+
+    #[test]
+    fn oversized_baseline_is_refused() {
+        let dir = std::env::temp_dir().join(format!("at-run575-u4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("huge-baseline.json");
+        let mut body = String::from("{}");
+        while body.len() <= 17 * 1024 * 1024 {
+            body.push(' ');
+        }
+        std::fs::write(&p, &body).unwrap();
+        let err = load_baseline_report(p.to_str().unwrap())
+            .expect_err("oversized baseline must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("read cap") || msg.to_lowercase().contains("cap"),
+            "refusal must disclose the cap, got: {msg}"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 }

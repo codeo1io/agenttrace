@@ -2119,7 +2119,14 @@ fn tui_cost_folds_and_comparator_gate_non_finite_costs() {
     );
 }
 
-fn session(name: &str, source: &str, model: &str, health: i32, cost: f64, tool: &str) -> Session {
+pub(crate) fn session(
+    name: &str,
+    source: &str,
+    model: &str,
+    health: i32,
+    cost: f64,
+    tool: &str,
+) -> Session {
     let mut metrics = Metrics {
         source_tool: source.to_string(),
         model_used: model.to_string(),
@@ -2894,5 +2901,45 @@ fn boot_load_summary_discloses_replay_adjustment() {
     assert!(
         line.contains("1 replay-adjusted sessions"),
         "boot summary must disclose the replay adjustment on first launch: {line}"
+    );
+}
+
+// run 575b0a78 U1 (rm-1500 family): NaN utilization_pct and NaN
+// p95_sec must sort deterministically (gated to 0.0 + total_cmp), not
+// tie with everything via partial_cmp().unwrap_or(Equal). App::new
+// pre-orders sessions (most recent first), so the assertions ride the
+// sorted values, not raw positions.
+#[test]
+fn nan_utilization_pct_sorts_deterministically() {
+    let mut s_hi = session("hi", "claude_code", "gpt-5", 100, 0.0, "bash");
+    s_hi.diagnostics.context_utilization.utilization_pct = 50.0;
+    let mut s_nan = session("nan", "claude_code", "gpt-5", 100, 0.0, "bash");
+    s_nan.diagnostics.context_utilization.utilization_pct = f64::NAN;
+    let mut s_lo = session("lo", "claude_code", "gpt-5", 100, 0.0, "bash");
+    s_lo.diagnostics.context_utilization.utilization_pct = 25.0;
+    let mut app = App::new(vec![s_hi, s_nan, s_lo], "test", None);
+    app.explorer_view = ExplorerView::Context;
+    let indices = app.explorer_indices();
+    let ordered: Vec<f64> = indices
+        .iter()
+        .map(|&index| {
+            app.sessions[index]
+                .diagnostics
+                .context_utilization
+                .utilization_pct
+        })
+        .collect();
+    assert_eq!(ordered.len(), 3, "all three sessions must be listed");
+    assert_eq!(
+        ordered[0], 50.0,
+        "highest finite utilization first; got {ordered:?}"
+    );
+    assert_eq!(
+        ordered[1], 25.0,
+        "then the lower finite one; got {ordered:?}"
+    );
+    assert!(
+        ordered[2].is_nan(),
+        "NaN utilization must gate to 0.0 and sort LAST, not tie with everything; got {ordered:?}"
     );
 }

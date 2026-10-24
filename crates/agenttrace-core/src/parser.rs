@@ -77,9 +77,12 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
 /// opencode reads (`read_opencode_records` and the opencode
 /// project-doc read) are stat-capped at
 /// `OPENCODE_TRANSCRIPT_READ_CAP_BYTES` (10 MiB) and compose with
-/// this cap — the remaining uncapped member is the opencode
-/// fork-parent pointer probe in discovery
-/// (`opencode_session_fork_parent`), tracked on rm-548's open row. `parse_file` serves the claude/codex/pi/cline named-file +
+/// this cap; the opencode fork-parent pointer probe in discovery
+/// (`opencode_session_fork_parent`) is itself stat-capped at
+/// `OPENCODE_INFO_DOC_READ_CAP_BYTES` (1 MiB) on the rm-548 lane, and
+/// run 575b0a78 (U3/U4) bounds the remaining marker/baseline reads
+/// (insights `worktree_main_root`, reports `load_baseline_report`) —
+/// no uncapped members remain. `parse_file` serves the claude/codex/pi/cline named-file +
 /// positional CLI lane; a huge file used to load fully into
 /// memory before format rejection (300 MiB of NULs peaked at 613
 /// MiB RSS via the positional lane, assess 635ecf6a F2). The read

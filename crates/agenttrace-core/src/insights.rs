@@ -720,9 +720,24 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
 
 // Linked worktrees carry a `.git` file ("gitdir: <repo>/.git/worktrees/<name>"); group them
 // under the main checkout so every agent worktree counts as the same project.
+/// Marker reads are bounded (run 575b0a78 U3, rm-212 family): git
+/// never writes a `.git` pointer bigger than a path, so anything past
+/// the cap cannot be a gitdir marker — oversized markers are refused
+/// (None) rather than read fully into memory.
+const WORKTREE_MARKER_READ_CAP_BYTES: u64 = 64 * 1024;
+
 fn worktree_main_root(marker: &Path) -> Option<PathBuf> {
-    let content = std::fs::read_to_string(marker).ok()?;
-    let gitdir = PathBuf::from(content.strip_prefix("gitdir:")?.trim());
+    use std::io::Read as _;
+    let mut text = String::new();
+    std::fs::File::open(marker)
+        .ok()?
+        .take(WORKTREE_MARKER_READ_CAP_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > WORKTREE_MARKER_READ_CAP_BYTES {
+        return None;
+    }
+    let gitdir = PathBuf::from(text.strip_prefix("gitdir:")?.trim());
     let git = gitdir.parent()?.parent()?;
     (git.file_name()? == ".git").then(|| git.parent().map(Path::to_path_buf))?
 }
@@ -1500,5 +1515,44 @@ mod tests {
         assert!(TimeRange::Today
             .since(now)
             .is_some_and(|start| start <= now));
+    }
+}
+
+// run 575b0a78 U3 (rm-212 family): the `.git` marker read is capped —
+// an oversized "marker" is refused instead of read fully.
+#[cfg(test)]
+mod run575_marker_cap {
+    use super::*;
+
+    fn marker_path(tag: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("at-run575-u3-{}-{}", tag, std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(".git");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn oversized_git_marker_is_refused() {
+        let mut body = String::from("gitdir: /repo/.git/worktrees/w\n");
+        while body.len() <= 256 * 1024 {
+            body.push_str("0123456789");
+        }
+        let p = marker_path("oversize", &body);
+        assert!(
+            worktree_main_root(&p).is_none(),
+            "oversized .git marker must be refused, not read fully"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn normal_git_marker_still_resolves() {
+        let root = std::env::temp_dir().join(format!("at-run575-u3-ok-{}", std::process::id()));
+        let wt = root.join("repo/.git/worktrees/w");
+        std::fs::create_dir_all(&wt).unwrap();
+        let p = marker_path("normal", &format!("gitdir: {}\n", wt.display()));
+        assert!(worktree_main_root(&p).is_some());
+        let _ = std::fs::remove_file(&p);
     }
 }
