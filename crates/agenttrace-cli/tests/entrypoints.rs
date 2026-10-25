@@ -3463,6 +3463,209 @@ fn cli_quota_view_reports_plan_windows_and_guards_its_lane() {
 }
 
 #[test]
+fn cli_quota_forecast_layers_over_the_quota_view() {
+    // rm-2033 (run a356ccb78fc1 cycle 2, batch CU-1): `--quota --forecast`
+    // layers a per-window burn-rate projection over the stable
+    // agenttrace.quota/1 report without changing one byte of the plain
+    // --quota lanes — the non-forecast json must gain no "forecast"
+    // member and the text lane must stay free of forecast prose.
+    let sandbox = scratch("at-quota-forecast-cli");
+    std::fs::create_dir_all(&sandbox).expect("sandbox dir");
+    let journal = sandbox.join("forecast-corpus.jsonl");
+    let body = concat!(
+        "{\"role\":\"assistant\",\"content\":\"old week work\",\"timestamp\":\"2026-10-03T10:00:00Z\",\"ModelUsed\":\"gpt-5\",\"SourceTool\":\"generic\",\"usage\":{\"input_tokens\":50000,\"output_tokens\":9000}}\n",
+        "{\"role\":\"assistant\",\"content\":\"recent work\",\"timestamp\":\"2026-10-12T06:30:00Z\",\"ModelUsed\":\"gpt-5\",\"SourceTool\":\"generic\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":200}}\n",
+        "{\"role\":\"assistant\",\"content\":\"newest work\",\"timestamp\":\"2026-10-12T07:45:00Z\",\"ModelUsed\":\"gpt-5\",\"SourceTool\":\"generic\",\"usage\":{\"input_tokens\":1200,\"output_tokens\":300}}\n",
+    );
+    std::fs::write(&journal, body).expect("fixture write");
+    let path = journal.to_str().expect("fixture path is UTF-8");
+
+    // The overlay lane: schema stays quota/1, forecast rides beside it.
+    let json = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", "--forecast", "-f", "json", path])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        json.status.success(),
+        "quota forecast json lane failed: {:?}",
+        json.status
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&json.stdout).trim_end())
+            .expect("quota forecast json lane is one pure JSON document");
+    assert_eq!(report["schema"], "agenttrace.quota/1");
+    let forecast = &report["forecast"];
+    assert!(
+        forecast.is_object(),
+        "the forecast member rides the quota report: {forecast}"
+    );
+    assert!(
+        forecast["basis"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("excluded from the rate and disclosed, not extrapolated"),
+        "the projection basis discloses the partial-TTL exclusion: {:?}",
+        forecast["basis"]
+    );
+    assert!(
+        forecast["basis"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("attribution follows"),
+        "the projection basis names the attribution discipline: {:?}",
+        forecast["basis"]
+    );
+    for window in ["five_hour", "weekly"] {
+        let arm = &forecast[window];
+        assert!(
+            arm.get("excluded").is_none() && arm["burn_rate_usd_per_hour"].is_f64(),
+            "the 213.75h corpus observes both windows fully (Full arm, not excluded): {arm}"
+        );
+        let rate = arm["burn_rate_usd_per_hour"].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            rate.is_finite() && rate > 0.0,
+            "{window} burn rate must be finite and positive: {rate}"
+        );
+        assert!(
+            arm["projected_next_window_usd"]
+                .as_f64()
+                .unwrap_or(f64::NAN)
+                .is_finite(),
+            "{window} projection must be finite"
+        );
+        assert!(
+            arm["attribution"].is_object(),
+            "{window} attribution disclosure must ride the arm"
+        );
+    }
+
+    // The text lane renders the projection beside the window summary.
+    let text = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", "--forecast", path])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        text.status.success(),
+        "quota forecast text lane failed: {:?}",
+        text.status
+    );
+    let text_stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text_stdout.contains("forecast (linear, local-first):"),
+        "the text lane names the forecast model: {text_stdout}"
+    );
+
+    // Zero-byte discipline (CU-1 acceptance): plain --quota gains
+    // nothing — the byte-level golden is "no forecast member, no
+    // forecast prose" on both lanes.
+    let plain_json = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", "-f", "json", path])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        plain_json.status.success(),
+        "plain quota json lane failed: {:?}",
+        plain_json.status
+    );
+    let plain = String::from_utf8_lossy(&plain_json.stdout);
+    assert!(
+        !plain.contains("forecast"),
+        "plain --quota output must not gain a forecast member: {plain}"
+    );
+    let plain_text = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", path])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        plain_text.status.success(),
+        "plain quota text lane failed: {:?}",
+        plain_text.status
+    );
+    assert!(
+        !String::from_utf8_lossy(&plain_text.stdout).contains("forecast"),
+        "plain --quota text lane must stay free of forecast prose"
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn cli_quota_forecast_refuses_loudly_when_detached_or_starved() {
+    // rm-2033 refusal discipline (the main.rs loud-bail convention):
+    // --forecast without --quota is a usage refusal, and a starved
+    // corpus (1.5h observed < the 5h floor) is a named rc1 refusal —
+    // never a $0.00 projection riding an empty window.
+    let fixture = generated_fixture("detailed-tool-steps.jsonl")
+        .to_str()
+        .expect("fixture path is valid UTF-8")
+        .to_string();
+
+    let detached = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--forecast", &fixture])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        !detached.status.success(),
+        "--forecast without --quota must exit non-zero"
+    );
+    let detached_err = String::from_utf8_lossy(&detached.stderr);
+    assert!(
+        detached_err.contains("--forecast requires --quota"),
+        "the detached-flag refusal names the rule: {detached_err:?}"
+    );
+
+    let sandbox = scratch("at-quota-forecast-starved-cli");
+    std::fs::create_dir_all(&sandbox).expect("sandbox dir");
+    let journal = sandbox.join("young-corpus.jsonl");
+    let body = concat!(
+        "{\"role\":\"assistant\",\"content\":\"young work\",\"timestamp\":\"2026-10-22T08:00:00Z\",\"ModelUsed\":\"gpt-5\",\"SourceTool\":\"generic\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":200}}\n",
+        "{\"role\":\"assistant\",\"content\":\"still young\",\"timestamp\":\"2026-10-22T09:30:00Z\",\"ModelUsed\":\"gpt-5\",\"SourceTool\":\"generic\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":200}}\n",
+    );
+    std::fs::write(&journal, body).expect("fixture write");
+
+    let starved = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--quota",
+            "--forecast",
+            journal.to_str().expect("fixture path is UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        !starved.status.success(),
+        "the starved forecast must exit non-zero"
+    );
+    let starved_err = String::from_utf8_lossy(&starved.stderr);
+    assert!(
+        starved_err.contains("insufficient signal"),
+        "the refusal names the signal floor: {starved_err:?}"
+    );
+    assert!(
+        starved_err.contains("--quota --forecast"),
+        "the refusal names the recovery path: {starved_err:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&starved.stdout).trim().is_empty(),
+        "a refused forecast must not half-render the quota view: {:?}",
+        String::from_utf8_lossy(&starved.stdout)
+    );
+
+    // The same starved corpus keeps rendering under plain --quota:
+    // the refusal belongs to the forecast layer, not the view.
+    let plain = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", journal.to_str().expect("fixture path is UTF-8")])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        plain.status.success(),
+        "plain --quota keeps working on the starved corpus: {:?}",
+        plain.status
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
 fn count_honesty_disclosures_in_cli_lanes() {
     // rm-1886/rm-1887/rm-1888 (run 77ca5de0 cycle 5, "count-honesty
     // ledger"): the --audit JSON report explains its own denominators —

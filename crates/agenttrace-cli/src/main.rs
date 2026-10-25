@@ -162,6 +162,13 @@ struct Args {
     /// data. Corpus-scope — view filters do not apply.
     #[arg(long)]
     quota: bool,
+    /// --forecast (rm-2033): layer per-window burn rate + projected
+    /// next-window spend over --quota with the estimate basis disclosed.
+    /// Partial-TTL windows are excluded from the rate and disclosed, never
+    /// extrapolated; starved corpora refuse loudly (exit 1) instead of
+    /// projecting from nothing. Follow-up on --quota.
+    #[arg(long)]
+    forecast: bool,
     /// Report on the Claude Code statusline capture journal (candidate
     /// 53, cycle 7): limit-pressure windows, reset crossings, and
     /// per-session prompt-cache miss causes recorded by
@@ -753,7 +760,20 @@ fn run() -> anyhow::Result<()> {
         // `--sample`, `--include-history`), which do not count `--quota`
         // as a session report action for exactly that reason.
         let sessions = load_sessions(&args)?;
-        let out = agenttrace_core::render_quota_view(&args.format, &sessions)?;
+        let out = if args.forecast {
+            match agenttrace_core::render_quota_view_forecast(&args.format, &sessions) {
+                Ok(out) => out,
+                Err(agenttrace_core::QuotaForecastError::InsufficientSignal(message)) => {
+                    eprintln!("{}", message);
+                    std::process::exit(1);
+                }
+                Err(agenttrace_core::QuotaForecastError::Render(message)) => {
+                    return Err(message);
+                }
+            }
+        } else {
+            agenttrace_core::render_quota_view(&args.format, &sessions)?
+        };
         let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
@@ -1407,6 +1427,7 @@ fn refuse_inapplicable_mcp_flags(args: &Args) {
     flag(args.update_pricing, "--update-pricing");
     flag(args.test_match, "--test-match");
     flag(args.quota, "--quota");
+    flag(args.forecast, "--forecast");
     flag(args.fetch, "--fetch");
     flag(args.weekly_budget.is_some(), "--weekly-budget");
     flag(args.budget, "--budget");
@@ -3259,6 +3280,15 @@ fn validate_range_applicability(args: &Args) -> anyhow::Result<()> {
             );
         }
     }
+    // rm-2033 forecast rider (run a356ccb78fc1 cycle 2): `--forecast`
+    // layers over the plan windows `--quota` bills; without --quota it
+    // has no windows to project and would silently render a plain
+    // quota view, so refuse the lone flag in this guard's own voice.
+    if args.forecast && !args.quota {
+        bail!(
+            "--forecast requires --quota: the forecast projects the --quota plan windows; pass both together (e.g. agenttrace --quota --forecast)"
+        );
+    }
     if args.range != "all" && !has_session_action(args) {
         bail!(
             "--range requires a session report action (for example --overview, --sessions, --diagnostics, --waste, --search QUERY, --compare, or --audit); the interactive and utility views ignore it"
@@ -3655,6 +3685,7 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
         list_models: false,
         statusline_report: false,
         quota: false,
+        forecast: false,
         fetch: false,
         update_pricing: false,
         test_match: false,

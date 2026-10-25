@@ -4,6 +4,29 @@
 
 ### Added
 
+- `--quota --forecast` projects each spend window to its own close with the
+  basis disclosed (rm-2033, run a356ccb78fc1 cycle 2): plain `--quota` keeps
+  its stable `agenttrace.quota/1` bytes byte-for-byte, while the opt-in
+  overlay adds a per-window burn rate (`spend / observed-active window
+  seconds`), projected window-end spend, and a `basis` disclosure naming the
+  linear model, the partial-TTL exclusion (a window whose observation span is
+  shorter than its TTL — e.g. a 6h-old corpus on the 7d window — is excluded
+  from projection, never silently projected), and the warm-cache attribution
+  discipline (recorded-cost sessions ride at face value; span-share fallback
+  covers warm-stream sessions whose billable seconds are not reconstructible).
+  Non-finite cost poison refuses loudly instead of projecting NaN/inf, and a
+  starved corpus (no usable events, <5h observed, or only-future timestamps)
+  is a named rc1 refusal, never a $0.00 forecast. Pinned by
+  `quota_forecast_contract` (8 tests) and the `cli_quota_forecast_*` CLI arms.
+- upstream merge-hazard plan for luoyuctl/agenttrace (rm-513 arms 1+3,
+  rm-2363 rider, run a356ccb78fc1 cycle 2):
+  `docs/stewardship/upstream-merge-plan-2026-10.md` records the explicit
+  pricing-architecture decision (keep the fork's bundled offline-first
+  snapshot; reject upstream runtime-fetch in the pricing seam), the
+  cache-schema renumber-above rule with its forced-reparse acceptance on
+  fixture v22/v7 caches, the fork-side path anchors to remap against upstream
+  renames, and the #320/#321 conflict maps (SHA-pinned actions; lockfile
+  walk order).
 - locally-defined model pricing is disclosed, not silently fabricated (rm-1426,
   run 7ee18a0d cycle 3): codex `model_catalog_json` / private-proxy deployments
   record slugs no pricing row backs — bare `glm-5.2` is absent from the bundled

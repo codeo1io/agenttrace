@@ -3515,6 +3515,296 @@ fn render_quota_text(report: &serde_json::Value) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// rm-2033 (cycle 2, run a356ccb78fc1): --quota --forecast.
+//
+// Forward-looking truth over the same plan windows --quota bills: a
+// per-window linear burn rate and the projected spend of an identical next
+// window at that rate, with the estimate basis disclosed. Windows the corpus
+// covers only partially (partial TTL) are excluded from the rate and
+// disclosed, never extrapolated; empty/starved corpora refuse loudly instead
+// of projecting from nothing. The non-forecast --quota output is untouched:
+// no forecast member is added to agenttrace.quota/1 unless --forecast is
+// passed.
+// ---------------------------------------------------------------------------
+
+/// Disclosed estimate basis for the forecast members (rm-2033: the basis is
+/// part of the contract, not an implementation detail).
+pub const QUOTA_FORECAST_BASIS: &str = "linear: burn rate = window spend / full window span; projected next-window spend = burn rate x window span; windows the corpus covers only partially (partial TTL) are excluded from the rate and disclosed, not extrapolated; attribution follows the quota window share classes (event-timed vs span-shared)";
+
+#[derive(Debug)]
+pub struct QuotaForecastWindow {
+    pub window_hours: f64,
+    pub observed_hours: f64,
+    pub burn_rate_usd_per_hour: f64,
+    pub projected_next_window_usd: f64,
+    pub window_spend_usd: f64,
+    pub attribution_event_basis: usize,
+    pub attribution_span_basis: usize,
+}
+
+#[derive(Debug)]
+pub enum QuotaForecastArm {
+    Full(QuotaForecastWindow),
+    Excluded {
+        reason: &'static str,
+        window_hours: f64,
+        observed_hours: f64,
+    },
+}
+
+#[derive(Debug)]
+pub struct QuotaForecast {
+    pub five_hour: QuotaForecastArm,
+    pub weekly: QuotaForecastArm,
+}
+
+#[derive(Debug)]
+pub enum QuotaForecastError {
+    /// Loud insufficient-signal refusal (the CLI maps this to exit code 1).
+    InsufficientSignal(String),
+    /// Same discipline as `render_quota_view` errors (CLI maps to exit 101).
+    Render(anyhow::Error),
+}
+
+/// Oldest at-or-before-now instant the corpus can bill from. Mirrors
+/// `quota_cutoff`'s plausibility discipline (events first, span fallback) so
+/// coverage can never overstate local observation.
+fn quota_forecast_oldest(sessions: &[Session]) -> Option<DateTime<Utc>> {
+    let now_ts = Utc::now().timestamp();
+    let mut oldest: Option<DateTime<Utc>> = None;
+    for session in sessions {
+        let mut candidate = session
+            .metrics
+            .timestamps
+            .iter()
+            .find(|ts| ts.timestamp() <= now_ts)
+            .copied();
+        if candidate.is_none() {
+            if let Some(start) = parse_ts(&session.metrics.session_start) {
+                if start.timestamp() <= now_ts {
+                    candidate = Some(start);
+                }
+            }
+        }
+        if let Some(candidate) = candidate {
+            oldest = Some(match oldest {
+                Some(current) if current <= candidate => current,
+                _ => candidate,
+            });
+        }
+    }
+    oldest
+}
+
+/// Per-window linear forecast over the plan windows `--quota` bills.
+/// Partial-TTL windows are excluded from the rate and disclosed; when no
+/// window qualifies the corpus is starved and the call refuses.
+pub fn quota_forecast(sessions: &[Session]) -> Result<QuotaForecast, QuotaForecastError> {
+    let refusal_no_placeable = || {
+        QuotaForecastError::InsufficientSignal(
+            "--quota --forecast: insufficient signal - no session carries a placeable instant at or before now, so no burn rate can be derived (refusing instead of projecting from nothing)"
+                .to_string(),
+        )
+    };
+    let (cutoff, _) = quota_cutoff(sessions);
+    let cutoff = match cutoff {
+        Some(cutoff) => cutoff,
+        None => return Err(refusal_no_placeable()),
+    };
+    let oldest = match quota_forecast_oldest(sessions) {
+        Some(oldest) => oldest,
+        None => return Err(refusal_no_placeable()),
+    };
+    let observed_hours = ((cutoff - oldest).num_seconds().max(0) as f64) / 3600.0;
+    let arm = |span_secs: i64| -> QuotaForecastArm {
+        let span = chrono::Duration::seconds(span_secs);
+        let window_hours = span_secs as f64 / 3600.0;
+        let window = quota_window(sessions, cutoff, span);
+        let window_start = cutoff - span;
+        let window_end = cutoff;
+        let mut attribution_event_basis = 0usize;
+        let mut attribution_span_basis = 0usize;
+        for session in sessions {
+            if let Some(share) = quota_cost_share(&session.metrics, &window_start, &window_end) {
+                if share > 0.0 {
+                    if session.metrics.timestamps.is_empty() {
+                        attribution_span_basis += 1;
+                    } else {
+                        attribution_event_basis += 1;
+                    }
+                }
+            }
+        }
+        if observed_hours + 1e-9 < window_hours {
+            return QuotaForecastArm::Excluded {
+                reason: "partial_ttl",
+                window_hours,
+                observed_hours,
+            };
+        }
+        if !window.spend_usd.is_finite() {
+            return QuotaForecastArm::Excluded {
+                reason: "non_finite_spend",
+                window_hours,
+                observed_hours,
+            };
+        }
+        let burn_rate_usd_per_hour = window.spend_usd / window_hours;
+        if !burn_rate_usd_per_hour.is_finite() {
+            return QuotaForecastArm::Excluded {
+                reason: "non_finite_rate",
+                window_hours,
+                observed_hours,
+            };
+        }
+        QuotaForecastArm::Full(QuotaForecastWindow {
+            window_hours,
+            observed_hours,
+            burn_rate_usd_per_hour,
+            projected_next_window_usd: burn_rate_usd_per_hour * window_hours,
+            window_spend_usd: window.spend_usd,
+            attribution_event_basis,
+            attribution_span_basis,
+        })
+    };
+    let five_hour = arm(5 * 3600);
+    let weekly = arm(7 * 24 * 3600);
+    if matches!(five_hour, QuotaForecastArm::Excluded { .. })
+        && matches!(weekly, QuotaForecastArm::Excluded { .. })
+    {
+        let poisoned = matches!(
+            (&five_hour, &weekly),
+            (
+                QuotaForecastArm::Excluded {
+                    reason: "non_finite_spend" | "non_finite_rate",
+                    ..
+                },
+                _
+            ) | (
+                _,
+                QuotaForecastArm::Excluded {
+                    reason: "non_finite_spend" | "non_finite_rate",
+                    ..
+                }
+            )
+        );
+        let message = if poisoned {
+            "--quota --forecast: insufficient signal - window spend did not reduce to a finite number (non-finite cost records poison the rate); refusing instead of projecting garbage".to_string()
+        } else {
+            format!(
+                "--quota --forecast: insufficient signal - the corpus covers only {:.1}h of placeable history, less than one full five-hour window (5.0h); partial-TTL windows are excluded from the rate rather than extrapolated, so no honest burn rate exists yet (refusing instead of projecting from nothing)",
+                observed_hours
+            )
+        };
+        return Err(QuotaForecastError::InsufficientSignal(message));
+    }
+    Ok(QuotaForecast { five_hour, weekly })
+}
+
+fn quota_forecast_window_json(window: &QuotaForecastWindow) -> Value {
+    serde_json::json!({
+        "burn_rate_usd_per_hour": window.burn_rate_usd_per_hour,
+        "projected_next_window_usd": window.projected_next_window_usd,
+        "window_spend_usd": window.window_spend_usd,
+        "window_hours": window.window_hours,
+        "observed_hours": window.observed_hours,
+        "attribution": {
+            "event_basis": window.attribution_event_basis,
+            "span_basis": window.attribution_span_basis,
+        },
+    })
+}
+
+fn quota_forecast_arm_json(arm: &QuotaForecastArm) -> Value {
+    match arm {
+        QuotaForecastArm::Full(window) => quota_forecast_window_json(window),
+        QuotaForecastArm::Excluded {
+            reason,
+            window_hours,
+            observed_hours,
+        } => serde_json::json!({
+            "excluded": true,
+            "reason": reason,
+            "window_hours": window_hours,
+            "observed_hours": observed_hours,
+        }),
+    }
+}
+
+/// Stable forecast schema member (inserted into the agenttrace.quota/1 object
+/// only when --forecast is passed).
+pub fn quota_forecast_json(forecast: &QuotaForecast) -> Value {
+    serde_json::json!({
+        "basis": QUOTA_FORECAST_BASIS,
+        "five_hour": quota_forecast_arm_json(&forecast.five_hour),
+        "weekly": quota_forecast_arm_json(&forecast.weekly),
+    })
+}
+
+fn render_forecast_window_text(kind: &str, arm: &QuotaForecastArm) -> String {
+    match arm {
+        QuotaForecastArm::Full(window) => format!(
+            "  {}: burn ${:.4}/h -> projected next window ${:.4} (observed {:.1}h of {:.1}h; event-timed {}, span-shared {})",
+            kind,
+            window.burn_rate_usd_per_hour,
+            window.projected_next_window_usd,
+            window.observed_hours,
+            window.window_hours,
+            window.attribution_event_basis,
+            window.attribution_span_basis,
+        ),
+        QuotaForecastArm::Excluded { reason, window_hours, observed_hours } => format!(
+            "  {}: excluded ({}) - corpus covers {:.1}h of {:.1}h; no rate extrapolated",
+            kind, reason, observed_hours, window_hours
+        ),
+    }
+}
+
+pub fn render_forecast_text(forecast: &QuotaForecast) -> String {
+    format!(
+        "forecast (linear, local-first):\n{}\n{}\n  basis: {}",
+        render_forecast_window_text("five_hour", &forecast.five_hour),
+        render_forecast_window_text("weekly", &forecast.weekly),
+        QUOTA_FORECAST_BASIS
+    )
+}
+
+/// `--quota --forecast` view: the untouched agenttrace.quota/1 report plus the
+/// forecast member (json) or the appended forecast section (text).
+pub fn render_quota_view_forecast(
+    format: &str,
+    sessions: &[Session],
+) -> Result<String, QuotaForecastError> {
+    let forecast = quota_forecast(sessions)?;
+    let mut report = quota_report(sessions);
+    if format == "json" {
+        if let Value::Object(map) = &mut report {
+            map.insert("forecast".to_string(), quota_forecast_json(&forecast));
+            return serde_json::to_string(&report).map_err(|e| {
+                QuotaForecastError::Render(anyhow::anyhow!(
+                    "--quota --forecast: serialization failed: {}",
+                    e
+                ))
+            });
+        }
+        return Err(QuotaForecastError::Render(anyhow::anyhow!(
+            "--quota --forecast: quota report is not a json object"
+        )));
+    }
+    if format == "text" {
+        return Ok(format!(
+            "{}\n{}",
+            render_quota_text(&report),
+            render_forecast_text(&forecast)
+        ));
+    }
+    Err(QuotaForecastError::Render(anyhow::anyhow!(
+        "--quota --forecast: unsupported format `{}` (want: json, text)",
+        format
+    )))
+}
+
 pub fn evaluate_overview_gate(
     overview: &Overview,
     sessions: &[Session],
