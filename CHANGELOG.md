@@ -1166,6 +1166,35 @@
 
 ### Fixed
 
+- Content-dedup survivor determinism: candidates are sorted before the
+  rm-1886 content-signature dedup in both walk lanes (#31, landing
+  58227d21, ci-audit 2026-10-22; row backfilled by rm-2056c, run
+  1f1f8ca1 cycle 3): the first-seen-wins dedup promised determinism but
+  inherited it from a walk whose root merge order is registration
+  order, not sorted order — on hosted CI the byte-identical beta copy
+  repeatedly became the survivor over alpha (master CI reds
+  39749246398, 39635038200; also seen on macos-14), failing
+  `count_honesty_disclosures_in_cli_lanes`, which pins
+  survivor <- suppressed. Sorting the candidate list before the dedup
+  makes the lexicographically-first path always survive; final output
+  ordering is unchanged (`sort_paths_by_cache` /
+  `sort_paths_by_mod_time` still own it).
+
+- Master ubuntu-lane reds cured: dependency floors past two RUSTSEC
+  advisories plus a release-build OS pin (#32, landing 6d1982d9, from
+  #30; row backfilled by rm-2056c, run 1f1f8ca1 cycle 3):
+  rustls-webpki 0.103.15 -> 0.103.16 rejects certificate paths
+  containing the distrusted emSign intermediate public keys
+  (RUSTSEC-2026-0382, via rustls 0.23.46 <- ureq 3.4.2), and
+  webpki-roots 1.0.9 -> 1.0.10 removes the emSign ECC Root CA - G3
+  root (RUSTSEC-2026-0381) — the two advisories the cargo-deny lane
+  was failing (receipts: cargo deny check -> advisories ok, bans ok,
+  licenses ok, sources ok). The release-binary build lane is pinned
+  to ubuntu-22.04: check-install-runtime.sh enforces the glibc-2.35
+  floor of the 47fa1154 install contract, and ubuntu-latest (now
+  24.04, glibc 2.39) produced binaries its own guard rejected —
+  artifact and floor agree again.
+
 - OpenCode store honesty: unreadable `summary_*` integers disclose instead of
   silently cross-checking as absent, and v2-only stores are named unhandled
   instead of a silent zero (rm-1926 + rm-1927, run 9d3b927c cycle 1, batch
