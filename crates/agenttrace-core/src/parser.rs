@@ -1575,6 +1575,18 @@ const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[
     // bundled snapshot, so this stays an identity-only mapping like
     // its sibling.
     (1050, "gemini-3.1-flash-lite"),
+    // rm-2058 x rm-1533 (run 12e8cf068a8a cycle 1, research 2e018067):
+    // ccusage v20.0.41 (2026-10-22, e9c344a8 #1947, shipped via #1948)
+    // completes the first-party map: 1402 -> claude-opus-5-5 and
+    // 1417..=1419 -> gemini-4-argon. 1402's bare key is priced in the
+    // bundled snapshot, so it behaves like the 1050 sibling;
+    // gemini-4-argon has no bare row of its own, but the raw-first
+    // ladder (rm-1532) serves it from the first-party gemini/
+    // qualified twin (google is the model's own vendor) — pricing
+    // always rides the catalog's normal lookup, never this table.
+    (1402, "claude-opus-5-5"),
+    (1418, "gemini-4-argon"),
+    (1419, "gemini-4-argon"),
 ];
 
 /// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
@@ -11236,6 +11248,118 @@ mod tests {
         assert!(
             session.metrics.cost_estimated > 0.0,
             "the bare gemini-3.1-flash-lite key is priced in the bundled snapshot"
+        );
+    }
+
+    #[test]
+    fn antigravity_numeric_1402_maps_to_claude_opus_5_5_and_prices() {
+        // rm-2058 (run 12e8cf068a8a cycle 1, research 2e018067): ccusage
+        // v20.0.41 (2026-10-22, e9c344a8 #1947, shipped via #1948) maps
+        // antigravity numeric modelConfigId 1402 to claude-opus-5-5 —
+        // the bare key is priced in the bundled snapshot, so like the
+        // 1050 sibling this stays an identity-only mapping and the
+        // spend prices instead of banking under a stringified "1402".
+        let raw = serde_json::json!({
+            "trajectoryId": "44444444-5555-6666-7777-888888888888",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-22T10:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Opus-5-5 generation.",
+                        "usageStats": {
+                            "inputTokens": 1200,
+                            "outputTokens": 400
+                        },
+                        "modelConfigId": 1402
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("numeric-1402", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "claude-opus-5-5",
+            "1402 maps through ANTIGRAVITY_NUMERIC_MODEL_MAP instead of stringifying"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+            "the mapped sighting still discloses its numeric origin"
+        );
+        assert!(
+            session.metrics.cost_estimated > 0.0,
+            "the bare claude-opus-5-5 key is priced in the bundled snapshot"
+        );
+    }
+
+    #[test]
+    fn antigravity_numeric_1418_1419_map_to_argon_and_price_first_party() {
+        // rm-2058: ccusage's 1417..=1419 extension brings 1418/1419 into
+        // the first-party map. The bare gemini-4-argon key has no row
+        // of its own in the bundled snapshot, but the raw-first ladder
+        // (rm-1532) serves it from the first-party gemini/ qualified
+        // twin (google is the model's own vendor), so identity fixes,
+        // every numeric sighting discloses, and the spend prices at
+        // first-party rates — verified arithmetic at the 2026-10-17
+        // bundle: 1600 input x 2e-06 + 500 output x 1e-05 = 0.0082.
+        // The assert stays > 0.0 so bundle refreshes cannot break it.
+        let raw = serde_json::json!({
+            "trajectoryId": "55555555-6666-7777-8888-999999999999",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-22T10:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Argon generation one.",
+                        "usageStats": { "inputTokens": 900, "outputTokens": 300 },
+                        "modelConfigId": 1418
+                    }
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-22T10:00:09Z" },
+                    "plannerResponse": {
+                        "response": "Argon generation two.",
+                        "usageStats": { "inputTokens": 700, "outputTokens": 200 },
+                        "modelConfigId": 1419
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("numeric-1418-1419", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "gemini-4-argon",
+            "1418/1419 map to the proven model name and last-wins keeps 1419"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&2),
+            "both mapped sightings disclose their numeric origin"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:multi_model_last_wins"),
+            Some(&2),
+            "the two mapped models still count as multi-model sightings"
+        );
+        assert!(
+            session.metrics.cost_estimated > 0.0,
+            "the first-party gemini/ qualified twin serves gemini-4-argon through the raw-first ladder"
         );
     }
 
