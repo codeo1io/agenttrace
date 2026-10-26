@@ -3289,7 +3289,9 @@ fn zstd_rollouts_fail_with_a_named_error_not_generic_utf8() {
 
 #[test]
 fn codex_compressed_rollout_is_admitted_by_name_and_decoded() {
-    // rm-992 (cycle 5, run e4209f0c assess F1 + research 30082665): the
+    // rm-992 (cycle 5, run e4209f0c assess F1 + research 30082665; the
+    // same test was ported verbatim onto run 7eb6138c cycle-3's wall as
+    // implement CU-B — one test, one lineage): the
     // discovery walk used to reject `.jsonl.zst` NAMES before the parser's
     // magic sniff could decode them, so a codex home migrated by
     // `codex migrate_rollouts` (compression stable-adjacent since 0.163.0,

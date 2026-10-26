@@ -1775,7 +1775,10 @@ pub fn is_session_file_name(name: &str) -> bool {
     // cycle 5 (assess F1 + research 30082665) and run d57c2e56 cycle 1
     // — the identical disjunction reconciled to one gate at
     // integration (conflict case ae49eb7a), keeping both lineages'
-    // comments and pin sets.
+    // comments and pin sets — and carried independently by run
+    // 7eb6138c cycle 3's terminal landing (a third parallel lineage,
+    // CU-B's verbatim port of the 0ff02e09 admission), reconciled
+    // here again: the gate and its comment stand unchanged.
     name.ends_with(".jsonl") || name.ends_with(".jsonl.zst") || name.ends_with(".json")
 }
 

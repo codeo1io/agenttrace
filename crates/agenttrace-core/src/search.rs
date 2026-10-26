@@ -32,7 +32,14 @@ pub struct TranscriptScanSummary {
     pub skipped_oversized: usize,
     pub skipped_non_file: usize,
     pub skipped_budget: usize,
-    pub skipped_zstd: usize,
+    /// rm-1872 residual-c (run 7eb6138c cycle 3): zstd-framed files
+    /// whose bounded decode refused (corrupt frame, over-cap output) —
+    /// compressed content that could not be honestly searched, so it
+    /// was disclosed instead of charged to the budget.
+    pub skipped_zstd_decode: usize,
+    /// rm-1872 (run d57c2e56 cycle 1, kept at this integration as a
+    /// strictly-additive corpus-level disclosure): decoded zstd frames
+    /// and the decompressed bytes actually charged to the scan budget.
     pub zstd_decoded_files: usize,
     pub zstd_decoded_bytes: u64,
     pub file_byte_cap: u64,
@@ -50,7 +57,7 @@ impl TranscriptScanSummary {
             skipped_oversized: 0,
             skipped_non_file: 0,
             skipped_budget: 0,
-            skipped_zstd: 0,
+            skipped_zstd_decode: 0,
             zstd_decoded_files: 0,
             zstd_decoded_bytes: 0,
             file_byte_cap,
@@ -74,7 +81,7 @@ impl TranscriptScanSummary {
             ("over byte cap", self.skipped_oversized),
             ("non-file", self.skipped_non_file),
             ("read budget exhausted", self.skipped_budget),
-            ("zstd decode refused", self.skipped_zstd),
+            ("zstd decode failed", self.skipped_zstd_decode),
         ] {
             if count > 0 {
                 parts.push(format!("{count} skipped: {label}"));
@@ -363,9 +370,12 @@ fn write_transcript_summary_json(out: &mut String, scan: &TranscriptScanSummary)
         ("skipped_oversized", scan.skipped_oversized.to_string()),
         ("skipped_non_file", scan.skipped_non_file.to_string()),
         ("skipped_budget", scan.skipped_budget.to_string()),
-        // rm-1872: the compressed-corpus truth — zstd refusals and decodes
-        // are first-class summary facts, not text-only footnotes.
-        ("skipped_zstd", scan.skipped_zstd.to_string()),
+        // rm-1872: the compressed-corpus truth — decode refusals and
+        // decodes are first-class summary facts, not text-only
+        // footnotes. The refusal key is the run-7eb6138c reviewed
+        // spelling (`skipped_zstd_decode`); the decode counters are
+        // the run-d57c2e56 landing, kept at this integration.
+        ("skipped_zstd_decode", scan.skipped_zstd_decode.to_string()),
         ("zstd_decoded_files", scan.zstd_decoded_files.to_string()),
         ("zstd_decoded_bytes", scan.zstd_decoded_bytes.to_string()),
         ("file_byte_cap", scan.file_byte_cap.to_string()),
@@ -522,7 +532,11 @@ fn add_match(
 /// every outcome — including skips — is counted in `scan` so the corpus-level
 /// summary can disclose what the lane did NOT read. Unreadable, missing,
 /// oversized, non-file (`demo://`) and budget-exhausted files are disclosed,
-/// never fatal: the metadata lanes above keep working verbatim.
+/// never fatal: the metadata lanes above keep working verbatim. zstd-framed
+/// rollouts (rm-1872) take the decompressed arm in
+/// [`zstd_transcript_evidence`]: decoded through the parser's bounded lane,
+/// searched as text, budgeted on DECOMPRESSED bytes, with decode refusals
+/// disclosed instead of charged.
 #[allow(clippy::too_many_arguments)]
 fn transcript_evidence(
     path: &str,
@@ -572,59 +586,44 @@ fn transcript_evidence(
         return (Vec::new(), "skipped: unreadable".to_string());
     }
     let read = bytes.len() as u64;
-    // rm-1872 (run d57c2e56 cycle 1): a rollout on disk may be a zstd
-    // frame (magic 28 B5 2F FD) under either a `.jsonl` or a `.jsonl.zst`
-    // name. Decode before matching and charge the budget in DEcompressed
-    // bytes - the compressed stat size would silently buy a much larger
-    // body. Refused frames are skipped loudly, never scanned as raw
-    // bytes behind a false `scanned` verdict.
-    let content: std::borrow::Cow<'_, str>;
-    // The bytes actually charged to the scan budget — decompressed size
-    // for a decoded frame, the raw read otherwise. The per-row verdict
-    // string discloses THIS number, never the on-disk size a compressed
-    // frame hides behind (rm-1872).
-    let charged: u64;
+    // rm-1872 residual-c (run 7eb6138c cycle 3): content-based zstd
+    // probe, exactly like the parse lane (parser.rs sniffs the same
+    // magic 28 B5 2F FD on bytes, never on the file name). A compressed
+    // rollout is not searchable text: the old arm lossy-decoded the RAW
+    // FRAME, charged its compressed size to the budget, and reported
+    // "scanned (849 bytes)" over bytes that could never match — a
+    // body-only needle inside the decompressed journal was silently
+    // invisible (assess A1 live PoC: identical content under a plain
+    // `.jsonl` name hit; its `.jsonl.zst` twin did not). The same probe
+    // landed in parallel on this wall as run d57c2e56 cycle 1's inline
+    // arm; this integration keeps the run-7eb6138c shape (the shared
+    // `zstd_transcript_evidence` arm with its scan-time disclosure
+    // wording) and folds d57c2e56's corpus-level decode counters in.
     if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        match crate::parser::decode_zstd_rollout_bounded(bytes, path) {
-            Ok(decoded) => {
-                let decoded_len = decoded.len() as u64;
-                if decoded_len > *budget_left {
-                    scan.skipped_budget += 1;
-                    return (
-                        Vec::new(),
-                        "skipped: read budget exhausted (decompressed body over remaining budget)"
-                            .to_string(),
-                    );
-                }
-                scan.zstd_decoded_files += 1;
-                scan.zstd_decoded_bytes += decoded_len;
-                *budget_left -= decoded_len;
-                charged = decoded_len;
-                scan.scanned_files += 1;
-                scan.scanned_bytes += decoded_len;
-                // Lossy decode: a torn multibyte tail must not abort the scan.
-                content = std::borrow::Cow::Owned(String::from_utf8_lossy(&decoded).into_owned());
-            }
-            Err(reason) => {
-                scan.skipped_zstd += 1;
-                return (
-                    Vec::new(),
-                    format!("skipped: zstd decode refused ({reason})"),
-                );
-            }
-        }
-    } else {
-        // growth race: the file may have grown past the stat length the
-        // budget was pre-checked against, so the charge saturates and
-        // never wraps the remaining budget backward.
-        *budget_left = budget_left.saturating_sub(read);
-        charged = read;
-        scan.scanned_files += 1;
-        scan.scanned_bytes += read;
-
-        // Lossy decode: a torn multibyte tail must not abort the scan.
-        content = String::from_utf8_lossy(&bytes);
+        return zstd_transcript_evidence(bytes, read, query, budget_left, scan, path);
     }
+    // rm-1872: the metadata-length gate above and this subtraction
+    // straddle the actual read — a file growing between them makes
+    // `read` exceed the checked `len`, and the old `-=` would wrap the
+    // u64 budget upward (panicking under debug builds, silently
+    // DISABLING the cap under release). Saturate: an over-read file
+    // exhausts the budget honestly, never resets it.
+    *budget_left = budget_left.saturating_sub(read);
+    scan.scanned_files += 1;
+    scan.scanned_bytes += read;
+
+    // Lossy decode: a torn multibyte tail must not abort the scan.
+    let content = String::from_utf8_lossy(&bytes);
+    (
+        transcript_hits(&content, query),
+        format!("scanned ({read} bytes)"),
+    )
+}
+
+/// rm-1415/rm-1872: the per-line body scan shared by the plain and the
+/// decompressed arms — at most [`TRANSCRIPT_MATCHES_PER_SESSION`]
+/// `transcript: …` snippet evidence items.
+fn transcript_hits(content: &str, query: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in content.lines() {
         if out.len() >= TRANSCRIPT_MATCHES_PER_SESSION {
@@ -634,7 +633,58 @@ fn transcript_evidence(
             out.push(format!("transcript: {snippet}"));
         }
     }
-    (out, format!("scanned ({charged} bytes)"))
+    out
+}
+
+/// rm-1872 residual-c (run 7eb6138c cycle 3): the compressed arm of
+/// [`transcript_evidence`]. The frame decodes through the parser's own
+/// [`decode_zstd_rollout_bounded`](crate::parser::decode_zstd_rollout_bounded)
+/// — one decoder, one 64 MiB total-output cap, one refusal wording, so
+/// the search lane and the parse lane can never disagree about what a
+/// rollout file contains. The budget meters DECOMPRESSED bytes: those
+/// are the bytes actually searched, and the row note discloses the
+/// compressed↔decompressed relationship at scan time. Every skip is
+/// disclosed BEFORE any budget accounting — a compressed file that
+/// cannot be honestly searched charges nothing, so a corpus of
+/// undecodable frames cannot burn down the budget it refuses to
+/// search.
+fn zstd_transcript_evidence(
+    frame: Vec<u8>,
+    compressed: u64,
+    query: &str,
+    budget_left: &mut u64,
+    scan: &mut TranscriptScanSummary,
+    label: &str,
+) -> (Vec<String>, String) {
+    let decoded = match crate::parser::decode_zstd_rollout_bounded(frame, label) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            scan.skipped_zstd_decode += 1;
+            return (Vec::new(), format!("skipped: zstd decode failed ({error})"));
+        }
+    };
+    let decompressed = decoded.len() as u64;
+    if decompressed > *budget_left {
+        scan.skipped_budget += 1;
+        return (
+            Vec::new(),
+            format!(
+                "skipped: decompressed {decompressed} bytes exceed the read budget ({compressed}-byte zstd frame)"
+            ),
+        );
+    }
+    *budget_left = budget_left.saturating_sub(decompressed);
+    scan.scanned_files += 1;
+    scan.scanned_bytes += decompressed;
+    // rm-1872 (run d57c2e56 cycle 1, kept at this integration): the
+    // corpus-level decode census rides the success arm.
+    scan.zstd_decoded_files += 1;
+    scan.zstd_decoded_bytes += decompressed;
+    let content = String::from_utf8_lossy(&decoded);
+    (
+        transcript_hits(&content, query),
+        format!("scanned ({decompressed} bytes decompressed from a {compressed}-byte zstd frame)"),
+    )
 }
 
 /// A `…window…` snippet centered on the first case-insensitive hit of

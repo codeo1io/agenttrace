@@ -100,9 +100,12 @@ fn sessions_csv_carries_the_disclosure_column_and_crlf_rows() {
     let out = run_csv(&dir, &["--sessions", "-f", "csv"]);
     let lines: Vec<&str> = out.split("\r\n").collect();
     assert_eq!(lines[0], "# sessions", "table marker first");
+    // rm-2019 (run 7eb6138c cycle 3): `stored_cost` sits directly beside
+    // `cost` — empty cell when nothing was recorded, never 0 standing in
+    // for absence.
     assert_eq!(
         lines[1],
-        "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost,parent_session"
+        "session,health,data,source,model,cost,stored_cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost,parent_session"
     );
     // rm-408: the reported-zero block is disclosed in the statement;
     // rm-855: the row ends with the subagent parity cells — 0/0.0000

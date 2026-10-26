@@ -105,6 +105,14 @@ struct Args {
     /// truncated/limit, and csv appends a `# truncated:` marker row
     /// when rows were dropped (rm-798); csv also carries the subagent
     /// parity columns subagents/subagent_cost/parent_session (rm-855).
+    /// Every format emits the upstream-RECORDED cost beside the
+    /// estimate (rm-2019): json `storedCost` (null when nothing was
+    /// recorded), csv/tsv `stored_cost`/STORED_COST (empty cell when
+    /// nothing was recorded — never 0 standing in for absence; a
+    /// non-finite recorded cost renders the shared `null` spelling in
+    /// every lane like the cost cells, and the json row carries the
+    /// StoredCostDivergence stamp so a diverging non-finite record
+    /// never reads as plain absence — review fix 4ddc66b7 F3).
     #[arg(long)]
     sessions: bool,
     /// Render per-session diagnostics: findings, evidence, fix
@@ -2707,6 +2715,25 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
         eprintln!("Saved: {} (streamed)", requested.display());
         return Ok(());
     }
+    // rm-784 rider (run 7eb6138c cycle 3): an existing DIRECTORY as
+    // the -o target used to fall through to the atomic
+    // stage-and-rename, whose rename(2) onto a directory fails with a
+    // bare EISDIR under an anonymous context — "writing report output
+    // file: Is a directory (os error 21)" — naming NEITHER the
+    // requested path nor the target. Refuse up front with the name,
+    // mirroring the fifo/socket/block-device refusal below (portable
+    // check: is_dir needs no Unix-only FileTypeExt).
+    if fs::symlink_metadata(target)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+    {
+        bail!(
+            "refusing to write -o {}: it is an existing directory — \
+             specify a file path (parent directories are still created \
+             automatically)",
+            requested.display()
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
@@ -3015,6 +3042,74 @@ fn matches_number(value: f64, filter: &str) -> bool {
     matches_numeric_filter(value, filter)
 }
 
+/// rm-2019 (run 7eb6138c cycle 3, ccusage v20.0.35 `storedCost` parity
+/// via #1903/#1898): the upstream-RECORDED cost of a session, as one
+/// shared derivation for every `--sessions` lane. `Some(v)` only when
+/// the journal authored a cost: positive recorded spend
+/// (`upstream_cost_usd > 0`), or an explicit recorded $0 — which is a
+/// VALUE (rm-1052: a gateway unpriced-passthrough disclosure, counted
+/// in `recorded_cost_zero_blocks`), never an absence marker. `None`
+/// when nothing was recorded: rendered as JSON `null` / an empty csv
+/// cell, never `0.0` standing in for "no data" (rm-408 zero-honesty
+/// discipline — 0.0000 must always mean "zero dollars were recorded").
+fn stored_cost_usd(session: &Session) -> Option<f64> {
+    if session.metrics.upstream_cost_usd > 0.0 {
+        return Some(session.metrics.upstream_cost_usd);
+    }
+    if session
+        .metrics
+        .disclosure_counters
+        .get("recorded_cost_zero_blocks")
+        .is_some_and(|blocks| *blocks > 0)
+    {
+        return Some(0.0);
+    }
+    None
+}
+
+/// rm-2019: one json row for the `--sessions -f json` arm — the full
+/// `Session` serialization (unchanged field-for-field, so existing
+/// consumers keep working) plus the recorded-cost surface:
+/// `metrics.storedCost` beside `metrics.cost_estimated` (always
+/// present — `null` when nothing was recorded), and a provenance
+/// disclosure when the recorded and estimated costs materially
+/// diverge — a >$0.005 gap means the estimate is adding catalog
+/// pricing on top of (or against) the recorded spend, and that must
+/// never ride silently (threshold mirrors the rm-499 suppression and
+/// governance drift audits at $0.005).
+fn session_json_row(session: &Session) -> serde_json::Value {
+    let mut value = serde_json::to_value(session).expect("session serializes");
+    let stored = stored_cost_usd(session);
+    let divergence =
+        stored.is_some_and(|recorded| (session.metrics.cost_estimated - recorded).abs() > 0.005);
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    let Some(metrics) = object
+        .get_mut("metrics")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return value;
+    };
+    metrics.insert("storedCost".to_string(), serde_json::json!(stored));
+    if divergence {
+        if let Some(provenance) = metrics
+            .get_mut("provenance")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            provenance.insert(
+                "StoredCostDivergence".to_string(),
+                serde_json::json!(format!(
+                    "cost_estimated {} vs storedCost {} USD — estimate includes catalog pricing beyond the recorded spend",
+                    csv_export::format_cost_cell(session.metrics.cost_estimated),
+                    csv_export::format_cost_cell(stored.unwrap_or_default())
+                )),
+            );
+        }
+    }
+    value
+}
+
 fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> anyhow::Result<String> {
     // rm-798: --limit is a DISPLAY cap, and a capped machine format
     // must never read as the whole corpus: the json arm wraps the rows
@@ -3028,7 +3123,10 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> anyh
             "returned_sessions": sessions.len(),
             "truncated": sessions.len() < matched,
             "limit": limit,
-            "sessions": sessions,
+            "sessions": sessions
+                .iter()
+                .map(|session| session_json_row(session))
+                .collect::<Vec<_>>(),
         }))
         // rm-1978: serialization of a `serde_json::Value` cannot fail on
         // operator input — the error path exists so the invariant is
@@ -3056,6 +3154,7 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> anyh
                 source: sanitize_line_segment(&session.metrics.source_tool),
                 model: sanitize_line_segment(&session.metrics.model_used),
                 cost: session.metrics.cost_estimated,
+                stored_cost: stored_cost_usd(session),
                 tokens: total_tokens(session),
                 fail: session.metrics.tool_calls_fail,
                 anomalies: session.anomalies.len(),
@@ -3068,7 +3167,7 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> anyh
         return Ok(csv_export::sessions_csv_bounded(&rows, matched, limit));
     }
     let mut lines = vec![
-        "SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES\tSUBAGENTS\tSUBAGENT_COST"
+        "SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tSTORED_COST\tTOKENS\tFAIL\tANOMALIES\tSUBAGENTS\tSUBAGENT_COST"
             .to_string(),
     ];
     lines.extend(sessions.into_iter().map(|session| {
@@ -3089,19 +3188,29 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> anyh
         // one session's spawned work stays visible without double
         // counting — the columns are internally derived (not
         // transcript-derived), so no sanitization is owed here.
+        // rm-2019: STORED_COST rides beside COST with the same
+        // value/absence contract as the csv lane (empty cell = nothing
+        // recorded, never 0 standing in for absence). rm-1500 rider:
+        // the cost cells route through format_cost_cell so a
+        // non-finite value renders `null`, never the literals
+        // NaN/inf the raw `{:.4}` used to emit. Review fix (4ddc66b7
+        // F3, 2026-10-21): STORED_COST rides the SAME null arm via
+        // format_cost_cell_opt — non-finite recorded spend renders
+        // `null` like the cost cell, and empty stays absence-only.
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{:.4}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             csv_export::guard_formula(&sanitize_line_segment(&session.name)),
             session.health,
             session_capability(session),
             csv_export::guard_formula(&sanitize_line_segment(&session.metrics.source_tool)),
             csv_export::guard_formula(&sanitize_line_segment(&session.metrics.model_used)),
-            session.metrics.cost_estimated,
+            csv_export::format_cost_cell(session.metrics.cost_estimated),
+            csv_export::format_cost_cell_opt(stored_cost_usd(session)),
             total_tokens(session),
             session.metrics.tool_calls_fail,
             session.anomalies.len(),
             session.metrics.subagent_count,
-            session.metrics.subagent_cost
+            csv_export::format_cost_cell(session.metrics.subagent_cost)
         )
     }));
     Ok(lines.join("\n"))
@@ -4065,6 +4174,290 @@ mod tests {
         assert_eq!(payload["truncated"], true);
         assert_eq!(payload["limit"], 2);
         assert_eq!(payload["sessions"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn session_list_json_emits_stored_cost_beside_cost() {
+        // rm-2019 (run 7eb6138c cycle 3): the recorded-cost surface in
+        // the json arm. `storedCost` sits in every row's metrics beside
+        // cost_estimated: the recorded spend when the journal authored
+        // one, `0.0` for an explicit recorded $0 (rm-1052: a value, not
+        // an absence), and `null` — never `0.0` — when nothing was
+        // recorded. A >$0.005 gap between estimate and recorded cost
+        // rides the provenance channel instead of passing silently
+        // (threshold mirrors the rm-499 suppression disclosure).
+        let base = || Session {
+            name: "s".to_string(),
+            path: "/tmp/s.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics::default(),
+        };
+        let mut recorded = base();
+        recorded.metrics.cost_estimated = 0.0075;
+        recorded.metrics.upstream_cost_usd = 0.0075;
+        let mut recorded_zero = base();
+        recorded_zero
+            .metrics
+            .disclosure_counters
+            .insert("recorded_cost_zero_blocks".to_string(), 1);
+        let mut diverging = base();
+        diverging.metrics.cost_estimated = 0.0135;
+        diverging.metrics.upstream_cost_usd = 0.0075;
+        let none = base();
+        let json =
+            render_session_list(&[recorded, recorded_zero, diverging, none], "json", 20).unwrap();
+        let payload = serde_json::from_str::<serde_json::Value>(&json).expect("valid json");
+        let rows = payload["sessions"].as_array().expect("rows");
+        assert_eq!(
+            rows[0]["metrics"]["storedCost"], 0.0075,
+            "recorded spend lands beside cost_estimated"
+        );
+        assert_eq!(
+            rows[0]["metrics"]["provenance"]["StoredCostDivergence"],
+            serde_json::Value::Null,
+            "estimate == recorded cost: no divergence stamp"
+        );
+        assert_eq!(
+            rows[1]["metrics"]["storedCost"], 0.0,
+            "an explicit recorded $0 is a VALUE (rm-1052)"
+        );
+        assert_eq!(
+            rows[3]["metrics"]["storedCost"],
+            serde_json::Value::Null,
+            "nothing recorded renders null — never 0.0 standing in for absence"
+        );
+        assert!(
+            rows[3]["metrics"].get("storedCost").is_some(),
+            "the key is ALWAYS present so consumers can index it"
+        );
+        let stamp = rows[2]["metrics"]["provenance"]["StoredCostDivergence"]
+            .as_str()
+            .expect("diverging row carries the provenance stamp");
+        assert!(
+            stamp.contains("0.0135") && stamp.contains("0.0075"),
+            "the stamp names both magnitudes: {stamp}"
+        );
+    }
+
+    #[test]
+    fn session_list_tsv_and_csv_carry_stored_cost_parity() {
+        // rm-2019: STORED_COST rides the TSV beside COST and
+        // stored_cost rides the csv header beside cost — one
+        // value/absence contract across all three formats (empty cell
+        // = nothing recorded; never 0 standing in for absence).
+        let recorded = Session {
+            name: "rec".to_string(),
+            path: "/tmp/rec.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics {
+                cost_estimated: 0.0075,
+                upstream_cost_usd: 0.0075,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics::default(),
+        };
+        let mut plain = recorded.clone();
+        plain.name = "plain".to_string();
+        plain.path = "/tmp/plain.jsonl".to_string();
+        plain.metrics.upstream_cost_usd = 0.0;
+        plain.metrics.cost_estimated = 0.0075;
+        let tsv = render_session_list(&[recorded.clone(), plain.clone()], "tsv", 20).unwrap();
+        let header = tsv.lines().next().expect("header");
+        let header_cells: Vec<&str> = header.split('\t').collect();
+        assert_eq!(
+            header_cells.iter().position(|cell| *cell == "STORED_COST"),
+            Some(6),
+            "STORED_COST sits directly beside COST: {header}"
+        );
+        let rec_row: Vec<&str> = tsv
+            .lines()
+            .nth(1)
+            .expect("recorded row")
+            .split('\t')
+            .collect();
+        assert_eq!(rec_row[6], "0.0075", "recorded cost cell: {rec_row:?}");
+        let plain_row: Vec<&str> = tsv.lines().nth(2).expect("plain row").split('\t').collect();
+        assert_eq!(plain_row[6], "", "absence renders empty: {plain_row:?}");
+        let csv = render_session_list(&[recorded, plain], "csv", 20).unwrap();
+        let header = csv.lines().nth(1).expect("csv header");
+        assert!(
+            header.contains("cost,stored_cost,tokens"),
+            "csv header carries stored_cost beside cost: {header}"
+        );
+        let rec_row = csv.lines().nth(2).expect("csv recorded row");
+        assert!(
+            rec_row.contains(",0.0075,0.0075,"),
+            "csv recorded cell: {rec_row}"
+        );
+        let plain_row = csv.lines().nth(3).expect("csv plain row");
+        assert!(
+            plain_row.contains(",0.0075,,"),
+            "csv absence renders an empty cell: {plain_row}"
+        );
+    }
+
+    #[test]
+    fn session_list_text_lanes_render_null_for_non_finite_costs() {
+        // rm-1500 rider (run 7eb6138c cycle 3): live PoC — two 1e308
+        // recorded costs fold past f64::MAX into inf, and the raw
+        // `{:.4}` rendered the literal `inf` into BOTH the TSV and csv
+        // cost cells. The text lanes now share the JSON lanes' `null`
+        // spelling: a non-finite spend never reads as zero-spend.
+        let mut session = Session {
+            name: "overflow".to_string(),
+            path: "/tmp/overflow.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics {
+                cost_estimated: f64::INFINITY,
+                subagent_cost: f64::NAN,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics::default(),
+        };
+        session.metrics.subagent_count = 1;
+        let tsv = render_session_list(std::slice::from_ref(&session), "tsv", 20).unwrap();
+        let row = tsv.lines().nth(1).expect("data row");
+        let cells: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cells[5], "null", "inf cost cell: {row}");
+        assert_eq!(cells[cells.len() - 1], "null", "NaN subagent cell: {row}");
+        assert!(!tsv.contains("inf") && !tsv.contains("NaN"), "{tsv}");
+        let csv = render_session_list(std::slice::from_ref(&session), "csv", 20).unwrap();
+        let row = csv.lines().nth(2).expect("csv data row");
+        assert!(
+            row.contains(",null,") && !row.contains("inf") && !row.contains("NaN"),
+            "csv cost cells render null: {row}"
+        );
+    }
+
+    #[test]
+    fn stored_cost_non_finite_renders_null_like_the_cost_cell() {
+        // Review fix (independent review 4ddc66b7 F3, 2026-10-21):
+        // two `1e308` recorded costs fold past `f64::MAX`, and the
+        // raw `{:.4}` on the STORED_COST / stored_cost cells rendered
+        // the literal `inf` while the cost cells already spelled the
+        // rm-1500 `null`. Every stored cell now rides that shared
+        // null arm — TSV/csv render `null` (empty stays reserved for
+        // genuine absence) — and the json row's `storedCost: null` is
+        // never misread as "nothing recorded" because a non-finite
+        // recorded value still diverges, so its row carries the
+        // StoredCostDivergence stamp (absence gets no stamp).
+        let base = || Session {
+            name: "s".to_string(),
+            path: "/tmp/s.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
+            metrics: Metrics {
+                cost_estimated: 0.0987,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics::default(),
+        };
+        let mut overflow = base();
+        overflow.metrics.upstream_cost_usd = f64::INFINITY;
+        let absent = base();
+        let tsv = render_session_list(&[overflow.clone(), absent.clone()], "tsv", 20).unwrap();
+        let cells: Vec<&str> = tsv
+            .lines()
+            .nth(1)
+            .expect("overflow row")
+            .split('\t')
+            .collect();
+        assert_eq!(
+            cells[6], "null",
+            "non-finite recorded cost renders null, never inf: {cells:?}"
+        );
+        assert!(!tsv.contains("inf"), "{tsv}");
+        let absent_cells: Vec<&str> = tsv
+            .lines()
+            .nth(2)
+            .expect("absent row")
+            .split('\t')
+            .collect();
+        assert_eq!(
+            absent_cells[6], "",
+            "true absence still renders the empty cell: {absent_cells:?}"
+        );
+        let csv = render_session_list(&[overflow.clone(), absent.clone()], "csv", 20).unwrap();
+        let overflow_row = csv.lines().nth(2).expect("csv overflow row");
+        assert!(
+            overflow_row.contains(",0.0987,null,"),
+            "csv stored cell rides the shared null arm: {overflow_row}"
+        );
+        assert!(!csv.contains("inf"), "{csv}");
+        let absent_row = csv.lines().nth(3).expect("csv absent row");
+        assert!(
+            absent_row.contains(",0.0987,,"),
+            "csv absence stays the empty cell, distinct from null: {absent_row}"
+        );
+        let json = render_session_list(&[overflow, absent], "json", 20).unwrap();
+        let payload = serde_json::from_str::<serde_json::Value>(&json).expect("valid json");
+        let rows = payload["sessions"].as_array().expect("rows");
+        assert_eq!(
+            rows[0]["metrics"]["storedCost"],
+            serde_json::Value::Null,
+            "a non-finite recorded value serializes to the shared null spelling"
+        );
+        let stamp = rows[0]["metrics"]["provenance"]["StoredCostDivergence"]
+            .as_str()
+            .expect("the non-finite record still diverges, so the stamp lands");
+        assert!(
+            stamp.contains("null") && !stamp.contains("inf"),
+            "the stamp spells the unrenderable magnitude null, never inf: {stamp}"
+        );
+        assert_eq!(
+            rows[1]["metrics"]["provenance"]["StoredCostDivergence"],
+            serde_json::Value::Null,
+            "absence carries no stamp — that is how a null storedCost never reads as recorded"
+        );
+    }
+
+    #[test]
+    fn write_output_names_the_target_when_it_is_an_existing_directory() {
+        // rm-784 rider (run 7eb6138c cycle 3): the anonymous pre-fix
+        // failure was "writing report output file: Is a directory (os
+        // error 21)" — naming neither the requested path nor the
+        // target. The refusal now names both the flag value and the
+        // reason, mirroring the fifo/socket refusal.
+        let dir = std::env::temp_dir().join(format!("agenttrace-write-dir-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let error = write_output(&Some(dir.clone()), "x\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refusing to write") && error.contains("it is an existing directory"),
+            "{error}"
+        );
+        assert!(
+            error.contains(dir.to_string_lossy().as_ref()),
+            "the error names the requested target: {error}"
+        );
+        assert!(dir.is_dir(), "the directory is left untouched");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

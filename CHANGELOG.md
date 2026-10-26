@@ -4,6 +4,44 @@
 
 ### Added
 
+- compressed-corpus honesty + recorded-cost surface (rm-1872 / rm-992 / rm-2019 / rm-1500 residuals / rm-784, run 7eb6138c cycle 3, batch "compressed-corpus honesty + recorded-cost surface"): transcript search is now zst-honest — an admitted `.jsonl.zst` rollout (zstd magic `28 B5 2F FD` probed on the capped read's head by `transcript_evidence`) routes to `zstd_transcript_evidence` through `decode_zstd_rollout_bounded` with the 64 MiB decode cap disclosed at scan time, the read budget charged on DECOMPRESSED bytes, compressed-content skips disclosed BEFORE budget accounting (`skipped: zstd decode failed (…)` / `skipped: decompressed N bytes exceed the read budget`), saturating budget arithmetic in both arms, and non-decodable admissions skip-with-disclosure instead of sitting silently invisible — discovery's `.jsonl.zst` name gate and search now agree on the compressed corpus (new `codex-compressed-rollout` red-first fixture). `--sessions` carries the upstream-RECORDED cost beside the estimate in every format (rm-2019): `metrics.storedCost` on json rows (null for absence, an explicit recorded `$0` as a value, a >$0.005 gap stamped `metrics.provenance.StoredCostDivergence` instead of passing silently — side-by-side disclosure, the estimate is never overridden), `STORED_COST` on the TSV, one `stored_cost` column in csv (empty cell = absence). `-o` into an existing directory errors naming the target (rm-784). A non-finite recorded or estimated cost renders the shared `null` spelling in every machine lane — including the stored cells — never the literals `inf`/`NaN` (see the Fixed arm below).
+
+  Integration seam (2026-10-26, conflict case f349270d81d346859b1953b5bb9dc5bc,
+  landing run 7eb6138c's terminal salvage 9eb508cd onto a wall many
+  commits past the run's wall b425eb91): this row lands atop the
+  Unreleased Added list as the newest landing commit, and five seams
+  were adjudicated against the advanced wall. (1) rm-1872 search — the
+  wall had already landed run d57c2e56 cycle 1's parallel first cut
+  (`skipped_zstd` + `zstd_decoded_*` summary keys, "zstd decode
+  refused" wording, an inline decode arm); THIS run's reviewed contract
+  governs the mechanics and wording (`zstd_transcript_evidence` through
+  `decode_zstd_rollout_bounded`, decompressed-byte budgeting,
+  skip-disclosed-before-budget-accounting, the `skipped_zstd_decode`
+  key, the scan-time compressed↔decompressed row disclosure) while
+  d57c2e56's corpus-level decode census (`zstd_decoded_files` /
+  `zstd_decoded_bytes`, text tail + json) is kept as a strictly
+  additive disclosure; d57c2e56's pin tests re-based to the standing
+  wording and keys. (2) rm-1500 CSV spelling — the wall's `money_cell`
+  `n/a` decision (run e40a66d3 cycle 6, which had superseded
+  18f9b98a's zero-clamp at case 524b2312) is itself superseded here by
+  this run's one-convention rider: every csv money cell now rides
+  `format_cost_cell` and renders the JSON lanes' `null` on non-finite —
+  the spelling rm-2019's three-state stored cells require (empty =
+  absence, `null` = poison, a number = recorded) so every machine lane
+  agrees on one non-finite spelling; `money_cell` is retired and its
+  poisoned-cost pin re-based to the null arm (healthy bytes unchanged:
+  exact four decimals). (3) rm-1978 — the wall's `render_session_list
+  -> anyhow::Result<String>` contract composes under this run's
+  stored-cost arms (json rows through `session_json_row`, the csv
+  `stored_cost` column, the TSV `STORED_COST` column); the run's new
+  unit arms unwrap the Result. (4) rm-992 — the `.jsonl.zst` admission
+  gate and its contract test were already landed on the wall (runs
+  e4209f0c + d57c2e56, case ae49eb7a); the run's CU-B verbatim port
+  reconciles onto the landed gate unchanged (the gate's comment carries
+  the third lineage). (5) The ROADMAP band, the cycle-3 stewardship
+  record, and the flake-prevention Rules 12–13 ride as minted; the
+  rm-1872/rm-1500 rows carry integration-correction notes naming this
+  seam.
 - locally-defined model pricing is disclosed, not silently fabricated (rm-1426,
   run 7ee18a0d cycle 3): codex `model_catalog_json` / private-proxy deployments
   record slugs no pricing row backs — bare `glm-5.2` is absent from the bundled
@@ -1322,6 +1360,7 @@
 
 ### Fixed
 
+- non-finite stored-cost cells + CSV null-parity residuals (rm-1500 residuals + independent review 4ddc66b7 F3 cure, run 7eb6138c cycle 3, review fix 5754f998): a recorded-cost fold overflowing `f64` (two `1e308` sums, the PoC class) rendered the literal `inf` into the `STORED_COST`/`stored_cost` cells through the raw `{:.4}` while the cost cells already spelled the rm-1500 `null` — `format_cost_cell_opt` now inherits `format_cost_cell`'s null arm, the TSV stored cell routes through it, and the `StoredCostDivergence` stamp spells non-finite magnitudes `null`, so a json `storedCost: null` row that diverges carries the stamp and never reads as "nothing recorded" (absence gets no stamp; pinned by `stored_cost_non_finite_renders_null_like_the_cost_cell`). Same batch: the reports overview `total_duration` fold excludes non-finite per-session durations — a NaN/±inf span used to round4 into a JSON `null` while the markdown/html twins printed the raw literals (pinned by `overview_summary_excludes_non_finite_durations_from_the_total`) — and the machine lanes' non-finite spelling is the shared `null` cost-cell convention above. (Integration review 2026-10-26, conflict case 5a588fcc: this sentence originally claimed a csv `duration_sec` cell renders the null literal — no csv/tsv lane renders a duration cell in this tree or its history; corrected to the real seams.)
 - cost-anomaly cohorts pool spelling variants through pricing normalization (rm-1900, cycle-2 lead, run e43883b3): the same-model baseline the check draws (rm-1514) keyed on the raw `model_used` string, while the pricing layer folds dated snapshots (`claude-sonnet-4-5-20250929`), provider `/`-path forms and case variants onto one rate row — so a mixed-spelling corpus (the common dated/undated home) priced every session identically yet the check silently skipped with “No same-model cost history”. The cohort key now runs through `pricing::normalize_model` (the same identity the rate lookup prices by), so those spellings pool into one baseline and the check evaluates; the alert's basis names the normalized cohort identity. Boundaries pinned by tests: distinct models never pool (the rm-1514 anti-cross-model guarantee is unchanged), sentinel labels and their case variants still fold to the unattributed cohort, and the rm-1053 region/vendor-qualified SKU twins (`us.anthropic.…-v1:0`, `global.…` — deliberately their own catalog rows at their own list prices) keep their own cohort instead of being judged against the base model's rate norm. Contract test `cost_anomaly_cohort_spelling_contract.rs` exercises the real parse → attribution → pricing → diagnostics chain with the assessment PoC corpora (mixed-spelling arm flips skipped → 3.0x critical; identical-spelling control unchanged).
 
   Integration seam (2026-10-23, conflict case fe1305f0, landing run

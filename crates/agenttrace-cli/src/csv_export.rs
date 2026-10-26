@@ -47,6 +47,13 @@ pub struct SessionCsvRow {
     pub source: String,
     pub model: String,
     pub cost: f64,
+    /// rm-2019 (run 7eb6138c cycle 3): the upstream-RECORDED cost of
+    /// the session (journal-authored `cost.total`, ccusage v20.0.35
+    /// `storedCost` parity). `Some(v)` only when the journal recorded
+    /// a cost — positive spend, or an explicit recorded $0 (rm-1052:
+    /// a real value, never an absence marker). `None` renders as an
+    /// EMPTY cell: no recorded cost is absence, not `0.0000`.
+    pub stored_cost: Option<f64>,
     pub tokens: i64,
     pub fail: usize,
     pub anomalies: usize,
@@ -64,18 +71,6 @@ pub struct SessionCsvRow {
     pub parent_session: String,
 }
 
-/// rm-1500 residual (run e40a66d3 cycle 6): money cells render `n/a`
-/// for non-finite values — a bare `NaN`/`inf` token inside a machine
-/// CSV column breaks downstream numeric parsers. Healthy values keep
-/// their exact four-decimal rendering, byte-for-byte.
-fn money_cell(value: f64) -> String {
-    if value.is_finite() {
-        format!("{:.4}", value)
-    } else {
-        "n/a".to_string()
-    }
-}
-
 pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
     let mut out = table(
         "sessions",
@@ -86,6 +81,7 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             "source",
             "model",
             "cost",
+            "stored_cost",
             "tokens",
             "fail",
             "anomalies",
@@ -102,17 +98,47 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             &row.data,
             &row.source,
             &row.model,
-            &money_cell(row.cost),
+            &format_cost_cell(row.cost),
+            &format_cost_cell_opt(row.stored_cost),
             &row.tokens.to_string(),
             &row.fail.to_string(),
             &row.anomalies.to_string(),
             &row.zero_usage_events.to_string(),
             &row.subagents.to_string(),
-            &money_cell(row.subagent_cost),
+            &format_cost_cell(row.subagent_cost),
             &row.parent_session,
         ]));
     }
     out
+}
+
+/// rm-1500 rider (run 7eb6138c cycle 3): one cost-cell convention for
+/// the machine `--sessions` lanes. A non-finite value (NaN from a
+/// hostile arithmetic fold, `inf` from two `1e308` recorded costs
+/// summing past `f64::MAX` — both PoC'd live) used to render as the
+/// literals `NaN`/`inf`, which spreadsheets and `awk` treat as text
+/// garbage while some importers coerce to 0 — a non-finite spend must
+/// never read as zero-spend (the rm-1500 family contract). Render the
+/// same `null` the JSON lanes use via `json_float`, so every machine
+/// format agrees on one non-finite spelling.
+pub(crate) fn format_cost_cell(cost: f64) -> String {
+    if cost.is_finite() {
+        format!("{cost:.4}")
+    } else {
+        "null".to_string()
+    }
+}
+
+/// rm-2019: the recorded-cost cell — a number when the journal
+/// recorded one (including a recorded $0), empty for absence. Never
+/// `0.0000` standing in for "no recorded cost" (rm-1052/rm-408
+/// zero-honesty discipline). Review fix (independent review 4ddc66b7
+/// F3, 2026-10-21): a non-finite recorded value (a recorded-cost fold
+/// past `f64::MAX`) inherits `format_cost_cell`'s `null` arm — the
+/// shared rm-1500 spelling — so the cell renders `null`, never the
+/// literal `inf`/`NaN`, and empty stays reserved for genuine absence.
+pub(crate) fn format_cost_cell_opt(cost: Option<f64>) -> String {
+    cost.map_or_else(String::new, format_cost_cell)
 }
 
 /// rm-798: [`sessions_csv`] plus an explicit truncation statement.
@@ -144,7 +170,7 @@ pub fn overview_csv(overview: &Overview) -> String {
         &overview.healthy.to_string(),
         &overview.warning.to_string(),
         &overview.critical.to_string(),
-        &money_cell(overview.total_cost),
+        &format_cost_cell(overview.total_cost),
     ]));
     for (name, rows) in [
         // rm-895 policy: the csv surface is a MACHINE surface — these
@@ -176,10 +202,12 @@ pub fn overview_csv(overview: &Overview) -> String {
         }
         for (group, entry) in rows {
             // rm-1574 (by_model pricing_basis column) + rm-1500 residual
-            // (run e40a66d3 cycle 6): the cost cell rides money_cell so a
-            // poisoned estimate renders `n/a`, never a bare NaN token.
+            // (run e40a66d3 cycle 6, superseded in spelling at this
+            // integration by run 7eb6138c cycle 3's one-convention
+            // rider): the cost cell rides format_cost_cell so a
+            // poisoned estimate renders `null`, never a bare NaN token.
             let sessions = entry.sessions.to_string();
-            let cost = money_cell(entry.cost);
+            let cost = format_cost_cell(entry.cost);
             if model_basis {
                 let basis = match pricing_basis_label(group) {
                     None => "exact",
@@ -200,7 +228,7 @@ pub fn overview_csv(overview: &Overview) -> String {
             out.push_str(&csv_row(&[
                 task_type,
                 &entry.sessions.to_string(),
-                &money_cell(entry.cost),
+                &format_cost_cell(entry.cost),
                 &entry.tokens_input.to_string(),
                 &entry.tokens_output.to_string(),
             ]));
@@ -316,21 +344,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn money_cell_renders_finite_and_marks_non_finite() {
-        // rm-1500 residual (run e40a66d3 cycle 6, assess 3483a6c6 F5):
-        // money columns must never emit a bare NaN/inf token —
-        // downstream numeric parsers choke on it. `n/a` is the
-        // established non-finite marker; healthy values keep their
-        // exact four-decimal bytes.
-        assert_eq!(money_cell(1.25), "1.2500");
-        assert_eq!(money_cell(0.0), "0.0000");
-        assert_eq!(money_cell(f64::NAN), "n/a");
-        assert_eq!(money_cell(f64::INFINITY), "n/a");
-        assert_eq!(money_cell(f64::NEG_INFINITY), "n/a");
-    }
-
-    #[test]
-    fn sessions_csv_poisoned_cost_renders_na_not_bare_nan() {
+    fn sessions_csv_poisoned_cost_renders_null_not_bare_nan() {
+        // rm-1500 residual (run e40a66d3 cycle 6, assess 3483a6c6 F5;
+        // superseded in spelling at this integration by run 7eb6138c
+        // cycle 3's one-convention rider): money columns must never emit
+        // a bare NaN/inf token — downstream numeric parsers choke on it.
+        // `null` is the single non-finite spelling across every machine
+        // lane (the JSON lanes' `json_float` spelling); healthy values
+        // keep their exact four-decimal bytes.
         let out = sessions_csv(&[SessionCsvRow {
             session: "poisoned".to_string(),
             health: 98,
@@ -338,6 +359,7 @@ mod tests {
             source: "claude_code".to_string(),
             model: "claude-sonnet-4-5".to_string(),
             cost: f64::NAN,
+            stored_cost: None,
             tokens: 900,
             fail: 0,
             anomalies: 0,
@@ -350,10 +372,10 @@ mod tests {
             !out.contains("NaN") && !out.contains("inf"),
             "no bare non-finite token in the machine CSV: {out}"
         );
-        assert_eq!(out.matches("n/a").count(), 2);
+        assert_eq!(out.matches("null").count(), 2);
         assert!(
             !out.contains("# non-finite"),
-            "`n/a` is self-disclosing — no marker row needed: {out}"
+            "`null` is self-disclosing — no marker row needed: {out}"
         );
     }
 
@@ -464,6 +486,7 @@ mod tests {
             source: "claude_code".to_string(),
             model: "claude-sonnet-4-5".to_string(),
             cost: 1.25,
+            stored_cost: Some(1.25),
             tokens: 900,
             fail: 0,
             anomalies: 0,
@@ -476,13 +499,102 @@ mod tests {
         assert_eq!(lines[0], "# sessions");
         assert_eq!(
             lines[1],
-            "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost,parent_session"
+            "session,health,data,source,model,cost,stored_cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost,parent_session"
         );
         assert_eq!(
             lines[2],
-            "\"fix the \"\"bug\"\", today\",98,green,claude_code,claude-sonnet-4-5,1.2500,900,0,0,2,1,0.5000,/p/proj/abc.jsonl"
+            "\"fix the \"\"bug\"\", today\",98,green,claude_code,claude-sonnet-4-5,1.2500,1.2500,900,0,0,2,1,0.5000,/p/proj/abc.jsonl"
         );
         assert!(out.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn stored_cost_column_emits_value_zero_and_absence() {
+        // rm-2019 (run 7eb6138c cycle 3): the recorded-cost column
+        // beside cost. A positive recorded cost renders its number; an
+        // explicit recorded $0 renders 0.0000 (rm-1052: a value, not
+        // an absence marker); NO recorded cost renders an EMPTY cell
+        // — never 0.0000 standing in for absence.
+        let base = SessionCsvRow {
+            session: "s".to_string(),
+            health: 100,
+            data: "green".to_string(),
+            source: "claude_code".to_string(),
+            model: "m".to_string(),
+            cost: 0.0075,
+            stored_cost: None,
+            tokens: 0,
+            fail: 0,
+            anomalies: 0,
+            zero_usage_events: 0,
+            subagents: 0,
+            subagent_cost: 0.0,
+            parent_session: String::new(),
+        };
+        let recorded = sessions_csv(&[SessionCsvRow {
+            stored_cost: Some(0.0075),
+            ..base.clone()
+        }]);
+        assert!(
+            recorded.contains(",0.0075,0.0075,"),
+            "recorded cost lands beside the estimated cost: {recorded}"
+        );
+        let recorded_zero = sessions_csv(&[SessionCsvRow {
+            stored_cost: Some(0.0),
+            ..base.clone()
+        }]);
+        assert!(
+            recorded_zero.contains(",0.0075,0.0000,"),
+            "an explicit recorded $0 is a value: {recorded_zero}"
+        );
+        let non_finite_row = SessionCsvRow {
+            stored_cost: Some(f64::INFINITY),
+            ..base.clone()
+        };
+        let absent = sessions_csv(&[base]);
+        assert!(
+            absent.contains(",0.0075,,"),
+            "absence renders as an empty cell, never 0.0000: {absent}"
+        );
+        let non_finite = sessions_csv(&[non_finite_row]);
+        assert!(
+            non_finite.contains(",0.0075,null,"),
+            "a non-finite recorded cost rides the shared null arm, never the literal inf: {non_finite}"
+        );
+    }
+
+    #[test]
+    fn non_finite_cost_cells_render_null_not_literal_nan_or_inf() {
+        // rm-1500 rider (run 7eb6138c cycle 3): live PoC — two
+        // `1e308` recorded costs fold past f64::MAX into `inf`, and
+        // the old `format!("{:.4}")` rendered the literal `inf` into
+        // the csv/tsv cost cells. The machine lanes now share the
+        // JSON lanes' `null` spelling for every non-finite value.
+        let out = sessions_csv(&[SessionCsvRow {
+            session: "overflow".to_string(),
+            health: 100,
+            data: "green".to_string(),
+            source: "oh_my_pi".to_string(),
+            model: "multiple".to_string(),
+            cost: f64::INFINITY,
+            stored_cost: None,
+            tokens: 63000,
+            fail: 0,
+            anomalies: 0,
+            zero_usage_events: 0,
+            subagents: 1,
+            subagent_cost: f64::NAN,
+            parent_session: String::new(),
+        }]);
+        let row = out.split("\r\n").nth(2).expect("data row");
+        assert_eq!(
+            row,
+            "overflow,100,green,oh_my_pi,multiple,null,,63000,0,0,0,1,null,"
+        );
+        assert!(!out.contains("inf"));
+        assert!(!out.contains("NaN"));
+        assert_eq!(format_cost_cell(f64::NEG_INFINITY), "null");
+        assert_eq!(format_cost_cell(0.0075), "0.0075");
     }
 
     #[test]
@@ -497,6 +609,7 @@ mod tests {
             source: "claude_code".to_string(),
             model: "m".to_string(),
             cost: 0.0,
+            stored_cost: None,
             tokens: 0,
             fail: 0,
             anomalies: 0,

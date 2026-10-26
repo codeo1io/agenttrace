@@ -24,6 +24,132 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The real zstd-framed codex rollout shipped by rm-992's admission
+/// contract (849 compressed bytes → 3574 decompressed). The needle
+/// words below live ONLY inside the decompressed frame, so any hit
+/// proves the search lane decoded the journal before scanning.
+fn compressed_rollout() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-compressed-rollout")
+        .join("rollout-2026-10-15-10-00-00-3f2a1b2c.jsonl.zst")
+}
+
+#[test]
+fn zstd_rollouts_are_decoded_searched_and_budgeted_on_decompressed_bytes() {
+    // rm-1872 residual-c (run 7eb6138c cycle 3, red-first): the
+    // transcript arm used to lossy-decode the RAW zstd frame, charge
+    // its compressed size (849) to the scan budget, and report
+    // "scanned (849 bytes)" — bytes that can never match. A body-only
+    // needle inside the decompressed journal was silently invisible
+    // (live red: count 0 with scanned_files 1 / scanned_bytes 849 over
+    // a corpus holding exactly this fixture).
+    let session = parse_file(&compressed_rollout()).expect("zst fixture parses");
+    let query = "golden fixture";
+    assert!(
+        !session.name.to_lowercase().contains(query),
+        "fixture hygiene: name {:?} must not contain the query, or the pin below is vacuous",
+        session.name
+    );
+    let report = search_sessions_detailed(
+        std::slice::from_ref(&session),
+        query,
+        20,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+    );
+    assert_eq!(report.results.len(), 1, "decoded transcript must hit");
+    assert!(
+        report.results[0]
+            .matches
+            .iter()
+            .any(|m| m.starts_with("transcript: ") && m.contains(query)),
+        "evidence must cite the DECOMPRESSED content: {:?}",
+        report.results[0].matches
+    );
+    assert_eq!(
+        report.results[0].transcript_scan,
+        "scanned (3574 bytes decompressed from a 849-byte zstd frame)",
+        "the row discloses the compressed↔decompressed relationship at scan time"
+    );
+    // The budget meters DECOMPRESSED bytes — the bytes actually
+    // searched — never the 849-byte frame.
+    assert_eq!(report.scan.scanned_files, 1);
+    assert_eq!(report.scan.scanned_bytes, 3574);
+    assert_eq!(report.scan.skipped_zstd_decode, 0);
+    assert_eq!(report.scan.skipped_budget, 0);
+    let json = agenttrace_core::report_search_json_detailed(&report);
+    let parsed: serde_json::Value = serde_json::from_str(&json)
+        .unwrap_or_else(|err| panic!("detailed search JSON must parse: {err}\n{json}"));
+    assert_eq!(
+        parsed["transcript_scan"]["skipped_zstd_decode"],
+        serde_json::json!(0)
+    );
+    let text = agenttrace_core::report_search_text_detailed(&report, query);
+    assert!(text.contains("1 file(s) scanned (3574 bytes)"));
+    assert!(!text.contains("zstd decode failed"));
+}
+
+#[test]
+fn undecodable_zstd_frames_are_disclosed_and_never_charged() {
+    // rm-1872: a corrupt frame (real magic, garbage body) must be
+    // disclosed as a zstd decode failure AT SCAN TIME and BEFORE any
+    // budget accounting: skipped_zstd_decode counts it, scanned_files
+    // and scanned_bytes stay 0 — compressed bytes that cannot be
+    // honestly searched must not burn the budget either.
+    let session = parse_file(&fixture("body-only.jsonl")).expect("fixture parses");
+    let corrupt =
+        std::env::temp_dir().join(format!("agenttrace-zst-corrupt-{}", std::process::id()));
+    let mut frame: Vec<u8> = vec![0x28, 0xB5, 0x2F, 0xFD];
+    frame.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00]);
+    std::fs::write(&corrupt, frame).expect("write corrupt frame");
+    let mut hoisted = session.clone();
+    hoisted.path = corrupt.display().to_string();
+    // Name query so a row exists to carry the per-file note.
+    let report = search_sessions_detailed(&[hoisted], "innocuous", 20, 1 << 20, 1 << 20);
+    assert_eq!(report.results.len(), 1, "metadata lanes stay verbatim");
+    assert!(
+        report.results[0]
+            .transcript_scan
+            .starts_with("skipped: zstd decode failed"),
+        "the row names the decode refusal: {:?}",
+        report.results[0].transcript_scan
+    );
+    assert_eq!(report.scan.skipped_zstd_decode, 1);
+    assert_eq!(report.scan.scanned_files, 0);
+    assert_eq!(report.scan.scanned_bytes, 0);
+    let json = agenttrace_core::report_search_json_detailed(&report);
+    assert!(json.contains("\"skipped_zstd_decode\": 1"));
+    let text = agenttrace_core::report_search_text_detailed(&report, "innocuous");
+    assert!(text.contains("1 skipped: zstd decode failed"));
+    let _ = std::fs::remove_file(&corrupt);
+}
+
+#[test]
+fn decompressed_budget_gate_skips_on_decompressed_size_not_frame_size() {
+    // rm-1872: the budget check for compressed files runs on the
+    // DECOMPRESSED size — a 849-byte frame that inflates to 3574 bytes
+    // is skipped against a 3573-byte budget even though the on-disk
+    // frame fits, and the skip note names both magnitudes.
+    let session = parse_file(&compressed_rollout()).expect("zst fixture parses");
+    let report = search_sessions_detailed(
+        std::slice::from_ref(&session),
+        "parser regression",
+        20,
+        1 << 20,
+        3573,
+    );
+    assert_eq!(report.scan.skipped_zstd_decode, 0);
+    assert_eq!(report.scan.skipped_budget, 1);
+    assert_eq!(report.scan.scanned_files, 0);
+    assert_eq!(report.scan.scanned_bytes, 0);
+    assert_eq!(
+        report.results[0].transcript_scan,
+        "skipped: decompressed 3574 bytes exceed the read budget (849-byte zstd frame)"
+    );
+    let text = agenttrace_core::report_search_text_detailed(&report, "parser regression");
+    assert!(text.contains("1 skipped: read budget exhausted"));
+}
+
 #[test]
 fn body_only_query_hits_transcript_content() {
     let session = parse_file(&fixture("body-only.jsonl")).expect("fixture parses");
@@ -221,11 +347,9 @@ fn compressed_transcript_is_decoded_and_matchable() {
         1 << 20,
     );
     assert!(
-        report
-            .results
-            .iter()
-            .any(|r| r.transcript_scan == "scanned (22652 bytes)"
-                && r.matches.iter().any(|m| m.contains("turn_context"))),
+        report.results.iter().any(|r| r.transcript_scan
+            == "scanned (22652 bytes decompressed from a 2833-byte zstd frame)"
+            && r.matches.iter().any(|m| m.contains("turn_context"))),
         "scan must decode the zstd frame, charge decompressed bytes, and match: {:?}",
         report.results
     );
@@ -271,17 +395,17 @@ fn refused_zstd_content_is_skipped_loudly() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        report.scan.skipped_zstd, 1,
+        report.scan.skipped_zstd_decode, 1,
         "the refusal must be counted in the summary, not just per row"
     );
     let text = agenttrace_core::report_search_text_detailed(&report, "innocuous");
     assert!(
-        text.contains("zstd decode refused"),
+        text.contains("zstd decode failed"),
         "the text summary must name the refusal: {text}"
     );
     let full_json = agenttrace_core::report_search_json_detailed(&report);
     assert!(
-        full_json.contains("\"skipped_zstd\": 1"),
+        full_json.contains("\"skipped_zstd_decode\": 1"),
         "the json summary must carry the refusal: {full_json}"
     );
 }
