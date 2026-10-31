@@ -5925,7 +5925,11 @@ mod tests {
             "not-a-token",
             std::time::Duration::from_millis(10)
         ));
-        #[cfg(unix)]
+        // Dead-owner semantics need a liveness probe to observe: with
+        // /proc absent the holder reads as live by design (see
+        // lock_pid_is_alive), so this pin is a Linux wiring check
+        // (macOS CI run 41193914191 failed it otherwise).
+        #[cfg(target_os = "linux")]
         assert!(lock_decision(
             "999999999-x",
             std::time::Duration::from_millis(10)
