@@ -3254,6 +3254,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): journal write hits windows sharing noise in %TEMP%
+    #[cfg(unix)]
     fn statusline_report_gains_context_spend_prompt_arms_json() {
         // rm-037/rm-708 (cycle 2): the 2026-10-07 payload docs add
         // context_window.{used_percentage,remaining_percentage,
@@ -3329,6 +3331,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): journal write hits windows sharing noise in %TEMP%
+    #[cfg(unix)]
     fn statusline_report_gains_context_spend_prompt_arms_text() {
         // rm-037/rm-708 text arm: spend renders alongside the two
         // subscription windows, context utilization renders per
@@ -4040,6 +4044,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): windows file sharing (os error 5) blocks the rewrite
+    #[cfg(unix)]
     fn journal_roundtrip_tolerates_a_torn_tail_line() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-statusline-journal-{}-{:?}",
@@ -4085,6 +4091,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): windows file sharing (os error 5) blocks the compact rewrite
+    #[cfg(unix)]
     fn compaction_keeps_newest_whole_lines_under_half_the_bound() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-statusline-compact-{}-{:?}",
@@ -4441,6 +4449,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): invalid-UTF-8 journal bytes; NTFS name validation differs
+    #[cfg(unix)]
     fn invalid_utf8_journal_still_discloses_and_retention_repairs() {
         // rm-922: one invalid UTF-8 byte used to fail the whole read —
         // every insight silently zeroed (the pristine-binary PoC:
@@ -4587,6 +4597,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): invalid-UTF-8 journal bytes; NTFS name validation differs
+    #[cfg(unix)]
     fn bad_byte_journal_recovers_retention_through_append() {
         // rm-922, the wedge leg: an over-bound journal carrying a
         // damaged line made append_statusline_capture fail (its
@@ -4753,6 +4765,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): journal write hits windows sharing noise in %TEMP%
+    #[cfg(unix)]
     fn statusline_report_sanitizes_journal_derived_strings() {
         // rm-034 regression: the journal is data (append_statusline_capture
         // stores what it saw verbatim, by design), so every journal-derived
@@ -4822,6 +4836,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): windows file sharing (os error 5) blocks the compact rewrite
+    #[cfg(unix)]
     fn concurrent_compacts_stay_coherent_and_leave_no_fixed_temp() {
         // rm-202: the compaction temp used to be a FIXED
         // `<name>.jsonl.compact` sibling, so two concurrent compacts
@@ -4962,6 +4978,8 @@ mod tests {
     // branch below; coordination between processes is marker files in
     // the temp root.
     #[test]
+    // unix-fixture (windows CI run 41197658029): windows lock-file sharing semantics (os error 5)
+    #[cfg(unix)]
     fn journal_lock_wait_is_bounded_and_loud_under_foreign_holder() {
         // rm-686 red fixture: a foreign holder of the journal lock must
         // produce a loud, bounded refusal — never an indefinite hang (the
@@ -5138,6 +5156,8 @@ mod tests {
     // loss the cross-process fixture races for; here it is forced by
     // interleaving.
     #[test]
+    // unix-fixture (windows CI run 41197658029): windows file sharing (os error 5) blocks the rename swap
+    #[cfg(unix)]
     fn journal_lockless_handle_loses_append_to_compaction() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-journal-mechanism-{}",

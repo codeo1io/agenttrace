@@ -2128,6 +2128,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): encodes the transcript dir with replace('/', '-') — windows paths carry backslashes, so nothing encodes
+    #[cfg(unix)]
     fn ambiguous_samples_dedup_by_project_path() {
         // rm-512 ambiguous arm: a transcript under an encoded dir that
         // decodes to both a literal and a shadowed alternative — three
@@ -2259,6 +2261,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): same dash-encoding contract as the ambiguous arm
+    #[cfg(unix)]
     fn resolved_decode_notes_dedup_by_identity_with_counts() {
         // Integration 2026-10-07 (conflict case d9ddc6a9): the rm-240
         // truncated and opaque arms count as resolved with one

@@ -822,6 +822,8 @@ mod tests {
 }
 
 #[test]
+// unix-fixture (windows CI run 41197658029): unix-path fixtures ('/xdg/data', '/home/...')
+#[cfg(unix)]
 fn history_path_ignores_relative_xdg_data_home() {
     // rm-248: same XDG rule for the history root — a relative
     // $XDG_DATA_HOME is ignored as if unset, so a cwd-relative

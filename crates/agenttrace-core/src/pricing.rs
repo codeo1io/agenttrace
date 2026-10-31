@@ -3624,6 +3624,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): chmod-based unwritable-mode fixture
+    #[cfg(unix)]
     fn stale_cache_is_served_as_is_without_download_or_rewrite() {
         with_isolated_cache_env(|| {
             let raw = br#"{"anthropic/claude-sonnet-4-5":{"input_cost_per_token":3e-6,"output_cost_per_token":1.5e-5,"cache_creation_input_token_cost":3.75e-7,"cache_read_input_token_cost":3e-7,"mode":"chat","litellm_provider":"anthropic"}}"#;

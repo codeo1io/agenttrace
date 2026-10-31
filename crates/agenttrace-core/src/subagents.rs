@@ -457,6 +457,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): hardlink inode-identity dedup is a POSIX property
+    #[cfg(unix)]
     fn hardlinked_parent_spellings_all_link() {
         // rm-797 red-first: the PoC shape from assess 35b3b690 —
         // A/P.jsonl and B/P.jsonl are the SAME file (hardlink), so
@@ -582,6 +584,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): hardlink inode-identity dedup is a POSIX property
+    #[cfg(unix)]
     fn resolves_same_dir_parent_from_journal_session_id() {
         let scratch = Scratch::new("resolve");
         let child = scratch.file(
