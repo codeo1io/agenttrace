@@ -276,6 +276,11 @@ fn tempdir(tag: &str) -> PathBuf {
 /// whichever of the two lanes a machine consumer imports, the cell
 /// is inert.
 #[test]
+// The fixtures write journals NAMED after hostile formula stems
+// ("=SUM(9+9).jsonl") — legal POSIX filenames, invalid on windows
+// (os error 123, CI run 41194809329). The CSV-introducer guard
+// itself is filename-agnostic and stays pinned on unix runners.
+#[cfg(unix)]
 fn default_text_lane_guards_spreadsheet_formulas_like_csv() {
     let tmp = tempdir("output-safety-formula");
     let corpus = tmp.join("corpus");
