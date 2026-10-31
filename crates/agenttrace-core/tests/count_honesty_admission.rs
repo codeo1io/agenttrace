@@ -35,7 +35,6 @@ use agenttrace_core::{
 };
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -475,8 +474,13 @@ fn explicit_dir_lane_keeps_duplicate_copies() {
     let _ = fs::remove_dir_all(&home);
 }
 
+#[cfg(unix)]
 #[test]
 fn unreadable_journal_is_kept_and_never_a_duplicate() {
+    // chmod-0o000 sealing is unix-only (PermissionsExt). CI run
+    // 41191833624: windows-latest failed to compile this file
+    // (E0433 `os::unix` + E0599 `Permissions::from_mode`).
+    use std::os::unix::fs::PermissionsExt;
     // A journal whose bytes cannot be read (permissions) has no
     // content signature: it must stay ADMITTED (its parse failure is
     // disclosed downstream) and must not be counted as a duplicate of
