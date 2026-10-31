@@ -65,6 +65,10 @@ fn with_sandboxed_home(f: impl FnOnce()) {
 }
 
 #[test]
+// Marker-string pins on the probed path: windows canonicalizes to
+// \\?\-prefixed verbatim paths with different case (run 41200240391),
+// so contains(marker) fails. Unix pins the disclosure contract.
+#[cfg(unix)]
 fn doctor_demo_dir_arg_gates_the_directory_lane() {
     with_sandboxed_home(|| {
         let root = planted_corpus("dirlane");
