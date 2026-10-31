@@ -1,3 +1,8 @@
+//! opencode project attribution contract. The hostile-project-id
+//! escape arm pins unix "/..."-is-absolute semantics (windows treats
+//! drive-less paths as relative — CI run 41201929804). Unix-only.
+#![cfg(unix)]
+
 //! rm-1865: opencode session docs carry `directory` (and `projectID`) that
 //! the parser never decoded — every opencode session rolled up as
 //! by_project "unknown", even docs with an explicit directory (the in-tree
