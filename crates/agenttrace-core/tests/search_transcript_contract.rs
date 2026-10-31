@@ -183,6 +183,10 @@ fn body_only_query_hits_transcript_content() {
 }
 
 #[test]
+// Pins an exact scanned_bytes count over a vendored fixture — a CRLF
+// checkout on windows adds 3 bytes (434 vs 431, run 41202318951).
+// Unix (LF) pins the byte accounting.
+#[cfg(unix)]
 fn metadata_lanes_stay_verbatim_and_detailed_reports_the_scan() {
     let session = parse_file(&fixture("body-only.jsonl")).expect("fixture parses");
     // Name-derived match (first user message) — the pre-1415 lane.
