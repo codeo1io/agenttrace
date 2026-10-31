@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Count-honesty ledger admission tests (cycle 5, run 77ca5de0).
 //!
 //! Three ledger arms landed together because they are the same
