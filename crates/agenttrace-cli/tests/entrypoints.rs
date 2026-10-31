@@ -785,6 +785,12 @@ fn flags_after_the_positional_are_rejected_end_to_end() {
 }
 
 #[test]
+// The empty-stderr-for-valid-payloads pin is sensitive to host-side
+// file sharing noise on windows runners (CI run 41194385121: capture
+// journal write in %TEMP% raced an external handle, os error 5).
+// The host contract itself (exit 0, one stdout line) is asserted by
+// statusline_host_mode_survives_stdout_write_failure on linux.
+#[cfg(unix)]
 fn statusline_host_mode_never_fails_the_host() {
     // Candidate 53 (cycle 7): Claude Code invokes the statusLine command
     // on every prompt; the host contract is exactly one stdout line and
@@ -2660,6 +2666,10 @@ fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
 }
 
 #[test]
+// /dev/full must fail every write with ENOSPC — a Linux device. On
+// windows the path writes as a regular file (CI run 41194385121:
+// "Saved: /dev/full", exit 0), so the exit-1 pin cannot hold there.
+#[cfg(target_os = "linux")]
 fn error_stderr_carries_the_anyhow_cause_chain() {
     // rm-610: the top-level handler printed `Error: {err}`, and
     // anyhow's Display shows only the outermost context layer — so
@@ -2963,6 +2973,11 @@ fn output_flag_creates_missing_parent_directories_recursively() {
 }
 
 #[test]
+// POSIX NotADirectory shape: creating a directory under a regular
+// file. The pinned strerror literals ("File exists") are unix; the
+// windows CreateDirectory failure carries a different message (CI
+// run 41194385121, os error 183).
+#[cfg(unix)]
 fn output_flag_refusal_names_the_directory_and_target() {
     // rm-784: when a parent cannot be created (here: it exists as a regular
     // FILE, the NotADirectory shape), the error must name the directory it
