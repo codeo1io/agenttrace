@@ -644,6 +644,11 @@ mod tests {
     }
 
     #[test]
+    // The table's inputs are unix paths ("/xdg", "/home"): on Windows
+    // Path::is_absolute requires a drive prefix, so "/xdg" reads as
+    // relative and the absolute-XDG rows fail (CI run 41193503447).
+    // The XDG_CONFIG_HOME contract these rows pin is a unix spec.
+    #[cfg(unix)]
     fn user_config_path_table_covers_empty_env_fallbacks() {
         use std::ffi::OsStr;
         let cases: &[(Option<&OsStr>, Option<&OsStr>, Option<PathBuf>)] = &[
@@ -1026,6 +1031,10 @@ mod tests {
 }
 
 #[test]
+// Unix-path fixture test ("/home/agenttrace-rm248", "/xdg/abs"):
+// Windows is_absolute rejects driveless paths, so the absolute-XDG
+// arm under test cannot be exercised with these values there.
+#[cfg(unix)]
 fn user_config_path_ignores_relative_xdg_config_home() {
     // rm-248: the XDG Base Directory Specification says a relative
     // $XDG_CONFIG_HOME is ignored as if unset. Before this guard a

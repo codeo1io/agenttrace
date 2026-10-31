@@ -5816,9 +5816,13 @@ mod tests {
 
         // A token naming a dead process: stealable at once (this
         // process is alive by construction, so borrow a pid that is
-        // not — /proc has none above pid_max). The liveness probe is
-        // unix-only; elsewhere the age lane carries staleness.
-        #[cfg(unix)]
+        // not — /proc has none above pid_max). Pinned only on hosts
+        // with a /proc probe: where the probe is absent the holder is
+        // treated as live (see lock_pid_is_alive) and the age lane
+        // carries staleness, so the dead-owner observation is a
+        // Linux-only wiring check (macOS CI run 41193503447 failed
+        // exactly this assertion).
+        #[cfg(target_os = "linux")]
         {
             fs::write(&lock_path, format!("999999999-{}", lock_path.display()))
                 .expect("write dead-owner lock");
