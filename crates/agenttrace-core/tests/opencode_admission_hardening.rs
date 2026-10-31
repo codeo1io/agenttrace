@@ -1,3 +1,10 @@
+//! opencode admission hardening contract (rm-1870). The absolute-id
+//! escape arms pin unix path semantics: an absolute id like
+//! "/nonexistent_at_all" is rejected-and-disclosed as an unsupported
+//! session format, but on windows a drive-less forward-slash path is
+//! not absolute (CI run 41201112736), so the arms diverge. Unix-only.
+#![cfg(unix)]
+
 //! rm-1870 + rm-1871: id-identity admission and the session-wide read
 //! budget for the opencode transcript lane.
 //!
