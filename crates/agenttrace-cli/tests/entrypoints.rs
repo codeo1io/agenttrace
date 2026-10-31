@@ -870,12 +870,15 @@ fn statusline_host_mode_never_fails_the_host() {
     let _ = std::fs::remove_dir_all(cache);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn statusline_host_mode_survives_stdout_write_failure() {
     // Review F2 (cycle 7): the host contract is exit 0 for any input —
     // and for any stdout condition. A host whose pipe is closed or whose
     // disk is full must not get a panic (was: exit 101 "failed printing
-    // to stdout"). /dev/full fails every write with ENOSPC.
+    // to stdout"). /dev/full fails every write with ENOSPC. Linux-only:
+    // macOS runners have no /dev/full (CI run 41150128651 panicked at
+    // this test with `open /dev/full: NotFound`).
     use std::io::Write as _;
     let cache = std::env::temp_dir().join(format!(
         "agenttrace-statusline-devfull-{}",
