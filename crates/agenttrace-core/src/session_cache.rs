@@ -1844,7 +1844,17 @@ fn lock_pid_is_alive(pid: u32) -> bool {
     // /proc is the std-only liveness probe on the unix family this
     // tool ships on; where it is absent the age lane still catches
     // the crash.
-    Path::new("/proc").join(pid.to_string()).exists()
+    if Path::new("/proc").exists() {
+        return Path::new("/proc").join(pid.to_string()).exists();
+    }
+    // No /proc (macOS hosts): there is no std-only liveness probe, so
+    // treat the holder as live and let the age lane
+    // (CACHE_LOCK_STALE_AFTER) govern staleness. Returning false here
+    // made every live lock read as dead and be stolen instantly
+    // (macOS CI leg, run 41192730818: concurrent_saves_merge and
+    // lock_staleness tests failed exactly this way — fresh locks
+    // stolen under their writers, saves racing to NotFound).
+    true
 }
 
 #[cfg(not(unix))]
@@ -6332,7 +6342,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    // The journal name embeds raw 0xff/0xfe bytes, which APFS rejects
+    // outright ("Illegal byte sequence", macOS CI run 41192730818) —
+    // the POSIX filename contract pinned here is a Linux/ext4
+    // property. Linux-only (was cfg(unix)).
+    #[cfg(target_os = "linux")]
     fn non_utf8_paths_round_trip_through_the_cache_store() {
         // rm-041: cache keys and listing members used to collapse
         // non-UTF-8 paths to `U+FFFD`, so a `bad\xff\xfename.jsonl`
@@ -6409,7 +6423,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    // The journal name embeds raw 0xff/0xfe bytes, which APFS rejects
+    // outright ("Illegal byte sequence", macOS CI run 41192730818) —
+    // the POSIX filename contract pinned here is a Linux/ext4
+    // property. Linux-only (was cfg(unix)).
+    #[cfg(target_os = "linux")]
     fn legacy_lossy_listing_members_are_dropped_once_at_load() {
         // rm-041 upgrade seam: a pre-v4 store carries listing members
         // built with `to_string_lossy`, so a non-UTF-8 journal is stored

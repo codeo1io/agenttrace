@@ -3334,9 +3334,13 @@ mod tests {
         let previous_env = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
         let previous_home = std::env::var_os("HOME");
         let previous_xdg = std::env::var_os("XDG_CACHE_HOME");
-        let default_root = root.join("home").join(".cache").join("agenttrace");
+        // Pin the XDG arm (decision 1 of the cache_dir ladder: an
+        // absolute XDG_CACHE_HOME wins on EVERY OS), not the HOME arm —
+        // on macOS the HOME arm resolves Library/Caches and this test's
+        // hardcoded .cache expectation fails (CI run 41192730818).
+        let default_root = root.join("xdg").join("agenttrace");
         std::env::set_var("HOME", root.join("home"));
-        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", root.join("xdg"));
 
         std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
         assert_eq!(
