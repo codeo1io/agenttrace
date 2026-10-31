@@ -106,6 +106,8 @@ mod tests {
     /// `Library/Caches` against the CWD, the bug the rm-248 rider
     /// landed the guard for; this shared form preserves that guard.
     #[test]
+    // unix-fixture (windows CI run 41197658029): table rows carry unix absolute paths ('/xdg-cache'); windows is_absolute demands a drive prefix
+    #[cfg(unix)]
     fn user_cache_dir_decision_table() {
         let empty = Some(OsStr::new(""));
         let home = Some(OsStr::new("/home/at-test"));

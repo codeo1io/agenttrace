@@ -703,6 +703,9 @@ fn live_search_escape_restores_structured_and_project_filters() {
 }
 
 #[test]
+// unix-path fixture ('/beta/same'): Path::join emits a
+// backslash separator on windows (run 41203061847).
+#[cfg(unix)]
 fn project_view_filters_by_canonical_id_and_keeps_same_names_separate() {
     let mut left = session("left", "codex_cli", "gpt-5", 90, 0.1, "rg");
     left.cwd = "/tmp/alpha/project".to_string();

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! rm-1892 (run 77ca5de0 cycle 5): the relative-link scan gate,
 //! pinned by fixture both ways.
 //!

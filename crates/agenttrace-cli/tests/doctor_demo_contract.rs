@@ -378,10 +378,14 @@ fn doctor_json_lane_escapes_spoofing_controls_in_failure_samples() {
         "the -o artifact must carry the escape text too (rm-656 embedding lane)"
     );
     // Fast path: the clean sample rides verbatim — escaping never
-    // touches clean strings, so clean output stays byte-identical.
+    // touches clean strings, so the decoded sample is byte-identical
+    // to the on-disk path. (Compared post-decode: raw stdout doubles
+    // every backslash per JSON, so a substring check on the raw lane
+    // is a unix-path assumption — windows CI run 41193914191 failed
+    // exactly that assert with a C:\Users\... sample present.)
     assert!(
-        stdout.contains(clean_path.as_str()),
-        "clean names must ride the json lane verbatim: {stdout}"
+        samples.iter().any(|sample| sample == &clean_path),
+        "clean names must ride the json lane verbatim: {samples:?} vs {clean_path:?}"
     );
 
     // Contrast pin: the text lane keeps its landed rm-936 behavior —

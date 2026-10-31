@@ -1150,6 +1150,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): dash-encoded unix path fixtures
+    #[cfg(unix)]
     fn projects_group_worktrees_and_decode_agent_dirs() {
         // rm-382: hermetic fixture — unique root, no `agenttrace` component
         // for host TMPDIR shadows to collide with.
@@ -1221,6 +1223,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): dash-encoded unix path fixtures
+    #[cfg(unix)]
     fn decode_ignores_shadow_directories_at_plausible_ancestors() {
         // rm-382 regression (assess N2): with TMPDIR=/home/agent/.hermes/
         // tmp/delegate and a leftover sibling directory literally named
@@ -1265,6 +1269,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): dash-encoded unix path fixtures
+    #[cfg(unix)]
     fn truncated_encoded_names_keep_a_stable_identity() {
         // rm-240 residual: encoded names over 200 chars are truncated to 200
         // chars and suffixed with a hash of the full path
@@ -1341,6 +1347,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): dash-encoded unix path fixtures
+    #[cfg(unix)]
     fn decode_prefers_the_longest_verified_path_over_a_decoy_split() {
         // rm-381 regression, assess PoC triple (delegate/172562a8…-scratch/
         // poc-misattr-{decoy,true,nodecoy}.json): with the true project
@@ -1429,6 +1437,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): dash-encoded unix path fixtures
+    #[cfg(unix)]
     fn decode_tolerates_literal_dashes_and_empty_components() {
         // A literal '-' inside a component name encodes exactly like a path
         // separator, so the longest-run rule prefers the joined spelling;

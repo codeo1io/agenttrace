@@ -26,6 +26,9 @@ fn card_of(theme: SvgCardTheme) -> String {
 }
 
 #[test]
+// Golden-byte pin over a vendored SVG fixture — CRLF checkout on
+// windows rewrites every newline (run 41202688535). Unix pins it.
+#[cfg(unix)]
 fn golden_bytes_are_pinned_for_the_demo_corpus() {
     for (name, theme) in [
         ("demo-auto.svg", SvgCardTheme::Auto),

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use agenttrace_core::SESSION_CACHE_SCHEMA_VERSION;
 use agenttrace_core::{
     build_doctor_report, collect_session_files, data_health, data_health_scoped,

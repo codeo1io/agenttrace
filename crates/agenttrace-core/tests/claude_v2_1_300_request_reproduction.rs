@@ -305,6 +305,11 @@ fn doctor_report_surfaces_the_unmatched_kind_counter() {
 /// known-shape lines (the byte-identical arm above compares across
 /// them, so they must not drift).
 #[test]
+// Byte-exact fixture provenance: the vendored jsonl must open with the
+// control line byte-for-byte. A CRLF git checkout on windows rewrites
+// the fixture bytes and starts_with fails (CI run 41198625911). The
+// repo checks out LF on unix; pin there.
+#[cfg(unix)]
 fn vendored_fixture_known_lines_match_the_inline_control_corpus() {
     let vendored = fs::read_to_string(Path::new(FIXTURE)).expect("fixture read");
     assert!(

@@ -3334,9 +3334,13 @@ mod tests {
         let previous_env = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
         let previous_home = std::env::var_os("HOME");
         let previous_xdg = std::env::var_os("XDG_CACHE_HOME");
-        let default_root = root.join("home").join(".cache").join("agenttrace");
+        // Pin the XDG arm (decision 1 of the cache_dir ladder: an
+        // absolute XDG_CACHE_HOME wins on EVERY OS), not the HOME arm —
+        // on macOS the HOME arm resolves Library/Caches and this test's
+        // hardcoded .cache expectation fails (CI run 41192730818).
+        let default_root = root.join("xdg").join("agenttrace");
         std::env::set_var("HOME", root.join("home"));
-        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", root.join("xdg"));
 
         std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
         assert_eq!(
@@ -3620,6 +3624,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): chmod-based unwritable-mode fixture
+    #[cfg(unix)]
     fn stale_cache_is_served_as_is_without_download_or_rewrite() {
         with_isolated_cache_env(|| {
             let raw = br#"{"anthropic/claude-sonnet-4-5":{"input_cost_per_token":3e-6,"output_cost_per_token":1.5e-5,"cache_creation_input_token_cost":3.75e-7,"cache_read_input_token_cost":3e-7,"mode":"chat","litellm_provider":"anthropic"}}"#;

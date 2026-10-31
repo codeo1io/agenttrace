@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Changelog structure-gate contract (rm-1928, run 9d3b927c cycle 1,
 //! repository-maintenance 14f74994).
 //!
@@ -77,6 +79,11 @@ fn temp_repo(tag: &str, changelog: &str) -> PathBuf {
     root
 }
 
+// The gate shells out to `bash scripts/ci/check-changelog-structure.sh`
+// — a unix toolchain assumption; on windows runners the git-bash
+// invocation produces empty output and every fixture fails (CI run
+// 41198246771, 0/6 passed). Unix-only harness.
+#[cfg(unix)]
 fn run_gate(root: &Path) -> (bool, String, String) {
     let output = Command::new("bash")
         .arg(root.join("scripts/ci/check-changelog-structure.sh"))

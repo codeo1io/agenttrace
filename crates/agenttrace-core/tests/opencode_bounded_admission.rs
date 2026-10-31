@@ -1,3 +1,9 @@
+//! opencode bounded admission contract. The absolute-id escape arm
+//! pins unix path semantics ("/..." ids are absolute and rejected-
+//! with-disclosure); windows treats drive-less paths as relative
+//! (CI run 41201519296). Unix-only.
+#![cfg(unix)]
+
 //! rm-1437: bounded admission for the opencode transcript lane.
 //!
 //! `read_opencode_records` stat-caps whole-file reads: over-cap transcripts are

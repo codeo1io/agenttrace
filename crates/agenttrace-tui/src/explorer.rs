@@ -2966,6 +2966,9 @@ mod interaction_tests {
     }
 
     #[test]
+    // unix-path fixture ('/beta/same'): Path::join emits a
+    // backslash separator on windows (run 41203061847).
+    #[cfg(unix)]
     fn searchable_projects_preserve_identity_and_refresh_reading_position() {
         let mut sessions = agenttrace_core::demo_sessions().unwrap();
         sessions[0].cwd = "/alpha/same".into();

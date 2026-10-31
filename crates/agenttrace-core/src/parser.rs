@@ -13612,6 +13612,8 @@ mod tests {
     }
 
     #[test]
+    // unix-fixture (windows CI run 41197658029): tzdata-dependent America/New_York DST fallback; windows tzdb mapping differs
+    #[cfg(unix)]
     fn aider_time_resolves_dst_ambiguity_deterministically() {
         // rm-899: aider chat histories carry LOCAL wall-clock starts
         // ("# aider chat started at 2026-11-01 01:30:00"). During a
