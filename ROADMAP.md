@@ -6,6 +6,11 @@
 
 **Pillars**: reliability work outranks customer-experience work; every roadmap item cites reproducible codebase signals; acceptance is proven by cited evidence, never claimed
 
+## Fleet context
+
+- dependents (changes here affect): (host), maestro
+- graph: evidence-derived (imports/refs/deploy surfaces); advisory
+
 ## Open items
 
 ### Deterministic project-dir decode (host-state-independent attribution)
