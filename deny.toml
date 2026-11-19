@@ -56,7 +56,18 @@ unsound = "all"
 # rule stays the remediation path for any advisory the policy flags —
 # lru 0.18.1 → 0.18.5 was already landed here as rm-552.
 unmaintained = "all"
-ignore = []
+ignore = [
+    # ci-audit 2026-11-19 (master runs 43857276031 / 44078204237 /
+    # 44297571296): RUSTSEC-2026-0543 declares chrono unmaintained in ALL
+    # versions — there is no patch floor to bump past, so the
+    # bump-past-the-patch-floor rule above has no target until the jiff
+    # migration (~120 chrono:: call sites in crates/agenttrace-core) lands,
+    # which is a code change outside CI-scope. Dated carve-out per the
+    # rm-587 precedent (dated ignore + explicit removal rule): drop this
+    # entry the moment Cargo.lock migrates chrono -> jiff or the advisory
+    # is withdrawn/retracted.
+    "RUSTSEC-2026-0543",
+]
 
 [licenses]
 version = 2
